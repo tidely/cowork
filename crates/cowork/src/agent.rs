@@ -4,8 +4,8 @@ use futures::SinkExt;
 use futures_util::StreamExt;
 use rig_core::{
     agent::{
-        HookAction, MultiTurnStreamItem, PromptHook, StreamingError, StreamingResult,
-        ToolCallHookAction,
+        AgentBuilder, HookAction, MultiTurnStreamItem, PromptHook, StreamingError, StreamingResult,
+        ToolCallHookAction, WithBuilderTools,
     },
     client::{CompletionClient, ProviderClient},
     completion::CompletionModel,
@@ -115,18 +115,55 @@ where
 
 pub const MODEL: &str = "gemma4:31b";
 pub(crate) const TOOL_CONCURRENCY: usize = 8;
-pub(crate) const PROMPT_RETRY_ATTEMPTS: usize = 5;
+pub(crate) const AGENT_MAX_TURNS: usize = 1000;
+/// Backoffs between successive retries, slowest last. We make one more attempt
+/// than there are backoffs — the final attempt has nothing waiting after it — so
+/// a failure on 1-based attempt `n` waits `PROMPT_RETRY_BACKOFFS[n - 1]`, and a
+/// failure on the last attempt finds no entry and gives up.
 pub(crate) const PROMPT_RETRY_BACKOFFS: [Duration; 4] = [
     Duration::from_secs(1),
     Duration::from_secs(3),
     Duration::from_secs(10),
     Duration::from_secs(30),
 ];
+pub(crate) const PROMPT_RETRY_ATTEMPTS: usize = PROMPT_RETRY_BACKOFFS.len() + 1;
+
+/// How long to wait before retrying a failed attempt, or `None` to give up —
+/// either because the error is deterministic or because we are out of retry
+/// budget. The `get` returning `None` past the schedule is the budget check.
+pub(crate) fn retry_backoff(
+    attempt: usize,
+    error: &(dyn std::error::Error + Send + Sync),
+) -> Option<Duration> {
+    if is_retryable_prompt_error(error) {
+        PROMPT_RETRY_BACKOFFS.get(attempt - 1).copied()
+    } else {
+        None
+    }
+}
+
+/// Build an agent preconfigured with the shared model, reasoning, the read-only
+/// filesystem tools, and a turn limit. Callers add memory, extra tools, and a
+/// hook before `build()`. Keeping this in one place means a new shared tool is a
+/// single-line change rather than one edit per agent level.
+pub(crate) fn base_agent_builder(
+    client: &ollama::Client,
+    preamble: &str,
+    max_turns: usize,
+) -> AgentBuilder<ollama::CompletionModel, (), WithBuilderTools> {
+    client
+        .agent(MODEL)
+        .preamble(preamble)
+        .additional_params(serde_json::json!({ "think": true }))
+        .default_max_turns(max_turns)
+        .tool(crate::tools::ReadFile)
+        .tool(crate::tools::ListDirectory)
+}
 
 pub const MAIN_AGENT_PREAMBLE: &str = "You are the top-level user-facing assistant with persistent conversation context. Use tools when relevant. \
      Do continuous work yourself when future prompts depend on your accumulated understanding, such as ongoing work in the same codebase or project. \
      For broad bounded one-off tasks with many independent chunks, prefer calling subagent instead of manually iterating every chunk yourself. \
-     A first-level subagent owns the bounded task, maximizes parallelism by splitting independent context-heavy chunks into one worker call per chunk, and synthesizes their results. \
+     A subagent owns the bounded task, maximizes parallelism by splitting independent context-heavy chunks into one child subagent per chunk, and synthesizes their results. \
      Do not use subagent for simple one- or two-tool tasks or tasks needing continuous shared context. \
      When delegating, pass the full bounded task plus enough context, constraints, and paths for the subagent to plan; after it returns, synthesize its result into the final answer or next action.";
 
@@ -189,7 +226,7 @@ async fn run_prompt_with_retries(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut sink = AgentEventSink::new(events.clone(), thread_id);
     for attempt in 1..=PROMPT_RETRY_ATTEMPTS {
-        match run_prompt_once(
+        let error = match run_prompt_once(
             thread_id,
             prompt.clone(),
             conversation_id.clone(),
@@ -199,34 +236,23 @@ async fn run_prompt_with_retries(
         .await
         {
             Ok(()) => return Ok(()),
-            Err(error)
-                if attempt < PROMPT_RETRY_ATTEMPTS && is_retryable_prompt_error(error.as_ref()) =>
-            {
-                let backoff = PROMPT_RETRY_BACKOFFS
-                    .get(attempt - 1)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        *PROMPT_RETRY_BACKOFFS
-                            .last()
-                            .expect("non-empty backoff list")
-                    });
-                let message = format!(
-                    "Attempt {attempt}/{PROMPT_RETRY_ATTEMPTS} failed with a transient error: {error}. Retrying in {}s…",
-                    backoff.as_secs()
-                );
+            Err(error) => error,
+        };
 
-                sink.send(AgentEvent::Status {
-                    addr: AgentAddr::Main,
-                    content: message,
-                })
-                .await;
-                tokio::time::sleep(backoff).await;
-            }
-            Err(error) => {
-                remember_failed_prompt(&memory, &conversation_id, &prompt, error.as_ref()).await;
-                return Err(error);
-            }
-        }
+        let Some(backoff) = retry_backoff(attempt, error.as_ref()) else {
+            remember_failed_prompt(&memory, &conversation_id, &prompt, error.as_ref()).await;
+            return Err(error);
+        };
+
+        sink.send(AgentEvent::Status {
+            addr: AgentAddr::Main,
+            content: format!(
+                "Attempt {attempt}/{PROMPT_RETRY_ATTEMPTS} failed with a transient error: {error}. Retrying in {}s…",
+                backoff.as_secs()
+            ),
+        })
+        .await;
+        tokio::time::sleep(backoff).await;
     }
 
     unreachable!("retry loop always returns")
@@ -256,13 +282,8 @@ async fn run_prompt_once(
     events: RuntimeEventSender,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = ollama::Client::from_env()?;
-    let agent = client
-        .agent(MODEL)
-        .preamble(MAIN_AGENT_PREAMBLE)
-        .additional_params(serde_json::json!({ "think": true }))
+    let agent = base_agent_builder(&client, MAIN_AGENT_PREAMBLE, AGENT_MAX_TURNS)
         .memory(memory)
-        .tool(crate::tools::ReadFile)
-        .tool(crate::tools::ListDirectory)
         .tool(crate::tools::EditFile)
         .tool(crate::tools::Subagent::new(
             crate::tools::ToolUiContext::new(thread_id, events.clone()),
@@ -271,7 +292,6 @@ async fn run_prompt_once(
             AgentEventSink::new(events.clone(), thread_id),
             AgentAddr::Main,
         ))
-        .default_max_turns(1000)
         .build();
 
     let mut stream = agent
@@ -390,6 +410,20 @@ mod tests {
         assert_eq!(PROMPT_RETRY_BACKOFFS[1], Duration::from_secs(3));
         assert_eq!(PROMPT_RETRY_BACKOFFS[2], Duration::from_secs(10));
         assert_eq!(PROMPT_RETRY_BACKOFFS[3], Duration::from_secs(30));
+    }
+
+    #[test]
+    fn retry_backoff_follows_schedule_then_gives_up() {
+        let transient = StaticError("CompletionError: HttpError: connection reset by peer");
+        let deterministic = StaticError("ToolSetError: ToolCallError: old_text was not found");
+
+        // A retryable error within budget waits the scheduled backoff...
+        assert_eq!(retry_backoff(1, &transient), Some(Duration::from_secs(1)));
+        assert_eq!(retry_backoff(4, &transient), Some(Duration::from_secs(30)));
+        // ...the last attempt has no budget left, and deterministic errors never
+        // retry — both give up.
+        assert_eq!(retry_backoff(PROMPT_RETRY_ATTEMPTS, &transient), None);
+        assert_eq!(retry_backoff(1, &deterministic), None);
     }
 
     #[test]

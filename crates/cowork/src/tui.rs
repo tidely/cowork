@@ -67,12 +67,10 @@ fn handle_runtime_event(
         RuntimeEvent::Terminal(Event::Key(key)) if key.kind == KeyEventKind::Press => {
             if let SubmitResult::Submitted {
                 thread_id,
-                agent_id,
                 conversation_id,
                 prompt,
             } = app.handle_key(key)
             {
-                let _ = (thread_id, agent_id);
                 agent::spawn_prompt_task(
                     thread_id,
                     prompt,

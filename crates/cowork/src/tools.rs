@@ -1,6 +1,5 @@
 use std::{
     convert::Infallible,
-    ffi::OsString,
     fs, io,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
@@ -13,7 +12,7 @@ use crate::{
 };
 use rig_core::{
     agent::{StreamingError, StreamingResult},
-    client::{CompletionClient, ProviderClient},
+    client::ProviderClient,
     completion::ToolDefinition,
     providers::ollama,
     schemars::{self, JsonSchema},
@@ -23,16 +22,23 @@ use rig_core::{
 use rig_derive::rig_tool;
 
 const MAX_READ_BYTES: u64 = 512 * 1024;
-const SUBAGENT_MODEL: &str = "gemma4:31b";
-const SUBAGENT_MAX_TURNS: usize = 1000;
-const WORKER_AGENT_MAX_TURNS: usize = 1000;
+
+/// Maximum agent nesting depth. The top-level assistant is depth 0; each
+/// `subagent` call spawns a child one level deeper. An agent below this depth
+/// receives the `subagent` tool and can delegate further; an agent at this depth
+/// is a leaf that does its chunk itself. Bounds runaway recursion.
+const MAX_AGENT_DEPTH: AgentDepth = 4;
 
 static NEXT_RUNTIME_AGENT_KEY: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
 pub struct ToolUiContext {
     thread_id: ThreadId,
+    /// Runtime key of the agent that owns these tools, and therefore the parent
+    /// of any agent they spawn. `None` for the top-level assistant.
     parent_key: Option<RuntimeAgentKey>,
+    /// Depth of the agent that owns these tools (top-level assistant is 0).
+    depth: AgentDepth,
     events: RuntimeEventSender,
 }
 
@@ -41,14 +47,18 @@ impl ToolUiContext {
         Self {
             thread_id,
             parent_key: None,
+            depth: 0,
             events,
         }
     }
 
-    fn with_parent_key(&self, parent_key: RuntimeAgentKey) -> Self {
+    /// Context for the tools handed to a freshly spawned child agent: the child
+    /// becomes the parent of its own children, one level deeper.
+    fn child_context(&self, child_key: RuntimeAgentKey, child_depth: AgentDepth) -> Self {
         Self {
             thread_id: self.thread_id,
-            parent_key: Some(parent_key),
+            parent_key: Some(child_key),
+            depth: child_depth,
             events: self.events.clone(),
         }
     }
@@ -58,51 +68,23 @@ fn next_runtime_agent_key() -> RuntimeAgentKey {
     NEXT_RUNTIME_AGENT_KEY.fetch_add(1, Ordering::Relaxed)
 }
 
-#[derive(Clone, Copy)]
-enum SubagentDepth {
-    FirstLevel,
-    Worker,
-}
-
-impl SubagentDepth {
-    fn label(self) -> &'static str {
-        match self {
-            SubagentDepth::FirstLevel => "subagent",
-            SubagentDepth::Worker => "worker_agent",
-        }
-    }
-
-    fn ui_depth(self) -> AgentDepth {
-        match self {
-            SubagentDepth::FirstLevel => AgentDepth::Subagent,
-            SubagentDepth::Worker => AgentDepth::Worker,
-        }
-    }
-
-    fn max_turns(self) -> usize {
-        match self {
-            SubagentDepth::FirstLevel => SUBAGENT_MAX_TURNS,
-            SubagentDepth::Worker => WORKER_AGENT_MAX_TURNS,
-        }
-    }
-
-    fn preamble(self) -> &'static str {
-        match self {
-            SubagentDepth::FirstLevel => {
-                "You are a first-level task agent spawned by a top-level assistant. Own the delegated bounded task. \
-                 Maximize parallelism: when there are many independent context-heavy chunks, issue separate worker_agent calls for each chunk instead of inspecting chunks yourself. \
-                 Use one worker per independent chunk and run as many worker calls in parallel as possible; do not batch multiple independent chunks into one worker. \
-                 Examples of chunks are one repository, one document, one subsystem, one account/resource, or one comparison item; the examples are not task-specific rules. \
-                 Do not send the entire task, a long global list, or a batch of unrelated chunks to one worker. Give each worker only its slice-specific context. \
-                 If the task requires continuous shared context rather than independent chunks, do the work yourself instead of spawning workers. \
-                 Use tools when needed, do not modify files, and return a concise result useful to the top-level assistant."
-            }
-            SubagentDepth::Worker => {
-                "You are a lowest-level worker agent. Do one independent context-heavy chunk and return a concise result. \
-                 Use tools when needed. Do not modify files. \
-                 If the task cannot be handled independently because it needs continuous shared context, say so briefly."
-            }
-        }
+/// Preamble for a spawned subagent. Agents that can still delegate are steered
+/// toward parallel fan-out; leaf agents (at `MAX_AGENT_DEPTH`) are told to do the
+/// chunk themselves.
+fn subagent_preamble(can_delegate: bool) -> &'static str {
+    if can_delegate {
+        "You are a task agent in an assistant hierarchy. Own the delegated bounded task. \
+         Maximize parallelism: when there are many independent context-heavy chunks, issue separate subagent calls for each chunk instead of inspecting chunks yourself. \
+         Use one child subagent per independent chunk and run as many in parallel as possible; do not batch multiple independent chunks into one child. \
+         Examples of chunks are one repository, one document, one subsystem, one account/resource, or one comparison item; the examples are not task-specific rules. \
+         Do not send the entire task, a long global list, or a batch of unrelated chunks to one child. Give each child only its slice-specific context. \
+         If the task requires continuous shared context rather than independent chunks, do the work yourself instead of spawning children. \
+         Use tools when needed, do not modify files, and return a concise result useful to your parent."
+    } else {
+        "You are a leaf agent at the maximum delegation depth and cannot spawn further agents. \
+         Do this one independent context-heavy chunk yourself and return a concise result. \
+         Use tools when needed. Do not modify files. \
+         If the task cannot be handled independently because it needs continuous shared context, say so briefly."
     }
 }
 
@@ -126,7 +108,7 @@ fn home_dir() -> Result<PathBuf, ToolError> {
                 return None;
             }
 
-            let mut home = OsString::from(drive);
+            let mut home = drive;
             home.push(path);
             Some(PathBuf::from(home))
         })
@@ -361,105 +343,80 @@ fn require_nested_response(response: String) -> Result<String, ToolError> {
 
 async fn run_nested_agent_with_retries(
     client: &ollama::Client,
-    ui_context: &ToolUiContext,
+    parent_context: &ToolUiContext,
     key: RuntimeAgentKey,
-    depth: SubagentDepth,
+    child_depth: AgentDepth,
     prompt: String,
 ) -> Result<String, ToolError> {
+    let can_delegate = child_depth < MAX_AGENT_DEPTH;
+    let mut sink = AgentEventSink::new(parent_context.events.clone(), parent_context.thread_id);
+
     for attempt in 1..=crate::agent::PROMPT_RETRY_ATTEMPTS {
-        let attempt_result = match depth {
-            SubagentDepth::FirstLevel => {
-                let agent = client
-                    .agent(SUBAGENT_MODEL)
-                    .preamble(depth.preamble())
-                    .additional_params(serde_json::json!({ "think": true }))
-                    .tool(ReadFile)
-                    .tool(ListDirectory)
-                    .tool(WorkerAgent::new(ui_context.with_parent_key(key)))
-                    .hook(crate::agent::UiPromptHook::new(
-                        AgentEventSink::new(ui_context.events.clone(), ui_context.thread_id),
-                        AgentAddr::Runtime(key),
-                    ))
-                    .default_max_turns(depth.max_turns())
-                    .build();
-                let mut stream = agent
-                    .stream_prompt(&prompt)
-                    .with_tool_concurrency(crate::agent::TOOL_CONCURRENCY)
-                    .await;
-                run_nested_stream(ui_context, key, &mut stream).await
-            }
-            SubagentDepth::Worker => {
-                let agent = client
-                    .agent(SUBAGENT_MODEL)
-                    .preamble(depth.preamble())
-                    .additional_params(serde_json::json!({ "think": true }))
-                    .tool(ReadFile)
-                    .tool(ListDirectory)
-                    .hook(crate::agent::UiPromptHook::new(
-                        AgentEventSink::new(ui_context.events.clone(), ui_context.thread_id),
-                        AgentAddr::Runtime(key),
-                    ))
-                    .default_max_turns(depth.max_turns())
-                    .build();
-                let mut stream = agent
-                    .stream_prompt(&prompt)
-                    .with_tool_concurrency(crate::agent::TOOL_CONCURRENCY)
-                    .await;
-                run_nested_stream(ui_context, key, &mut stream).await
-            }
+        // Every level shares the same base build. Agents that can still delegate
+        // also get the recursive `subagent` tool, wired so their own children
+        // land one level deeper.
+        let mut builder = crate::agent::base_agent_builder(
+            client,
+            subagent_preamble(can_delegate),
+            crate::agent::AGENT_MAX_TURNS,
+        )
+        .hook(crate::agent::UiPromptHook::new(
+            AgentEventSink::new(parent_context.events.clone(), parent_context.thread_id),
+            AgentAddr::Runtime(key),
+        ));
+        if can_delegate {
+            builder = builder.tool(Subagent::new(
+                parent_context.child_context(key, child_depth),
+            ));
+        }
+
+        let agent = builder.build();
+        let mut stream = agent
+            .stream_prompt(&prompt)
+            .with_tool_concurrency(crate::agent::TOOL_CONCURRENCY)
+            .await;
+
+        let error = match run_nested_stream(parent_context, key, &mut stream).await {
+            Ok(response) => return require_nested_response(response),
+            Err(error) => error,
         };
 
-        match attempt_result {
-            Ok(response) => return require_nested_response(response),
-            Err(error)
-                if attempt < crate::agent::PROMPT_RETRY_ATTEMPTS
-                    && crate::agent::is_retryable_prompt_error(&error) =>
-            {
-                let backoff = crate::agent::PROMPT_RETRY_BACKOFFS
-                    .get(attempt - 1)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        *crate::agent::PROMPT_RETRY_BACKOFFS
-                            .last()
-                            .expect("non-empty backoff list")
-                    });
-                let message = format!(
-                    "{} attempt {attempt}/{} failed with a transient error: {error}. Retrying in {}s…",
-                    depth.label(),
-                    crate::agent::PROMPT_RETRY_ATTEMPTS,
-                    backoff.as_secs()
-                );
+        let Some(backoff) = crate::agent::retry_backoff(attempt, &error) else {
+            return Err(tool_error(format!("subagent failed: {error}")));
+        };
 
-                let mut sink = AgentEventSink::new(ui_context.events.clone(), ui_context.thread_id);
-                sink.send(AgentEvent::Status {
-                    addr: AgentAddr::Runtime(key),
-                    content: message,
-                })
-                .await;
-                tokio::time::sleep(backoff).await;
-            }
-            Err(error) => return Err(tool_error(format!("subagent failed: {error}"))),
-        }
+        sink.send(AgentEvent::Status {
+            addr: AgentAddr::Runtime(key),
+            content: format!(
+                "subagent (depth {child_depth}) attempt {attempt}/{} failed with a transient error: {error}. Retrying in {}s…",
+                crate::agent::PROMPT_RETRY_ATTEMPTS,
+                backoff.as_secs()
+            ),
+        })
+        .await;
+        tokio::time::sleep(backoff).await;
     }
 
     unreachable!("retry loop always returns")
 }
 
-async fn run_subagent_at_depth(
-    ui_context: ToolUiContext,
-    depth: SubagentDepth,
+/// Spawn a child agent one level below `parent_context` for `task`, stream its
+/// run into the UI tree, and return its final response.
+async fn run_child_agent(
+    parent_context: ToolUiContext,
     task: String,
     context: Option<String>,
 ) -> Result<String, ToolError> {
     let key = next_runtime_agent_key();
+    let child_depth = parent_context.depth + 1;
 
     let prompt = subagent_prompt(&task, context.as_deref());
 
-    let mut sink = AgentEventSink::new(ui_context.events.clone(), ui_context.thread_id);
+    let mut sink = AgentEventSink::new(parent_context.events.clone(), parent_context.thread_id);
     sink.send(AgentEvent::Spawned {
         key,
-        parent: ui_context.parent_key,
-        depth: depth.ui_depth(),
+        parent: parent_context.parent_key,
+        depth: child_depth,
         task,
         context,
     })
@@ -468,7 +425,8 @@ async fn run_subagent_at_depth(
     let client = ollama::Client::from_env()
         .map_err(|error| tool_error(format!("failed to create Ollama client: {error}")))?;
 
-    let result = run_nested_agent_with_retries(&client, &ui_context, key, depth, prompt).await;
+    let result =
+        run_nested_agent_with_retries(&client, &parent_context, key, child_depth, prompt).await;
 
     match &result {
         Ok(result) => {
@@ -491,17 +449,6 @@ async fn run_subagent_at_depth(
 }
 
 #[derive(Clone)]
-pub struct WorkerAgent {
-    ui_context: ToolUiContext,
-}
-
-impl WorkerAgent {
-    pub fn new(ui_context: ToolUiContext) -> Self {
-        Self { ui_context }
-    }
-}
-
-#[derive(Clone)]
 pub struct Subagent {
     ui_context: ToolUiContext,
 }
@@ -514,47 +461,11 @@ impl Subagent {
 
 #[derive(serde::Deserialize, JsonSchema)]
 #[schemars(crate = "schemars")]
-pub struct WorkerAgentParameters {
-    /// The specific independent chunk this worker should complete. It should be narrow enough that the worker can finish it and return a concise result.
-    task: String,
-    /// Context, constraints, paths, service details, or prior findings needed for this chunk only. Do not include unrelated global task context.
-    context: Option<String>,
-}
-
-#[derive(serde::Deserialize, JsonSchema)]
-#[schemars(crate = "schemars")]
 pub struct SubagentParameters {
-    /// The bounded task for this first-level agent to own. This can be the full one-off user task when it can be split into independent chunks or completed without needing the top-level agent's persistent context. The first-level agent should split parallelizable work into one worker per chunk, not batches.
+    /// The bounded, independent sub-task for this child agent to own. Make it narrow enough that the child can finish it and return a concise result whose context can then be discarded.
     task: String,
-    /// Context, constraints, paths, service details, or prior findings the task agent needs. Include enough context to plan chunks, but avoid unrelated ongoing-conversation context.
+    /// Context, constraints, paths, service details, or prior findings needed for this sub-task only. Do not include unrelated global or ongoing-conversation context.
     context: Option<String>,
-}
-
-impl Tool for WorkerAgent {
-    const NAME: &'static str = "worker_agent";
-
-    type Args = WorkerAgentParameters;
-    type Output = String;
-    type Error = ToolError;
-
-    async fn definition(&self, _prompt: String) -> ToolDefinition {
-        tool_definition(
-            Self::NAME,
-            "Spawn one lowest-level worker agent for one independent context-heavy chunk. This tool is for first-level subagents, not for delegating full tasks. Use it only when the current task can be split into independent chunks whose context can be discarded after a concise result.",
-            serde_json::to_value(schemars::schema_for!(WorkerAgentParameters))
-                .expect("schema serialization"),
-        )
-    }
-
-    async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        run_subagent_at_depth(
-            self.ui_context.clone(),
-            SubagentDepth::Worker,
-            args.task,
-            args.context,
-        )
-        .await
-    }
 }
 
 impl Tool for Subagent {
@@ -567,20 +478,14 @@ impl Tool for Subagent {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         tool_definition(
             Self::NAME,
-            "Spawn one first-level task agent for a broad bounded task. Prefer this for one-off tasks with many independent context-heavy chunks; the task agent should maximize parallelism by calling worker_agent once per independent chunk, then synthesize their results. Do not use this for long-running continuous work where the top-level agent should preserve understanding across many user prompts.",
+            "Spawn a child agent to own one bounded, independent sub-task. The child has the read-only file tools and, unless it is already at the maximum delegation depth, can recursively split its work into parallel grandchildren. Prefer one child per independent context-heavy chunk so each chunk's context can be discarded after it returns a concise result. Do not use it for simple one- or two-tool steps or for work that needs your continuous shared context.",
             serde_json::to_value(schemars::schema_for!(SubagentParameters))
                 .expect("schema serialization"),
         )
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        run_subagent_at_depth(
-            self.ui_context.clone(),
-            SubagentDepth::FirstLevel,
-            args.task,
-            args.context,
-        )
-        .await
+        run_child_agent(self.ui_context.clone(), args.task, args.context).await
     }
 }
 

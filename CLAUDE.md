@@ -12,7 +12,7 @@ cargo clippy && cargo fmt
 
 ## What this project is
 
-`cowork` is a TUI-first AI assistant where the main agent can delegate to a tree of subagents and workers in parallel. The TUI makes this hierarchy visible: the sidebar shows spawned agents live as they run, and their message streams are individually inspectable.
+`cowork` is a TUI-first AI assistant where the main agent can delegate to a recursive tree of subagents in parallel. The TUI makes this hierarchy visible: the sidebar shows spawned agents live as they run, and their message streams are individually inspectable.
 
 It uses a local Ollama model (`gemma4:31b`) with reasoning enabled (`think: true`).
 
@@ -33,7 +33,7 @@ Rig's `InMemoryConversationMemory` stores the model's conversation context (what
 
 ## Agent hierarchy and event routing
 
-Agents form a tree: one main agent at the top, subagents beneath it, workers beneath subagents. Each spawned agent gets a runtime key used to route its events to the correct node in the tree. Tool structs (`Subagent`, `WorkerAgent` in `tools.rs`) carry an event sink and parent IDs rather than being zero-sized — this is how nested agents can emit events that surface in the TUI.
+Agents form a tree: one main agent at depth 0, with each `subagent` call spawning a child one level deeper. The single recursive `Subagent` tool (`tools.rs`) carries an event sink, parent ID, and the owning agent's depth rather than being zero-sized — this is how nested agents can emit events that surface in the TUI. A child can itself delegate until `MAX_AGENT_DEPTH`, where agents become leaves with no `subagent` tool. Each spawned agent gets a runtime key used to route its events to the correct node in the tree.
 
 ## Design decisions already made
 
