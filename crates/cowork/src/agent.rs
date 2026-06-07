@@ -94,14 +94,6 @@ pub fn spawn_prompt_task(
     memory: InMemoryConversationMemory,
     events: RuntimeEventSender,
 ) {
-    crate::debug_log::event(
-        "prompt_task_spawned",
-        [
-            ("conversation", conversation_id.clone()),
-            ("prompt_chars", prompt.chars().count().to_string()),
-        ],
-    );
-
     tokio::spawn(async move {
         let sink = ChannelSink::new(events.clone(), thread_id);
         sink.emit(AgentEvent::Started).await;
@@ -133,7 +125,6 @@ async fn run_prompt_with_retries(
             conversation_id.clone(),
             memory.clone(),
             events.clone(),
-            attempt,
         )
         .await
         {
@@ -153,15 +144,7 @@ async fn run_prompt_with_retries(
                     "Attempt {attempt}/{PROMPT_RETRY_ATTEMPTS} failed with a transient error: {error}. Retrying in {}s…",
                     backoff.as_secs()
                 );
-                crate::debug_log::event(
-                    "prompt_retry_scheduled",
-                    [
-                        ("attempt", attempt.to_string()),
-                        ("max_attempts", PROMPT_RETRY_ATTEMPTS.to_string()),
-                        ("backoff_secs", backoff.as_secs().to_string()),
-                        ("error", error.to_string()),
-                    ],
-                );
+
                 sink.emit(AgentEvent::Status {
                     addr: AgentAddr::Main,
                     content: message,
@@ -192,12 +175,7 @@ async fn remember_failed_prompt(
         ))),
     ];
 
-    if let Err(memory_error) = memory.append(conversation_id, messages).await {
-        crate::debug_log::event(
-            "failed_prompt_memory_append_error",
-            [("error", memory_error.to_string())],
-        );
-    }
+    let _ = memory.append(conversation_id, messages).await;
 }
 
 async fn run_prompt_once(
@@ -206,18 +184,7 @@ async fn run_prompt_once(
     conversation_id: String,
     memory: InMemoryConversationMemory,
     events: RuntimeEventSender,
-    attempt: usize,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    crate::debug_log::event(
-        "prompt_started",
-        [
-            ("conversation", conversation_id.clone()),
-            ("model", MODEL.to_string()),
-            ("tool_concurrency", TOOL_CONCURRENCY.to_string()),
-            ("attempt", attempt.to_string()),
-        ],
-    );
-
     let client = ollama::Client::from_env()?;
     let agent = client
         .agent(MODEL)
@@ -242,7 +209,6 @@ async fn run_prompt_once(
     let sink = ChannelSink::new(events, thread_id);
     pump_stream(&sink, AgentAddr::Main, &mut stream).await?;
 
-    crate::debug_log::event("prompt_finished", [("conversation", conversation_id)]);
     sink.emit(AgentEvent::Finished {
         addr: AgentAddr::Main,
         result: None,
@@ -268,30 +234,16 @@ pub(crate) async fn pump_stream<R>(
                 if let StreamedAssistantContent::Text(text) = &content {
                     streamed_text.push_str(&text.text);
                 }
-                log_assistant_item(&content);
                 for event in assistant_events(addr, content) {
                     sink.emit(event).await;
                 }
             }
             MultiTurnStreamItem::StreamUserItem(content) => {
                 for event in user_events(addr, content) {
-                    if let AgentEvent::ToolResult { id, content, .. } = &event {
-                        crate::debug_log::event(
-                            "tool_result_streamed",
-                            [
-                                ("id", id.clone()),
-                                ("content_chars", content.chars().count().to_string()),
-                            ],
-                        );
-                    }
                     sink.emit(event).await;
                 }
             }
             MultiTurnStreamItem::CompletionCall(call) => {
-                crate::debug_log::event(
-                    "completion_call_finished",
-                    [("call_index", call.call_index.to_string())],
-                );
                 if let Some(usage) = call.usage {
                     sink.emit(AgentEvent::Usage {
                         addr,
@@ -368,19 +320,6 @@ fn user_events(addr: AgentAddr, content: StreamedUserContent) -> Vec<AgentEvent>
         id: internal_call_id,
         content,
     }]
-}
-
-fn log_assistant_item<R>(content: &StreamedAssistantContent<R>) {
-    if let StreamedAssistantContent::ToolCall { tool_call, .. } = content {
-        crate::debug_log::event(
-            "tool_call_streamed",
-            [
-                ("id", tool_call.id.clone()),
-                ("name", tool_call.function.name.clone()),
-                ("args", tool_call.function.arguments.to_string()),
-            ],
-        );
-    }
 }
 
 #[cfg(test)]

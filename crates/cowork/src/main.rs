@@ -2,7 +2,7 @@ use rig_core::memory::InMemoryConversationMemory;
 
 mod agent;
 mod app;
-mod debug_log;
+
 mod tools;
 mod tui;
 mod ui;

@@ -430,19 +430,7 @@ async fn run_nested_agent_with_retries(
                     crate::agent::PROMPT_RETRY_ATTEMPTS,
                     backoff.as_secs()
                 );
-                crate::debug_log::event(
-                    "nested_agent_retry_scheduled",
-                    [
-                        ("kind", depth.label().to_string()),
-                        ("attempt", attempt.to_string()),
-                        (
-                            "max_attempts",
-                            crate::agent::PROMPT_RETRY_ATTEMPTS.to_string(),
-                        ),
-                        ("backoff_secs", backoff.as_secs().to_string()),
-                        ("error", error.to_string()),
-                    ],
-                );
+
                 ui_context
                     .emit(AgentEvent::Status {
                         addr: AgentAddr::Runtime(key),
@@ -475,40 +463,11 @@ async fn run_subagent_at_depth(
         })
         .await;
 
-    crate::debug_log::event(
-        "nested_agent_started",
-        [
-            ("kind", depth.label().to_string()),
-            ("task_chars", task.chars().count().to_string()),
-            (
-                "context_chars",
-                context
-                    .as_deref()
-                    .map(str::chars)
-                    .map(Iterator::count)
-                    .unwrap_or_default()
-                    .to_string(),
-            ),
-            (
-                "tool_concurrency",
-                crate::agent::TOOL_CONCURRENCY.to_string(),
-            ),
-        ],
-    );
-
     let client = ollama::Client::from_env()
         .map_err(|error| tool_error(format!("failed to create Ollama client: {error}")))?;
     let prompt = subagent_prompt(&task, context.as_deref());
 
     let result = run_nested_agent_with_retries(&client, &ui_context, key, depth, prompt).await;
-
-    crate::debug_log::event(
-        "nested_agent_finished",
-        [
-            ("kind", depth.label().to_string()),
-            ("ok", result.is_ok().to_string()),
-        ],
-    );
 
     match &result {
         Ok(result) => {

@@ -913,19 +913,10 @@ fn append_child_sidebar_items(
 }
 
 fn initial_main_messages() -> Vec<Message> {
-    let mut messages = vec![Message::new(
+    vec![Message::new(
         MessageRole::System,
         crate::agent::MAIN_AGENT_PREAMBLE,
-    )];
-
-    if crate::debug_log::enabled() {
-        messages.push(Message::new(
-            MessageRole::Status,
-            "Debug logging enabled via COWORK_DEBUG_LOG",
-        ));
-    }
-
-    messages
+    )]
 }
 
 fn collapse_reasoning(agent: &mut AgentNode) {
