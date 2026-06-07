@@ -5,70 +5,44 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-cargo build                          # debug build
-cargo build --release                # optimized build
-cargo run -p cowork                  # run the TUI app
-cargo test -p cowork                 # run all tests
-cargo test -p cowork <test_name>     # run a single test (e.g. test_typing_and_backspace_edit_the_input)
-cargo test -p cowork -- --nocapture  # show println output during tests
-cargo clippy                         # lint
-cargo fmt                            # format
+cargo run -p cowork
+cargo test -p cowork [test_name]
+cargo clippy && cargo fmt
 ```
 
-## Architecture
+## What this project is
 
-`cowork` is an async Rust TUI application that runs a multi-agent AI assistant with hierarchical agent delegation. The user interacts with a main agent in a terminal; that agent can spawn subagents and workers to parallelize tasks.
+`cowork` is a TUI-first AI assistant where the main agent can delegate to a tree of subagents and workers in parallel. The TUI makes this hierarchy visible: the sidebar shows spawned agents live as they run, and their message streams are individually inspectable.
 
-### Module relationships
+It uses a local Ollama model (`gemma4:31b`) with reasoning enabled (`think: true`).
 
-```
-main.rs       — initializes InMemoryConversationMemory, starts TUI
-tui.rs        — terminal setup (alternate screen, raw mode), event loop, TerminalGuard
-app.rs        — AppState reducer: receives RuntimeEvents, updates state; all unit tests live here
-ui.rs         — Ratatui render functions (sidebar, main pane, input bar); reads AppState, no mutations
-agent.rs      — Rig client setup, stream pumping, hooks; spawns tokio tasks that emit AgentEvents
-tools.rs      — tool implementations: read_file, list_directory, edit_file, subagent, worker_agent
-```
+## Core architectural tension
 
-### Event-driven data flow
+Rig agent streams are async; Ratatui rendering is synchronous. The solution is a single `mpsc` channel that everything funnels into:
 
-A dedicated input thread polls `crossterm::event::poll` and forwards `KeyEvent`s. Agent tasks run on the Tokio runtime. Both send into a single `mpsc::channel<RuntimeEvent>` that the TUI loop drains:
+- A dedicated blocking thread polls `crossterm` for keyboard input
+- Tokio tasks run agent streams and emit `AgentEvent`s
+- Both send `RuntimeEvent`s into one channel
+- The TUI loop drains that channel, updates `AppState`, then re-renders
 
-```
-crossterm (input thread) ──┐
-                           ├──> mpsc::Sender<RuntimeEvent> ──> tui.rs loop ──> app.rs reducer ──> ui.rs render
-tokio tasks (agents)     ──┘
-```
+`app.rs` is the reducer: it receives events and mutates state. `ui.rs` only reads state — it never mutates. This separation is intentional and should be preserved.
 
-`RuntimeEvent` wraps terminal events, a `Tick` for cursor blinking, and `AgentEvent`s. `AgentEvent` variants: `Started`, `Spawned`, `AssistantDelta`, `ReasoningDelta`, `ToolCall`, `ToolResult`, `Status`, `Usage`, `Finished`, `Error`.
+## Dual memory model
 
-### Agent hierarchy and routing
+Rig's `InMemoryConversationMemory` stores the model's conversation context (what the LLM sees). `AppState` stores the visible message history (what the user sees). These are separate on purpose — the UI history can include things like status messages, structured tool call display, and per-agent views that don't map cleanly to model turns.
 
-- The main agent is always `AgentId(0)` / `AgentAddr::Main`.
-- `subagent` tool spawns first-level task agents; `worker_agent` spawns under a subagent.
-- Each spawned agent gets an atomic runtime key (`AgentAddr::Runtime(key)`); events carry this key so `app.rs` can route them to the correct node in the thread tree.
-- Parent–child relationships are preserved in `AppState.threads[].subagents` (each subagent has its own `workers` list).
+## Agent hierarchy and event routing
 
-### Focus model
+Agents form a tree: one main agent at the top, subagents beneath it, workers beneath subagents. Each spawned agent gets a runtime key used to route its events to the correct node in the tree. Tool structs (`Subagent`, `WorkerAgent` in `tools.rs`) carry an event sink and parent IDs rather than being zero-sized — this is how nested agents can emit events that surface in the TUI.
 
-Three focus states cycle with Tab; Esc returns to `Input`:
-- **Input** — prompt bar active, Enter submits (disabled while an agent is running)
-- **Sidebar** — navigate threads/agents with arrow keys
-- **Conversation** — browse messages, toggle collapsibles (reasoning blocks and tool calls) with Space
+## Design decisions already made
 
-### Message roles and collapsibles
+- **TUI-only**: no CLI fallback mode. Direct `println!` anywhere corrupts the alternate screen.
+- **Submit disabled during active run**: simplest way to avoid concurrent state issues. No queuing.
+- **Reasoning shown inline but collapsed**: visible for agent debugging, not noisy by default.
+- **One thread for now**: the data model (`threads: Vec<ThreadState>`) is built for multiple threads, but only one is used currently.
+- **No persistence**: all state is in-memory. Rig's memory isn't trivially serializable.
 
-Roles: `System`, `User`, `Assistant`, `Reasoning`, `ToolCall`, `ToolResult`, `Status`, `Error`.  
-`Reasoning` and `ToolCall` messages are collapsible (▾/▸) and hidden by default.
+## Open areas
 
-### Rig dependency
-
-`rig-core` and `rig-derive` come from a custom fork (`tidely` branch `feat/streaming-tool-concurrency`) pinned in `Cargo.lock`. This adds streaming concurrent tool support not yet merged upstream. The agent uses an Ollama backend (`gemma4:31b`).
-
-### Retry logic
-
-Transient errors (network, timeout, DNS) retry with backoff: 1 s → 3 s → 10 s → 30 s. Deterministic errors (tool errors, schema errors, max turns) fail immediately.
-
-### Path handling in tools
-
-`tools.rs` resolves `~`, relative, and absolute paths and normalizes separators. It falls back through `HOME` → `USERPROFILE` → `HOMEDRIVE+HOMEPATH` for the home directory.
+`docs/tui-design.md` documents the full design rationale including unresolved decisions (cancellation, mouse support, persistence, multi-thread UX). Read it before making architectural changes.
