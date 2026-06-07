@@ -44,9 +44,9 @@ impl EventSink for ChannelSink {
 }
 
 pub const MODEL: &str = "gemma4:31b";
-const DEFAULT_TOOL_CONCURRENCY: usize = 8;
-const DEFAULT_PROMPT_RETRY_ATTEMPTS: usize = 5;
-const PROMPT_RETRY_BACKOFFS: [Duration; 4] = [
+pub(crate) const TOOL_CONCURRENCY: usize = 8;
+pub(crate) const PROMPT_RETRY_ATTEMPTS: usize = 5;
+pub(crate) const PROMPT_RETRY_BACKOFFS: [Duration; 4] = [
     Duration::from_secs(1),
     Duration::from_secs(3),
     Duration::from_secs(10),
@@ -59,33 +59,6 @@ pub const MAIN_AGENT_PREAMBLE: &str = "You are the top-level user-facing assista
      A first-level subagent owns the bounded task, maximizes parallelism by splitting independent context-heavy chunks into one worker call per chunk, and synthesizes their results. \
      Do not use subagent for simple one- or two-tool tasks or tasks needing continuous shared context. \
      When delegating, pass the full bounded task plus enough context, constraints, and paths for the subagent to plan; after it returns, synthesize its result into the final answer or next action.";
-
-pub fn tool_concurrency() -> usize {
-    std::env::var("COWORK_TOOL_CONCURRENCY")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_TOOL_CONCURRENCY)
-}
-
-pub fn prompt_retry_attempts() -> usize {
-    std::env::var("COWORK_PROMPT_RETRY_ATTEMPTS")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_PROMPT_RETRY_ATTEMPTS)
-}
-
-pub(crate) fn prompt_retry_backoff(failed_attempt: usize) -> Duration {
-    PROMPT_RETRY_BACKOFFS
-        .get(failed_attempt.saturating_sub(1))
-        .copied()
-        .unwrap_or_else(|| {
-            *PROMPT_RETRY_BACKOFFS
-                .last()
-                .expect("non-empty backoff list")
-        })
-}
 
 pub(crate) fn is_retryable_prompt_error(error: &(dyn std::error::Error + Send + Sync)) -> bool {
     let message = error.to_string().to_ascii_lowercase();
@@ -153,9 +126,7 @@ async fn run_prompt_with_retries(
     events: RuntimeEventSender,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sink = ChannelSink::new(events.clone(), thread_id);
-    let max_attempts = prompt_retry_attempts();
-
-    for attempt in 1..=max_attempts {
+    for attempt in 1..=PROMPT_RETRY_ATTEMPTS {
         match run_prompt_once(
             thread_id,
             prompt.clone(),
@@ -167,17 +138,26 @@ async fn run_prompt_with_retries(
         .await
         {
             Ok(()) => return Ok(()),
-            Err(error) if attempt < max_attempts && is_retryable_prompt_error(error.as_ref()) => {
-                let backoff = prompt_retry_backoff(attempt);
+            Err(error)
+                if attempt < PROMPT_RETRY_ATTEMPTS && is_retryable_prompt_error(error.as_ref()) =>
+            {
+                let backoff = PROMPT_RETRY_BACKOFFS
+                    .get(attempt - 1)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        *PROMPT_RETRY_BACKOFFS
+                            .last()
+                            .expect("non-empty backoff list")
+                    });
                 let message = format!(
-                    "Attempt {attempt}/{max_attempts} failed with a transient error: {error}. Retrying in {}s…",
+                    "Attempt {attempt}/{PROMPT_RETRY_ATTEMPTS} failed with a transient error: {error}. Retrying in {}s…",
                     backoff.as_secs()
                 );
                 crate::debug_log::event(
                     "prompt_retry_scheduled",
                     [
                         ("attempt", attempt.to_string()),
-                        ("max_attempts", max_attempts.to_string()),
+                        ("max_attempts", PROMPT_RETRY_ATTEMPTS.to_string()),
                         ("backoff_secs", backoff.as_secs().to_string()),
                         ("error", error.to_string()),
                     ],
@@ -233,7 +213,7 @@ async fn run_prompt_once(
         [
             ("conversation", conversation_id.clone()),
             ("model", MODEL.to_string()),
-            ("tool_concurrency", tool_concurrency().to_string()),
+            ("tool_concurrency", TOOL_CONCURRENCY.to_string()),
             ("attempt", attempt.to_string()),
         ],
     );
@@ -256,7 +236,7 @@ async fn run_prompt_once(
     let mut stream = agent
         .stream_prompt(prompt)
         .conversation(&conversation_id)
-        .with_tool_concurrency(tool_concurrency())
+        .with_tool_concurrency(TOOL_CONCURRENCY)
         .await;
 
     let sink = ChannelSink::new(events, thread_id);
@@ -423,12 +403,11 @@ mod tests {
     impl std::error::Error for StaticError {}
 
     #[test]
-    fn retry_backoff_uses_fixed_slow_schedule() {
-        assert_eq!(prompt_retry_backoff(1), Duration::from_secs(1));
-        assert_eq!(prompt_retry_backoff(2), Duration::from_secs(3));
-        assert_eq!(prompt_retry_backoff(3), Duration::from_secs(10));
-        assert_eq!(prompt_retry_backoff(4), Duration::from_secs(30));
-        assert_eq!(prompt_retry_backoff(5), Duration::from_secs(30));
+    fn retry_backoffs_use_fixed_slow_schedule() {
+        assert_eq!(PROMPT_RETRY_BACKOFFS[0], Duration::from_secs(1));
+        assert_eq!(PROMPT_RETRY_BACKOFFS[1], Duration::from_secs(3));
+        assert_eq!(PROMPT_RETRY_BACKOFFS[2], Duration::from_secs(10));
+        assert_eq!(PROMPT_RETRY_BACKOFFS[3], Duration::from_secs(30));
     }
 
     #[test]

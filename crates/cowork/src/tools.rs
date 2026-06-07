@@ -1,5 +1,6 @@
 use std::{
     convert::Infallible,
+    ffi::OsString,
     fs, io,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
@@ -119,18 +120,45 @@ fn tool_error(message: impl Into<String>) -> ToolError {
     ToolError::ToolCallError(Box::new(io::Error::other(message.into())))
 }
 
+fn home_dir() -> Result<PathBuf, ToolError> {
+    std::env::var_os("HOME")
+        .filter(|home| !home.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .filter(|home| !home.is_empty())
+                .map(PathBuf::from)
+        })
+        .or_else(|| {
+            let drive = std::env::var_os("HOMEDRIVE")?;
+            let path = std::env::var_os("HOMEPATH")?;
+            if drive.is_empty() || path.is_empty() {
+                return None;
+            }
+
+            let mut home = OsString::from(drive);
+            home.push(path);
+            Some(PathBuf::from(home))
+        })
+        .ok_or_else(|| tool_error("home directory environment variables are not set"))
+}
+
+fn normalize_path_separators(path: &str) -> String {
+    if cfg!(windows) {
+        path.replace('/', "\\")
+    } else {
+        path.replace('\\', "/")
+    }
+}
+
 fn resolve_path(path: &str) -> Result<PathBuf, ToolError> {
     let path = path.trim();
     let path = if path == "~" {
-        std::env::var("HOME")
-            .map(PathBuf::from)
-            .map_err(|_| tool_error("HOME environment variable is not set"))?
-    } else if let Some(rest) = path.strip_prefix("~/") {
-        std::env::var("HOME")
-            .map(|home| PathBuf::from(home).join(rest))
-            .map_err(|_| tool_error("HOME environment variable is not set"))?
+        home_dir()?
+    } else if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        home_dir()?.join(normalize_path_separators(rest))
     } else {
-        PathBuf::from(path)
+        PathBuf::from(normalize_path_separators(path))
     };
 
     if path.is_absolute() {
@@ -347,9 +375,7 @@ async fn run_nested_agent_with_retries(
     depth: SubagentDepth,
     prompt: String,
 ) -> Result<String, ToolError> {
-    let max_attempts = crate::agent::prompt_retry_attempts();
-
-    for attempt in 1..=max_attempts {
+    for attempt in 1..=crate::agent::PROMPT_RETRY_ATTEMPTS {
         let attempt_result = match depth {
             SubagentDepth::FirstLevel => {
                 let agent = client
@@ -363,7 +389,7 @@ async fn run_nested_agent_with_retries(
                     .build();
                 let mut stream = agent
                     .stream_prompt(prompt.clone())
-                    .with_tool_concurrency(crate::agent::tool_concurrency())
+                    .with_tool_concurrency(crate::agent::TOOL_CONCURRENCY)
                     .await;
                 run_nested_stream(ui_context, key, &mut stream).await
             }
@@ -378,7 +404,7 @@ async fn run_nested_agent_with_retries(
                     .build();
                 let mut stream = agent
                     .stream_prompt(prompt.clone())
-                    .with_tool_concurrency(crate::agent::tool_concurrency())
+                    .with_tool_concurrency(crate::agent::TOOL_CONCURRENCY)
                     .await;
                 run_nested_stream(ui_context, key, &mut stream).await
             }
@@ -387,12 +413,21 @@ async fn run_nested_agent_with_retries(
         match attempt_result {
             Ok(response) => return require_nested_response(response),
             Err(error)
-                if attempt < max_attempts && crate::agent::is_retryable_prompt_error(&error) =>
+                if attempt < crate::agent::PROMPT_RETRY_ATTEMPTS
+                    && crate::agent::is_retryable_prompt_error(&error) =>
             {
-                let backoff = crate::agent::prompt_retry_backoff(attempt);
+                let backoff = crate::agent::PROMPT_RETRY_BACKOFFS
+                    .get(attempt - 1)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        *crate::agent::PROMPT_RETRY_BACKOFFS
+                            .last()
+                            .expect("non-empty backoff list")
+                    });
                 let message = format!(
-                    "{} attempt {attempt}/{max_attempts} failed with a transient error: {error}. Retrying in {}s…",
+                    "{} attempt {attempt}/{} failed with a transient error: {error}. Retrying in {}s…",
                     depth.label(),
+                    crate::agent::PROMPT_RETRY_ATTEMPTS,
                     backoff.as_secs()
                 );
                 crate::debug_log::event(
@@ -400,7 +435,10 @@ async fn run_nested_agent_with_retries(
                     [
                         ("kind", depth.label().to_string()),
                         ("attempt", attempt.to_string()),
-                        ("max_attempts", max_attempts.to_string()),
+                        (
+                            "max_attempts",
+                            crate::agent::PROMPT_RETRY_ATTEMPTS.to_string(),
+                        ),
                         ("backoff_secs", backoff.as_secs().to_string()),
                         ("error", error.to_string()),
                     ],
@@ -453,7 +491,7 @@ async fn run_subagent_at_depth(
             ),
             (
                 "tool_concurrency",
-                crate::agent::tool_concurrency().to_string(),
+                crate::agent::TOOL_CONCURRENCY.to_string(),
             ),
         ],
     );
@@ -598,5 +636,36 @@ fn tool_definition(
         name: name.to_string(),
         description: description.to_string(),
         parameters,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_path_separators_accepts_either_slash_style() {
+        let normalized = normalize_path_separators("parent/child\\leaf");
+
+        if cfg!(windows) {
+            assert_eq!(normalized, "parent\\child\\leaf");
+        } else {
+            assert_eq!(normalized, "parent/child/leaf");
+        }
+    }
+
+    #[test]
+    fn resolve_path_accepts_backslash_relative_paths() {
+        let path = resolve_path("parent\\child").expect("path resolves");
+
+        assert!(path.ends_with(PathBuf::from("parent").join("child")));
+    }
+
+    #[test]
+    fn resolve_path_accepts_backslash_tilde_paths() {
+        let path = resolve_path("~\\child").expect("path resolves");
+
+        assert!(path.ends_with("child"));
+        assert!(!path.to_string_lossy().contains('~'));
     }
 }
