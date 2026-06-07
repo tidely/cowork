@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Wrap},
 };
 
 use crate::app::{AgentDepth, AgentStatus, AppState, Focus, Message, MessageRole, ToolStatus};
@@ -496,30 +496,4 @@ fn depth_label(depth: AgentDepth) -> &'static str {
         AgentDepth::Subagent => "subagent",
         AgentDepth::Worker => "worker",
     }
-}
-
-#[allow(dead_code)]
-fn centered_rect(percent_x: u16, percent_y: u16, rect: Rect) -> Rect {
-    let popup_layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - percent_y) / 2),
-            Constraint::Percentage(percent_y),
-            Constraint::Percentage((100 - percent_y) / 2),
-        ])
-        .split(rect);
-
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(popup_layout[1])[1]
-}
-
-#[allow(dead_code)]
-fn render_clear(frame: &mut Frame<'_>, area: Rect) {
-    frame.render_widget(Clear, area);
 }

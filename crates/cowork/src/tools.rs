@@ -1,6 +1,5 @@
 use std::{
     convert::Infallible,
-    ffi::OsString,
     fs, io,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
@@ -13,7 +12,7 @@ use crate::{
 };
 use rig_core::{
     agent::{StreamingError, StreamingResult},
-    client::{CompletionClient, ProviderClient},
+    client::ProviderClient,
     completion::ToolDefinition,
     providers::ollama,
     schemars::{self, JsonSchema},
@@ -23,9 +22,6 @@ use rig_core::{
 use rig_derive::rig_tool;
 
 const MAX_READ_BYTES: u64 = 512 * 1024;
-const SUBAGENT_MODEL: &str = "gemma4:31b";
-const SUBAGENT_MAX_TURNS: usize = 1000;
-const WORKER_AGENT_MAX_TURNS: usize = 1000;
 
 static NEXT_RUNTIME_AGENT_KEY: AtomicU64 = AtomicU64::new(1);
 
@@ -79,13 +75,6 @@ impl SubagentDepth {
         }
     }
 
-    fn max_turns(self) -> usize {
-        match self {
-            SubagentDepth::FirstLevel => SUBAGENT_MAX_TURNS,
-            SubagentDepth::Worker => WORKER_AGENT_MAX_TURNS,
-        }
-    }
-
     fn preamble(self) -> &'static str {
         match self {
             SubagentDepth::FirstLevel => {
@@ -126,7 +115,7 @@ fn home_dir() -> Result<PathBuf, ToolError> {
                 return None;
             }
 
-            let mut home = OsString::from(drive);
+            let mut home = drive;
             home.push(path);
             Some(PathBuf::from(home))
         })
@@ -366,83 +355,55 @@ async fn run_nested_agent_with_retries(
     depth: SubagentDepth,
     prompt: String,
 ) -> Result<String, ToolError> {
-    for attempt in 1..=crate::agent::PROMPT_RETRY_ATTEMPTS {
-        let attempt_result = match depth {
-            SubagentDepth::FirstLevel => {
-                let agent = client
-                    .agent(SUBAGENT_MODEL)
-                    .preamble(depth.preamble())
-                    .additional_params(serde_json::json!({ "think": true }))
-                    .tool(ReadFile)
-                    .tool(ListDirectory)
-                    .tool(WorkerAgent::new(ui_context.with_parent_key(key)))
-                    .hook(crate::agent::UiPromptHook::new(
-                        AgentEventSink::new(ui_context.events.clone(), ui_context.thread_id),
-                        AgentAddr::Runtime(key),
-                    ))
-                    .default_max_turns(depth.max_turns())
-                    .build();
-                let mut stream = agent
-                    .stream_prompt(&prompt)
-                    .with_tool_concurrency(crate::agent::TOOL_CONCURRENCY)
-                    .await;
-                run_nested_stream(ui_context, key, &mut stream).await
+    let result = crate::agent::retry_with_backoff(
+        |_attempt| async {
+            // First-level agents can spawn workers; workers run with the shared
+            // read-only tools only. Everything else is identical, so build the
+            // common base once and add the worker tool conditionally.
+            let mut builder = crate::agent::base_agent_builder(
+                client,
+                depth.preamble(),
+                crate::agent::AGENT_MAX_TURNS,
+            )
+            .hook(crate::agent::UiPromptHook::new(
+                AgentEventSink::new(ui_context.events.clone(), ui_context.thread_id),
+                AgentAddr::Runtime(key),
+            ));
+            if matches!(depth, SubagentDepth::FirstLevel) {
+                builder = builder.tool(WorkerAgent::new(ui_context.with_parent_key(key)));
             }
-            SubagentDepth::Worker => {
-                let agent = client
-                    .agent(SUBAGENT_MODEL)
-                    .preamble(depth.preamble())
-                    .additional_params(serde_json::json!({ "think": true }))
-                    .tool(ReadFile)
-                    .tool(ListDirectory)
-                    .hook(crate::agent::UiPromptHook::new(
-                        AgentEventSink::new(ui_context.events.clone(), ui_context.thread_id),
-                        AgentAddr::Runtime(key),
-                    ))
-                    .default_max_turns(depth.max_turns())
-                    .build();
-                let mut stream = agent
-                    .stream_prompt(&prompt)
-                    .with_tool_concurrency(crate::agent::TOOL_CONCURRENCY)
-                    .await;
-                run_nested_stream(ui_context, key, &mut stream).await
-            }
-        };
 
-        match attempt_result {
-            Ok(response) => return require_nested_response(response),
-            Err(error)
-                if attempt < crate::agent::PROMPT_RETRY_ATTEMPTS
-                    && crate::agent::is_retryable_prompt_error(&error) =>
-            {
-                let backoff = crate::agent::PROMPT_RETRY_BACKOFFS
-                    .get(attempt - 1)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        *crate::agent::PROMPT_RETRY_BACKOFFS
-                            .last()
-                            .expect("non-empty backoff list")
-                    });
-                let message = format!(
-                    "{} attempt {attempt}/{} failed with a transient error: {error}. Retrying in {}s…",
-                    depth.label(),
-                    crate::agent::PROMPT_RETRY_ATTEMPTS,
-                    backoff.as_secs()
-                );
-
-                let mut sink = AgentEventSink::new(ui_context.events.clone(), ui_context.thread_id);
+            let agent = builder.build();
+            let mut stream = agent
+                .stream_prompt(&prompt)
+                .with_tool_concurrency(crate::agent::TOOL_CONCURRENCY)
+                .await;
+            run_nested_stream(ui_context, key, &mut stream).await
+        },
+        |error| crate::agent::is_retryable_prompt_error(error),
+        |attempt, error, backoff| {
+            let mut sink = AgentEventSink::new(ui_context.events.clone(), ui_context.thread_id);
+            let message = format!(
+                "{} attempt {attempt}/{} failed with a transient error: {error}. Retrying in {}s…",
+                depth.label(),
+                crate::agent::PROMPT_RETRY_ATTEMPTS,
+                backoff.as_secs()
+            );
+            async move {
                 sink.send(AgentEvent::Status {
                     addr: AgentAddr::Runtime(key),
                     content: message,
                 })
                 .await;
-                tokio::time::sleep(backoff).await;
             }
-            Err(error) => return Err(tool_error(format!("subagent failed: {error}"))),
-        }
-    }
+        },
+    )
+    .await;
 
-    unreachable!("retry loop always returns")
+    match result {
+        Ok(response) => require_nested_response(response),
+        Err(error) => Err(tool_error(format!("subagent failed: {error}"))),
+    }
 }
 
 async fn run_subagent_at_depth(

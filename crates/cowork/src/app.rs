@@ -182,7 +182,6 @@ pub enum SubmitResult {
     None,
     Submitted {
         thread_id: ThreadId,
-        agent_id: AgentId,
         conversation_id: String,
         prompt: String,
     },
@@ -614,7 +613,6 @@ impl AppState {
 
         SubmitResult::Submitted {
             thread_id: self.selected.thread_id,
-            agent_id: MAIN_AGENT_ID,
             conversation_id,
             prompt,
         }
