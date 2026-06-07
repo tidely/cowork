@@ -10,12 +10,6 @@ use crate::{
     app::{AgentAddr, AgentDepth, AgentEvent, RuntimeAgentKey, ThreadId},
     tui::RuntimeEventSender,
 };
-
-/// Maximum agent nesting depth. The top-level assistant is depth 0; each
-/// `subagent` call spawns a child one level deeper. An agent below this depth
-/// receives the `subagent` tool and can delegate further; an agent at this depth
-/// is a leaf that does its chunk itself. Bounds runaway recursion.
-const MAX_AGENT_DEPTH: AgentDepth = 4;
 use rig_core::{
     agent::{StreamingError, StreamingResult},
     client::ProviderClient,
@@ -28,6 +22,12 @@ use rig_core::{
 use rig_derive::rig_tool;
 
 const MAX_READ_BYTES: u64 = 512 * 1024;
+
+/// Maximum agent nesting depth. The top-level assistant is depth 0; each
+/// `subagent` call spawns a child one level deeper. An agent below this depth
+/// receives the `subagent` tool and can delegate further; an agent at this depth
+/// is a leaf that does its chunk itself. Bounds runaway recursion.
+const MAX_AGENT_DEPTH: AgentDepth = 4;
 
 static NEXT_RUNTIME_AGENT_KEY: AtomicU64 = AtomicU64::new(1);
 
@@ -349,56 +349,55 @@ async fn run_nested_agent_with_retries(
     prompt: String,
 ) -> Result<String, ToolError> {
     let can_delegate = child_depth < MAX_AGENT_DEPTH;
-    let result = crate::agent::retry_with_backoff(
-        |_attempt| async {
-            // Every level shares the same base build. Agents that can still
-            // delegate also get the recursive `subagent` tool, wired so their
-            // own children land one level deeper.
-            let mut builder = crate::agent::base_agent_builder(
-                client,
-                subagent_preamble(can_delegate),
-                crate::agent::AGENT_MAX_TURNS,
-            )
-            .hook(crate::agent::UiPromptHook::new(
-                AgentEventSink::new(parent_context.events.clone(), parent_context.thread_id),
-                AgentAddr::Runtime(key),
-            ));
-            if can_delegate {
-                builder = builder
-                    .tool(Subagent::new(parent_context.child_context(key, child_depth)));
-            }
+    let mut sink = AgentEventSink::new(parent_context.events.clone(), parent_context.thread_id);
 
-            let agent = builder.build();
-            let mut stream = agent
-                .stream_prompt(&prompt)
-                .with_tool_concurrency(crate::agent::TOOL_CONCURRENCY)
-                .await;
-            run_nested_stream(parent_context, key, &mut stream).await
-        },
-        |error| crate::agent::is_retryable_prompt_error(error),
-        |attempt, error, backoff| {
-            let mut sink =
-                AgentEventSink::new(parent_context.events.clone(), parent_context.thread_id);
-            let message = format!(
+    for attempt in 1..=crate::agent::PROMPT_RETRY_ATTEMPTS {
+        // Every level shares the same base build. Agents that can still delegate
+        // also get the recursive `subagent` tool, wired so their own children
+        // land one level deeper.
+        let mut builder = crate::agent::base_agent_builder(
+            client,
+            subagent_preamble(can_delegate),
+            crate::agent::AGENT_MAX_TURNS,
+        )
+        .hook(crate::agent::UiPromptHook::new(
+            AgentEventSink::new(parent_context.events.clone(), parent_context.thread_id),
+            AgentAddr::Runtime(key),
+        ));
+        if can_delegate {
+            builder = builder.tool(Subagent::new(
+                parent_context.child_context(key, child_depth),
+            ));
+        }
+
+        let agent = builder.build();
+        let mut stream = agent
+            .stream_prompt(&prompt)
+            .with_tool_concurrency(crate::agent::TOOL_CONCURRENCY)
+            .await;
+
+        let error = match run_nested_stream(parent_context, key, &mut stream).await {
+            Ok(response) => return require_nested_response(response),
+            Err(error) => error,
+        };
+
+        let Some(backoff) = crate::agent::retry_backoff(attempt, &error) else {
+            return Err(tool_error(format!("subagent failed: {error}")));
+        };
+
+        sink.send(AgentEvent::Status {
+            addr: AgentAddr::Runtime(key),
+            content: format!(
                 "subagent (depth {child_depth}) attempt {attempt}/{} failed with a transient error: {error}. Retrying in {}s…",
                 crate::agent::PROMPT_RETRY_ATTEMPTS,
                 backoff.as_secs()
-            );
-            async move {
-                sink.send(AgentEvent::Status {
-                    addr: AgentAddr::Runtime(key),
-                    content: message,
-                })
-                .await;
-            }
-        },
-    )
-    .await;
-
-    match result {
-        Ok(response) => require_nested_response(response),
-        Err(error) => Err(tool_error(format!("subagent failed: {error}"))),
+            ),
+        })
+        .await;
+        tokio::time::sleep(backoff).await;
     }
+
+    unreachable!("retry loop always returns")
 }
 
 /// Spawn a child agent one level below `parent_context` for `task`, stream its

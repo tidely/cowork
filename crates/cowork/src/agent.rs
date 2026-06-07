@@ -1,4 +1,4 @@
-use std::{future::Future, time::Duration};
+use std::time::Duration;
 
 use futures::SinkExt;
 use futures_util::StreamExt;
@@ -116,58 +116,30 @@ where
 pub const MODEL: &str = "gemma4:31b";
 pub(crate) const TOOL_CONCURRENCY: usize = 8;
 pub(crate) const AGENT_MAX_TURNS: usize = 1000;
-pub(crate) const PROMPT_RETRY_ATTEMPTS: usize = 5;
+/// Backoffs between successive retries, slowest last. We make one more attempt
+/// than there are backoffs — the final attempt has nothing waiting after it — so
+/// a failure on 1-based attempt `n` waits `PROMPT_RETRY_BACKOFFS[n - 1]`, and a
+/// failure on the last attempt finds no entry and gives up.
 pub(crate) const PROMPT_RETRY_BACKOFFS: [Duration; 4] = [
     Duration::from_secs(1),
     Duration::from_secs(3),
     Duration::from_secs(10),
     Duration::from_secs(30),
 ];
+pub(crate) const PROMPT_RETRY_ATTEMPTS: usize = PROMPT_RETRY_BACKOFFS.len() + 1;
 
-/// Backoff to wait after a failed attempt before retrying. Attempts beyond the
-/// fixed schedule reuse the last (slowest) backoff.
-pub(crate) fn backoff_for_attempt(attempt: usize) -> Duration {
-    PROMPT_RETRY_BACKOFFS
-        .get(attempt - 1)
-        .copied()
-        .unwrap_or_else(|| {
-            *PROMPT_RETRY_BACKOFFS
-                .last()
-                .expect("non-empty backoff list")
-        })
-}
-
-/// Run `run_attempt` up to `PROMPT_RETRY_ATTEMPTS` times, retrying while
-/// `is_retryable` accepts the error. Before each retry the computed backoff is
-/// passed to `notify_retry` (used to surface a status line) and then awaited.
-/// Returns the first success or the final error. `is_retryable` is a parameter
-/// rather than a fixed call so the helper places no trait bound on `E` (the
-/// top-level path uses a boxed error, subagents a concrete stream error).
-pub(crate) async fn retry_with_backoff<T, E, A, AF, R, N, NF>(
-    mut run_attempt: A,
-    is_retryable: R,
-    mut notify_retry: N,
-) -> Result<T, E>
-where
-    A: FnMut(usize) -> AF,
-    AF: Future<Output = Result<T, E>>,
-    R: Fn(&E) -> bool,
-    N: FnMut(usize, &E, Duration) -> NF,
-    NF: Future<Output = ()>,
-{
-    for attempt in 1..=PROMPT_RETRY_ATTEMPTS {
-        match run_attempt(attempt).await {
-            Ok(value) => return Ok(value),
-            Err(error) if attempt < PROMPT_RETRY_ATTEMPTS && is_retryable(&error) => {
-                let backoff = backoff_for_attempt(attempt);
-                notify_retry(attempt, &error, backoff).await;
-                tokio::time::sleep(backoff).await;
-            }
-            Err(error) => return Err(error),
-        }
+/// How long to wait before retrying a failed attempt, or `None` to give up —
+/// either because the error is deterministic or because we are out of retry
+/// budget. The `get` returning `None` past the schedule is the budget check.
+pub(crate) fn retry_backoff(
+    attempt: usize,
+    error: &(dyn std::error::Error + Send + Sync),
+) -> Option<Duration> {
+    if is_retryable_prompt_error(error) {
+        PROMPT_RETRY_BACKOFFS.get(attempt - 1).copied()
+    } else {
+        None
     }
-
-    unreachable!("retry loop always returns")
 }
 
 /// Build an agent preconfigured with the shared model, reasoning, the read-only
@@ -252,39 +224,38 @@ async fn run_prompt_with_retries(
     memory: InMemoryConversationMemory,
     events: RuntimeEventSender,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let result = retry_with_backoff(
-        |_attempt| {
-            run_prompt_once(
-                thread_id,
-                prompt.clone(),
-                conversation_id.clone(),
-                memory.clone(),
-                events.clone(),
-            )
-        },
-        |error| is_retryable_prompt_error(error.as_ref()),
-        |attempt, error, backoff| {
-            let mut sink = AgentEventSink::new(events.clone(), thread_id);
-            let message = format!(
+    let mut sink = AgentEventSink::new(events.clone(), thread_id);
+    for attempt in 1..=PROMPT_RETRY_ATTEMPTS {
+        let error = match run_prompt_once(
+            thread_id,
+            prompt.clone(),
+            conversation_id.clone(),
+            memory.clone(),
+            events.clone(),
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) => error,
+        };
+
+        let Some(backoff) = retry_backoff(attempt, error.as_ref()) else {
+            remember_failed_prompt(&memory, &conversation_id, &prompt, error.as_ref()).await;
+            return Err(error);
+        };
+
+        sink.send(AgentEvent::Status {
+            addr: AgentAddr::Main,
+            content: format!(
                 "Attempt {attempt}/{PROMPT_RETRY_ATTEMPTS} failed with a transient error: {error}. Retrying in {}s…",
                 backoff.as_secs()
-            );
-            async move {
-                sink.send(AgentEvent::Status {
-                    addr: AgentAddr::Main,
-                    content: message,
-                })
-                .await;
-            }
-        },
-    )
-    .await;
-
-    if let Err(error) = &result {
-        remember_failed_prompt(&memory, &conversation_id, &prompt, error.as_ref()).await;
+            ),
+        })
+        .await;
+        tokio::time::sleep(backoff).await;
     }
 
-    result
+    unreachable!("retry loop always returns")
 }
 
 async fn remember_failed_prompt(
@@ -439,6 +410,20 @@ mod tests {
         assert_eq!(PROMPT_RETRY_BACKOFFS[1], Duration::from_secs(3));
         assert_eq!(PROMPT_RETRY_BACKOFFS[2], Duration::from_secs(10));
         assert_eq!(PROMPT_RETRY_BACKOFFS[3], Duration::from_secs(30));
+    }
+
+    #[test]
+    fn retry_backoff_follows_schedule_then_gives_up() {
+        let transient = StaticError("CompletionError: HttpError: connection reset by peer");
+        let deterministic = StaticError("ToolSetError: ToolCallError: old_text was not found");
+
+        // A retryable error within budget waits the scheduled backoff...
+        assert_eq!(retry_backoff(1, &transient), Some(Duration::from_secs(1)));
+        assert_eq!(retry_backoff(4, &transient), Some(Duration::from_secs(30)));
+        // ...the last attempt has no budget left, and deterministic errors never
+        // retry — both give up.
+        assert_eq!(retry_backoff(PROMPT_RETRY_ATTEMPTS, &transient), None);
+        assert_eq!(retry_backoff(1, &deterministic), None);
     }
 
     #[test]
