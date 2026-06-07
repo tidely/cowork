@@ -1,0 +1,547 @@
+use std::{future::Future, time::Duration};
+
+use futures_util::StreamExt;
+use rig_core::{
+    agent::{MultiTurnStreamItem, StreamingError, StreamingResult},
+    client::{CompletionClient, ProviderClient},
+    memory::{ConversationMemory, InMemoryConversationMemory},
+    message::{AssistantContent, Message as RigMessage, ToolResultContent},
+    providers::ollama,
+    streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt},
+};
+
+use crate::{
+    app::{AgentAddr, AgentEvent, ThreadId},
+    tui::{RuntimeEvent, RuntimeEventSender},
+};
+
+/// Receives UI events produced while pumping an agent's stream. Implemented by
+/// the channel-backed sinks in this binary and faked in tests, so the
+/// stream→event translation can be exercised without a live model.
+pub trait EventSink: Sync {
+    fn emit(&self, event: AgentEvent) -> impl Future<Output = ()> + Send;
+}
+
+/// `EventSink` that forwards events to the TUI runtime channel for a thread.
+pub struct ChannelSink {
+    events: RuntimeEventSender,
+    thread_id: ThreadId,
+}
+
+impl ChannelSink {
+    pub fn new(events: RuntimeEventSender, thread_id: ThreadId) -> Self {
+        Self { events, thread_id }
+    }
+}
+
+impl EventSink for ChannelSink {
+    async fn emit(&self, event: AgentEvent) {
+        let _ = self
+            .events
+            .send(RuntimeEvent::Agent(self.thread_id, event))
+            .await;
+    }
+}
+
+pub const MODEL: &str = "gemma4:31b";
+const DEFAULT_TOOL_CONCURRENCY: usize = 8;
+const DEFAULT_PROMPT_RETRY_ATTEMPTS: usize = 5;
+const PROMPT_RETRY_BACKOFFS: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(3),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+];
+
+pub const MAIN_AGENT_PREAMBLE: &str = "You are the top-level user-facing assistant with persistent conversation context. Use tools when relevant. \
+     Do continuous work yourself when future prompts depend on your accumulated understanding, such as ongoing work in the same codebase or project. \
+     For broad bounded one-off tasks with many independent chunks, prefer calling subagent instead of manually iterating every chunk yourself. \
+     A first-level subagent owns the bounded task, maximizes parallelism by splitting independent context-heavy chunks into one worker call per chunk, and synthesizes their results. \
+     Do not use subagent for simple one- or two-tool tasks or tasks needing continuous shared context. \
+     When delegating, pass the full bounded task plus enough context, constraints, and paths for the subagent to plan; after it returns, synthesize its result into the final answer or next action.";
+
+pub fn tool_concurrency() -> usize {
+    std::env::var("COWORK_TOOL_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_TOOL_CONCURRENCY)
+}
+
+pub fn prompt_retry_attempts() -> usize {
+    std::env::var("COWORK_PROMPT_RETRY_ATTEMPTS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_PROMPT_RETRY_ATTEMPTS)
+}
+
+pub(crate) fn prompt_retry_backoff(failed_attempt: usize) -> Duration {
+    PROMPT_RETRY_BACKOFFS
+        .get(failed_attempt.saturating_sub(1))
+        .copied()
+        .unwrap_or_else(|| {
+            *PROMPT_RETRY_BACKOFFS
+                .last()
+                .expect("non-empty backoff list")
+        })
+}
+
+pub(crate) fn is_retryable_prompt_error(error: &(dyn std::error::Error + Send + Sync)) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+
+    // Tool and JSON/schema errors are usually deterministic. Retrying those can
+    // duplicate tool side effects without improving the outcome.
+    if message.contains("toolseterror")
+        || message.contains("toolcallerror")
+        || message.contains("toolnotfounderror")
+        || message.contains("jsonerror")
+        || message.contains("maxturnserror")
+    {
+        return false;
+    }
+
+    message.contains("httperror")
+        || message.contains("providererror") && message.contains("status code")
+        || message.contains("connection")
+        || message.contains("timeout")
+        || message.contains("timed out")
+        || message.contains("network")
+        || message.contains("broken pipe")
+        || message.contains("connection reset")
+        || message.contains("connection refused")
+        || message.contains("temporarily unavailable")
+        || message.contains("dns")
+}
+
+pub fn spawn_prompt_task(
+    thread_id: ThreadId,
+    prompt: String,
+    conversation_id: String,
+    memory: InMemoryConversationMemory,
+    events: RuntimeEventSender,
+) {
+    crate::debug_log::event(
+        "prompt_task_spawned",
+        [
+            ("conversation", conversation_id.clone()),
+            ("prompt_chars", prompt.chars().count().to_string()),
+        ],
+    );
+
+    tokio::spawn(async move {
+        let sink = ChannelSink::new(events.clone(), thread_id);
+        sink.emit(AgentEvent::Started).await;
+
+        if let Err(error) =
+            run_prompt_with_retries(thread_id, prompt, conversation_id, memory, events).await
+        {
+            sink.emit(AgentEvent::Error {
+                addr: AgentAddr::Main,
+                error: error.to_string(),
+            })
+            .await;
+        }
+    });
+}
+
+async fn run_prompt_with_retries(
+    thread_id: ThreadId,
+    prompt: String,
+    conversation_id: String,
+    memory: InMemoryConversationMemory,
+    events: RuntimeEventSender,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sink = ChannelSink::new(events.clone(), thread_id);
+    let max_attempts = prompt_retry_attempts();
+
+    for attempt in 1..=max_attempts {
+        match run_prompt_once(
+            thread_id,
+            prompt.clone(),
+            conversation_id.clone(),
+            memory.clone(),
+            events.clone(),
+            attempt,
+        )
+        .await
+        {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < max_attempts && is_retryable_prompt_error(error.as_ref()) => {
+                let backoff = prompt_retry_backoff(attempt);
+                let message = format!(
+                    "Attempt {attempt}/{max_attempts} failed with a transient error: {error}. Retrying in {}s…",
+                    backoff.as_secs()
+                );
+                crate::debug_log::event(
+                    "prompt_retry_scheduled",
+                    [
+                        ("attempt", attempt.to_string()),
+                        ("max_attempts", max_attempts.to_string()),
+                        ("backoff_secs", backoff.as_secs().to_string()),
+                        ("error", error.to_string()),
+                    ],
+                );
+                sink.emit(AgentEvent::Status {
+                    addr: AgentAddr::Main,
+                    content: message,
+                })
+                .await;
+                tokio::time::sleep(backoff).await;
+            }
+            Err(error) => {
+                remember_failed_prompt(&memory, &conversation_id, &prompt, error.as_ref()).await;
+                return Err(error);
+            }
+        }
+    }
+
+    unreachable!("retry loop always returns")
+}
+
+async fn remember_failed_prompt(
+    memory: &InMemoryConversationMemory,
+    conversation_id: &str,
+    prompt: &str,
+    error: &(dyn std::error::Error + Send + Sync),
+) {
+    let messages = vec![
+        RigMessage::from(prompt),
+        RigMessage::from(AssistantContent::from(format!(
+            "The previous attempt failed before a final response was produced: {error}"
+        ))),
+    ];
+
+    if let Err(memory_error) = memory.append(conversation_id, messages).await {
+        crate::debug_log::event(
+            "failed_prompt_memory_append_error",
+            [("error", memory_error.to_string())],
+        );
+    }
+}
+
+async fn run_prompt_once(
+    thread_id: ThreadId,
+    prompt: String,
+    conversation_id: String,
+    memory: InMemoryConversationMemory,
+    events: RuntimeEventSender,
+    attempt: usize,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    crate::debug_log::event(
+        "prompt_started",
+        [
+            ("conversation", conversation_id.clone()),
+            ("model", MODEL.to_string()),
+            ("tool_concurrency", tool_concurrency().to_string()),
+            ("attempt", attempt.to_string()),
+        ],
+    );
+
+    let client = ollama::Client::from_env()?;
+    let agent = client
+        .agent(MODEL)
+        .preamble(MAIN_AGENT_PREAMBLE)
+        .additional_params(serde_json::json!({ "think": true }))
+        .memory(memory)
+        .tool(crate::tools::ReadFile)
+        .tool(crate::tools::ListDirectory)
+        .tool(crate::tools::EditFile)
+        .tool(crate::tools::Subagent::new(
+            crate::tools::ToolUiContext::new(thread_id, events.clone()),
+        ))
+        .default_max_turns(1000)
+        .build();
+
+    let mut stream = agent
+        .stream_prompt(prompt)
+        .conversation(&conversation_id)
+        .with_tool_concurrency(tool_concurrency())
+        .await;
+
+    let sink = ChannelSink::new(events, thread_id);
+    pump_stream(&sink, AgentAddr::Main, &mut stream).await?;
+
+    crate::debug_log::event("prompt_finished", [("conversation", conversation_id)]);
+    sink.emit(AgentEvent::Finished {
+        addr: AgentAddr::Main,
+        result: None,
+    })
+    .await;
+    Ok(())
+}
+
+/// Drive an agent's stream to completion, emitting UI events for `addr` through
+/// `sink`. Returns the agent's final response text (used by subagents; ignored
+/// by the top-level agent).
+pub(crate) async fn pump_stream<R>(
+    sink: &impl EventSink,
+    addr: AgentAddr,
+    stream: &mut StreamingResult<R>,
+) -> Result<String, StreamingError> {
+    let mut streamed_text = String::new();
+    let mut final_response = None;
+
+    while let Some(item) = stream.next().await {
+        match item? {
+            MultiTurnStreamItem::StreamAssistantItem(content) => {
+                if let StreamedAssistantContent::Text(text) = &content {
+                    streamed_text.push_str(&text.text);
+                }
+                log_assistant_item(&content);
+                for event in assistant_events(addr, content) {
+                    sink.emit(event).await;
+                }
+            }
+            MultiTurnStreamItem::StreamUserItem(content) => {
+                for event in user_events(addr, content) {
+                    if let AgentEvent::ToolResult { id, content, .. } = &event {
+                        crate::debug_log::event(
+                            "tool_result_streamed",
+                            [
+                                ("id", id.clone()),
+                                ("content_chars", content.chars().count().to_string()),
+                            ],
+                        );
+                    }
+                    sink.emit(event).await;
+                }
+            }
+            MultiTurnStreamItem::CompletionCall(call) => {
+                crate::debug_log::event(
+                    "completion_call_finished",
+                    [("call_index", call.call_index.to_string())],
+                );
+                if let Some(usage) = call.usage {
+                    sink.emit(AgentEvent::Usage {
+                        addr,
+                        content: format!(
+                            "completion {} tokens: input={}, output={}, total={}",
+                            call.call_index,
+                            usage.input_tokens,
+                            usage.output_tokens,
+                            usage.total_tokens
+                        ),
+                    })
+                    .await;
+                }
+            }
+            MultiTurnStreamItem::FinalResponse(response) => {
+                final_response = Some(response.response().to_string());
+            }
+            _ => {}
+        }
+    }
+
+    Ok(final_response.unwrap_or(streamed_text))
+}
+
+/// Translate a streamed assistant item into UI events. Pure (no I/O), so the
+/// mapping is unit-tested directly.
+fn assistant_events<R>(addr: AgentAddr, content: StreamedAssistantContent<R>) -> Vec<AgentEvent> {
+    match content {
+        StreamedAssistantContent::Text(text) => vec![AgentEvent::AssistantDelta {
+            addr,
+            delta: text.text,
+        }],
+        StreamedAssistantContent::Reasoning(reasoning) => vec![AgentEvent::ReasoningDelta {
+            addr,
+            delta: reasoning.display_text().to_string(),
+        }],
+        StreamedAssistantContent::ReasoningDelta { reasoning, .. } => {
+            vec![AgentEvent::ReasoningDelta {
+                addr,
+                delta: reasoning,
+            }]
+        }
+        StreamedAssistantContent::ToolCall {
+            tool_call,
+            internal_call_id,
+        } => vec![AgentEvent::ToolCall {
+            addr,
+            id: internal_call_id,
+            name: tool_call.function.name,
+            arguments: tool_call.function.arguments,
+        }],
+        // ToolCallDelta and the provider-specific Final(R) carry no UI update.
+        _ => vec![],
+    }
+}
+
+/// Translate a streamed user item (a tool result) into UI events. Pure.
+fn user_events(addr: AgentAddr, content: StreamedUserContent) -> Vec<AgentEvent> {
+    let StreamedUserContent::ToolResult {
+        tool_result,
+        internal_call_id,
+    } = content;
+    let content = tool_result
+        .content
+        .into_iter()
+        .map(|content| match content {
+            ToolResultContent::Text(text) => text.text,
+            ToolResultContent::Image(_) => "[image result]".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    vec![AgentEvent::ToolResult {
+        addr,
+        id: internal_call_id,
+        content,
+    }]
+}
+
+fn log_assistant_item<R>(content: &StreamedAssistantContent<R>) {
+    if let StreamedAssistantContent::ToolCall { tool_call, .. } = content {
+        crate::debug_log::event(
+            "tool_call_streamed",
+            [
+                ("id", tool_call.id.clone()),
+                ("name", tool_call.function.name.clone()),
+                ("args", tool_call.function.arguments.to_string()),
+            ],
+        );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the pure stream-item → UI-event translation. The address
+    //! is threaded through unchanged, and provider-only items yield nothing.
+    use super::*;
+    use rig_core::message::{ToolCall, ToolFunction, ToolResult, ToolResultContent};
+    use serde_json::json;
+
+    #[derive(Debug)]
+    struct StaticError(&'static str);
+
+    impl std::fmt::Display for StaticError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for StaticError {}
+
+    #[test]
+    fn retry_backoff_uses_fixed_slow_schedule() {
+        assert_eq!(prompt_retry_backoff(1), Duration::from_secs(1));
+        assert_eq!(prompt_retry_backoff(2), Duration::from_secs(3));
+        assert_eq!(prompt_retry_backoff(3), Duration::from_secs(10));
+        assert_eq!(prompt_retry_backoff(4), Duration::from_secs(30));
+        assert_eq!(prompt_retry_backoff(5), Duration::from_secs(30));
+    }
+
+    #[test]
+    fn retry_classifier_allows_transient_network_errors() {
+        assert!(is_retryable_prompt_error(&StaticError(
+            "CompletionError: HttpError: connection reset by peer"
+        )));
+        assert!(is_retryable_prompt_error(&StaticError(
+            "CompletionError: ProviderError: Got error status code trying to send a request to Ollama: 502 Bad Gateway"
+        )));
+    }
+
+    #[test]
+    fn retry_classifier_rejects_deterministic_errors() {
+        assert!(!is_retryable_prompt_error(&StaticError(
+            "ToolSetError: ToolCallError: old_text was not found"
+        )));
+        assert!(!is_retryable_prompt_error(&StaticError(
+            "CompletionError: JsonError: expected value"
+        )));
+    }
+
+    #[test]
+    fn assistant_text_maps_to_assistant_delta() {
+        let events = assistant_events(AgentAddr::Main, StreamedAssistantContent::<()>::text("hi"));
+        match events.as_slice() {
+            [
+                AgentEvent::AssistantDelta {
+                    addr: AgentAddr::Main,
+                    delta,
+                },
+            ] => {
+                assert_eq!(delta, "hi");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_reasoning_delta_maps_and_preserves_address() {
+        let content = StreamedAssistantContent::<()>::ReasoningDelta {
+            id: None,
+            reasoning: "thinking".into(),
+        };
+        let events = assistant_events(AgentAddr::Runtime(7), content);
+        match events.as_slice() {
+            [
+                AgentEvent::ReasoningDelta {
+                    addr: AgentAddr::Runtime(7),
+                    delta,
+                },
+            ] => {
+                assert_eq!(delta, "thinking");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_tool_call_maps_to_tool_call_event() {
+        let content = StreamedAssistantContent::<()>::ToolCall {
+            tool_call: ToolCall::new(
+                "call-1".into(),
+                ToolFunction::new("read_file".into(), json!({ "path": "/x" })),
+            ),
+            internal_call_id: "ic".into(),
+        };
+        match assistant_events(AgentAddr::Main, content).as_slice() {
+            [
+                AgentEvent::ToolCall {
+                    addr: AgentAddr::Main,
+                    id,
+                    name,
+                    arguments,
+                },
+            ] => {
+                assert_eq!(id, "ic");
+                assert_eq!(name, "read_file");
+                assert_eq!(arguments, &json!({ "path": "/x" }));
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn assistant_provider_final_yields_no_events() {
+        assert!(
+            assistant_events(AgentAddr::Main, StreamedAssistantContent::<()>::Final(())).is_empty()
+        );
+    }
+
+    #[test]
+    fn user_tool_result_maps_to_tool_result_event() {
+        let content = StreamedUserContent::ToolResult {
+            tool_result: ToolResult {
+                id: "call-1".into(),
+                call_id: None,
+                content: ToolResultContent::from_tool_output("done"),
+            },
+            internal_call_id: "ic".into(),
+        };
+        match user_events(AgentAddr::Runtime(3), content).as_slice() {
+            [
+                AgentEvent::ToolResult {
+                    addr: AgentAddr::Runtime(3),
+                    id,
+                    content,
+                },
+            ] => {
+                assert_eq!(id, "ic");
+                assert_eq!(content, "done");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+}

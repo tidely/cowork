@@ -1,0 +1,17 @@
+[package]
+name = "cowork"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+tokio.workspace = true
+rig-core.workspace = true
+rig-derive.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+futures-util.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
