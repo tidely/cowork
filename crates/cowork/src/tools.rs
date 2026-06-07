@@ -388,7 +388,7 @@ async fn run_nested_agent_with_retries(
                     .default_max_turns(depth.max_turns())
                     .build();
                 let mut stream = agent
-                    .stream_prompt(prompt.clone())
+                    .stream_prompt(&prompt)
                     .with_tool_concurrency(crate::agent::TOOL_CONCURRENCY)
                     .await;
                 run_nested_stream(ui_context, key, &mut stream).await
@@ -403,7 +403,7 @@ async fn run_nested_agent_with_retries(
                     .default_max_turns(depth.max_turns())
                     .build();
                 let mut stream = agent
-                    .stream_prompt(prompt.clone())
+                    .stream_prompt(&prompt)
                     .with_tool_concurrency(crate::agent::TOOL_CONCURRENCY)
                     .await;
                 run_nested_stream(ui_context, key, &mut stream).await
@@ -453,19 +453,21 @@ async fn run_subagent_at_depth(
     context: Option<String>,
 ) -> Result<String, ToolError> {
     let key = next_runtime_agent_key();
+
+    let prompt = subagent_prompt(&task, context.as_deref());
+
     ui_context
         .emit(AgentEvent::Spawned {
             key,
             parent: ui_context.parent_key,
             depth: depth.ui_depth(),
-            task: task.clone(),
-            context: context.clone(),
+            task,
+            context,
         })
         .await;
 
     let client = ollama::Client::from_env()
         .map_err(|error| tool_error(format!("failed to create Ollama client: {error}")))?;
-    let prompt = subagent_prompt(&task, context.as_deref());
 
     let result = run_nested_agent_with_retries(&client, &ui_context, key, depth, prompt).await;
 
