@@ -6,6 +6,11 @@ use std::{
     sync::atomic::{AtomicU64, Ordering},
 };
 
+use crate::{
+    agent::{AgentEventSink, pump_stream},
+    app::{AgentAddr, AgentDepth, AgentEvent, RuntimeAgentKey, ThreadId},
+    tui::RuntimeEventSender,
+};
 use rig_core::{
     agent::{StreamingError, StreamingResult},
     client::{CompletionClient, ProviderClient},
@@ -16,12 +21,6 @@ use rig_core::{
     tool::{Tool, ToolEmbedding, ToolError},
 };
 use rig_derive::rig_tool;
-
-use crate::{
-    agent::{EventSink, pump_stream},
-    app::{AgentAddr, AgentDepth, AgentEvent, RuntimeAgentKey, ThreadId},
-    tui::{RuntimeEvent, RuntimeEventSender},
-};
 
 const MAX_READ_BYTES: u64 = 512 * 1024;
 const SUBAGENT_MODEL: &str = "gemma4:31b";
@@ -57,15 +56,6 @@ impl ToolUiContext {
 
 fn next_runtime_agent_key() -> RuntimeAgentKey {
     NEXT_RUNTIME_AGENT_KEY.fetch_add(1, Ordering::Relaxed)
-}
-
-impl EventSink for ToolUiContext {
-    async fn emit(&self, event: AgentEvent) {
-        let _ = self
-            .events
-            .send(RuntimeEvent::Agent(self.thread_id, event))
-            .await;
-    }
 }
 
 #[derive(Clone, Copy)]
@@ -355,7 +345,8 @@ async fn run_nested_stream<R>(
     key: RuntimeAgentKey,
     stream: &mut StreamingResult<R>,
 ) -> Result<String, StreamingError> {
-    pump_stream(ui_context, AgentAddr::Runtime(key), stream).await
+    let mut sink = AgentEventSink::new(ui_context.events.clone(), ui_context.thread_id);
+    pump_stream(&mut sink, AgentAddr::Runtime(key), stream).await
 }
 
 fn require_nested_response(response: String) -> Result<String, ToolError> {
@@ -386,7 +377,7 @@ async fn run_nested_agent_with_retries(
                     .tool(ListDirectory)
                     .tool(WorkerAgent::new(ui_context.with_parent_key(key)))
                     .hook(crate::agent::UiPromptHook::new(
-                        ui_context.clone(),
+                        AgentEventSink::new(ui_context.events.clone(), ui_context.thread_id),
                         AgentAddr::Runtime(key),
                     ))
                     .default_max_turns(depth.max_turns())
@@ -405,7 +396,7 @@ async fn run_nested_agent_with_retries(
                     .tool(ReadFile)
                     .tool(ListDirectory)
                     .hook(crate::agent::UiPromptHook::new(
-                        ui_context.clone(),
+                        AgentEventSink::new(ui_context.events.clone(), ui_context.thread_id),
                         AgentAddr::Runtime(key),
                     ))
                     .default_max_turns(depth.max_turns())
@@ -439,12 +430,12 @@ async fn run_nested_agent_with_retries(
                     backoff.as_secs()
                 );
 
-                ui_context
-                    .emit(AgentEvent::Status {
-                        addr: AgentAddr::Runtime(key),
-                        content: message,
-                    })
-                    .await;
+                let mut sink = AgentEventSink::new(ui_context.events.clone(), ui_context.thread_id);
+                sink.send(AgentEvent::Status {
+                    addr: AgentAddr::Runtime(key),
+                    content: message,
+                })
+                .await;
                 tokio::time::sleep(backoff).await;
             }
             Err(error) => return Err(tool_error(format!("subagent failed: {error}"))),
@@ -464,15 +455,15 @@ async fn run_subagent_at_depth(
 
     let prompt = subagent_prompt(&task, context.as_deref());
 
-    ui_context
-        .emit(AgentEvent::Spawned {
-            key,
-            parent: ui_context.parent_key,
-            depth: depth.ui_depth(),
-            task,
-            context,
-        })
-        .await;
+    let mut sink = AgentEventSink::new(ui_context.events.clone(), ui_context.thread_id);
+    sink.send(AgentEvent::Spawned {
+        key,
+        parent: ui_context.parent_key,
+        depth: depth.ui_depth(),
+        task,
+        context,
+    })
+    .await;
 
     let client = ollama::Client::from_env()
         .map_err(|error| tool_error(format!("failed to create Ollama client: {error}")))?;
@@ -481,20 +472,18 @@ async fn run_subagent_at_depth(
 
     match &result {
         Ok(result) => {
-            ui_context
-                .emit(AgentEvent::Finished {
-                    addr: AgentAddr::Runtime(key),
-                    result: Some(result.clone()),
-                })
-                .await;
+            sink.send(AgentEvent::Finished {
+                addr: AgentAddr::Runtime(key),
+                result: Some(result.clone()),
+            })
+            .await;
         }
         Err(error) => {
-            ui_context
-                .emit(AgentEvent::Error {
-                    addr: AgentAddr::Runtime(key),
-                    error: error.to_string(),
-                })
-                .await;
+            sink.send(AgentEvent::Error {
+                addr: AgentAddr::Runtime(key),
+                error: error.to_string(),
+            })
+            .await;
         }
     }
 
