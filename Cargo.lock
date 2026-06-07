@@ -1464,7 +1464,7 @@ dependencies = [
 [[package]]
 name = "rig-core"
 version = "0.38.1"
-source = "git+https://github.com/tidely/rig.git?branch=feat%2Fstreaming-tool-concurrency#c55b5cb0dd58eaa8ac31084d18549f6b905db894"
+source = "git+https://github.com/tidely/rig.git?branch=feat%2Fstreaming-tool-concurrency#142a0bdea06fd85c9490ec56ab6e7330d84296f0"
 dependencies = [
  "as-any",
  "async-stream",
@@ -1497,7 +1497,7 @@ dependencies = [
 [[package]]
 name = "rig-derive"
 version = "0.38.1"
-source = "git+https://github.com/tidely/rig.git?branch=feat%2Fstreaming-tool-concurrency#c55b5cb0dd58eaa8ac31084d18549f6b905db894"
+source = "git+https://github.com/tidely/rig.git?branch=feat%2Fstreaming-tool-concurrency#142a0bdea06fd85c9490ec56ab6e7330d84296f0"
 dependencies = [
  "convert_case",
  "deluxe",

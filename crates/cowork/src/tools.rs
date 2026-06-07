@@ -385,6 +385,10 @@ async fn run_nested_agent_with_retries(
                     .tool(ReadFile)
                     .tool(ListDirectory)
                     .tool(WorkerAgent::new(ui_context.with_parent_key(key)))
+                    .hook(crate::agent::UiPromptHook::new(
+                        ui_context.clone(),
+                        AgentAddr::Runtime(key),
+                    ))
                     .default_max_turns(depth.max_turns())
                     .build();
                 let mut stream = agent
@@ -400,6 +404,10 @@ async fn run_nested_agent_with_retries(
                     .additional_params(serde_json::json!({ "think": true }))
                     .tool(ReadFile)
                     .tool(ListDirectory)
+                    .hook(crate::agent::UiPromptHook::new(
+                        ui_context.clone(),
+                        AgentAddr::Runtime(key),
+                    ))
                     .default_max_turns(depth.max_turns())
                     .build();
                 let mut stream = agent

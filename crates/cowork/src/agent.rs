@@ -2,12 +2,16 @@ use std::{future::Future, time::Duration};
 
 use futures_util::StreamExt;
 use rig_core::{
-    agent::{MultiTurnStreamItem, StreamingError, StreamingResult},
+    agent::{
+        HookAction, MultiTurnStreamItem, PromptHook, StreamingError, StreamingResult,
+        ToolCallHookAction,
+    },
     client::{CompletionClient, ProviderClient},
+    completion::CompletionModel,
     memory::{ConversationMemory, InMemoryConversationMemory},
-    message::{AssistantContent, Message as RigMessage, ToolResultContent},
+    message::{AssistantContent, Message as RigMessage},
     providers::ollama,
-    streaming::{StreamedAssistantContent, StreamedUserContent, StreamingPrompt},
+    streaming::{StreamedAssistantContent, StreamingPrompt},
 };
 
 use crate::{
@@ -23,6 +27,7 @@ pub trait EventSink: Sync {
 }
 
 /// `EventSink` that forwards events to the TUI runtime channel for a thread.
+#[derive(Clone)]
 pub struct ChannelSink {
     events: RuntimeEventSender,
     thread_id: ThreadId,
@@ -40,6 +45,81 @@ impl EventSink for ChannelSink {
             .events
             .send(RuntimeEvent::Agent(self.thread_id, event))
             .await;
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct UiPromptHook<S> {
+    sink: S,
+    addr: AgentAddr,
+}
+
+impl<S> UiPromptHook<S> {
+    pub(crate) fn new(sink: S, addr: AgentAddr) -> Self {
+        Self { sink, addr }
+    }
+}
+
+impl<S> UiPromptHook<S>
+where
+    S: EventSink,
+{
+    async fn emit_tool_call_event(
+        &self,
+        tool_name: &str,
+        internal_call_id: &str,
+        args: &str,
+    ) -> ToolCallHookAction {
+        let arguments = serde_json::from_str(args)
+            .unwrap_or_else(|_| serde_json::Value::String(args.to_string()));
+        self.sink
+            .emit(AgentEvent::ToolCall {
+                addr: self.addr,
+                id: internal_call_id.to_string(),
+                name: tool_name.to_string(),
+                arguments,
+            })
+            .await;
+        ToolCallHookAction::cont()
+    }
+
+    async fn emit_tool_result_event(&self, internal_call_id: &str, result: &str) -> HookAction {
+        self.sink
+            .emit(AgentEvent::ToolResult {
+                addr: self.addr,
+                id: internal_call_id.to_string(),
+                content: result.to_string(),
+            })
+            .await;
+        HookAction::cont()
+    }
+}
+
+impl<M, S> PromptHook<M> for UiPromptHook<S>
+where
+    M: CompletionModel,
+    S: EventSink + Clone + Send + Sync,
+{
+    async fn on_tool_call(
+        &self,
+        tool_name: &str,
+        _tool_call_id: Option<String>,
+        internal_call_id: &str,
+        args: &str,
+    ) -> ToolCallHookAction {
+        self.emit_tool_call_event(tool_name, internal_call_id, args)
+            .await
+    }
+
+    async fn on_tool_result(
+        &self,
+        _tool_name: &str,
+        _tool_call_id: Option<String>,
+        internal_call_id: &str,
+        _args: &str,
+        result: &str,
+    ) -> HookAction {
+        self.emit_tool_result_event(internal_call_id, result).await
     }
 }
 
@@ -197,6 +277,10 @@ async fn run_prompt_once(
         .tool(crate::tools::Subagent::new(
             crate::tools::ToolUiContext::new(thread_id, events.clone()),
         ))
+        .hook(UiPromptHook::new(
+            ChannelSink::new(events.clone(), thread_id),
+            AgentAddr::Main,
+        ))
         .default_max_turns(1000)
         .build();
 
@@ -238,11 +322,7 @@ pub(crate) async fn pump_stream<R>(
                     sink.emit(event).await;
                 }
             }
-            MultiTurnStreamItem::StreamUserItem(content) => {
-                for event in user_events(addr, content) {
-                    sink.emit(event).await;
-                }
-            }
+            MultiTurnStreamItem::StreamUserItem(_) => {}
             MultiTurnStreamItem::CompletionCall(call) => {
                 if let Some(usage) = call.usage {
                     sink.emit(AgentEvent::Usage {
@@ -286,40 +366,12 @@ fn assistant_events<R>(addr: AgentAddr, content: StreamedAssistantContent<R>) ->
                 delta: reasoning,
             }]
         }
-        StreamedAssistantContent::ToolCall {
-            tool_call,
-            internal_call_id,
-        } => vec![AgentEvent::ToolCall {
-            addr,
-            id: internal_call_id,
-            name: tool_call.function.name,
-            arguments: tool_call.function.arguments,
-        }],
+        // Tool calls/results are emitted through UiPromptHook so this stream
+        // mapper only handles assistant-facing content.
+        StreamedAssistantContent::ToolCall { .. } => vec![],
         // ToolCallDelta and the provider-specific Final(R) carry no UI update.
         _ => vec![],
     }
-}
-
-/// Translate a streamed user item (a tool result) into UI events. Pure.
-fn user_events(addr: AgentAddr, content: StreamedUserContent) -> Vec<AgentEvent> {
-    let StreamedUserContent::ToolResult {
-        tool_result,
-        internal_call_id,
-    } = content;
-    let content = tool_result
-        .content
-        .into_iter()
-        .map(|content| match content {
-            ToolResultContent::Text(text) => text.text,
-            ToolResultContent::Image(_) => "[image result]".to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    vec![AgentEvent::ToolResult {
-        addr,
-        id: internal_call_id,
-        content,
-    }]
 }
 
 #[cfg(test)]
@@ -327,8 +379,9 @@ mod tests {
     //! Unit tests for the pure stream-item → UI-event translation. The address
     //! is threaded through unchanged, and provider-only items yield nothing.
     use super::*;
-    use rig_core::message::{ToolCall, ToolFunction, ToolResult, ToolResultContent};
+    use rig_core::message::{ToolCall, ToolFunction};
     use serde_json::json;
+    use std::sync::{Arc, Mutex};
 
     #[derive(Debug)]
     struct StaticError(&'static str);
@@ -340,6 +393,23 @@ mod tests {
     }
 
     impl std::error::Error for StaticError {}
+
+    #[derive(Clone, Default)]
+    struct RecordingSink {
+        events: Arc<Mutex<Vec<AgentEvent>>>,
+    }
+
+    impl RecordingSink {
+        fn events(&self) -> Vec<AgentEvent> {
+            self.events.lock().unwrap().clone()
+        }
+    }
+
+    impl EventSink for RecordingSink {
+        async fn emit(&self, event: AgentEvent) {
+            self.events.lock().unwrap().push(event);
+        }
+    }
 
     #[test]
     fn retry_backoffs_use_fixed_slow_schedule() {
@@ -406,7 +476,7 @@ mod tests {
     }
 
     #[test]
-    fn assistant_tool_call_maps_to_tool_call_event() {
+    fn assistant_tool_call_yields_no_stream_events() {
         let content = StreamedAssistantContent::<()>::ToolCall {
             tool_call: ToolCall::new(
                 "call-1".into(),
@@ -414,7 +484,21 @@ mod tests {
             ),
             internal_call_id: "ic".into(),
         };
-        match assistant_events(AgentAddr::Main, content).as_slice() {
+
+        assert!(assistant_events(AgentAddr::Main, content).is_empty());
+    }
+
+    #[tokio::test]
+    async fn hook_tool_call_maps_to_tool_call_event() {
+        let sink = RecordingSink::default();
+        let hook = UiPromptHook::new(sink.clone(), AgentAddr::Main);
+
+        let action = hook
+            .emit_tool_call_event("read_file", "ic", r#"{"path":"/x"}"#)
+            .await;
+
+        assert_eq!(action, ToolCallHookAction::Continue);
+        match sink.events().as_slice() {
             [
                 AgentEvent::ToolCall {
                     addr: AgentAddr::Main,
@@ -438,17 +522,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn user_tool_result_maps_to_tool_result_event() {
-        let content = StreamedUserContent::ToolResult {
-            tool_result: ToolResult {
-                id: "call-1".into(),
-                call_id: None,
-                content: ToolResultContent::from_tool_output("done"),
-            },
-            internal_call_id: "ic".into(),
-        };
-        match user_events(AgentAddr::Runtime(3), content).as_slice() {
+    #[tokio::test]
+    async fn hook_tool_result_maps_to_tool_result_event() {
+        let sink = RecordingSink::default();
+        let hook = UiPromptHook::new(sink.clone(), AgentAddr::Runtime(3));
+
+        let action = hook.emit_tool_result_event("ic", "done").await;
+
+        assert_eq!(action, HookAction::Continue);
+        match sink.events().as_slice() {
             [
                 AgentEvent::ToolResult {
                     addr: AgentAddr::Runtime(3),
