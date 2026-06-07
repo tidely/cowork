@@ -490,10 +490,10 @@ fn status_color(status: AgentStatus) -> Color {
     }
 }
 
-fn depth_label(depth: AgentDepth) -> &'static str {
-    match depth {
-        AgentDepth::Main => "main",
-        AgentDepth::Subagent => "subagent",
-        AgentDepth::Worker => "worker",
+fn depth_label(depth: AgentDepth) -> String {
+    if depth == 0 {
+        "main".to_string()
+    } else {
+        format!("subagent (depth {depth})")
     }
 }

@@ -7,12 +7,12 @@ pub type RuntimeAgentKey = u64;
 
 pub const MAIN_AGENT_ID: AgentId = 0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AgentDepth {
-    Main,
-    Subagent,
-    Worker,
-}
+/// Nesting depth of an agent in the hierarchy. The top-level assistant is 0;
+/// each `subagent` call spawns a child one level deeper. A plain count rather
+/// than a fixed enum so the tree can recurse to an arbitrary (bounded) depth.
+pub type AgentDepth = usize;
+
+pub const MAIN_AGENT_DEPTH: AgentDepth = 0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentStatus {
@@ -115,7 +115,7 @@ impl AgentNode {
             parent_id: None,
             runtime_key: None,
             label: "Main Agent".to_string(),
-            depth: AgentDepth::Main,
+            depth: MAIN_AGENT_DEPTH,
             status: AgentStatus::Idle,
             expanded: true,
             messages: initial_main_messages(),
@@ -188,7 +188,7 @@ pub enum SubmitResult {
 }
 
 /// Identifies which agent within a thread an event targets. The top-level agent
-/// is `Main`; spawned subagents/workers are addressed by their runtime key.
+/// is `Main`; spawned subagents are addressed by their runtime key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AgentAddr {
     Main,
@@ -199,7 +199,7 @@ pub enum AgentAddr {
 pub enum AgentEvent {
     /// The top-level prompt run has begun.
     Started,
-    /// A subagent/worker stream has begun; creates its node in the tree.
+    /// A subagent stream has begun; creates its node in the tree.
     Spawned {
         key: RuntimeAgentKey,
         parent: Option<RuntimeAgentKey>,
@@ -739,11 +739,6 @@ impl AppState {
         let id = self.next_agent_id;
         self.next_agent_id += 1;
         let label = truncate_chars(&task, 36);
-        let name = match depth {
-            AgentDepth::Main => "agent",
-            AgentDepth::Subagent => "subagent",
-            AgentDepth::Worker => "worker_agent",
-        };
 
         let mut messages = vec![Message::new(MessageRole::User, task)];
         if let Some(context) = context.filter(|context| !context.trim().is_empty()) {
@@ -759,7 +754,7 @@ impl AppState {
                 id,
                 parent_id: Some(parent_id),
                 runtime_key: Some(key),
-                label: format!("{name}: {label}"),
+                label: format!("subagent: {label}"),
                 depth,
                 status: AgentStatus::Running,
                 expanded: false,
@@ -1220,14 +1215,14 @@ mod tests {
     #[test]
     fn nested_started_creates_subagent_under_main() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, nested_started(1, None, AgentDepth::Subagent, "do thing"));
+        app.apply_agent_event(T, nested_started(1, None, 1, "do thing"));
 
         let subs = &app.threads[0].subagents;
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].parent_id, Some(MAIN_AGENT_ID));
         assert_eq!(subs[0].runtime_key, Some(1));
         assert_eq!(subs[0].status, AgentStatus::Running);
-        assert_eq!(subs[0].depth, AgentDepth::Subagent);
+        assert_eq!(subs[0].depth, 1);
         assert_eq!(subs[0].label, "subagent: do thing");
         assert!(
             app.threads[0].expanded,
@@ -1245,7 +1240,7 @@ mod tests {
             AgentEvent::Spawned {
                 key: 1,
                 parent: None,
-                depth: AgentDepth::Subagent,
+                depth: 1,
                 task: "task".into(),
                 context: Some("important ctx".into()),
             },
@@ -1261,9 +1256,9 @@ mod tests {
     #[test]
     fn worker_nests_under_its_parent_subagent() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, nested_started(1, None, AgentDepth::Subagent, "parent"));
+        app.apply_agent_event(T, nested_started(1, None, 1, "parent"));
         let parent_id = app.threads[0].subagents[0].id;
-        app.apply_agent_event(T, nested_started(2, Some(1), AgentDepth::Worker, "child"));
+        app.apply_agent_event(T, nested_started(2, Some(1), 2, "child"));
 
         let worker = app.threads[0]
             .subagents
@@ -1271,13 +1266,35 @@ mod tests {
             .find(|a| a.runtime_key == Some(2))
             .expect("worker node");
         assert_eq!(worker.parent_id, Some(parent_id));
-        assert_eq!(worker.depth, AgentDepth::Worker);
+        assert_eq!(worker.depth, 2);
+    }
+
+    #[test]
+    fn nested_agents_recurse_arbitrarily_deep() {
+        let mut app = AppState::new();
+        // main(0) -> a(1) -> b(2) -> c(3): the tree nests past the old two-level
+        // cap, each child one level deeper than its parent.
+        app.apply_agent_event(T, nested_started(1, None, 1, "a"));
+        app.apply_agent_event(T, nested_started(2, Some(1), 2, "b"));
+        app.apply_agent_event(T, nested_started(3, Some(2), 3, "c"));
+
+        let subs = &app.threads[0].subagents;
+        let find = |key| {
+            subs.iter()
+                .find(|a| a.runtime_key == Some(key))
+                .expect("node")
+        };
+        assert_eq!(find(1).depth, 1);
+        assert_eq!(find(2).depth, 2);
+        assert_eq!(find(3).depth, 3);
+        assert_eq!(find(2).parent_id, Some(find(1).id));
+        assert_eq!(find(3).parent_id, Some(find(2).id));
     }
 
     #[test]
     fn nested_deltas_and_completion_target_the_right_node() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, nested_started(1, None, AgentDepth::Subagent, "task"));
+        app.apply_agent_event(T, nested_started(1, None, 1, "task"));
         app.apply_agent_event(T, nested_assistant(1, "hi"));
         app.apply_agent_event(T, nested_finished(1, "done"));
 
@@ -1295,7 +1312,7 @@ mod tests {
     #[test]
     fn nested_error_marks_node_error() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, nested_started(1, None, AgentDepth::Subagent, "task"));
+        app.apply_agent_event(T, nested_started(1, None, 1, "task"));
         app.apply_agent_event(T, nested_error(1, "bad"));
         assert_eq!(app.threads[0].subagents[0].status, AgentStatus::Error);
     }
@@ -1312,8 +1329,8 @@ mod tests {
     #[test]
     fn sidebar_items_reflect_nesting_depth() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, nested_started(1, None, AgentDepth::Subagent, "sub"));
-        app.apply_agent_event(T, nested_started(2, Some(1), AgentDepth::Worker, "work"));
+        app.apply_agent_event(T, nested_started(1, None, 1, "sub"));
+        app.apply_agent_event(T, nested_started(2, Some(1), 2, "work"));
         // Expand the subagent so its worker child is rendered.
         app.threads[0]
             .subagents
