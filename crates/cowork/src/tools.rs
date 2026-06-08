@@ -434,6 +434,13 @@ async fn run_child_agent(
     })
     .await;
 
+    let _permit = parent_context
+        .child_subagent_permits
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| tool_error("subagent scheduler was closed"))?;
+
     let client = ollama::Client::from_env()
         .map_err(|error| tool_error(format!("failed to create Ollama client: {error}")))?;
 
@@ -497,13 +504,6 @@ impl Tool for Subagent {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
-        let _permit = self
-            .ui_context
-            .child_subagent_permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| tool_error("subagent scheduler was closed"))?;
         run_child_agent(self.ui_context.clone(), args.task, args.context).await
     }
 }
