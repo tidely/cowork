@@ -73,16 +73,19 @@ fn next_runtime_agent_key() -> RuntimeAgentKey {
 /// chunk themselves.
 fn subagent_preamble(can_delegate: bool) -> &'static str {
     if can_delegate {
-        "You are a task agent in an assistant hierarchy. Own the delegated bounded task. \
-         Maximize parallelism: when there are many independent context-heavy chunks, issue separate subagent calls for each chunk instead of inspecting chunks yourself. \
-         Use one child subagent per independent chunk and run as many in parallel as possible; do not batch multiple independent chunks into one child. \
-         Examples of chunks are one repository, one document, one subsystem, one account/resource, or one comparison item; the examples are not task-specific rules. \
-         Do not send the entire task, a long global list, or a batch of unrelated chunks to one child. Give each child only its slice-specific context. \
+        "You are a task agent in an assistant hierarchy. Own only the delegated bounded task and stay within its stated scope. \
+         Treat the parent's instructions as a contract: goal, context, paths/resources, constraints, expected output, and failure policy. Do not infer permission to broaden scope. \
+         Do not explore unrelated directories, search for alternative targets, or invent follow-up work just because the direct path is blocked. \
+         If a required file/path/resource is missing, too large to read, inaccessible, ambiguous, or otherwise blocks the task, stop and return a concise blocker report: what failed, what you tried, and what decision/input the parent should provide. \
+         Spawn child subagents only when the parent explicitly delegated multiple known independent chunks or clearly authorized further fan-out; never spawn children to recover from a blocker or to explore outside scope. \
+         When spawning children, give each child one slice-specific goal, context, paths/resources, constraints, expected output, and failure policy. \
          If the task requires continuous shared context rather than independent chunks, do the work yourself instead of spawning children. \
          Use tools when needed, do not modify files, and return a concise result useful to your parent."
     } else {
         "You are a leaf agent at the maximum delegation depth and cannot spawn further agents. \
-         Do this one independent context-heavy chunk yourself and return a concise result. \
+         Do only the delegated bounded task and stay within its stated scope. \
+         Do not explore unrelated directories, search for alternative targets, or invent follow-up work just because the direct path is blocked. \
+         If a required file/path/resource is missing, too large to read, inaccessible, ambiguous, or otherwise blocks the task, stop and return a concise blocker report: what failed, what you tried, and what decision/input the parent should provide. \
          Use tools when needed. Do not modify files. \
          If the task cannot be handled independently because it needs continuous shared context, say so briefly."
     }
@@ -462,9 +465,9 @@ impl Subagent {
 #[derive(serde::Deserialize, JsonSchema)]
 #[schemars(crate = "schemars")]
 pub struct SubagentParameters {
-    /// The bounded, independent sub-task for this child agent to own. Make it narrow enough that the child can finish it and return a concise result whose context can then be discarded.
+    /// The bounded, independent sub-task for this child agent to own. Include the goal, expected output, and exact scope boundaries. Make it narrow enough that the child can finish it and return a concise result whose context can then be discarded.
     task: String,
-    /// Context, constraints, paths, service details, or prior findings needed for this sub-task only. Do not include unrelated global or ongoing-conversation context.
+    /// Slice-specific context only: why the goal matters, known paths/resources, constraints, relevant prior findings, and what to do if a path/resource is missing, too large, inaccessible, ambiguous, or otherwise blocks the task. Prefer telling the child to stop and report the blocker rather than explore outside scope.
     context: Option<String>,
 }
 
@@ -478,7 +481,7 @@ impl Tool for Subagent {
     async fn definition(&self, _prompt: String) -> ToolDefinition {
         tool_definition(
             Self::NAME,
-            "Spawn a child agent to own one bounded, independent sub-task. The child has the read-only file tools and, unless it is already at the maximum delegation depth, can recursively split its work into parallel grandchildren. Prefer one child per independent context-heavy chunk so each chunk's context can be discarded after it returns a concise result. Do not use it for simple one- or two-tool steps or for work that needs your continuous shared context.",
+            "Spawn a child agent to own one bounded, independent sub-task. Do not use it for simple one- or two-tool steps, single-file inspection, straightforward path reads/listing, or work that needs your continuous shared context. Give the child a clear goal, goal context, exact scope boundaries, known paths/resources, constraints, expected output shape, and failure policy. If a file/path/resource is missing, too large, inaccessible, ambiguous, or otherwise blocks the task, tell the child to stop and report the blocker rather than explore elsewhere or spawn recovery agents. Only delegate fan-out when there are multiple known independent chunks whose context can be discarded after a concise result.",
             serde_json::to_value(schemars::schema_for!(SubagentParameters))
                 .expect("schema serialization"),
         )
