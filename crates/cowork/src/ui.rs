@@ -6,7 +6,9 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Wrap},
 };
 
-use crate::app::{AgentDepth, AgentStatus, AppState, Focus, Message, MessageRole, ToolStatus};
+use crate::app::{
+    AgentDepth, AgentStatus, AppState, Focus, Message, MessageRole, TokenUsage, ToolStatus,
+};
 
 pub fn render(frame: &mut Frame<'_>, app: &AppState) {
     let root = frame.area();
@@ -156,11 +158,46 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
 fn render_main(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(3)])
+        .constraints([
+            Constraint::Min(5),
+            Constraint::Length(1),
+            Constraint::Length(3),
+        ])
         .split(area);
 
     render_conversation(frame, app, rows[0]);
-    render_input(frame, app, rows[1]);
+    render_agent_status(frame, app, rows[1]);
+    render_input(frame, app, rows[2]);
+}
+
+fn render_agent_status(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
+    let thread_usage = app
+        .selected_thread()
+        .map(|thread| thread.total_token_usage())
+        .unwrap_or_default();
+
+    let line = match app.selected_agent() {
+        Some(agent) => Line::from(vec![
+            Span::styled(" Status: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                status_label(agent.status),
+                Style::default().fg(status_color(agent.status)),
+            ),
+            Span::styled("  Depth: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(depth_label(agent.depth), Style::default().fg(Color::Gray)),
+            Span::styled("  Thread tokens: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                token_usage_label(thread_usage),
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+        None => Line::from(Span::styled(
+            " No agent selected",
+            Style::default().fg(Color::DarkGray),
+        )),
+    };
+
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn render_conversation(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
@@ -188,17 +225,6 @@ fn render_conversation(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let mut lines = Vec::new();
     let mut selected_line_start = None;
     if let Some(agent) = agent {
-        lines.push(Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                status_label(agent.status),
-                Style::default().fg(status_color(agent.status)),
-            ),
-            Span::styled("  Depth: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(depth_label(agent.depth), Style::default().fg(Color::Gray)),
-        ]));
-        lines.push(Line::from(""));
-
         for (index, message) in agent.messages.iter().enumerate() {
             let selected = selected_message == Some(index);
             if selected {
@@ -457,7 +483,6 @@ fn message_style(role: MessageRole) -> Style {
         MessageRole::Reasoning => Style::default().fg(Color::DarkGray),
         MessageRole::ToolCall => Style::default().fg(Color::Yellow),
         MessageRole::ToolResult => Style::default().fg(Color::Blue),
-        MessageRole::Status => Style::default().fg(Color::Gray),
         MessageRole::Error => Style::default().fg(Color::Red),
     }
 }
@@ -496,4 +521,11 @@ fn depth_label(depth: AgentDepth) -> String {
     } else {
         format!("subagent (depth {depth})")
     }
+}
+
+fn token_usage_label(usage: TokenUsage) -> String {
+    format!(
+        "{} (in {}, out {})",
+        usage.total_tokens, usage.input_tokens, usage.output_tokens
+    )
 }

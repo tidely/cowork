@@ -14,7 +14,7 @@ cargo clippy && cargo fmt
 
 `cowork` is a TUI-first AI assistant where the main agent can delegate to a recursive tree of subagents in parallel. The TUI makes this hierarchy visible: the sidebar shows spawned agents live as they run, and their message streams are individually inspectable.
 
-It uses a local Ollama model (`gemma4:31b`) with reasoning enabled (`think: true`).
+It uses a local Ollama model (`gemma4:31b-it-qat`) with reasoning enabled (`think: true`).
 
 ## Core architectural tension
 

@@ -113,9 +113,36 @@ where
     }
 }
 
-pub const MODEL: &str = "gemma4:31b";
-pub(crate) const TOOL_CONCURRENCY: usize = 8;
+pub const MODEL: &str = "gemma4:31b-it-qat";
+const DEFAULT_TOOL_CONCURRENCY: usize = 8;
+const DEFAULT_CHILD_SUBAGENT_CONCURRENCY: usize = 1;
 pub(crate) const AGENT_MAX_TURNS: usize = 1000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ExecutionPolicy {
+    pub(crate) tool_concurrency: usize,
+    pub(crate) child_subagent_concurrency: usize,
+}
+
+impl ExecutionPolicy {
+    pub(crate) fn from_env() -> Self {
+        Self {
+            tool_concurrency: env_usize("COWORK_TOOL_CONCURRENCY", DEFAULT_TOOL_CONCURRENCY),
+            child_subagent_concurrency: env_usize(
+                "COWORK_SUBAGENT_CONCURRENCY",
+                DEFAULT_CHILD_SUBAGENT_CONCURRENCY,
+            ),
+        }
+    }
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
 /// Backoffs between successive retries, slowest last. We make one more attempt
 /// than there are backoffs — the final attempt has nothing waiting after it — so
 /// a failure on 1-based attempt `n` waits `PROMPT_RETRY_BACKOFFS[n - 1]`, and a
@@ -226,7 +253,6 @@ async fn run_prompt_with_retries(
     memory: InMemoryConversationMemory,
     events: RuntimeEventSender,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut sink = AgentEventSink::new(events.clone(), thread_id);
     for attempt in 1..=PROMPT_RETRY_ATTEMPTS {
         let error = match run_prompt_once(
             thread_id,
@@ -246,14 +272,6 @@ async fn run_prompt_with_retries(
             return Err(error);
         };
 
-        sink.send(AgentEvent::Status {
-            addr: AgentAddr::Main,
-            content: format!(
-                "Attempt {attempt}/{PROMPT_RETRY_ATTEMPTS} failed with a transient error: {error}. Retrying in {}s…",
-                backoff.as_secs()
-            ),
-        })
-        .await;
         tokio::time::sleep(backoff).await;
     }
 
@@ -284,11 +302,12 @@ async fn run_prompt_once(
     events: RuntimeEventSender,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let client = ollama::Client::from_env()?;
+    let policy = ExecutionPolicy::from_env();
     let agent = base_agent_builder(&client, MAIN_AGENT_PREAMBLE, AGENT_MAX_TURNS)
         .memory(memory)
         .tool(crate::tools::EditFile)
         .tool(crate::tools::Subagent::new(
-            crate::tools::ToolUiContext::new(thread_id, events.clone()),
+            crate::tools::ToolUiContext::new(thread_id, events.clone(), policy),
         ))
         .hook(UiPromptHook::new(
             AgentEventSink::new(events.clone(), thread_id),
@@ -299,7 +318,7 @@ async fn run_prompt_once(
     let mut stream = agent
         .stream_prompt(prompt)
         .conversation(&conversation_id)
-        .with_tool_concurrency(TOOL_CONCURRENCY)
+        .with_tool_concurrency(policy.tool_concurrency)
         .await;
 
     let mut sink = AgentEventSink::new(events, thread_id);
@@ -339,13 +358,9 @@ pub(crate) async fn pump_stream<R>(
                 if let Some(usage) = call.usage {
                     sink.send(AgentEvent::Usage {
                         addr,
-                        content: format!(
-                            "completion {} tokens: input={}, output={}, total={}",
-                            call.call_index,
-                            usage.input_tokens,
-                            usage.output_tokens,
-                            usage.total_tokens
-                        ),
+                        input_tokens: usage.input_tokens,
+                        output_tokens: usage.output_tokens,
+                        total_tokens: usage.total_tokens,
                     })
                     .await;
                 }

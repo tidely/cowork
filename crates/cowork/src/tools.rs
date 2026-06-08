@@ -2,11 +2,14 @@ use std::{
     convert::Infallible,
     fs, io,
     path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use crate::{
-    agent::{AgentEventSink, pump_stream},
+    agent::{AgentEventSink, ExecutionPolicy, pump_stream},
     app::{AgentAddr, AgentDepth, AgentEvent, RuntimeAgentKey, ThreadId},
     tui::RuntimeEventSender,
 };
@@ -20,6 +23,7 @@ use rig_core::{
     tool::{Tool, ToolEmbedding, ToolError},
 };
 use rig_derive::rig_tool;
+use tokio::sync::Semaphore;
 
 const MAX_READ_BYTES: u64 = 512 * 1024;
 
@@ -32,7 +36,7 @@ const MAX_AGENT_DEPTH: AgentDepth = 4;
 static NEXT_RUNTIME_AGENT_KEY: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Clone)]
-pub struct ToolUiContext {
+pub(crate) struct ToolUiContext {
     thread_id: ThreadId,
     /// Runtime key of the agent that owns these tools, and therefore the parent
     /// of any agent they spawn. `None` for the top-level assistant.
@@ -40,15 +44,26 @@ pub struct ToolUiContext {
     /// Depth of the agent that owns these tools (top-level assistant is 0).
     depth: AgentDepth,
     events: RuntimeEventSender,
+    policy: ExecutionPolicy,
+    /// FIFO gate for this agent's immediate child subagents. Holding the permit
+    /// for the full child run serializes sibling subtrees without preventing the
+    /// parent from emitting multiple `subagent` tool calls in one turn.
+    child_subagent_permits: Arc<Semaphore>,
 }
 
 impl ToolUiContext {
-    pub fn new(thread_id: ThreadId, events: RuntimeEventSender) -> Self {
+    pub(crate) fn new(
+        thread_id: ThreadId,
+        events: RuntimeEventSender,
+        policy: ExecutionPolicy,
+    ) -> Self {
         Self {
             thread_id,
             parent_key: None,
             depth: 0,
             events,
+            policy,
+            child_subagent_permits: Arc::new(Semaphore::new(policy.child_subagent_concurrency)),
         }
     }
 
@@ -60,6 +75,10 @@ impl ToolUiContext {
             parent_key: Some(child_key),
             depth: child_depth,
             events: self.events.clone(),
+            policy: self.policy,
+            child_subagent_permits: Arc::new(Semaphore::new(
+                self.policy.child_subagent_concurrency,
+            )),
         }
     }
 }
@@ -352,7 +371,6 @@ async fn run_nested_agent_with_retries(
     prompt: String,
 ) -> Result<String, ToolError> {
     let can_delegate = child_depth < MAX_AGENT_DEPTH;
-    let mut sink = AgentEventSink::new(parent_context.events.clone(), parent_context.thread_id);
 
     for attempt in 1..=crate::agent::PROMPT_RETRY_ATTEMPTS {
         // Every level shares the same base build. Agents that can still delegate
@@ -376,7 +394,7 @@ async fn run_nested_agent_with_retries(
         let agent = builder.build();
         let mut stream = agent
             .stream_prompt(&prompt)
-            .with_tool_concurrency(crate::agent::TOOL_CONCURRENCY)
+            .with_tool_concurrency(parent_context.policy.tool_concurrency)
             .await;
 
         let error = match run_nested_stream(parent_context, key, &mut stream).await {
@@ -388,15 +406,6 @@ async fn run_nested_agent_with_retries(
             return Err(tool_error(format!("subagent failed: {error}")));
         };
 
-        sink.send(AgentEvent::Status {
-            addr: AgentAddr::Runtime(key),
-            content: format!(
-                "subagent (depth {child_depth}) attempt {attempt}/{} failed with a transient error: {error}. Retrying in {}s…",
-                crate::agent::PROMPT_RETRY_ATTEMPTS,
-                backoff.as_secs()
-            ),
-        })
-        .await;
         tokio::time::sleep(backoff).await;
     }
 
@@ -452,12 +461,12 @@ async fn run_child_agent(
 }
 
 #[derive(Clone)]
-pub struct Subagent {
+pub(crate) struct Subagent {
     ui_context: ToolUiContext,
 }
 
 impl Subagent {
-    pub fn new(ui_context: ToolUiContext) -> Self {
+    pub(crate) fn new(ui_context: ToolUiContext) -> Self {
         Self { ui_context }
     }
 }
@@ -488,6 +497,13 @@ impl Tool for Subagent {
     }
 
     async fn call(&self, args: Self::Args) -> Result<Self::Output, Self::Error> {
+        let _permit = self
+            .ui_context
+            .child_subagent_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| tool_error("subagent scheduler was closed"))?;
         run_child_agent(self.ui_context.clone(), args.task, args.context).await
     }
 }

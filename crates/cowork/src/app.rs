@@ -30,7 +30,6 @@ pub enum MessageRole {
     Reasoning,
     ToolCall,
     ToolResult,
-    Status,
     Error,
 }
 
@@ -43,7 +42,6 @@ impl MessageRole {
             MessageRole::Reasoning => "Thinking",
             MessageRole::ToolCall => "Tool call",
             MessageRole::ToolResult => "Tool result",
-            MessageRole::Status => "Status",
             MessageRole::Error => "Error",
         }
     }
@@ -100,6 +98,21 @@ impl Message {
     }
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+}
+
+impl TokenUsage {
+    fn add(&mut self, other: TokenUsage) {
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.total_tokens += other.total_tokens;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AgentNode {
     pub id: AgentId,
@@ -109,6 +122,7 @@ pub struct AgentNode {
     pub depth: AgentDepth,
     pub status: AgentStatus,
     pub expanded: bool,
+    pub token_usage: TokenUsage,
     pub messages: Vec<Message>,
 }
 
@@ -122,6 +136,7 @@ impl AgentNode {
             depth: MAIN_AGENT_DEPTH,
             status: AgentStatus::Idle,
             expanded: true,
+            token_usage: TokenUsage::default(),
             messages: initial_main_messages(),
         }
     }
@@ -135,6 +150,16 @@ pub struct ThreadState {
     pub expanded: bool,
     pub main_agent: AgentNode,
     pub subagents: Vec<AgentNode>,
+}
+
+impl ThreadState {
+    pub fn total_token_usage(&self) -> TokenUsage {
+        let mut usage = self.main_agent.token_usage;
+        for agent in &self.subagents {
+            usage.add(agent.token_usage);
+        }
+        usage
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -230,13 +255,11 @@ pub enum AgentEvent {
         id: String,
         content: String,
     },
-    Status {
-        addr: AgentAddr,
-        content: String,
-    },
     Usage {
         addr: AgentAddr,
-        content: String,
+        input_tokens: u64,
+        output_tokens: u64,
+        total_tokens: u64,
     },
     /// An agent finished. `result` is the subagent's returned text (shown as a
     /// tool result); `None` marks the top-level agent done.
@@ -369,9 +392,6 @@ impl AppState {
             AgentEvent::Started => {
                 if let Some(agent) = self.agent_mut(thread_id, MAIN_AGENT_ID) {
                     agent.status = AgentStatus::Running;
-                    agent
-                        .messages
-                        .push(Message::new(MessageRole::Status, "Agent started"));
                 }
             }
             AgentEvent::Spawned {
@@ -413,13 +433,20 @@ impl AppState {
                     self.apply_tool_result_to_agent(thread_id, agent_id, &id, &content);
                 }
             }
-            AgentEvent::Status { addr, content } | AgentEvent::Usage { addr, content } => {
+            AgentEvent::Usage {
+                addr,
+                input_tokens,
+                output_tokens,
+                total_tokens,
+            } => {
                 if let Some(agent_id) = self.resolve_addr(thread_id, addr) {
                     self.collapse_last_reasoning(thread_id, agent_id);
                     if let Some(agent) = self.agent_mut(thread_id, agent_id) {
-                        agent
-                            .messages
-                            .push(Message::new(MessageRole::Status, content));
+                        agent.token_usage.add(TokenUsage {
+                            input_tokens,
+                            output_tokens,
+                            total_tokens,
+                        });
                     }
                 }
             }
@@ -429,13 +456,10 @@ impl AppState {
                 {
                     agent.status = AgentStatus::Complete;
                     collapse_reasoning(agent);
-                    match result {
-                        Some(result) => agent
+                    if let Some(result) = result {
+                        agent
                             .messages
-                            .push(Message::new(MessageRole::ToolResult, result)),
-                        None => agent
-                            .messages
-                            .push(Message::new(MessageRole::Status, "Agent finished")),
+                            .push(Message::new(MessageRole::ToolResult, result));
                     }
                 }
             }
@@ -762,6 +786,7 @@ impl AppState {
                 depth,
                 status: AgentStatus::Running,
                 expanded: false,
+                token_usage: TokenUsage::default(),
                 messages,
             });
         }
@@ -1054,12 +1079,12 @@ mod tests {
     }
 
     #[test]
-    fn started_sets_running_and_status_message() {
+    fn started_sets_running_without_visible_message() {
         let mut app = AppState::new();
+        let message_count = main_messages(&app).len();
         app.apply_agent_event(T, AgentEvent::Started);
         assert_eq!(app.threads[0].main_agent.status, AgentStatus::Running);
-        assert_eq!(last(&app).role, MessageRole::Status);
-        assert_eq!(last(&app).content, "Agent started");
+        assert_eq!(main_messages(&app).len(), message_count);
     }
 
     #[test]
@@ -1082,13 +1107,14 @@ mod tests {
     }
 
     #[test]
-    fn finished_sets_complete_and_collapses_reasoning() {
+    fn finished_sets_complete_and_collapses_reasoning_without_visible_message() {
         let mut app = AppState::new();
         app.apply_agent_event(T, reasoning("x"));
+        let message_count = main_messages(&app).len();
         app.apply_agent_event(T, finished(None));
         assert_eq!(app.threads[0].main_agent.status, AgentStatus::Complete);
         assert!(main_messages(&app)[1].collapsed);
-        assert_eq!(last(&app).content, "Agent finished");
+        assert_eq!(main_messages(&app).len(), message_count);
     }
 
     #[test]
@@ -1276,6 +1302,20 @@ mod tests {
         }
     }
 
+    fn usage(
+        addr: AgentAddr,
+        input_tokens: u64,
+        output_tokens: u64,
+        total_tokens: u64,
+    ) -> AgentEvent {
+        AgentEvent::Usage {
+            addr,
+            input_tokens,
+            output_tokens,
+            total_tokens,
+        }
+    }
+
     #[test]
     fn nested_started_creates_subagent_under_main() {
         let mut app = AppState::new();
@@ -1386,6 +1426,22 @@ mod tests {
         let mut app = AppState::new();
         app.apply_agent_event(T, nested_assistant(99, "x"));
         assert_eq!(app.threads[0].subagents.len(), 0);
+    }
+
+    #[test]
+    fn thread_token_usage_includes_nested_agents_recursively() {
+        let mut app = AppState::new();
+        app.apply_agent_event(T, nested_started(1, None, 1, "subagent"));
+        app.apply_agent_event(T, nested_started(2, Some(1), 2, "worker"));
+
+        app.apply_agent_event(T, usage(AgentAddr::Main, 10, 5, 15));
+        app.apply_agent_event(T, usage(AgentAddr::Runtime(1), 20, 7, 27));
+        app.apply_agent_event(T, usage(AgentAddr::Runtime(2), 3, 4, 7));
+
+        let total = app.threads[0].total_token_usage();
+        assert_eq!(total.input_tokens, 33);
+        assert_eq!(total.output_tokens, 16);
+        assert_eq!(total.total_tokens, 49);
     }
 
     // ----- selectors -----
