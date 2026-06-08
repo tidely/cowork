@@ -184,6 +184,7 @@ pub(crate) fn base_agent_builder(
         .additional_params(serde_json::json!({ "think": true }))
         .default_max_turns(max_turns)
         .tool(crate::tools::ReadFile)
+        .tool(crate::tools::ReadPdf)
         .tool(crate::tools::ListDirectory)
 }
 

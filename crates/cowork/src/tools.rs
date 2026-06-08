@@ -17,6 +17,7 @@ use rig_core::{
     agent::{StreamingError, StreamingResult},
     client::ProviderClient,
     completion::ToolDefinition,
+    loaders::PdfFileLoader,
     providers::ollama,
     schemars::{self, JsonSchema},
     streaming::StreamingPrompt,
@@ -26,6 +27,7 @@ use rig_derive::rig_tool;
 use tokio::sync::Semaphore;
 
 const MAX_READ_BYTES: u64 = 512 * 1024;
+const MAX_PDF_BYTES: u64 = 25 * 1024 * 1024;
 
 /// Maximum agent nesting depth. The top-level assistant is depth 0; each
 /// `subagent` call spawns a child one level deeper. An agent below this depth
@@ -112,6 +114,20 @@ fn subagent_preamble(can_delegate: bool) -> &'static str {
 
 fn tool_error(message: impl Into<String>) -> ToolError {
     ToolError::ToolCallError(Box::new(io::Error::other(message.into())))
+}
+
+fn truncate_to_char_boundary(value: &mut String, max_len: usize) {
+    if value.len() <= max_len {
+        return;
+    }
+
+    let boundary = value
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_len)
+        .last()
+        .unwrap_or(0);
+    value.truncate(boundary);
 }
 
 fn home_dir() -> Result<PathBuf, ToolError> {
@@ -206,6 +222,100 @@ impl ToolEmbedding for ReadFile {
 
     fn init(_state: Self::State, _context: Self::Context) -> Result<Self, Self::InitError> {
         Ok(ReadFile)
+    }
+}
+
+/// Convert a PDF file into markdown text extracted page-by-page.
+#[rig_tool]
+pub fn read_pdf(
+    /// Absolute path, path relative to the current working directory, `~`, or `~/...`.
+    path: String,
+) -> Result<String, ToolError> {
+    let path = resolve_path(&path)?;
+    let metadata =
+        fs::metadata(&path).map_err(|error| ToolError::ToolCallError(Box::new(error)))?;
+
+    if !metadata.is_file() {
+        return Err(tool_error(format!("{} is not a file", path.display())));
+    }
+
+    if metadata.len() > MAX_PDF_BYTES {
+        return Err(tool_error(format!(
+            "{} is too large to convert as PDF ({} bytes, max {MAX_PDF_BYTES})",
+            path.display(),
+            metadata.len()
+        )));
+    }
+
+    let bytes = fs::read(&path).map_err(|error| ToolError::ToolCallError(Box::new(error)))?;
+    let document = PdfFileLoader::from_bytes(bytes)
+        .load()
+        .into_iter()
+        .next()
+        .ok_or_else(|| tool_error(format!("{} produced no PDF document", path.display())))?
+        .map_err(|error| tool_error(format!("failed to load PDF {}: {error}", path.display())))?;
+
+    let mut output = format!("# {}\n\n", path.display());
+    let mut text_found = false;
+    let mut truncated = false;
+
+    for (page_index, _) in document.page_iter().enumerate() {
+        let page_number = page_index + 1;
+        let page_text = document
+            .extract_text(&[page_number as u32])
+            .map_err(|error| {
+                tool_error(format!("failed to extract page {page_number}: {error}"))
+            })?;
+
+        let page_text = page_text.trim();
+        text_found |= !page_text.is_empty();
+
+        if !output.ends_with("\n\n") {
+            output.push('\n');
+        }
+        output.push_str(&format!("## Page {page_number}\n\n"));
+        output.push_str(page_text);
+        output.push_str("\n\n");
+
+        if output.len() as u64 > MAX_READ_BYTES {
+            truncate_to_char_boundary(&mut output, MAX_READ_BYTES as usize);
+            output.push_str("\n\n...\n\nPDF output truncated; ask for a narrower file or split the PDF before reading more.\n");
+            truncated = true;
+            break;
+        }
+    }
+
+    if !text_found {
+        return Ok(format!(
+            "# {}\n\nNo extractable text was found in this PDF. It may be scanned or image-only.",
+            path.display()
+        ));
+    }
+
+    if !truncated {
+        output.push_str("Converted from PDF with Rig's PDF document loader.\n");
+    }
+
+    Ok(output)
+}
+
+impl ToolEmbedding for ReadPdf {
+    type InitError = Infallible;
+    type Context = ();
+    type State = ();
+
+    fn embedding_docs(&self) -> Vec<String> {
+        vec![
+            "Convert a local PDF file into markdown text by path.".to_string(),
+            "Use when the user asks to inspect, read, summarize, or understand a PDF document."
+                .to_string(),
+        ]
+    }
+
+    fn context(&self) -> Self::Context {}
+
+    fn init(_state: Self::State, _context: Self::Context) -> Result<Self, Self::InitError> {
+        Ok(ReadPdf)
     }
 }
 

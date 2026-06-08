@@ -965,7 +965,9 @@ fn pretty_json(value: &Value) -> String {
 
 fn tool_call_summary(name: &str, arguments: &Value) -> String {
     match name {
-        "read_file" | "list_directory" | "edit_file" => path_tool_summary(name, arguments),
+        "read_file" | "read_pdf" | "list_directory" | "edit_file" => {
+            path_tool_summary(name, arguments)
+        }
         "subagent" => string_arg(arguments, "task")
             .map(|task| format!("{name} {}", truncate_chars(task, 80)))
             .unwrap_or_else(|| name.to_string()),
