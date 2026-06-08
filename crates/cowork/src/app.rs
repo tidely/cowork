@@ -87,7 +87,11 @@ impl Message {
     fn tool_call(id: String, name: String, arguments: &Value) -> Self {
         Self {
             role: MessageRole::ToolCall,
-            content: format!("{name}\n{}", pretty_json(arguments)),
+            content: format!(
+                "{}\n{}",
+                tool_call_summary(&name, arguments),
+                pretty_json(arguments)
+            ),
             collapsed: true,
             tool_call_id: Some(id),
             tool_result: None,
@@ -934,6 +938,29 @@ fn pretty_json(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
+fn tool_call_summary(name: &str, arguments: &Value) -> String {
+    match name {
+        "read_file" | "list_directory" | "edit_file" => path_tool_summary(name, arguments),
+        "subagent" => string_arg(arguments, "task")
+            .map(|task| format!("{name} {}", truncate_chars(task, 80)))
+            .unwrap_or_else(|| name.to_string()),
+        _ => name.to_string(),
+    }
+}
+
+fn path_tool_summary(name: &str, arguments: &Value) -> String {
+    string_arg(arguments, "path")
+        .map(|path| format!("{name} {path}"))
+        .unwrap_or_else(|| name.to_string())
+}
+
+fn string_arg<'a>(arguments: &'a Value, key: &str) -> Option<&'a str> {
+    arguments
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+}
+
 fn title_from_prompt(current: &str, prompt: &str) -> String {
     if current != "Thread 1" {
         return current.to_string();
@@ -1088,6 +1115,43 @@ mod tests {
         assert_eq!(last(&app).role, MessageRole::ToolCall);
         assert_eq!(last(&app).tool_call_id.as_deref(), Some("t1"));
         assert_eq!(last(&app).tool_status, ToolStatus::Running);
+        assert_eq!(last(&app).content.lines().next(), Some("read_file /tmp"));
+    }
+
+    #[test]
+    fn path_tool_call_summary_includes_path() {
+        let mut app = AppState::new();
+        app.apply_agent_event(
+            T,
+            AgentEvent::ToolCall {
+                addr: AgentAddr::Main,
+                id: "t1".into(),
+                name: "list_directory".into(),
+                arguments: json!({ "path": "/workspace/src" }),
+            },
+        );
+        assert_eq!(
+            last(&app).content.lines().next(),
+            Some("list_directory /workspace/src")
+        );
+    }
+
+    #[test]
+    fn subagent_tool_call_summary_includes_task() {
+        let mut app = AppState::new();
+        app.apply_agent_event(
+            T,
+            AgentEvent::ToolCall {
+                addr: AgentAddr::Main,
+                id: "t1".into(),
+                name: "subagent".into(),
+                arguments: json!({ "task": "review the parser module", "context": "src/parser.rs" }),
+            },
+        );
+        assert_eq!(
+            last(&app).content.lines().next(),
+            Some("subagent review the parser module")
+        );
     }
 
     #[test]
