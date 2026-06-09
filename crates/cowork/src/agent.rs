@@ -127,8 +127,8 @@ pub(crate) struct ExecutionPolicy {
 impl ExecutionPolicy {
     pub(crate) fn from_env() -> Self {
         Self {
-            tool_concurrency: env_usize("COWORK_TOOL_CONCURRENCY", DEFAULT_TOOL_CONCURRENCY),
-            child_subagent_concurrency: env_usize(
+            tool_concurrency: parse_env("COWORK_TOOL_CONCURRENCY", DEFAULT_TOOL_CONCURRENCY),
+            child_subagent_concurrency: parse_env(
                 "COWORK_SUBAGENT_CONCURRENCY",
                 DEFAULT_CHILD_SUBAGENT_CONCURRENCY,
             ),
@@ -136,13 +136,13 @@ impl ExecutionPolicy {
     }
 }
 
-fn env_usize(name: &str, default: usize) -> usize {
+fn parse_env<R: std::str::FromStr>(name: &str, default: R) -> R {
     std::env::var(name)
         .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|value| *value > 0)
+        .and_then(|value| value.parse().ok())
         .unwrap_or(default)
 }
+
 /// Backoffs between successive retries, slowest last. We make one more attempt
 /// than there are backoffs — the final attempt has nothing waiting after it — so
 /// a failure on 1-based attempt `n` waits `PROMPT_RETRY_BACKOFFS[n - 1]`, and a
