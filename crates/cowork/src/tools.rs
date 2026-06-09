@@ -37,29 +37,6 @@ const MAX_AGENT_DEPTH: AgentDepth = 4;
 
 static NEXT_RUNTIME_AGENT_KEY: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ToolCapability {
-    ReadFilesystem,
-    WriteFilesystem,
-    Delegate,
-}
-
-pub(crate) trait ToolAccessMetadata {
-    const CAPABILITY: ToolCapability;
-}
-
-pub(crate) fn tool_capability(tool_name: &str) -> Option<ToolCapability> {
-    match tool_name {
-        <ReadFile as Tool>::NAME => Some(<ReadFile as ToolAccessMetadata>::CAPABILITY),
-        <ReadPdf as Tool>::NAME => Some(<ReadPdf as ToolAccessMetadata>::CAPABILITY),
-        <ListDirectory as Tool>::NAME => Some(<ListDirectory as ToolAccessMetadata>::CAPABILITY),
-        <EditFile as Tool>::NAME => Some(<EditFile as ToolAccessMetadata>::CAPABILITY),
-        <WriteFile as Tool>::NAME => Some(<WriteFile as ToolAccessMetadata>::CAPABILITY),
-        Subagent::NAME => Some(<Subagent as ToolAccessMetadata>::CAPABILITY),
-        _ => None,
-    }
-}
-
 #[derive(Clone)]
 pub(crate) struct ToolUiContext {
     thread_id: ThreadId,
@@ -216,10 +193,6 @@ pub fn read_file(
     fs::read_to_string(&path).map_err(|error| ToolError::ToolCallError(Box::new(error)))
 }
 
-impl ToolAccessMetadata for ReadFile {
-    const CAPABILITY: ToolCapability = ToolCapability::ReadFilesystem;
-}
-
 impl ToolEmbedding for ReadFile {
     type InitError = Infallible;
     type Context = ();
@@ -314,10 +287,6 @@ pub fn read_pdf(
     Ok(output)
 }
 
-impl ToolAccessMetadata for ReadPdf {
-    const CAPABILITY: ToolCapability = ToolCapability::ReadFilesystem;
-}
-
 impl ToolEmbedding for ReadPdf {
     type InitError = Infallible;
     type Context = ();
@@ -387,10 +356,6 @@ pub fn list_directory(
     Ok(output)
 }
 
-impl ToolAccessMetadata for ListDirectory {
-    const CAPABILITY: ToolCapability = ToolCapability::ReadFilesystem;
-}
-
 impl ToolEmbedding for ListDirectory {
     type InitError = Infallible;
     type Context = ();
@@ -441,10 +406,6 @@ pub fn edit_file(
             "old_text appears {count} times; provide a more specific span"
         ))),
     }
-}
-
-impl ToolAccessMetadata for EditFile {
-    const CAPABILITY: ToolCapability = ToolCapability::WriteFilesystem;
 }
 
 impl ToolEmbedding for EditFile {
@@ -500,10 +461,6 @@ pub fn write_file(
 
     fs::write(&path, content).map_err(|error| ToolError::ToolCallError(Box::new(error)))?;
     Ok(format!("Wrote {}", path.display()))
-}
-
-impl ToolAccessMetadata for WriteFile {
-    const CAPABILITY: ToolCapability = ToolCapability::WriteFilesystem;
 }
 
 impl ToolEmbedding for WriteFile {
@@ -683,10 +640,6 @@ pub struct SubagentParameters {
     context: Option<String>,
 }
 
-impl ToolAccessMetadata for Subagent {
-    const CAPABILITY: ToolCapability = ToolCapability::Delegate;
-}
-
 impl Tool for Subagent {
     const NAME: &'static str = "subagent";
 
@@ -749,30 +702,6 @@ mod tests {
 
         assert!(path.ends_with("child"));
         assert!(!path.to_string_lossy().contains('~'));
-    }
-
-    #[test]
-    fn tools_declare_capabilities_without_profile_policy() {
-        assert_eq!(
-            tool_capability(EditFile::NAME),
-            Some(ToolCapability::WriteFilesystem)
-        );
-        assert_eq!(
-            tool_capability(WriteFile::NAME),
-            Some(ToolCapability::WriteFilesystem)
-        );
-        assert_eq!(
-            tool_capability(ReadFile::NAME),
-            Some(ToolCapability::ReadFilesystem)
-        );
-        assert_eq!(
-            tool_capability(ListDirectory::NAME),
-            Some(ToolCapability::ReadFilesystem)
-        );
-        assert_eq!(
-            tool_capability(Subagent::NAME),
-            Some(ToolCapability::Delegate)
-        );
     }
 
     #[test]

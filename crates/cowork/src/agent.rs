@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use futures::SinkExt;
 use futures_util::StreamExt;
@@ -13,13 +13,13 @@ use rig_core::{
     message::{AssistantContent, Message as RigMessage},
     providers::ollama,
     streaming::{StreamedAssistantContent, StreamingPrompt},
-    tool::ToolSetError,
+    tool::{Tool, ToolSetError},
 };
 use tokio_util::sync::PollSender;
 
 use crate::{
     app::{AgentAddr, AgentEvent, PendingToolPermission, ThreadId, ToolPermissionResponse},
-    tools::{ToolCapability, tool_capability},
+    tools::{EditFile, ListDirectory, ReadFile, ReadPdf, Subagent, WriteFile},
     tui::{RuntimeEvent, RuntimeEventSender},
 };
 
@@ -30,12 +30,11 @@ pub(crate) enum ToolPermissionMode {
     Deny,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AgentProfile {
-    read_filesystem: ToolPermissionMode,
-    write_filesystem: ToolPermissionMode,
-    delegate: ToolPermissionMode,
-    unknown_tool: ToolPermissionMode,
+    allowed_tools: HashSet<&'static str>,
+    denied_tools: HashSet<&'static str>,
+    default_permission: ToolPermissionMode,
 }
 
 impl AgentProfile {
@@ -53,39 +52,50 @@ impl AgentProfile {
 
     fn ask_for_writes() -> Self {
         Self {
-            read_filesystem: ToolPermissionMode::Allow,
-            write_filesystem: ToolPermissionMode::Ask,
-            delegate: ToolPermissionMode::Allow,
-            unknown_tool: ToolPermissionMode::Ask,
+            allowed_tools: always_allowed_read_and_delegate_tools(),
+            denied_tools: HashSet::new(),
+            default_permission: ToolPermissionMode::Ask,
         }
     }
 
     fn skip_permissions() -> Self {
         Self {
-            read_filesystem: ToolPermissionMode::Allow,
-            write_filesystem: ToolPermissionMode::Allow,
-            delegate: ToolPermissionMode::Allow,
-            unknown_tool: ToolPermissionMode::Allow,
+            allowed_tools: HashSet::new(),
+            denied_tools: HashSet::new(),
+            default_permission: ToolPermissionMode::Allow,
         }
     }
 
     fn read_only() -> Self {
         Self {
-            read_filesystem: ToolPermissionMode::Allow,
-            write_filesystem: ToolPermissionMode::Deny,
-            delegate: ToolPermissionMode::Allow,
-            unknown_tool: ToolPermissionMode::Ask,
+            allowed_tools: always_allowed_read_and_delegate_tools(),
+            denied_tools: tool_names([<EditFile as Tool>::NAME, <WriteFile as Tool>::NAME]),
+            default_permission: ToolPermissionMode::Ask,
         }
     }
 
-    pub(crate) fn permission_for_tool(self, tool_name: &str) -> ToolPermissionMode {
-        match tool_capability(tool_name) {
-            Some(ToolCapability::ReadFilesystem) => self.read_filesystem,
-            Some(ToolCapability::WriteFilesystem) => self.write_filesystem,
-            Some(ToolCapability::Delegate) => self.delegate,
-            None => self.unknown_tool,
+    pub(crate) fn permission_for_tool(&self, tool_name: &str) -> ToolPermissionMode {
+        if self.denied_tools.contains(tool_name) {
+            ToolPermissionMode::Deny
+        } else if self.allowed_tools.contains(tool_name) {
+            ToolPermissionMode::Allow
+        } else {
+            self.default_permission
         }
     }
+}
+
+fn always_allowed_read_and_delegate_tools() -> HashSet<&'static str> {
+    tool_names([
+        <ReadFile as Tool>::NAME,
+        <ReadPdf as Tool>::NAME,
+        <ListDirectory as Tool>::NAME,
+        Subagent::NAME,
+    ])
+}
+
+fn tool_names<const N: usize>(names: [&'static str; N]) -> HashSet<&'static str> {
+    names.into_iter().collect()
 }
 
 #[derive(Clone)]
@@ -830,7 +840,7 @@ mod tests {
     }
 
     #[test]
-    fn profiles_resolve_permissions_from_tool_capabilities() {
+    fn profiles_resolve_permissions_from_tool_names() {
         assert_eq!(
             AgentProfile::ask_for_writes().permission_for_tool("edit_file"),
             ToolPermissionMode::Ask
