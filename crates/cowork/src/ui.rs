@@ -180,7 +180,10 @@ fn render_agent_status(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         Line::from(vec![
             Span::styled(" Permission required: ", Style::default().fg(Color::Yellow)),
             Span::styled(request.summary(), Style::default().fg(Color::White)),
-            Span::styled("  a accept  r reject ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                "  a accept  A always for tool  r reject ",
+                Style::default().fg(Color::Cyan),
+            ),
         ])
     } else {
         match app.selected_agent() {
@@ -287,7 +290,7 @@ fn render_input(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let running = app.active_agent_running();
     let permission = app.pending_tool_permission();
     let title = if permission.is_some() {
-        " Tool permission — press a to accept or r to reject "
+        " Tool permission — a accept  A always for tool  r reject "
     } else if running {
         " Prompt — waiting for active agent "
     } else {

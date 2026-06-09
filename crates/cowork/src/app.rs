@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{HashSet, VecDeque};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
@@ -207,6 +207,7 @@ pub struct AppState {
     pub conversation_scroll: u16,
     pub conversation_cursor: usize,
     pending_tool_permissions: VecDeque<PendingToolPermission>,
+    always_allowed_tools: HashSet<String>,
     next_thread_id: ThreadId,
     next_agent_id: AgentId,
 }
@@ -224,6 +225,7 @@ pub enum SubmitResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolPermissionResponse {
     Allow,
+    AllowAlways,
     Reject { reason: String },
 }
 
@@ -346,6 +348,7 @@ impl AppState {
             conversation_scroll: 0,
             conversation_cursor: 0,
             pending_tool_permissions: VecDeque::new(),
+            always_allowed_tools: HashSet::new(),
             next_thread_id: 1,
             next_agent_id: 1,
         }
@@ -403,12 +406,21 @@ impl AppState {
 
         if self.pending_tool_permission().is_some() {
             match key.code {
-                KeyCode::Char('a') | KeyCode::Char('A') => {
-                    self.resolve_next_tool_permission(true);
+                KeyCode::Char('a') => {
+                    self.resolve_next_tool_permission(ToolPermissionResponse::Allow);
+                    return SubmitResult::None;
+                }
+                KeyCode::Char('A') => {
+                    self.resolve_next_tool_permission(ToolPermissionResponse::AllowAlways);
                     return SubmitResult::None;
                 }
                 KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Esc => {
-                    self.resolve_next_tool_permission(false);
+                    let Some(request) = self.pending_tool_permission() else {
+                        return SubmitResult::None;
+                    };
+                    self.resolve_next_tool_permission(ToolPermissionResponse::Reject {
+                        reason: rejected_tool_permission_reason(&request.name),
+                    });
                     return SubmitResult::None;
                 }
                 _ => {}
@@ -456,6 +468,11 @@ impl AppState {
     }
 
     pub fn apply_tool_permission_request(&mut self, request: PendingToolPermission) {
+        if self.always_allowed_tools.contains(&request.name) {
+            self.allow_tool_permission(request, ToolPermissionResponse::AllowAlways);
+            return;
+        }
+
         if let Some(agent_id) = self.resolve_addr(request.thread_id, request.addr) {
             self.selected = Selection {
                 thread_id: request.thread_id,
@@ -562,22 +579,56 @@ impl AppState {
         }
     }
 
-    fn resolve_next_tool_permission(&mut self, allow: bool) {
+    fn resolve_next_tool_permission(&mut self, response: ToolPermissionResponse) {
         let Some(request) = self.pending_tool_permissions.pop_front() else {
             return;
         };
 
-        let response = if allow {
-            ToolPermissionResponse::Allow
-        } else {
-            ToolPermissionResponse::Reject {
-                reason: rejected_tool_permission_reason(&request.name),
-            }
-        };
+        if matches!(
+            response,
+            ToolPermissionResponse::Allow | ToolPermissionResponse::AllowAlways
+        ) {
+            self.allow_tool_permission(request, response);
+            self.resolve_always_allowed_tool_permissions();
+            return;
+        }
 
+        self.finish_tool_permission(request, response);
+    }
+
+    fn allow_tool_permission(
+        &mut self,
+        request: PendingToolPermission,
+        response: ToolPermissionResponse,
+    ) {
+        if matches!(response, ToolPermissionResponse::AllowAlways) {
+            self.always_allowed_tools.insert(request.name.clone());
+        }
+        self.finish_tool_permission(request, response);
+    }
+
+    fn resolve_always_allowed_tool_permissions(&mut self) {
+        let mut remaining = VecDeque::new();
+        while let Some(request) = self.pending_tool_permissions.pop_front() {
+            if self.always_allowed_tools.contains(&request.name) {
+                self.allow_tool_permission(request, ToolPermissionResponse::AllowAlways);
+            } else {
+                remaining.push_back(request);
+            }
+        }
+        self.pending_tool_permissions = remaining;
+    }
+
+    fn finish_tool_permission(
+        &mut self,
+        request: PendingToolPermission,
+        response: ToolPermissionResponse,
+    ) {
         if let Some(agent_id) = self.resolve_addr(request.thread_id, request.addr) {
             let (status, result) = match &response {
-                ToolPermissionResponse::Allow => (ToolStatus::Running, None),
+                ToolPermissionResponse::Allow | ToolPermissionResponse::AllowAlways => {
+                    (ToolStatus::Running, None)
+                }
                 ToolPermissionResponse::Reject { reason } => {
                     (ToolStatus::Failed, Some(reason.as_str()))
                 }
@@ -1395,6 +1446,127 @@ mod tests {
         assert_eq!(response.await.unwrap(), ToolPermissionResponse::Allow);
         assert_eq!(last(&app).tool_status, ToolStatus::Running);
         assert!(app.pending_tool_permission().is_none());
+    }
+
+    #[tokio::test]
+    async fn accept_once_does_not_allow_future_calls_for_same_tool() {
+        let mut app = AppState::new();
+        app.apply_agent_event(
+            T,
+            AgentEvent::ToolCall {
+                addr: AgentAddr::Main,
+                id: "t1".into(),
+                name: "edit_file".into(),
+                arguments: json!({ "path": "/tmp/a" }),
+            },
+        );
+        let (respond_to, response) = oneshot::channel();
+        app.apply_tool_permission_request(PendingToolPermission::new(
+            T,
+            AgentAddr::Main,
+            "t1".into(),
+            "edit_file".into(),
+            json!({ "path": "/tmp/a" }),
+            respond_to,
+        ));
+
+        app.handle_key(key(KeyCode::Char('a')));
+        assert_eq!(response.await.unwrap(), ToolPermissionResponse::Allow);
+
+        app.apply_agent_event(
+            T,
+            AgentEvent::ToolCall {
+                addr: AgentAddr::Main,
+                id: "t2".into(),
+                name: "edit_file".into(),
+                arguments: json!({ "path": "/tmp/b" }),
+            },
+        );
+        let (respond_to, mut response) = oneshot::channel();
+        app.apply_tool_permission_request(PendingToolPermission::new(
+            T,
+            AgentAddr::Main,
+            "t2".into(),
+            "edit_file".into(),
+            json!({ "path": "/tmp/b" }),
+            respond_to,
+        ));
+
+        assert_eq!(app.pending_tool_permission().unwrap().id, "t2");
+        assert!(response.try_recv().is_err(), "second call still prompts");
+    }
+
+    #[tokio::test]
+    async fn accept_always_allows_same_tool_only() {
+        let mut app = AppState::new();
+        app.apply_agent_event(
+            T,
+            AgentEvent::ToolCall {
+                addr: AgentAddr::Main,
+                id: "t1".into(),
+                name: "edit_file".into(),
+                arguments: json!({ "path": "/tmp/a" }),
+            },
+        );
+        let (respond_to, response) = oneshot::channel();
+        app.apply_tool_permission_request(PendingToolPermission::new(
+            T,
+            AgentAddr::Main,
+            "t1".into(),
+            "edit_file".into(),
+            json!({ "path": "/tmp/a" }),
+            respond_to,
+        ));
+
+        app.handle_key(key(KeyCode::Char('A')));
+        assert_eq!(response.await.unwrap(), ToolPermissionResponse::AllowAlways);
+        assert!(app.pending_tool_permission().is_none());
+
+        app.apply_agent_event(
+            T,
+            AgentEvent::ToolCall {
+                addr: AgentAddr::Main,
+                id: "t2".into(),
+                name: "edit_file".into(),
+                arguments: json!({ "path": "/tmp/b" }),
+            },
+        );
+        let (respond_to, response) = oneshot::channel();
+        app.apply_tool_permission_request(PendingToolPermission::new(
+            T,
+            AgentAddr::Main,
+            "t2".into(),
+            "edit_file".into(),
+            json!({ "path": "/tmp/b" }),
+            respond_to,
+        ));
+        assert_eq!(response.await.unwrap(), ToolPermissionResponse::AllowAlways);
+        assert!(app.pending_tool_permission().is_none());
+
+        app.apply_agent_event(
+            T,
+            AgentEvent::ToolCall {
+                addr: AgentAddr::Main,
+                id: "t3".into(),
+                name: "write_file".into(),
+                arguments: json!({ "path": "/tmp/c", "content": "", "overwrite": false }),
+            },
+        );
+        let (respond_to, mut response) = oneshot::channel();
+        app.apply_tool_permission_request(PendingToolPermission::new(
+            T,
+            AgentAddr::Main,
+            "t3".into(),
+            "write_file".into(),
+            json!({ "path": "/tmp/c", "content": "", "overwrite": false }),
+            respond_to,
+        ));
+
+        assert_eq!(app.pending_tool_permission().unwrap().name, "write_file");
+        assert!(
+            response.try_recv().is_err(),
+            "different write tool still prompts"
+        );
     }
 
     #[tokio::test]
