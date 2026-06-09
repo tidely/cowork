@@ -8,18 +8,85 @@ use rig_core::{
         ToolCallHookAction, WithBuilderTools,
     },
     client::{CompletionClient, ProviderClient},
-    completion::CompletionModel,
+    completion::{CompletionError, CompletionModel, PromptError},
     memory::{ConversationMemory, InMemoryConversationMemory},
     message::{AssistantContent, Message as RigMessage},
     providers::ollama,
     streaming::{StreamedAssistantContent, StreamingPrompt},
+    tool::ToolSetError,
 };
 use tokio_util::sync::PollSender;
 
 use crate::{
-    app::{AgentAddr, AgentEvent, ThreadId},
+    app::{AgentAddr, AgentEvent, PendingToolPermission, ThreadId, ToolPermissionResponse},
+    tools::{ToolCapability, tool_capability},
     tui::{RuntimeEvent, RuntimeEventSender},
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolPermissionMode {
+    Allow,
+    Ask,
+    Deny,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AgentProfile {
+    read_filesystem: ToolPermissionMode,
+    write_filesystem: ToolPermissionMode,
+    delegate: ToolPermissionMode,
+    unknown_tool: ToolPermissionMode,
+}
+
+impl AgentProfile {
+    pub(crate) fn from_env() -> Self {
+        match std::env::var("COWORK_AGENT_PROFILE")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "skip-permissions" | "unrestricted" => Self::skip_permissions(),
+            "read" | "read-only" => Self::read_only(),
+            _ => Self::ask_for_writes(),
+        }
+    }
+
+    fn ask_for_writes() -> Self {
+        Self {
+            read_filesystem: ToolPermissionMode::Allow,
+            write_filesystem: ToolPermissionMode::Ask,
+            delegate: ToolPermissionMode::Allow,
+            unknown_tool: ToolPermissionMode::Ask,
+        }
+    }
+
+    fn skip_permissions() -> Self {
+        Self {
+            read_filesystem: ToolPermissionMode::Allow,
+            write_filesystem: ToolPermissionMode::Allow,
+            delegate: ToolPermissionMode::Allow,
+            unknown_tool: ToolPermissionMode::Allow,
+        }
+    }
+
+    fn read_only() -> Self {
+        Self {
+            read_filesystem: ToolPermissionMode::Allow,
+            write_filesystem: ToolPermissionMode::Deny,
+            delegate: ToolPermissionMode::Allow,
+            unknown_tool: ToolPermissionMode::Ask,
+        }
+    }
+
+    pub(crate) fn permission_for_tool(self, tool_name: &str) -> ToolPermissionMode {
+        match tool_capability(tool_name) {
+            Some(ToolCapability::ReadFilesystem) => self.read_filesystem,
+            Some(ToolCapability::WriteFilesystem) => self.write_filesystem,
+            Some(ToolCapability::Delegate) => self.delegate,
+            None => self.unknown_tool,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct AgentEventSink {
@@ -43,17 +110,49 @@ impl AgentEventSink {
             .send(RuntimeEvent::Agent(self.thread_id, event))
             .await;
     }
+
+    pub(crate) async fn request_tool_permission(
+        &mut self,
+        addr: AgentAddr,
+        id: String,
+        name: String,
+        arguments: serde_json::Value,
+    ) -> Option<ToolPermissionResponse> {
+        let (respond_to, response) = tokio::sync::oneshot::channel();
+        let request =
+            PendingToolPermission::new(self.thread_id, addr, id, name, arguments, respond_to);
+
+        self.events
+            .send(RuntimeEvent::ToolPermissionRequest(request))
+            .await
+            .ok()?;
+
+        response.await.ok()
+    }
 }
 
 #[derive(Clone)]
 pub(crate) struct UiPromptHook {
     sink: AgentEventSink,
     addr: AgentAddr,
+    profile: AgentProfile,
 }
 
 impl UiPromptHook {
     pub(crate) fn new(sink: AgentEventSink, addr: AgentAddr) -> Self {
-        Self { sink, addr }
+        Self::with_profile(sink, addr, AgentProfile::from_env())
+    }
+
+    pub(crate) fn with_profile(
+        sink: AgentEventSink,
+        addr: AgentAddr,
+        profile: AgentProfile,
+    ) -> Self {
+        Self {
+            sink,
+            addr,
+            profile,
+        }
     }
     async fn emit_tool_call_event(
         &self,
@@ -68,10 +167,31 @@ impl UiPromptHook {
             addr: self.addr,
             id: internal_call_id.to_string(),
             name: tool_name.to_string(),
-            arguments,
+            arguments: arguments.clone(),
         })
         .await;
-        ToolCallHookAction::cont()
+
+        match self.profile.permission_for_tool(tool_name) {
+            ToolPermissionMode::Allow => ToolCallHookAction::cont(),
+            ToolPermissionMode::Deny => ToolCallHookAction::skip(format!(
+                "Tool call rejected by active profile: {tool_name} is not allowed"
+            )),
+            ToolPermissionMode::Ask => match sink
+                .request_tool_permission(
+                    self.addr,
+                    internal_call_id.to_string(),
+                    tool_name.to_string(),
+                    arguments,
+                )
+                .await
+            {
+                Some(ToolPermissionResponse::Allow) => ToolCallHookAction::cont(),
+                Some(ToolPermissionResponse::Reject { reason }) => ToolCallHookAction::skip(reason),
+                None => ToolCallHookAction::skip(
+                    "Tool call rejected because the permission UI is unavailable",
+                ),
+            },
+        }
     }
 
     async fn emit_tool_result_event(&self, internal_call_id: &str, result: &str) -> HookAction {
@@ -158,11 +278,8 @@ pub(crate) const PROMPT_RETRY_ATTEMPTS: usize = PROMPT_RETRY_BACKOFFS.len() + 1;
 /// How long to wait before retrying a failed attempt, or `None` to give up —
 /// either because the error is deterministic or because we are out of retry
 /// budget. The `get` returning `None` past the schedule is the budget check.
-pub(crate) fn retry_backoff(
-    attempt: usize,
-    error: &(dyn std::error::Error + Send + Sync),
-) -> Option<Duration> {
-    if is_retryable_prompt_error(error) {
+pub(crate) fn retry_backoff(attempt: usize, error: &StreamingError) -> Option<Duration> {
+    if is_retryable_streaming_error(error) {
         PROMPT_RETRY_BACKOFFS.get(attempt - 1).copied()
     } else {
         None
@@ -197,22 +314,47 @@ pub const MAIN_AGENT_PREAMBLE: &str = "You are the top-level user-facing assista
      If a delegated path is missing, too large, inaccessible, or otherwise blocks the task, instruct the subagent to stop and report the blocker plus what it tried rather than exploring elsewhere or spawning recovery subagents. \
      Only authorize subagents to spawn children when the delegated task explicitly contains multiple known independent chunks; otherwise they should do the task themselves and return a concise result.";
 
-pub(crate) fn is_retryable_prompt_error(error: &(dyn std::error::Error + Send + Sync)) -> bool {
-    let message = error.to_string().to_ascii_lowercase();
-
-    // Tool and JSON/schema errors are usually deterministic. Retrying those can
-    // duplicate tool side effects without improving the outcome.
-    if message.contains("toolseterror")
-        || message.contains("toolcallerror")
-        || message.contains("toolnotfounderror")
-        || message.contains("jsonerror")
-        || message.contains("maxturnserror")
-    {
-        return false;
+pub(crate) fn is_retryable_streaming_error(error: &StreamingError) -> bool {
+    match error {
+        StreamingError::Completion(error) => is_retryable_completion_error(error),
+        StreamingError::Prompt(error) => is_retryable_prompt_error(error),
+        // Tool execution and tool JSON/schema errors are usually deterministic.
+        // Retrying can duplicate side effects without improving the outcome.
+        StreamingError::Tool(error) => is_retryable_tool_set_error(error),
     }
+}
 
-    message.contains("httperror")
-        || message.contains("providererror") && message.contains("status code")
+fn is_retryable_prompt_error(error: &PromptError) -> bool {
+    match error {
+        PromptError::CompletionError(error) => is_retryable_completion_error(error),
+        PromptError::ToolError(error) => is_retryable_tool_set_error(error),
+        PromptError::ToolServerError(_) => false,
+        PromptError::MaxTurnsError { .. }
+        | PromptError::PromptCancelled { .. }
+        | PromptError::UnknownToolCall { .. } => false,
+    }
+}
+
+fn is_retryable_completion_error(error: &CompletionError) -> bool {
+    match error {
+        CompletionError::HttpError(_) => true,
+        // Provider errors are currently opaque strings in Rig. Keep this fallback
+        // narrow until Rig exposes provider status/error kinds directly.
+        CompletionError::ProviderError(message) => is_retryable_provider_error(message),
+        CompletionError::JsonError(_)
+        | CompletionError::UrlError(_)
+        | CompletionError::RequestError(_)
+        | CompletionError::ResponseError(_) => false,
+    }
+}
+
+fn is_retryable_tool_set_error(_error: &ToolSetError) -> bool {
+    false
+}
+
+fn is_retryable_provider_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("status code")
         || message.contains("connection")
         || message.contains("timeout")
         || message.contains("timed out")
@@ -222,6 +364,48 @@ pub(crate) fn is_retryable_prompt_error(error: &(dyn std::error::Error + Send + 
         || message.contains("connection refused")
         || message.contains("temporarily unavailable")
         || message.contains("dns")
+}
+
+#[derive(Debug)]
+enum PromptRunError {
+    Client(Box<dyn std::error::Error + Send + Sync>),
+    Stream(StreamingError),
+}
+
+impl PromptRunError {
+    fn retry_backoff(&self, attempt: usize) -> Option<Duration> {
+        match self {
+            // Client construction is environment/configuration setup, not a
+            // transient model request.
+            Self::Client(_) => None,
+            Self::Stream(error) => retry_backoff(attempt, error),
+        }
+    }
+
+    fn as_error(&self) -> &(dyn std::error::Error + Send + Sync) {
+        match self {
+            Self::Client(error) => error.as_ref(),
+            Self::Stream(error) => error,
+        }
+    }
+}
+
+impl std::fmt::Display for PromptRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Client(error) => write!(f, "{error}"),
+            Self::Stream(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl std::error::Error for PromptRunError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Client(error) => Some(error.as_ref()),
+            Self::Stream(error) => Some(error),
+        }
+    }
 }
 
 pub fn spawn_prompt_task(
@@ -253,7 +437,7 @@ async fn run_prompt_with_retries(
     conversation_id: String,
     memory: InMemoryConversationMemory,
     events: RuntimeEventSender,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), PromptRunError> {
     for attempt in 1..=PROMPT_RETRY_ATTEMPTS {
         let error = match run_prompt_once(
             thread_id,
@@ -268,8 +452,8 @@ async fn run_prompt_with_retries(
             Err(error) => error,
         };
 
-        let Some(backoff) = retry_backoff(attempt, error.as_ref()) else {
-            remember_failed_prompt(&memory, &conversation_id, &prompt, error.as_ref()).await;
+        let Some(backoff) = error.retry_backoff(attempt) else {
+            remember_failed_prompt(&memory, &conversation_id, &prompt, error.as_error()).await;
             return Err(error);
         };
 
@@ -301,12 +485,14 @@ async fn run_prompt_once(
     conversation_id: String,
     memory: InMemoryConversationMemory,
     events: RuntimeEventSender,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let client = ollama::Client::from_env()?;
+) -> Result<(), PromptRunError> {
+    let client =
+        ollama::Client::from_env().map_err(|error| PromptRunError::Client(Box::new(error)))?;
     let policy = ExecutionPolicy::from_env();
     let agent = base_agent_builder(&client, MAIN_AGENT_PREAMBLE, AGENT_MAX_TURNS)
         .memory(memory)
         .tool(crate::tools::EditFile)
+        .tool(crate::tools::WriteFile)
         .tool(crate::tools::Subagent::new(
             crate::tools::ToolUiContext::new(thread_id, events.clone(), policy),
         ))
@@ -323,7 +509,9 @@ async fn run_prompt_once(
         .await;
 
     let mut sink = AgentEventSink::new(events, thread_id);
-    pump_stream(&mut sink, AgentAddr::Main, &mut stream).await?;
+    pump_stream(&mut sink, AgentAddr::Main, &mut stream)
+        .await
+        .map_err(PromptRunError::Stream)?;
 
     sink.send(AgentEvent::Finished {
         addr: AgentAddr::Main,
@@ -411,16 +599,20 @@ mod tests {
     use serde_json::json;
     use tokio::sync::mpsc;
 
-    #[derive(Debug)]
-    struct StaticError(&'static str);
-
-    impl std::fmt::Display for StaticError {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(self.0)
-        }
+    fn provider_status_error() -> StreamingError {
+        StreamingError::Completion(CompletionError::ProviderError(
+            "Got error status code trying to send a request to Ollama: 502 Bad Gateway".into(),
+        ))
     }
 
-    impl std::error::Error for StaticError {}
+    fn tool_not_found_error() -> StreamingError {
+        StreamingError::Tool(ToolSetError::ToolNotFoundError("missing_tool".into()))
+    }
+
+    fn json_completion_error() -> StreamingError {
+        let error = serde_json::from_str::<serde_json::Value>("{").expect_err("invalid json");
+        StreamingError::Completion(CompletionError::JsonError(error))
+    }
 
     #[test]
     fn retry_backoffs_use_fixed_slow_schedule() {
@@ -432,8 +624,8 @@ mod tests {
 
     #[test]
     fn retry_backoff_follows_schedule_then_gives_up() {
-        let transient = StaticError("CompletionError: HttpError: connection reset by peer");
-        let deterministic = StaticError("ToolSetError: ToolCallError: old_text was not found");
+        let transient = provider_status_error();
+        let deterministic = tool_not_found_error();
 
         // A retryable error within budget waits the scheduled backoff...
         assert_eq!(retry_backoff(1, &transient), Some(Duration::from_secs(1)));
@@ -445,23 +637,23 @@ mod tests {
     }
 
     #[test]
-    fn retry_classifier_allows_transient_network_errors() {
-        assert!(is_retryable_prompt_error(&StaticError(
-            "CompletionError: HttpError: connection reset by peer"
-        )));
-        assert!(is_retryable_prompt_error(&StaticError(
-            "CompletionError: ProviderError: Got error status code trying to send a request to Ollama: 502 Bad Gateway"
-        )));
+    fn retry_classifier_allows_retryable_provider_errors() {
+        assert!(is_retryable_streaming_error(&provider_status_error()));
     }
 
     #[test]
     fn retry_classifier_rejects_deterministic_errors() {
-        assert!(!is_retryable_prompt_error(&StaticError(
-            "ToolSetError: ToolCallError: old_text was not found"
+        assert!(!is_retryable_streaming_error(&tool_not_found_error()));
+        assert!(!is_retryable_streaming_error(&json_completion_error()));
+    }
+
+    #[test]
+    fn retry_classifier_rejects_prompt_tool_errors() {
+        let error = StreamingError::Prompt(Box::new(PromptError::ToolError(
+            ToolSetError::ToolNotFoundError("missing_tool".into()),
         )));
-        assert!(!is_retryable_prompt_error(&StaticError(
-            "CompletionError: JsonError: expected value"
-        )));
+
+        assert!(!is_retryable_streaming_error(&error));
     }
 
     #[test]
@@ -545,6 +737,124 @@ mod tests {
     fn assistant_provider_final_yields_no_events() {
         assert!(
             assistant_events(AgentAddr::Main, StreamedAssistantContent::<()>::Final(())).is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_edit_file_waits_for_permission_and_continues_when_allowed() {
+        let (sender, mut receiver) = mpsc::channel(8);
+        let hook = UiPromptHook::with_profile(
+            AgentEventSink::new(sender, 11),
+            AgentAddr::Main,
+            AgentProfile::ask_for_writes(),
+        );
+
+        let pending = tokio::spawn(async move {
+            hook.emit_tool_call_event("edit_file", "ic", r#"{"path":"/x"}"#)
+                .await
+        });
+
+        match receiver.recv().await {
+            Some(RuntimeEvent::Agent(11, AgentEvent::ToolCall { name, .. })) => {
+                assert_eq!(name, "edit_file");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        match receiver.recv().await {
+            Some(RuntimeEvent::ToolPermissionRequest(request)) => {
+                assert_eq!(request.id, "ic");
+                assert_eq!(request.name, "edit_file");
+                request.respond(ToolPermissionResponse::Allow);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        assert_eq!(
+            pending.await.expect("hook task"),
+            ToolCallHookAction::Continue
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_edit_file_rejection_skips_tool_execution() {
+        let (sender, mut receiver) = mpsc::channel(8);
+        let hook = UiPromptHook::with_profile(
+            AgentEventSink::new(sender, 11),
+            AgentAddr::Main,
+            AgentProfile::ask_for_writes(),
+        );
+
+        let pending = tokio::spawn(async move {
+            hook.emit_tool_call_event("edit_file", "ic", r#"{"path":"/x"}"#)
+                .await
+        });
+
+        let _ = receiver.recv().await.expect("tool call event");
+        match receiver.recv().await {
+            Some(RuntimeEvent::ToolPermissionRequest(request)) => {
+                request.respond(ToolPermissionResponse::Reject {
+                    reason: "not today".into(),
+                });
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        assert_eq!(
+            pending.await.expect("hook task"),
+            ToolCallHookAction::Skip {
+                reason: "not today".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn hook_read_only_profile_denies_edit_file_without_ui_request() {
+        let (sender, mut receiver) = mpsc::channel(8);
+        let hook = UiPromptHook::with_profile(
+            AgentEventSink::new(sender, 11),
+            AgentAddr::Main,
+            AgentProfile::read_only(),
+        );
+
+        let action = hook
+            .emit_tool_call_event("edit_file", "ic", r#"{"path":"/x"}"#)
+            .await;
+
+        match action {
+            ToolCallHookAction::Skip { reason } => {
+                assert!(reason.contains("edit_file"));
+            }
+            other => panic!("unexpected action: {other:?}"),
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Ok(RuntimeEvent::Agent(11, AgentEvent::ToolCall { .. }))
+        ));
+        assert!(receiver.try_recv().is_err(), "no UI prompt is sent");
+    }
+
+    #[test]
+    fn profiles_resolve_permissions_from_tool_capabilities() {
+        assert_eq!(
+            AgentProfile::ask_for_writes().permission_for_tool("edit_file"),
+            ToolPermissionMode::Ask
+        );
+        assert_eq!(
+            AgentProfile::ask_for_writes().permission_for_tool("write_file"),
+            ToolPermissionMode::Ask
+        );
+        assert_eq!(
+            AgentProfile::skip_permissions().permission_for_tool("edit_file"),
+            ToolPermissionMode::Allow
+        );
+        assert_eq!(
+            AgentProfile::read_only().permission_for_tool("edit_file"),
+            ToolPermissionMode::Deny
+        );
+        assert_eq!(
+            AgentProfile::read_only().permission_for_tool("read_file"),
+            ToolPermissionMode::Allow
         );
     }
 

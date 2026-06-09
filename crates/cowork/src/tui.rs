@@ -12,7 +12,7 @@ use tokio::{sync::mpsc, time};
 
 use crate::{
     agent,
-    app::{AgentEvent, AppState, SubmitResult, ThreadId},
+    app::{AgentEvent, AppState, PendingToolPermission, SubmitResult, ThreadId},
     ui,
 };
 
@@ -24,6 +24,7 @@ type TuiTerminal = Terminal<CrosstermBackend<io::Stdout>>;
 pub enum RuntimeEvent {
     Terminal(Event),
     Agent(ThreadId, AgentEvent),
+    ToolPermissionRequest(PendingToolPermission),
     Tick,
 }
 
@@ -82,6 +83,7 @@ fn handle_runtime_event(
         }
         RuntimeEvent::Terminal(_) => {}
         RuntimeEvent::Agent(thread_id, event) => app.apply_agent_event(thread_id, event),
+        RuntimeEvent::ToolPermissionRequest(request) => app.apply_tool_permission_request(request),
         RuntimeEvent::Tick => {}
     }
 }

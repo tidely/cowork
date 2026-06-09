@@ -1,5 +1,8 @@
+use std::collections::VecDeque;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
+use tokio::sync::oneshot;
 
 pub type ThreadId = usize;
 pub type AgentId = usize;
@@ -49,6 +52,7 @@ impl MessageRole {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ToolStatus {
+    AwaitingPermission,
     Running,
     Finished,
     Failed,
@@ -56,7 +60,7 @@ pub enum ToolStatus {
 
 impl ToolStatus {
     pub fn is_done(self) -> bool {
-        !matches!(self, ToolStatus::Running)
+        !matches!(self, ToolStatus::AwaitingPermission | ToolStatus::Running)
     }
 }
 
@@ -202,6 +206,7 @@ pub struct AppState {
     pub should_quit: bool,
     pub conversation_scroll: u16,
     pub conversation_cursor: usize,
+    pending_tool_permissions: VecDeque<PendingToolPermission>,
     next_thread_id: ThreadId,
     next_agent_id: AgentId,
 }
@@ -214,6 +219,50 @@ pub enum SubmitResult {
         conversation_id: String,
         prompt: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ToolPermissionResponse {
+    Allow,
+    Reject { reason: String },
+}
+
+#[derive(Debug)]
+pub struct PendingToolPermission {
+    pub thread_id: ThreadId,
+    pub addr: AgentAddr,
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+    respond_to: oneshot::Sender<ToolPermissionResponse>,
+}
+
+impl PendingToolPermission {
+    pub fn new(
+        thread_id: ThreadId,
+        addr: AgentAddr,
+        id: String,
+        name: String,
+        arguments: Value,
+        respond_to: oneshot::Sender<ToolPermissionResponse>,
+    ) -> Self {
+        Self {
+            thread_id,
+            addr,
+            id,
+            name,
+            arguments,
+            respond_to,
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        tool_call_summary(&self.name, &self.arguments)
+    }
+
+    pub(crate) fn respond(self, response: ToolPermissionResponse) {
+        _ = self.respond_to.send(response);
+    }
 }
 
 /// Identifies which agent within a thread an event targets. The top-level agent
@@ -296,6 +345,7 @@ impl AppState {
             should_quit: false,
             conversation_scroll: 0,
             conversation_cursor: 0,
+            pending_tool_permissions: VecDeque::new(),
             next_thread_id: 1,
             next_agent_id: 1,
         }
@@ -314,6 +364,10 @@ impl AppState {
         self.threads
             .iter()
             .find(|thread| thread.id == self.selected.thread_id)
+    }
+
+    pub fn pending_tool_permission(&self) -> Option<&PendingToolPermission> {
+        self.pending_tool_permissions.front()
     }
 
     pub fn sidebar_items(&self) -> Vec<SidebarItem> {
@@ -345,6 +399,20 @@ impl AppState {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
             return SubmitResult::None;
+        }
+
+        if self.pending_tool_permission().is_some() {
+            match key.code {
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    self.resolve_next_tool_permission(true);
+                    return SubmitResult::None;
+                }
+                KeyCode::Char('r') | KeyCode::Char('R') | KeyCode::Esc => {
+                    self.resolve_next_tool_permission(false);
+                    return SubmitResult::None;
+                }
+                _ => {}
+            }
         }
 
         match key.code {
@@ -385,6 +453,25 @@ impl AppState {
                 Focus::Input => self.handle_input_key(key),
             },
         }
+    }
+
+    pub fn apply_tool_permission_request(&mut self, request: PendingToolPermission) {
+        if let Some(agent_id) = self.resolve_addr(request.thread_id, request.addr) {
+            self.selected = Selection {
+                thread_id: request.thread_id,
+                agent_id,
+            };
+            self.focus = Focus::Conversation;
+            self.collapse_last_reasoning(request.thread_id, agent_id);
+            self.set_tool_status(
+                request.thread_id,
+                agent_id,
+                &request.id,
+                ToolStatus::AwaitingPermission,
+                None,
+            );
+        }
+        self.pending_tool_permissions.push_back(request);
     }
 
     pub fn apply_agent_event(&mut self, thread_id: ThreadId, event: AgentEvent) {
@@ -473,6 +560,32 @@ impl AppState {
                 }
             }
         }
+    }
+
+    fn resolve_next_tool_permission(&mut self, allow: bool) {
+        let Some(request) = self.pending_tool_permissions.pop_front() else {
+            return;
+        };
+
+        let response = if allow {
+            ToolPermissionResponse::Allow
+        } else {
+            ToolPermissionResponse::Reject {
+                reason: rejected_tool_permission_reason(&request.name),
+            }
+        };
+
+        if let Some(agent_id) = self.resolve_addr(request.thread_id, request.addr) {
+            let (status, result) = match &response {
+                ToolPermissionResponse::Allow => (ToolStatus::Running, None),
+                ToolPermissionResponse::Reject { reason } => {
+                    (ToolStatus::Failed, Some(reason.as_str()))
+                }
+            };
+            self.set_tool_status(request.thread_id, agent_id, &request.id, status, result);
+        }
+
+        request.respond(response);
     }
 
     /// Resolves an event address to a concrete agent id within the thread.
@@ -799,28 +912,48 @@ impl AppState {
         tool_call_id: &str,
         content: &str,
     ) {
-        let Some(agent) = self.agent_mut(thread_id, agent_id) else {
+        let status = if is_tool_error(content) {
+            ToolStatus::Failed
+        } else {
+            ToolStatus::Finished
+        };
+        if self.set_tool_status(thread_id, agent_id, tool_call_id, status, Some(content)) {
             return;
+        }
+
+        if let Some(agent) = self.agent_mut(thread_id, agent_id) {
+            agent
+                .messages
+                .push(Message::new(MessageRole::ToolResult, content.to_string()));
+        }
+    }
+
+    fn set_tool_status(
+        &mut self,
+        thread_id: ThreadId,
+        agent_id: AgentId,
+        tool_call_id: &str,
+        status: ToolStatus,
+        result: Option<&str>,
+    ) -> bool {
+        let Some(agent) = self.agent_mut(thread_id, agent_id) else {
+            return false;
         };
 
-        if let Some(message) = agent
+        let Some(message) = agent
             .messages
             .iter_mut()
             .rev()
             .find(|message| message.tool_call_id.as_deref() == Some(tool_call_id))
-        {
-            message.tool_result = Some(content.to_string());
-            message.tool_status = if is_tool_error(content) {
-                ToolStatus::Failed
-            } else {
-                ToolStatus::Finished
-            };
-            return;
-        }
+        else {
+            return false;
+        };
 
-        agent
-            .messages
-            .push(Message::new(MessageRole::ToolResult, content.to_string()));
+        if let Some(result) = result {
+            message.tool_result = Some(result.to_string());
+        }
+        message.tool_status = status;
+        true
     }
 
     fn collapse_last_reasoning(&mut self, thread_id: ThreadId, agent_id: AgentId) {
@@ -956,7 +1089,12 @@ fn is_tool_error(content: &str) -> bool {
     content.starts_with("ToolCallError:")
         || content.starts_with("ToolNotFoundError:")
         || content.starts_with("JsonError:")
+        || content.starts_with("Tool call rejected")
         || content == "Tool call interrupted"
+}
+
+fn rejected_tool_permission_reason(tool_name: &str) -> String {
+    format!("Tool call rejected by user: {tool_name} was not executed")
 }
 
 fn pretty_json(value: &Value) -> String {
@@ -965,7 +1103,7 @@ fn pretty_json(value: &Value) -> String {
 
 fn tool_call_summary(name: &str, arguments: &Value) -> String {
     match name {
-        "read_file" | "read_pdf" | "list_directory" | "edit_file" => {
+        "read_file" | "read_pdf" | "list_directory" | "edit_file" | "write_file" => {
             path_tool_summary(name, arguments)
         }
         "subagent" => string_arg(arguments, "task")
@@ -1165,6 +1303,24 @@ mod tests {
     }
 
     #[test]
+    fn write_file_tool_call_summary_includes_path() {
+        let mut app = AppState::new();
+        app.apply_agent_event(
+            T,
+            AgentEvent::ToolCall {
+                addr: AgentAddr::Main,
+                id: "t1".into(),
+                name: "write_file".into(),
+                arguments: json!({ "path": "/workspace/src/new.rs", "content": "", "overwrite": false }),
+            },
+        );
+        assert_eq!(
+            last(&app).content.lines().next(),
+            Some("write_file /workspace/src/new.rs")
+        );
+    }
+
+    #[test]
     fn subagent_tool_call_summary_includes_task() {
         let mut app = AppState::new();
         app.apply_agent_event(
@@ -1204,6 +1360,76 @@ mod tests {
         );
         assert_eq!(last(&app).tool_status, ToolStatus::Finished);
         assert_eq!(last(&app).tool_result.as_deref(), Some("file contents"));
+    }
+
+    #[tokio::test]
+    async fn permission_request_marks_tool_call_and_accept_resumes_it() {
+        let mut app = AppState::new();
+        app.apply_agent_event(
+            T,
+            AgentEvent::ToolCall {
+                addr: AgentAddr::Main,
+                id: "t1".into(),
+                name: "edit_file".into(),
+                arguments: json!({ "path": "/tmp/a" }),
+            },
+        );
+        let (respond_to, response) = oneshot::channel();
+
+        app.apply_tool_permission_request(PendingToolPermission::new(
+            T,
+            AgentAddr::Main,
+            "t1".into(),
+            "edit_file".into(),
+            json!({ "path": "/tmp/a" }),
+            respond_to,
+        ));
+        assert_eq!(last(&app).tool_status, ToolStatus::AwaitingPermission);
+        assert_eq!(
+            app.pending_tool_permission().unwrap().summary(),
+            "edit_file /tmp/a"
+        );
+
+        app.handle_key(key(KeyCode::Char('a')));
+
+        assert_eq!(response.await.unwrap(), ToolPermissionResponse::Allow);
+        assert_eq!(last(&app).tool_status, ToolStatus::Running);
+        assert!(app.pending_tool_permission().is_none());
+    }
+
+    #[tokio::test]
+    async fn rejecting_permission_marks_tool_call_failed() {
+        let mut app = AppState::new();
+        app.apply_agent_event(
+            T,
+            AgentEvent::ToolCall {
+                addr: AgentAddr::Main,
+                id: "t1".into(),
+                name: "edit_file".into(),
+                arguments: json!({ "path": "/tmp/a" }),
+            },
+        );
+        let (respond_to, response) = oneshot::channel();
+
+        app.apply_tool_permission_request(PendingToolPermission::new(
+            T,
+            AgentAddr::Main,
+            "t1".into(),
+            "edit_file".into(),
+            json!({ "path": "/tmp/a" }),
+            respond_to,
+        ));
+        app.handle_key(key(KeyCode::Char('r')));
+
+        match response.await.unwrap() {
+            ToolPermissionResponse::Reject { reason } => {
+                assert!(reason.contains("edit_file"));
+                assert_eq!(last(&app).tool_result.as_deref(), Some(reason.as_str()));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+        assert_eq!(last(&app).tool_status, ToolStatus::Failed);
+        assert!(app.pending_tool_permission().is_none());
     }
 
     #[test]

@@ -37,6 +37,29 @@ const MAX_AGENT_DEPTH: AgentDepth = 4;
 
 static NEXT_RUNTIME_AGENT_KEY: AtomicU64 = AtomicU64::new(1);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolCapability {
+    ReadFilesystem,
+    WriteFilesystem,
+    Delegate,
+}
+
+pub(crate) trait ToolAccessMetadata {
+    const CAPABILITY: ToolCapability;
+}
+
+pub(crate) fn tool_capability(tool_name: &str) -> Option<ToolCapability> {
+    match tool_name {
+        <ReadFile as Tool>::NAME => Some(<ReadFile as ToolAccessMetadata>::CAPABILITY),
+        <ReadPdf as Tool>::NAME => Some(<ReadPdf as ToolAccessMetadata>::CAPABILITY),
+        <ListDirectory as Tool>::NAME => Some(<ListDirectory as ToolAccessMetadata>::CAPABILITY),
+        <EditFile as Tool>::NAME => Some(<EditFile as ToolAccessMetadata>::CAPABILITY),
+        <WriteFile as Tool>::NAME => Some(<WriteFile as ToolAccessMetadata>::CAPABILITY),
+        Subagent::NAME => Some(<Subagent as ToolAccessMetadata>::CAPABILITY),
+        _ => None,
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ToolUiContext {
     thread_id: ThreadId,
@@ -205,6 +228,10 @@ pub fn read_file(
     fs::read_to_string(&path).map_err(|error| ToolError::ToolCallError(Box::new(error)))
 }
 
+impl ToolAccessMetadata for ReadFile {
+    const CAPABILITY: ToolCapability = ToolCapability::ReadFilesystem;
+}
+
 impl ToolEmbedding for ReadFile {
     type InitError = Infallible;
     type Context = ();
@@ -299,6 +326,10 @@ pub fn read_pdf(
     Ok(output)
 }
 
+impl ToolAccessMetadata for ReadPdf {
+    const CAPABILITY: ToolCapability = ToolCapability::ReadFilesystem;
+}
+
 impl ToolEmbedding for ReadPdf {
     type InitError = Infallible;
     type Context = ();
@@ -368,6 +399,10 @@ pub fn list_directory(
     Ok(output)
 }
 
+impl ToolAccessMetadata for ListDirectory {
+    const CAPABILITY: ToolCapability = ToolCapability::ReadFilesystem;
+}
+
 impl ToolEmbedding for ListDirectory {
     type InitError = Infallible;
     type Context = ();
@@ -420,6 +455,10 @@ pub fn edit_file(
     }
 }
 
+impl ToolAccessMetadata for EditFile {
+    const CAPABILITY: ToolCapability = ToolCapability::WriteFilesystem;
+}
+
 impl ToolEmbedding for EditFile {
     type InitError = Infallible;
     type Context = ();
@@ -437,6 +476,65 @@ impl ToolEmbedding for EditFile {
 
     fn init(_state: Self::State, _context: Self::Context) -> Result<Self, Self::InitError> {
         Ok(EditFile)
+    }
+}
+
+/// Create a text file, or overwrite an existing text file when explicitly allowed.
+#[rig_tool]
+pub fn write_file(
+    /// Absolute path, path relative to the current working directory, `~`, or `~/...`.
+    path: String,
+    /// Full contents to write to the file.
+    content: String,
+    /// Set to true to replace an existing file. If false, existing files are left untouched.
+    overwrite: bool,
+) -> Result<String, ToolError> {
+    let path = resolve_path(&path)?;
+
+    if let Ok(metadata) = fs::metadata(&path) {
+        if !metadata.is_file() {
+            return Err(tool_error(format!("{} is not a file", path.display())));
+        }
+        if !overwrite {
+            return Err(tool_error(format!(
+                "{} already exists; set overwrite to true to replace it",
+                path.display()
+            )));
+        }
+    } else if let Some(parent) = path.parent()
+        && !parent.is_dir()
+    {
+        return Err(tool_error(format!(
+            "parent directory {} does not exist",
+            parent.display()
+        )));
+    }
+
+    fs::write(&path, content).map_err(|error| ToolError::ToolCallError(Box::new(error)))?;
+    Ok(format!("Wrote {}", path.display()))
+}
+
+impl ToolAccessMetadata for WriteFile {
+    const CAPABILITY: ToolCapability = ToolCapability::WriteFilesystem;
+}
+
+impl ToolEmbedding for WriteFile {
+    type InitError = Infallible;
+    type Context = ();
+    type State = ();
+
+    fn embedding_docs(&self) -> Vec<String> {
+        vec![
+            "Create or overwrite a local text file with full contents.".to_string(),
+            "Use when the user asks to create a new file, write a complete file, or replace a file's full contents."
+                .to_string(),
+        ]
+    }
+
+    fn context(&self) -> Self::Context {}
+
+    fn init(_state: Self::State, _context: Self::Context) -> Result<Self, Self::InitError> {
+        Ok(WriteFile)
     }
 }
 
@@ -597,6 +695,10 @@ pub struct SubagentParameters {
     context: Option<String>,
 }
 
+impl ToolAccessMetadata for Subagent {
+    const CAPABILITY: ToolCapability = ToolCapability::Delegate;
+}
+
 impl Tool for Subagent {
     const NAME: &'static str = "subagent";
 
@@ -659,5 +761,80 @@ mod tests {
 
         assert!(path.ends_with("child"));
         assert!(!path.to_string_lossy().contains('~'));
+    }
+
+    #[test]
+    fn tools_declare_capabilities_without_profile_policy() {
+        assert_eq!(
+            tool_capability(EditFile::NAME),
+            Some(ToolCapability::WriteFilesystem)
+        );
+        assert_eq!(
+            tool_capability(WriteFile::NAME),
+            Some(ToolCapability::WriteFilesystem)
+        );
+        assert_eq!(
+            tool_capability(ReadFile::NAME),
+            Some(ToolCapability::ReadFilesystem)
+        );
+        assert_eq!(
+            tool_capability(ListDirectory::NAME),
+            Some(ToolCapability::ReadFilesystem)
+        );
+        assert_eq!(
+            tool_capability(Subagent::NAME),
+            Some(ToolCapability::Delegate)
+        );
+    }
+
+    #[test]
+    fn write_file_creates_new_file() {
+        let path = unique_temp_path("new.txt");
+        let _ = fs::remove_file(&path);
+
+        let result = write_file(path.to_string_lossy().to_string(), "hello".into(), false)
+            .expect("file is written");
+
+        assert!(result.contains("Wrote"));
+        assert_eq!(fs::read_to_string(&path).expect("read file"), "hello");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn write_file_refuses_to_overwrite_without_flag() {
+        let path = unique_temp_path("existing.txt");
+        fs::write(&path, "original").expect("seed file");
+
+        let error = write_file(path.to_string_lossy().to_string(), "updated".into(), false)
+            .expect_err("overwrite is rejected");
+
+        assert!(error.to_string().contains("already exists"));
+        assert_eq!(fs::read_to_string(&path).expect("read file"), "original");
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn write_file_overwrites_when_allowed() {
+        let path = unique_temp_path("overwrite.txt");
+        fs::write(&path, "original").expect("seed file");
+
+        write_file(path.to_string_lossy().to_string(), "updated".into(), true)
+            .expect("overwrite succeeds");
+
+        assert_eq!(fs::read_to_string(&path).expect("read file"), "updated");
+        let _ = fs::remove_file(path);
+    }
+
+    fn unique_temp_path(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "cowork-write-file-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir.join(name)
     }
 }

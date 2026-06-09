@@ -176,25 +176,33 @@ fn render_agent_status(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         .map(|thread| thread.total_token_usage())
         .unwrap_or_default();
 
-    let line = match app.selected_agent() {
-        Some(agent) => Line::from(vec![
-            Span::styled(" Status: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                status_label(agent.status),
-                Style::default().fg(status_color(agent.status)),
-            ),
-            Span::styled("  Depth: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(depth_label(agent.depth), Style::default().fg(Color::Gray)),
-            Span::styled("  Thread tokens: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                token_usage_label(thread_usage),
-                Style::default().fg(Color::Gray),
-            ),
-        ]),
-        None => Line::from(Span::styled(
-            " No agent selected",
-            Style::default().fg(Color::DarkGray),
-        )),
+    let line = if let Some(request) = app.pending_tool_permission() {
+        Line::from(vec![
+            Span::styled(" Permission required: ", Style::default().fg(Color::Yellow)),
+            Span::styled(request.summary(), Style::default().fg(Color::White)),
+            Span::styled("  a accept  r reject ", Style::default().fg(Color::Cyan)),
+        ])
+    } else {
+        match app.selected_agent() {
+            Some(agent) => Line::from(vec![
+                Span::styled(" Status: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    status_label(agent.status),
+                    Style::default().fg(status_color(agent.status)),
+                ),
+                Span::styled("  Depth: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(depth_label(agent.depth), Style::default().fg(Color::Gray)),
+                Span::styled("  Thread tokens: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    token_usage_label(thread_usage),
+                    Style::default().fg(Color::Gray),
+                ),
+            ]),
+            None => Line::from(Span::styled(
+                " No agent selected",
+                Style::default().fg(Color::DarkGray),
+            )),
+        }
     };
 
     frame.render_widget(Paragraph::new(line), area);
@@ -277,7 +285,10 @@ fn wrapped_line_count(lines: &[Line<'_>], width: usize) -> usize {
 
 fn render_input(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let running = app.active_agent_running();
-    let title = if running {
+    let permission = app.pending_tool_permission();
+    let title = if permission.is_some() {
+        " Tool permission — press a to accept or r to reject "
+    } else if running {
         " Prompt — waiting for active agent "
     } else {
         " Prompt — Tab cycles focus "
@@ -287,7 +298,9 @@ fn render_input(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
-    let input_style = if running {
+    let input_style = if permission.is_some() {
+        Style::default().fg(Color::Yellow)
+    } else if running {
         Style::default().fg(Color::DarkGray)
     } else {
         Style::default().fg(Color::White)
@@ -298,15 +311,15 @@ fn render_input(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     const PREFIX: &str = "> ";
     let inner_width = area.width.saturating_sub(2) as usize;
     let available = inner_width.saturating_sub(PREFIX.chars().count()).max(1);
-    let cursor_chars = app.input.value[..app.input.cursor].chars().count();
+    let input_value = permission
+        .map(|request| request.summary())
+        .unwrap_or_else(|| app.input.value.clone());
+    let cursor = permission
+        .map(|_| input_value.len())
+        .unwrap_or(app.input.cursor);
+    let cursor_chars = input_value[..cursor].chars().count();
     let scroll = cursor_chars.saturating_sub(available - 1);
-    let visible: String = app
-        .input
-        .value
-        .chars()
-        .skip(scroll)
-        .take(available)
-        .collect();
+    let visible: String = input_value.chars().skip(scroll).take(available).collect();
 
     let paragraph = Paragraph::new(format!("{PREFIX}{visible}"))
         .style(input_style)
@@ -318,7 +331,7 @@ fn render_input(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         );
     frame.render_widget(paragraph, area);
 
-    if app.focus == Focus::Input && !running {
+    if app.focus == Focus::Input && !running && permission.is_none() {
         let cursor_offset = (cursor_chars - scroll) as u16;
         let x = area
             .x
@@ -370,12 +383,15 @@ fn append_tool_call_lines(lines: &mut Vec<Line<'static>>, message: &Message, sel
     let style = match message.tool_status {
         ToolStatus::Failed => Style::default().fg(Color::Red),
         ToolStatus::Finished => Style::default().fg(Color::Green),
-        ToolStatus::Running => message_style(MessageRole::ToolCall),
+        ToolStatus::AwaitingPermission | ToolStatus::Running => {
+            message_style(MessageRole::ToolCall)
+        }
     };
     let marker = if message.collapsed { "▸" } else { "▾" };
     let status = match message.tool_status {
         ToolStatus::Failed => "✗",
         ToolStatus::Finished => "✓",
+        ToolStatus::AwaitingPermission => "?",
         ToolStatus::Running => "◐",
     };
     let tool_name = tool_call_name(&message.content);
@@ -395,6 +411,8 @@ fn append_tool_call_lines(lines: &mut Vec<Line<'static>>, message: &Message, sel
                 .filter(|result| !result.is_empty())
                 .map(collapsed_preview)
                 .unwrap_or_default()
+        } else if message.tool_status == ToolStatus::AwaitingPermission {
+            "waiting for approval".to_string()
         } else {
             "running".to_string()
         };
@@ -429,7 +447,13 @@ fn append_tool_call_lines(lines: &mut Vec<Line<'static>>, message: &Message, sel
                 }
             }
             _ => {
-                let label = if done { "(no output)" } else { "running" };
+                let label = if done {
+                    "(no output)"
+                } else if message.tool_status == ToolStatus::AwaitingPermission {
+                    "waiting for approval"
+                } else {
+                    "running"
+                };
                 lines.push(Line::from(vec![
                     Span::styled("│ ", style),
                     Span::styled(label.to_string(), style),
