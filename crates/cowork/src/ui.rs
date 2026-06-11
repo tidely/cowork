@@ -292,7 +292,7 @@ fn render_input(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let title = if permission.is_some() {
         " Tool permission — a accept  A always for tool  r reject "
     } else if running {
-        " Prompt — waiting for active agent "
+        " Prompt — running · Ctrl+X cancels thread "
     } else {
         " Prompt — Tab cycles focus "
     };
@@ -520,6 +520,7 @@ fn status_icon(status: Option<AgentStatus>) -> &'static str {
         Some(AgentStatus::Running) => "◐",
         Some(AgentStatus::Complete) => "●",
         Some(AgentStatus::Error) => "!",
+        Some(AgentStatus::Cancelled) => "✕",
         None => " ",
     }
 }
@@ -530,6 +531,7 @@ fn status_label(status: AgentStatus) -> &'static str {
         AgentStatus::Running => "running",
         AgentStatus::Complete => "complete",
         AgentStatus::Error => "error",
+        AgentStatus::Cancelled => "cancelled",
     }
 }
 
@@ -539,6 +541,7 @@ fn status_color(status: AgentStatus) -> Color {
         AgentStatus::Running => Color::Yellow,
         AgentStatus::Complete => Color::Green,
         AgentStatus::Error => Color::Red,
+        AgentStatus::Cancelled => Color::DarkGray,
     }
 }
 

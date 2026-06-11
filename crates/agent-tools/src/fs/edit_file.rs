@@ -1,5 +1,5 @@
 use futures::FutureExt;
-use llm::{Tool, ToolError, ToolOutput, ToolSchemaFormat, parse_args, schema_for};
+use llm::{Tool, ToolError, ToolOutput, parse_args, schema_for};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -27,8 +27,8 @@ impl Tool for EditFile {
         "Edit a text file by replacing one exact text span with another."
     }
 
-    fn parameters_schema(&self, format: ToolSchemaFormat) -> Result<serde_json::Value, ToolError> {
-        schema_for::<EditFileInput>(format)
+    fn parameters_schema(&self) -> Result<serde_json::Value, ToolError> {
+        schema_for::<EditFileInput>()
     }
 
     fn call(

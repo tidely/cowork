@@ -1,5 +1,5 @@
 use futures::FutureExt;
-use llm::{Tool, ToolError, ToolOutput, ToolSchemaFormat, parse_args, schema_for};
+use llm::{Tool, ToolError, ToolOutput, parse_args, schema_for};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -23,8 +23,8 @@ impl Tool for ListDirectory {
         "List files and directories inside a directory."
     }
 
-    fn parameters_schema(&self, format: ToolSchemaFormat) -> Result<serde_json::Value, ToolError> {
-        schema_for::<ListDirectoryInput>(format)
+    fn parameters_schema(&self) -> Result<serde_json::Value, ToolError> {
+        schema_for::<ListDirectoryInput>()
     }
 
     fn call(

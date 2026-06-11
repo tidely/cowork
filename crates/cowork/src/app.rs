@@ -1,12 +1,16 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::Value;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 pub type ThreadId = usize;
 pub type AgentId = usize;
-pub type RuntimeAgentKey = u64;
+/// A random, per-spawn agent id (a UUIDv4 as a `u128`). Random rather than a
+/// counter so persisted `runtime-agent-{key}` conversation ids never collide,
+/// in a session or across sessions once persistence lands.
+pub type RuntimeAgentKey = u128;
 
 pub const MAIN_AGENT_ID: AgentId = 0;
 
@@ -23,6 +27,7 @@ pub enum AgentStatus {
     Running,
     Complete,
     Error,
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -128,10 +133,15 @@ pub struct AgentNode {
     pub expanded: bool,
     pub token_usage: TokenUsage,
     pub messages: Vec<Message>,
+    /// Number of messages present before the current run began. A retry rewinds
+    /// the transcript to this point so a failed attempt's partial output does
+    /// not stack under the next attempt's.
+    message_baseline: usize,
 }
 
 impl AgentNode {
     fn main() -> Self {
+        let messages = initial_main_messages();
         Self {
             id: MAIN_AGENT_ID,
             parent_id: None,
@@ -141,7 +151,8 @@ impl AgentNode {
             status: AgentStatus::Idle,
             expanded: true,
             token_usage: TokenUsage::default(),
-            messages: initial_main_messages(),
+            message_baseline: messages.len(),
+            messages,
         }
     }
 }
@@ -208,6 +219,9 @@ pub struct AppState {
     pub conversation_cursor: usize,
     pending_tool_permissions: VecDeque<PendingToolPermission>,
     always_allowed_tools: HashSet<String>,
+    /// Cancellation token for each thread's in-flight run, so the cancel keybind
+    /// can stop a specific thread. Removed when the run reaches a terminal state.
+    running_cancellations: HashMap<ThreadId, CancellationToken>,
     next_thread_id: ThreadId,
     next_agent_id: AgentId,
 }
@@ -219,6 +233,9 @@ pub enum SubmitResult {
         thread_id: ThreadId,
         conversation_id: String,
         prompt: String,
+        /// Cancellation token for this run; the runtime races it so the cancel
+        /// keybind can stop the thread.
+        cancel: CancellationToken,
     },
 }
 
@@ -323,6 +340,15 @@ pub enum AgentEvent {
         addr: AgentAddr,
         error: String,
     },
+    /// The top-level run was cancelled by the user. Marks the main agent and any
+    /// still-running subagents of the thread as cancelled. Thread-wide, so it
+    /// carries no agent address — the thread id routes it.
+    Cancelled,
+    /// Rewind an agent's visible transcript to its pre-run baseline. Emitted
+    /// before a retry so the partial output of the failed attempt is discarded.
+    Reset {
+        addr: AgentAddr,
+    },
 }
 
 impl AppState {
@@ -350,6 +376,7 @@ impl AppState {
             conversation_cursor: 0,
             pending_tool_permissions: VecDeque::new(),
             always_allowed_tools: HashSet::new(),
+            running_cancellations: HashMap::new(),
             next_thread_id: 1,
             next_agent_id: 1,
         }
@@ -433,6 +460,10 @@ impl AppState {
                 self.create_thread();
                 SubmitResult::None
             }
+            KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.cancel_selected_thread();
+                SubmitResult::None
+            }
             KeyCode::Char('[') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.collapse_all_sidebar();
                 SubmitResult::None
@@ -497,6 +528,9 @@ impl AppState {
             AgentEvent::Started => {
                 if let Some(agent) = self.agent_mut(thread_id, MAIN_AGENT_ID) {
                     agent.status = AgentStatus::Running;
+                    // The user prompt is already appended; mark this as the
+                    // rewind point so a retry keeps the prompt but drops output.
+                    agent.message_baseline = agent.messages.len();
                 }
             }
             AgentEvent::Spawned {
@@ -561,6 +595,9 @@ impl AppState {
                 }
             }
             AgentEvent::Finished { addr, result } => {
+                if addr == AgentAddr::Main {
+                    self.running_cancellations.remove(&thread_id);
+                }
                 if let Some(agent_id) = self.resolve_addr(thread_id, addr)
                     && let Some(agent) = self.agent_mut(thread_id, agent_id)
                 {
@@ -574,12 +611,31 @@ impl AppState {
                 }
             }
             AgentEvent::Error { addr, error } => {
+                if addr == AgentAddr::Main {
+                    self.running_cancellations.remove(&thread_id);
+                }
                 if let Some(agent_id) = self.resolve_addr(thread_id, addr)
                     && let Some(agent) = self.agent_mut(thread_id, agent_id)
                 {
                     agent.status = AgentStatus::Error;
                     collapse_reasoning(agent);
                     agent.messages.push(Message::new(MessageRole::Error, error));
+                }
+            }
+            AgentEvent::Cancelled => {
+                // Cancellation is thread-wide: the dropped run leaves running
+                // subagents with no terminal event of their own, so sweep them
+                // all here and drop the run's token and pending prompts.
+                self.running_cancellations.remove(&thread_id);
+                self.discard_pending_permissions_for_thread(thread_id);
+                self.cancel_thread_agents(thread_id);
+            }
+            AgentEvent::Reset { addr } => {
+                if let Some(agent_id) = self.resolve_addr(thread_id, addr)
+                    && let Some(agent) = self.agent_mut(thread_id, agent_id)
+                {
+                    agent.messages.truncate(agent.message_baseline);
+                    agent.status = AgentStatus::Running;
                 }
             }
         }
@@ -809,10 +865,15 @@ impl AppState {
         self.conversation_scroll = 0;
         self.conversation_cursor = 0;
 
+        let cancel = CancellationToken::new();
+        self.running_cancellations
+            .insert(self.selected.thread_id, cancel.clone());
+
         SubmitResult::Submitted {
             thread_id: self.selected.thread_id,
             conversation_id,
             prompt,
+            cancel,
         }
     }
 
@@ -854,6 +915,43 @@ impl AppState {
         {
             agent.expanded = false;
         }
+    }
+
+    /// Cancel the in-flight run for the selected thread. Cancelling the token
+    /// stops the backend; the resulting terminal `Cancelled` event sweeps the
+    /// agent statuses. A no-op when the thread has no active run.
+    fn cancel_selected_thread(&mut self) {
+        let thread_id = self.selected.thread_id;
+        let is_running = self
+            .agent(thread_id, MAIN_AGENT_ID)
+            .is_some_and(|agent| agent.status == AgentStatus::Running);
+        if !is_running {
+            return;
+        }
+        if let Some(token) = self.running_cancellations.get(&thread_id) {
+            token.cancel();
+        }
+    }
+
+    /// Mark the main agent and any still-running subagents of a thread as
+    /// cancelled. The dropped run never delivers their own terminal events.
+    fn cancel_thread_agents(&mut self, thread_id: ThreadId) {
+        let Some(thread) = self.thread_mut(thread_id) else {
+            return;
+        };
+        for agent in std::iter::once(&mut thread.main_agent).chain(thread.subagents.iter_mut()) {
+            if agent.status == AgentStatus::Running {
+                collapse_reasoning(agent);
+                agent.status = AgentStatus::Cancelled;
+            }
+        }
+    }
+
+    /// Drop any pending permission prompts belonging to a thread whose run was
+    /// cancelled; their requesting tool calls will never resume.
+    fn discard_pending_permissions_for_thread(&mut self, thread_id: ThreadId) {
+        self.pending_tool_permissions
+            .retain(|request| request.thread_id != thread_id);
     }
 
     fn create_thread(&mut self) {
@@ -957,6 +1055,9 @@ impl AppState {
                 status: AgentStatus::Running,
                 expanded: false,
                 token_usage: TokenUsage::default(),
+                // The task/context messages are seeded above; a retry rewinds to
+                // them and discards only the model's output.
+                message_baseline: messages.len(),
                 messages,
             });
         }
@@ -970,7 +1071,7 @@ impl AppState {
         content: &str,
         is_error: bool,
     ) {
-        let status = if is_error || is_tool_error(content) {
+        let status = if is_error {
             ToolStatus::Failed
         } else {
             ToolStatus::Finished
@@ -1138,17 +1239,6 @@ fn collapse_reasoning(agent: &mut AgentNode) {
             message.collapsed = true;
         }
     }
-}
-
-/// Tool failures arrive as string tool results; recognize the prefixes used by
-/// both the old and current tool layers so the UI can mark them as failed.
-fn is_tool_error(content: &str) -> bool {
-    let content = content.trim_start();
-    content.starts_with("ToolCallError:")
-        || content.starts_with("ToolNotFoundError:")
-        || content.starts_with("JsonError:")
-        || content.starts_with("Tool call rejected")
-        || content == "Tool call interrupted"
 }
 
 fn rejected_tool_permission_reason(tool_name: &str) -> String {
@@ -1614,7 +1704,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_error_marks_failed() {
+    fn tool_result_status_follows_is_error_flag_not_content() {
         let mut app = AppState::new();
         app.apply_agent_event(
             T,
@@ -1625,8 +1715,11 @@ mod tests {
                 arguments: json!({}),
             },
         );
+        // The status comes from the `is_error` flag now, not by sniffing the
+        // content: a successful result is finished even if its text happens to
+        // look like an error string.
         app.apply_agent_event(T, tool_result("t1", "ToolCallError: no such file"));
-        assert_eq!(last(&app).tool_status, ToolStatus::Failed);
+        assert_eq!(last(&app).tool_status, ToolStatus::Finished);
     }
 
     #[test]
@@ -1971,6 +2064,105 @@ mod tests {
             SubmitResult::None
         ));
         assert_eq!(app.threads[0].main_agent.status, AgentStatus::Idle);
+    }
+
+    // ----- cancellation -----
+
+    fn submit(app: &mut AppState, prompt: &str) -> CancellationToken {
+        type_str(app, prompt);
+        match app.handle_key(key(KeyCode::Enter)) {
+            SubmitResult::Submitted { cancel, .. } => cancel,
+            other => panic!("expected Submitted, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cancel_keybind_cancels_the_running_thread_token() {
+        let mut app = AppState::new();
+        let cancel = submit(&mut app, "do work");
+        assert!(!cancel.is_cancelled());
+        assert!(app.active_agent_running());
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert!(cancel.is_cancelled(), "Ctrl+X cancels the run's token");
+    }
+
+    #[test]
+    fn cancel_keybind_is_a_noop_without_a_running_agent() {
+        let mut app = AppState::new();
+        // No active run: cancelling must not panic or change state.
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+        assert_eq!(app.threads[0].main_agent.status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn cancelled_event_marks_running_agents_and_reenables_submit() {
+        let mut app = AppState::new();
+        let _ = submit(&mut app, "go");
+        app.apply_agent_event(T, nested_started(1, None, 1, "sub"));
+        assert_eq!(app.threads[0].main_agent.status, AgentStatus::Running);
+        assert_eq!(app.threads[0].subagents[0].status, AgentStatus::Running);
+
+        app.apply_agent_event(T, AgentEvent::Cancelled);
+
+        assert_eq!(app.threads[0].main_agent.status, AgentStatus::Cancelled);
+        assert_eq!(
+            app.threads[0].subagents[0].status,
+            AgentStatus::Cancelled,
+            "a running subagent is swept even though it sent no terminal event"
+        );
+        assert!(
+            !app.active_agent_running(),
+            "the thread accepts a new prompt after cancellation"
+        );
+    }
+
+    #[test]
+    fn cancelled_event_leaves_already_finished_agents_untouched() {
+        let mut app = AppState::new();
+        let _ = submit(&mut app, "go");
+        app.apply_agent_event(T, nested_started(1, None, 1, "sub"));
+        app.apply_agent_event(T, nested_finished(1, "done"));
+        assert_eq!(app.threads[0].subagents[0].status, AgentStatus::Complete);
+
+        app.apply_agent_event(T, AgentEvent::Cancelled);
+
+        assert_eq!(
+            app.threads[0].subagents[0].status,
+            AgentStatus::Complete,
+            "a finished subagent keeps its status"
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_drops_pending_permissions_for_the_thread() {
+        let mut app = AppState::new();
+        let _ = submit(&mut app, "go");
+        app.apply_agent_event(
+            T,
+            AgentEvent::ToolCall {
+                addr: AgentAddr::Main,
+                id: "t1".into(),
+                name: "edit_file".into(),
+                arguments: json!({ "path": "/tmp/a" }),
+            },
+        );
+        let (respond_to, _response) = oneshot::channel();
+        app.apply_tool_permission_request(PendingToolPermission::new(
+            T,
+            AgentAddr::Main,
+            "t1".into(),
+            "edit_file".into(),
+            json!({ "path": "/tmp/a" }),
+            respond_to,
+        ));
+        assert!(app.pending_tool_permission().is_some());
+
+        app.apply_agent_event(T, AgentEvent::Cancelled);
+        assert!(
+            app.pending_tool_permission().is_none(),
+            "a cancelled run's pending prompts are discarded"
+        );
     }
 
     #[test]

@@ -1,18 +1,18 @@
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{collections::BTreeMap, fmt, sync::Arc};
 
 use futures::future::BoxFuture;
-use schemars::{JsonSchema, Schema, generate::SchemaSettings, schema_for};
+use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::{ToolCall, ToolDefinition, ToolSchemaFormat};
+use crate::{ToolCall, ToolDefinition};
 
 pub trait Tool: Send + Sync {
     fn name(&self) -> &'static str;
 
     fn description(&self) -> &'static str;
 
-    fn parameters_schema(&self, format: ToolSchemaFormat) -> Result<Value, ToolError>;
+    fn parameters_schema(&self) -> Result<Value, ToolError>;
 
     fn supports_argument_streaming(&self) -> bool {
         false
@@ -20,11 +20,11 @@ pub trait Tool: Send + Sync {
 
     fn call(&self, arguments: Value) -> BoxFuture<'_, Result<ToolOutput, ToolError>>;
 
-    fn definition(&self, format: ToolSchemaFormat) -> Result<ToolDefinition, ToolError> {
+    fn definition(&self) -> Result<ToolDefinition, ToolError> {
         Ok(ToolDefinition {
             name: self.name().to_string(),
             description: self.description().to_string(),
-            parameters: self.parameters_schema(format)?,
+            parameters: self.parameters_schema()?,
             supports_argument_streaming: self.supports_argument_streaming(),
         })
     }
@@ -87,7 +87,9 @@ impl std::error::Error for ToolError {}
 
 #[derive(Clone, Default)]
 pub struct ToolRegistry {
-    tools: HashMap<String, Arc<dyn Tool>>,
+    /// `BTreeMap` so `definitions` yields tools in a stable, name-sorted order;
+    /// the model otherwise sees a different tool ordering on every turn.
+    tools: BTreeMap<String, Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
@@ -111,11 +113,8 @@ impl ToolRegistry {
         Ok(())
     }
 
-    pub fn definitions(&self, format: ToolSchemaFormat) -> Result<Vec<ToolDefinition>, ToolError> {
-        self.tools
-            .values()
-            .map(|tool| tool.definition(format))
-            .collect()
+    pub fn definitions(&self) -> Result<Vec<ToolDefinition>, ToolError> {
+        self.tools.values().map(|tool| tool.definition()).collect()
     }
 
     pub fn get(&self, name: &str) -> Result<Arc<dyn Tool>, ToolError> {
@@ -142,46 +141,21 @@ where
         .map_err(|error| ToolError::InvalidArguments(error.to_string()))
 }
 
-pub fn schema_for<T>(format: ToolSchemaFormat) -> Result<Value, ToolError>
+pub fn schema_for<T>() -> Result<Value, ToolError>
 where
     T: JsonSchema,
 {
-    let schema = root_schema_for::<T>(format);
-    let mut value =
-        serde_json::to_value(schema).map_err(|error| ToolError::Schema(error.to_string()))?;
-    preprocess_schema(&mut value, format)?;
-    Ok(value)
-}
-
-fn root_schema_for<T>(format: ToolSchemaFormat) -> Schema
-where
-    T: JsonSchema,
-{
-    match format {
-        ToolSchemaFormat::JsonSchema => schema_for!(T),
-        ToolSchemaFormat::JsonSchemaSubset => SchemaSettings::openapi3()
-            .with(|settings| {
-                settings.meta_schema = None;
-                settings.inline_subschemas = true;
-            })
-            .into_generator()
-            .root_schema_for::<T>(),
-    }
-}
-
-fn preprocess_schema(value: &mut Value, format: ToolSchemaFormat) -> Result<(), ToolError> {
-    if let Value::Object(object) = value {
+    let mut value = serde_json::to_value(schema_for!(T))
+        .map_err(|error| ToolError::Schema(error.to_string()))?;
+    if let Value::Object(object) = &mut value {
         object.remove("$schema");
         object.remove("title");
     }
-
-    match format {
-        ToolSchemaFormat::JsonSchema => ensure_object_schema_defaults(value),
-        ToolSchemaFormat::JsonSchemaSubset => strip_subset_unsupported_schema_keys(value),
-    }
+    ensure_object_schema_defaults(&mut value);
+    Ok(value)
 }
 
-fn ensure_object_schema_defaults(value: &mut Value) -> Result<(), ToolError> {
+fn ensure_object_schema_defaults(value: &mut Value) {
     if let Value::Object(object) = value
         && matches!(object.get("type"), Some(Value::String(kind)) if kind == "object")
     {
@@ -192,42 +166,54 @@ fn ensure_object_schema_defaults(value: &mut Value) -> Result<(), ToolError> {
             .entry("properties")
             .or_insert(Value::Object(Default::default()));
     }
-    Ok(())
 }
 
-fn strip_subset_unsupported_schema_keys(value: &mut Value) -> Result<(), ToolError> {
-    match value {
-        Value::Object(object) => {
-            for key in ["if", "then", "else", "$ref"] {
-                if object.contains_key(key) {
-                    return Err(ToolError::Schema(format!(
-                        "schema subset cannot contain {key:?}"
-                    )));
-                }
-            }
-            for key in [
-                "format",
-                "additionalProperties",
-                "propertyNames",
-                "exclusiveMinimum",
-                "exclusiveMaximum",
-                "optional",
-            ] {
-                object.remove(key);
-            }
-            if let Some(one_of) = object.remove("oneOf") {
-                object.insert("anyOf".to_string(), one_of);
-            }
-            for nested in object.values_mut() {
-                strip_subset_unsupported_schema_keys(nested)?;
-            }
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A tool whose name is whatever it was constructed with, so a registry can
+    /// be populated out of alphabetical order.
+    struct NamedTool(&'static str);
+
+    impl Tool for NamedTool {
+        fn name(&self) -> &'static str {
+            self.0
         }
-        Value::Array(items) => {
-            for item in items {
-                strip_subset_unsupported_schema_keys(item)?;
-            }
+
+        fn description(&self) -> &'static str {
+            "test tool"
         }
-        Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
+
+        fn parameters_schema(&self) -> Result<Value, ToolError> {
+            Ok(json!({ "type": "object", "properties": {} }))
+        }
+
+        fn call(&self, _arguments: Value) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
+            Box::pin(async { Ok(ToolOutput::text("ok")) })
+        }
     }
-    Ok(())
+
+    #[test]
+    fn definitions_are_returned_in_stable_name_order() {
+        let mut registry = ToolRegistry::new();
+        // Insert out of order; the registry must still emit them name-sorted so
+        // the model sees a deterministic tool list every turn.
+        for name in ["write_file", "edit_file", "read_file", "list_directory"] {
+            registry.insert(NamedTool(name)).expect("unique tool");
+        }
+
+        let names: Vec<String> = registry
+            .definitions()
+            .expect("definitions build")
+            .into_iter()
+            .map(|definition| definition.name)
+            .collect();
+
+        assert_eq!(
+            names,
+            ["edit_file", "list_directory", "read_file", "write_file"]
+        );
+    }
 }

@@ -1,5 +1,5 @@
 use futures::FutureExt;
-use llm::{Tool, ToolError, ToolOutput, ToolSchemaFormat, parse_args, schema_for};
+use llm::{Tool, ToolError, ToolOutput, parse_args, schema_for};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
@@ -25,8 +25,8 @@ impl Tool for ReadPdf {
         "Convert a local PDF file into markdown text."
     }
 
-    fn parameters_schema(&self, format: ToolSchemaFormat) -> Result<serde_json::Value, ToolError> {
-        schema_for::<ReadPdfInput>(format)
+    fn parameters_schema(&self) -> Result<serde_json::Value, ToolError> {
+        schema_for::<ReadPdfInput>()
     }
 
     fn call(

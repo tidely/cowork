@@ -70,6 +70,7 @@ fn handle_runtime_event(
                 thread_id,
                 conversation_id,
                 prompt,
+                cancel,
             } = app.handle_key(key)
             {
                 runtime::spawn_prompt_task(
@@ -78,6 +79,7 @@ fn handle_runtime_event(
                     conversation_id,
                     memory.clone(),
                     events.clone(),
+                    cancel,
                 );
             }
         }

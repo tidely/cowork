@@ -4,15 +4,14 @@ use futures::{StreamExt, future::BoxFuture};
 use llm::{
     ChatMessage, ChatRequest, ConversationMemory, FinishReason, LlmError, Provider, StreamEvent,
     TokenUsage, ToolArgumentParseError, ToolCall, ToolError, ToolOutput, ToolRegistry,
-    ToolSchemaFormat,
 };
+use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub model: String,
     pub preamble: Option<String>,
     pub max_turns: usize,
-    pub tool_schema_format: ToolSchemaFormat,
 }
 
 impl AgentConfig {
@@ -21,7 +20,6 @@ impl AgentConfig {
             model: model.into(),
             preamble: None,
             max_turns: 100,
-            tool_schema_format: ToolSchemaFormat::JsonSchema,
         }
     }
 }
@@ -82,17 +80,44 @@ impl AgentRuntime {
             } else {
                 Some(turn.reasoning.clone())
             };
+            // Malformed tool calls never produced a usable `ToolCall`, but the
+            // model still emitted them, so record them on the assistant turn and
+            // feed an error result back below so it can correct itself.
+            let parse_error_calls: Vec<ToolCall> = turn
+                .argument_parse_errors
+                .iter()
+                .map(argument_parse_error_call)
+                .collect();
+            let mut assistant_tool_calls = turn.tool_calls.clone();
+            assistant_tool_calls.extend(parse_error_calls);
+
             let assistant_message = ChatMessage::assistant_with_tools(
                 turn.assistant_text.clone(),
                 reasoning,
-                turn.tool_calls.clone(),
+                assistant_tool_calls,
             );
             self.memory
                 .append(conversation_id, vec![assistant_message.clone()])
                 .await;
             history.push(assistant_message);
 
-            if turn.tool_calls.is_empty() {
+            let has_tool_activity =
+                !turn.tool_calls.is_empty() || !turn.argument_parse_errors.is_empty();
+
+            // A response cut off at the output-length limit is incomplete. With
+            // no tool calls to continue from, the partial text is not a real
+            // answer, so surface it rather than returning it as if finished.
+            if matches!(turn.finish_reason, Some(FinishReason::Length)) && !has_tool_activity {
+                let error = AgentRunError::Truncated;
+                events
+                    .emit(AgentEvent::Error {
+                        error: error.to_string(),
+                    })
+                    .await;
+                return Err(error);
+            }
+
+            if !has_tool_activity {
                 events
                     .emit(AgentEvent::Finished {
                         response: turn.assistant_text.clone(),
@@ -101,7 +126,11 @@ impl AgentRuntime {
                 return Ok(turn.assistant_text);
             }
 
-            let tool_messages = self.execute_tools(turn.tool_calls, events).await;
+            let mut tool_messages = self.execute_tools(turn.tool_calls, events).await;
+            tool_messages.extend(
+                self.report_argument_parse_errors(turn.argument_parse_errors, events)
+                    .await,
+            );
             self.memory
                 .append(conversation_id, tool_messages.clone())
                 .await;
@@ -140,7 +169,7 @@ impl AgentRuntime {
         messages.extend_from_slice(history);
 
         let mut request = ChatRequest::new(self.config.model.clone(), messages);
-        request.tools = self.tools.definitions(self.config.tool_schema_format)?;
+        request.tools = self.tools.definitions()?;
 
         let mut stream = self.provider.stream_chat(request).await?;
         let mut output = TurnOutput::default();
@@ -177,8 +206,9 @@ impl AgentRuntime {
                 }
                 StreamEvent::ToolCallArgumentParseError(error) => {
                     events
-                        .emit(AgentEvent::ToolCallArgumentParseError(error))
+                        .emit(AgentEvent::ToolCallArgumentParseError(error.clone()))
                         .await;
+                    output.argument_parse_errors.push(error);
                 }
                 StreamEvent::Usage(usage) => {
                     events.emit(AgentEvent::Usage(usage)).await;
@@ -192,6 +222,14 @@ impl AgentRuntime {
         Ok(output)
     }
 
+    /// Runs a turn's tool calls **sequentially**, one `await` at a time.
+    ///
+    /// Do not convert this to `join_all`/concurrent execution without an
+    /// explicit design decision. The only provider is local Ollama, which
+    /// serves one prompt at a time; the `subagent` tool runs a nested agent
+    /// turn, so concurrent tool calls would issue overlapping Ollama requests
+    /// that thrash its shared KV cache and serialize behind the global lock
+    /// anyway — slower, not faster. Sequential execution is intentional here.
     async fn execute_tools(
         &self,
         tool_calls: Vec<ToolCall>,
@@ -227,6 +265,57 @@ impl AgentRuntime {
 
         messages
     }
+
+    /// Turn each malformed tool call into an error tool result so the model is
+    /// told its arguments could not be parsed and can retry, instead of the call
+    /// being silently dropped. Emits a matching `ToolResult` event for the UI.
+    async fn report_argument_parse_errors(
+        &self,
+        errors: Vec<ToolArgumentParseError>,
+        events: &mut impl EventSink,
+    ) -> Vec<ChatMessage> {
+        let mut messages = Vec::with_capacity(errors.len());
+
+        for error in errors {
+            let call = argument_parse_error_call(&error);
+            let output = ToolOutput::error(argument_parse_error_message(&error));
+
+            events
+                .emit(AgentEvent::ToolResult {
+                    call: call.clone(),
+                    output: output.clone(),
+                })
+                .await;
+
+            messages.push(ChatMessage::tool(
+                call.id,
+                call.name,
+                output.content,
+                output.is_error,
+            ));
+        }
+
+        messages
+    }
+}
+
+/// Synthetic [`ToolCall`] standing in for a call whose arguments failed to
+/// parse, so the assistant turn and its error result reference the same id.
+fn argument_parse_error_call(error: &ToolArgumentParseError) -> ToolCall {
+    ToolCall {
+        id: error.id.clone(),
+        name: error.name.clone(),
+        raw_arguments: error.raw_arguments.clone(),
+        arguments: Value::Null,
+    }
+}
+
+fn argument_parse_error_message(error: &ToolArgumentParseError) -> String {
+    format!(
+        "invalid tool arguments: {}. The arguments could not be parsed as JSON; \
+         resend the call with valid JSON arguments. Raw arguments received: {}",
+        error.error, error.raw_arguments
+    )
 }
 
 #[derive(Debug, Clone, Default)]
@@ -234,6 +323,7 @@ struct TurnOutput {
     assistant_text: String,
     reasoning: String,
     tool_calls: Vec<ToolCall>,
+    argument_parse_errors: Vec<ToolArgumentParseError>,
     finish_reason: Option<FinishReason>,
 }
 
@@ -295,7 +385,12 @@ impl EventSink for NoopEventSink {
 pub enum AgentRunError {
     Llm(LlmError),
     ToolSetup(ToolError),
-    MaxTurns { max_turns: usize },
+    MaxTurns {
+        max_turns: usize,
+    },
+    /// The model stopped at the output-length limit with no tool calls to
+    /// continue from, so the response was cut off before completion.
+    Truncated,
 }
 
 impl fmt::Display for AgentRunError {
@@ -306,6 +401,10 @@ impl fmt::Display for AgentRunError {
             Self::MaxTurns { max_turns } => {
                 write!(f, "agent reached the maximum turn limit ({max_turns})")
             }
+            Self::Truncated => write!(
+                f,
+                "the model response was cut off at the output-length limit before completion"
+            ),
         }
     }
 }
@@ -384,7 +483,7 @@ mod tests {
             "test tool"
         }
 
-        fn parameters_schema(&self, _format: ToolSchemaFormat) -> Result<Value, ToolError> {
+        fn parameters_schema(&self) -> Result<Value, ToolError> {
             Ok(json!({ "type": "object", "properties": {} }))
         }
 
@@ -461,5 +560,157 @@ mod tests {
             .expect("run completes");
 
         assert!(called.load(Ordering::SeqCst), "allowed tool runs");
+    }
+
+    /// Replays a fixed script of stream events per turn; falls back to a plain
+    /// text finish once the script is exhausted so loops always terminate.
+    struct ScriptProvider {
+        turns: std::sync::Mutex<std::collections::VecDeque<Vec<StreamEvent>>>,
+    }
+
+    impl ScriptProvider {
+        fn new(turns: Vec<Vec<StreamEvent>>) -> Self {
+            Self {
+                turns: std::sync::Mutex::new(turns.into()),
+            }
+        }
+    }
+
+    impl Provider for ScriptProvider {
+        fn stream_chat(&self, _request: ChatRequest) -> BoxFuture<'_, Result<LlmStream, LlmError>> {
+            let turn = self.turns.lock().unwrap().pop_front().unwrap_or_else(|| {
+                vec![
+                    StreamEvent::TextDelta("done".into()),
+                    StreamEvent::Finished {
+                        reason: FinishReason::Stop,
+                    },
+                ]
+            });
+            Box::pin(async move {
+                let events: Vec<Result<StreamEvent, LlmError>> = turn.into_iter().map(Ok).collect();
+                Ok(Box::pin(stream::iter(events)) as LlmStream)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_tool_arguments_are_reported_to_the_model() {
+        let called = Arc::new(AtomicBool::new(false));
+        let memory = Arc::new(ConversationStore::new());
+        let mut tools = ToolRegistry::new();
+        tools
+            .insert(FlagTool {
+                called: called.clone(),
+            })
+            .expect("register tool");
+
+        // Turn 0 emits a tool call whose arguments fail to parse; turn 1 is the
+        // model recovering after it sees the error result.
+        let provider = Arc::new(ScriptProvider::new(vec![
+            vec![
+                StreamEvent::ToolCallStarted {
+                    id: "call-1".into(),
+                    name: "writer".into(),
+                },
+                StreamEvent::ToolCallArgumentParseError(ToolArgumentParseError {
+                    id: "call-1".into(),
+                    name: "writer".into(),
+                    raw_arguments: "{bad".into(),
+                    error: "expected value".into(),
+                }),
+                StreamEvent::Finished {
+                    reason: FinishReason::ToolCalls,
+                },
+            ],
+            vec![
+                StreamEvent::TextDelta("recovered".into()),
+                StreamEvent::Finished {
+                    reason: FinishReason::Stop,
+                },
+            ],
+        ]));
+
+        let runtime = AgentRuntime::new(
+            provider,
+            memory.clone(),
+            tools,
+            AgentConfig::new("test-model"),
+        );
+        let response = runtime
+            .run("conv", "go", &mut NoopEventSink)
+            .await
+            .expect("run continues past the malformed call");
+
+        assert_eq!(response, "recovered");
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "a call with unparseable arguments must not execute the tool"
+        );
+
+        let history = memory.load("conv").await;
+        let tool_result = history
+            .iter()
+            .find_map(|message| match message {
+                ChatMessage::Tool {
+                    content,
+                    is_error,
+                    call_id,
+                    ..
+                } => Some((content.clone(), *is_error, call_id.clone())),
+                _ => None,
+            })
+            .expect("the malformed call is fed back as a tool result");
+        assert!(tool_result.1, "the malformed-argument result is an error");
+        assert_eq!(tool_result.2, "call-1");
+        assert!(tool_result.0.contains("invalid tool arguments"));
+        assert!(
+            tool_result.0.contains("{bad"),
+            "the raw arguments are echoed back so the model can correct them"
+        );
+
+        // The assistant turn references the malformed call so the result pairs
+        // with it rather than dangling.
+        assert!(
+            history.iter().any(|message| matches!(
+                message,
+                ChatMessage::Assistant { tool_calls, .. }
+                    if tool_calls.iter().any(|call| call.id == "call-1")
+            )),
+            "the assistant turn records the malformed call"
+        );
+    }
+
+    #[tokio::test]
+    async fn length_truncated_response_without_tools_surfaces_an_error() {
+        let memory = Arc::new(ConversationStore::new());
+        let provider = Arc::new(ScriptProvider::new(vec![vec![
+            StreamEvent::TextDelta("partial".into()),
+            StreamEvent::Finished {
+                reason: FinishReason::Length,
+            },
+        ]]));
+        let runtime = AgentRuntime::new(
+            provider,
+            memory.clone(),
+            ToolRegistry::new(),
+            AgentConfig::new("test-model"),
+        );
+
+        let error = runtime
+            .run("conv", "go", &mut NoopEventSink)
+            .await
+            .expect_err("a cut-off response is not a completed answer");
+        assert_eq!(error, AgentRunError::Truncated);
+
+        // The partial text is still preserved in memory; truncation does not
+        // discard what the model did produce.
+        let history = memory.load("conv").await;
+        assert!(
+            history.iter().any(|message| matches!(
+                message,
+                ChatMessage::Assistant { content, .. } if content == "partial"
+            )),
+            "partial output is kept"
+        );
     }
 }

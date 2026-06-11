@@ -6,20 +6,15 @@
 //! subagents, deterministic filesystem/PDF tools, and profile-driven permission
 //! prompts.
 
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 
 use futures::future::BoxFuture;
 use llm::{
     ChatMessage, ConversationMemory, ConversationStore, Tool, ToolCall, ToolError, ToolOutput,
-    ToolRegistry, ToolSchemaFormat, parse_args,
+    ToolRegistry, parse_args,
 };
 use ollama::OllamaProvider;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     app::{AgentAddr, AgentDepth, AgentEvent, RuntimeAgentKey, ThreadId, ToolPermissionResponse},
@@ -37,8 +32,6 @@ use agent::{
 };
 
 const MAX_AGENT_DEPTH: AgentDepth = 4;
-
-static NEXT_RUNTIME_AGENT_KEY: AtomicU64 = AtomicU64::new(1);
 
 /// Bridges the generic `agent::EventSink` to the app's runtime channel. Generic
 /// events are translated to `app::AgentEvent`s addressed to one agent node and
@@ -60,6 +53,13 @@ impl ChannelEventSink {
     /// the terminal Finished/Error derived from the run result).
     fn lifecycle(&self) -> AgentEventSink {
         self.inner.clone()
+    }
+
+    /// Rewind this agent's visible transcript to its pre-run baseline. Called
+    /// before a retry so the next attempt's output does not stack on top of the
+    /// failed attempt's partial output. Model memory is reset separately.
+    async fn reset(&mut self) {
+        self.inner.send(AgentEvent::Reset { addr: self.addr }).await;
     }
 }
 
@@ -100,6 +100,18 @@ fn map_event(event: RuntimeAgentEvent, addr: AgentAddr) -> Option<AgentEvent> {
             content: output.content,
             is_error: output.is_error,
         }),
+        // A call whose arguments failed to parse still gets a tool-call card so
+        // the run loop's follow-up error result (matched by id) has something to
+        // mark failed, rather than dangling as a bare result.
+        RuntimeAgentEvent::ToolCallArgumentParseError(error) => Some(AgentEvent::ToolCall {
+            addr,
+            id: error.id,
+            name: error.name,
+            arguments: serde_json::json!({
+                "raw_arguments": error.raw_arguments,
+                "parse_error": error.error,
+            }),
+        }),
         RuntimeAgentEvent::Usage(usage) => Some(AgentEvent::Usage {
             addr,
             input_tokens: usage.input_tokens,
@@ -111,7 +123,6 @@ fn map_event(event: RuntimeAgentEvent, addr: AgentAddr) -> Option<AgentEvent> {
         | RuntimeAgentEvent::ProviderStarted
         | RuntimeAgentEvent::ToolCallStarted { .. }
         | RuntimeAgentEvent::ToolCallArgumentDelta { .. }
-        | RuntimeAgentEvent::ToolCallArgumentParseError(_)
         | RuntimeAgentEvent::Finished { .. }
         | RuntimeAgentEvent::Error { .. } => None,
     }
@@ -214,6 +225,7 @@ pub(crate) fn spawn_prompt_task(
     conversation_id: String,
     store: ConversationStore,
     events: RuntimeEventSender,
+    cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
         let mut sink = ChannelEventSink::new(events.clone(), thread_id, AgentAddr::Main);
@@ -231,25 +243,30 @@ pub(crate) fn spawn_prompt_task(
             MAIN_AGENT_PREAMBLE,
             Some(SubagentContext::root(thread_id, events, store.clone())),
         );
-        match run_prompt_with_retries(&prompt, &conversation_id, &store, &runtime, &mut sink).await
-        {
-            Ok(_) => {
-                lifecycle
-                    .send(AgentEvent::Finished {
-                        addr: AgentAddr::Main,
-                        result: None,
-                    })
-                    .await;
-            }
-            Err(error) => {
-                lifecycle
-                    .send(AgentEvent::Error {
-                        addr: AgentAddr::Main,
-                        error: error.to_string(),
-                    })
-                    .await;
-            }
-        }
+
+        // Race the whole run (retries, sleeps, and the nested subagent tree)
+        // against cancellation. Losing the race drops the run future, which
+        // tears down every in-flight provider request and subagent beneath it.
+        let outcome = tokio::select! {
+            biased;
+            _ = cancel.cancelled() => None,
+            result = run_prompt_with_retries(
+                &prompt, &conversation_id, &store, &runtime, &mut sink,
+            ) => Some(result),
+        };
+
+        let terminal = match outcome {
+            Some(Ok(_)) => AgentEvent::Finished {
+                addr: AgentAddr::Main,
+                result: None,
+            },
+            Some(Err(error)) => AgentEvent::Error {
+                addr: AgentAddr::Main,
+                error: error.to_string(),
+            },
+            None => AgentEvent::Cancelled,
+        };
+        lifecycle.send(terminal).await;
     });
 }
 
@@ -258,7 +275,7 @@ async fn run_prompt_with_retries(
     conversation_id: &str,
     store: &ConversationStore,
     runtime: &AgentRuntime,
-    events: &mut impl EventSink,
+    sink: &mut ChannelEventSink,
 ) -> Result<String, AgentRunError> {
     let initial_history = store.load(conversation_id).await;
 
@@ -268,7 +285,7 @@ async fn run_prompt_with_retries(
             .await;
 
         let error = match runtime
-            .run(conversation_id, prompt.to_string(), events)
+            .run(conversation_id, prompt.to_string(), &mut *sink)
             .await
         {
             Ok(response) => return Ok(response),
@@ -281,6 +298,9 @@ async fn run_prompt_with_retries(
             return Err(error);
         };
 
+        // Model memory is rewound at the top of the next iteration; rewind the
+        // visible transcript to match so the retry starts from a clean slate.
+        sink.reset().await;
         tokio::time::sleep(backoff).await;
     }
 
@@ -338,11 +358,14 @@ impl SubagentContext {
         }
     }
 
-    fn child_context(&self, child_key: RuntimeAgentKey, child_depth: AgentDepth) -> Self {
+    /// Context handed to a freshly spawned child. From the child's perspective
+    /// `parent_key` is *its own* runtime key — it becomes the parent of any
+    /// grandchildren the child later spawns.
+    fn child_context(&self, parent_key: RuntimeAgentKey, depth: AgentDepth) -> Self {
         Self {
             thread_id: self.thread_id,
-            parent_key: Some(child_key),
-            depth: child_depth,
+            parent_key: Some(parent_key),
+            depth,
             events: self.events.clone(),
             store: self.store.clone(),
         }
@@ -375,7 +398,7 @@ impl Tool for SubagentTool {
         "Spawn a child agent to own one bounded, independent sub-task. Do not use it for simple one- or two-tool steps, single-file inspection, straightforward path reads/listing, or work that needs your continuous shared context. Give the child a clear goal, goal context, exact scope boundaries, known paths/resources, constraints, expected output shape, and failure policy. If a file/path/resource is missing, too large, inaccessible, ambiguous, or otherwise blocks the task, tell the child to stop and report the blocker rather than explore elsewhere or spawn recovery agents. Only delegate fan-out when there are multiple known independent chunks whose context can be discarded after a concise result."
     }
 
-    fn parameters_schema(&self, _format: ToolSchemaFormat) -> Result<serde_json::Value, ToolError> {
+    fn parameters_schema(&self) -> Result<serde_json::Value, ToolError> {
         Ok(serde_json::json!({
             "type": "object",
             "properties": {
@@ -409,8 +432,12 @@ impl Tool for SubagentTool {
     }
 }
 
+/// A random, effectively-collision-free id for a spawned agent (a UUIDv4 as a
+/// `u128`). Random rather than a growing counter so persisted
+/// `runtime-agent-{key}` conversation ids stay distinct across sessions once
+/// persistence lands, instead of restarting at the same values every run.
 fn next_runtime_agent_key() -> RuntimeAgentKey {
-    NEXT_RUNTIME_AGENT_KEY.fetch_add(1, Ordering::Relaxed)
+    uuid::Uuid::new_v4().as_u128()
 }
 
 fn subagent_preamble(can_delegate: bool) -> &'static str {
@@ -636,6 +663,44 @@ mod tests {
     }
 
     #[test]
+    fn runtime_agent_keys_are_unique_and_non_sequential() {
+        let keys: Vec<RuntimeAgentKey> = (0..100).map(|_| next_runtime_agent_key()).collect();
+        let unique: std::collections::HashSet<_> = keys.iter().copied().collect();
+        assert_eq!(unique.len(), keys.len(), "ids must not collide");
+        // A growing counter would have produced a contiguous run; random ids
+        // should not be 1, 2, 3, ...
+        assert!(
+            keys.windows(2)
+                .any(|pair| pair[1] != pair[0].wrapping_add(1)),
+            "ids should not be sequential"
+        );
+    }
+
+    #[test]
+    fn argument_parse_error_maps_to_a_tool_call_card() {
+        let event = RuntimeAgentEvent::ToolCallArgumentParseError(ToolArgumentParseError {
+            id: "call-1".into(),
+            name: "read_file".into(),
+            raw_arguments: "{bad".into(),
+            error: "eof".into(),
+        });
+        match map_event(event, AgentAddr::Main) {
+            Some(AgentEvent::ToolCall {
+                addr: AgentAddr::Main,
+                id,
+                name,
+                arguments,
+            }) => {
+                assert_eq!(id, "call-1");
+                assert_eq!(name, "read_file");
+                assert_eq!(arguments["raw_arguments"], "{bad");
+                assert_eq!(arguments["parse_error"], "eof");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn usage_carries_token_counts() {
         let event = RuntimeAgentEvent::Usage(TokenUsage::from_input_output(10, 5));
         match map_event(event, AgentAddr::Main) {
@@ -704,12 +769,6 @@ mod tests {
                 id: "call-1".into(),
                 delta: "{".into(),
             },
-            RuntimeAgentEvent::ToolCallArgumentParseError(ToolArgumentParseError {
-                id: "call-1".into(),
-                name: "read_file".into(),
-                raw_arguments: "{".into(),
-                error: "eof".into(),
-            }),
             RuntimeAgentEvent::Finished {
                 response: "done".into(),
             },

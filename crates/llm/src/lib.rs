@@ -8,5 +8,5 @@ pub use provider::{LlmStream, Provider};
 pub use tool::{Tool, ToolError, ToolOutput, ToolRegistry, parse_args, schema_for};
 pub use types::{
     ChatMessage, ChatOptions, ChatRequest, FinishReason, LlmError, StreamEvent, TokenUsage,
-    ToolArgumentParseError, ToolCall, ToolCallId, ToolDefinition, ToolSchemaFormat,
+    ToolArgumentParseError, ToolCall, ToolCallId, ToolDefinition,
 };

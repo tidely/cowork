@@ -12,7 +12,7 @@ cargo clippy && cargo fmt
 
 ## What this project is
 
-`cowork` is a TUI-first AI assistant where the main agent can delegate to a recursive tree of subagents in parallel. The TUI makes this hierarchy visible: the sidebar shows spawned agents live as they run, and their message streams are individually inspectable.
+`cowork` is a TUI-first AI assistant where the main agent can delegate to a recursive tree of subagents. The TUI makes this hierarchy visible: the sidebar shows spawned agents live as they run, and their message streams are individually inspectable. Subagents run one at a time, not concurrently — see the Ollama serialization constraint below.
 
 It uses a local Ollama model (`gemma4:12b-it-qat`) through the in-workspace `ollama` provider with reasoning enabled (`think: true`).
 
@@ -38,6 +38,7 @@ Agents form a tree: one main agent at depth 0, with each `subagent` call spawnin
 ## Design decisions already made
 
 - **TUI-only**: no CLI fallback mode. Direct `println!` anywhere corrupts the alternate screen.
+- **Subagents/tool calls run sequentially, never concurrently**: the only provider is local Ollama, which serves one prompt at a time. Because the `subagent` tool runs a nested agent turn, parallel tool execution would issue overlapping Ollama requests that thrash its shared KV cache and serialize behind its global lock anyway — slower, not faster. The sequential `for` loop in `agent::AgentRuntime::execute_tools` is load-bearing; do **not** switch it to `join_all`/concurrent execution (nor lift the per-app submit gate to per-thread) without an explicit decision that accounts for the single-instance Ollama backend. The same constraint is why submission is gated per app, not per thread.
 - **Submit disabled during active run**: simplest way to avoid concurrent state issues. No queuing.
 - **Reasoning shown inline but collapsed**: visible for agent debugging, not noisy by default.
 - **One thread for now**: the data model (`threads: Vec<ThreadState>`) is built for multiple threads, but only one is used currently.
