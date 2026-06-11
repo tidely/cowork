@@ -7,9 +7,11 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
+agent.workspace = true
+agent-tools.workspace = true
+llm.workspace = true
+ollama.workspace = true
 tokio.workspace = true
-rig-core.workspace = true
-rig-derive.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true

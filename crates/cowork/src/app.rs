@@ -305,6 +305,7 @@ pub enum AgentEvent {
         addr: AgentAddr,
         id: String,
         content: String,
+        is_error: bool,
     },
     Usage {
         addr: AgentAddr,
@@ -531,10 +532,15 @@ impl AppState {
                     }
                 }
             }
-            AgentEvent::ToolResult { addr, id, content } => {
+            AgentEvent::ToolResult {
+                addr,
+                id,
+                content,
+                is_error,
+            } => {
                 if let Some(agent_id) = self.resolve_addr(thread_id, addr) {
                     self.collapse_last_reasoning(thread_id, agent_id);
-                    self.apply_tool_result_to_agent(thread_id, agent_id, &id, &content);
+                    self.apply_tool_result_to_agent(thread_id, agent_id, &id, &content, is_error);
                 }
             }
             AgentEvent::Usage {
@@ -962,8 +968,9 @@ impl AppState {
         agent_id: AgentId,
         tool_call_id: &str,
         content: &str,
+        is_error: bool,
     ) {
-        let status = if is_tool_error(content) {
+        let status = if is_error || is_tool_error(content) {
             ToolStatus::Failed
         } else {
             ToolStatus::Finished
@@ -1121,7 +1128,7 @@ fn append_child_sidebar_items(
 fn initial_main_messages() -> Vec<Message> {
     vec![Message::new(
         MessageRole::System,
-        crate::agent::MAIN_AGENT_PREAMBLE,
+        crate::config::MAIN_AGENT_PREAMBLE,
     )]
 }
 
@@ -1133,8 +1140,8 @@ fn collapse_reasoning(agent: &mut AgentNode) {
     }
 }
 
-/// A failed tool call surfaces only as a string in rig's streamed result, prefixed
-/// with the error variant's name (see `rig_core::tool::ToolError`/`ToolSetError`).
+/// Tool failures arrive as string tool results; recognize the prefixes used by
+/// both the old and current tool layers so the UI can mark them as failed.
 fn is_tool_error(content: &str) -> bool {
     let content = content.trim_start();
     content.starts_with("ToolCallError:")
@@ -1242,6 +1249,7 @@ mod tests {
             addr: AgentAddr::Main,
             id: id.into(),
             content: content.into(),
+            is_error: false,
         }
     }
 
@@ -1407,6 +1415,7 @@ mod tests {
                 addr: AgentAddr::Main,
                 id: "t1".into(),
                 content: "file contents".into(),
+                is_error: false,
             },
         );
         assert_eq!(last(&app).tool_status, ToolStatus::Finished);
@@ -1617,6 +1626,30 @@ mod tests {
             },
         );
         app.apply_agent_event(T, tool_result("t1", "ToolCallError: no such file"));
+        assert_eq!(last(&app).tool_status, ToolStatus::Failed);
+    }
+
+    #[test]
+    fn explicit_tool_result_error_marks_failed_without_legacy_prefix() {
+        let mut app = AppState::new();
+        app.apply_agent_event(
+            T,
+            AgentEvent::ToolCall {
+                addr: AgentAddr::Main,
+                id: "t1".into(),
+                name: "edit_file".into(),
+                arguments: json!({}),
+            },
+        );
+        app.apply_agent_event(
+            T,
+            AgentEvent::ToolResult {
+                addr: AgentAddr::Main,
+                id: "t1".into(),
+                content: "old_text was not found in the file".into(),
+                is_error: true,
+            },
+        );
         assert_eq!(last(&app).tool_status, ToolStatus::Failed);
     }
 

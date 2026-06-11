@@ -1,0 +1,16 @@
+[package]
+name = "ollama"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+llm.workspace = true
+async-stream.workspace = true
+futures.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true

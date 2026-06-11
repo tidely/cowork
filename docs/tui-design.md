@@ -38,50 +38,53 @@ Approximate layout:
 
 ## Current architecture summary
 
-Current code is a line-oriented CLI:
+`cowork` is now TUI-only. The runtime path is in-workspace rather than backed by an external agent framework:
 
-- `main.rs` reads one line from stdin using blocking `std::io::stdin().read_line`.
-- It calls `agent.stream_prompt(prompt).conversation("agent-thread-0").await`.
-- It streams events directly to stdout using `print!` / `println!`.
-- Tool and subagent output is also printed directly from stream handlers.
-- Conversation persistence is provided only by `InMemoryConversationMemory`; there is no app-owned message/event store.
-- Subagents are real nested Rig agents, but their events are only surfaced by printing to stdout.
+- `main.rs` starts the TUI; there is no line-oriented CLI fallback.
+- `tui.rs` owns terminal setup, the single runtime event channel, keyboard input forwarding, and prompt task spawning.
+- `runtime.rs` builds `agent::AgentRuntime` with `ollama::OllamaProvider`, `llm::ConversationStore`, `agent_tools` filesystem/PDF tools, and the app-coupled recursive `subagent` tool.
+- `app.rs` is the reducer/state owner. It mutates `AppState` in response to structured `AgentEvent`s and terminal actions.
+- `ui.rs` renders `AppState` only; it does not mutate state.
+- No runtime path writes directly to stdout, because that would corrupt the alternate screen.
 
-For a TUI, the core change is moving from "print streamed events immediately" to "convert streamed events into structured app events, store them in app state, and render app state repeatedly".
+The core architectural move is: convert streamed model/tool/subagent events into structured app events, store visible UI history in `AppState`, keep model context in `llm::ConversationStore`, and render from state repeatedly.
 
-## Proposed code organization
-
-Potential module layout:
+## Code organization
 
 ```text
 crates/cowork/src/
-├── main.rs
-├── agent.rs          # Rig client/agent construction and streaming orchestration
-├── app.rs            # App state, reducer/update logic, thread/agent/message models
-├── tui.rs            # Terminal setup, event loop, drawing
-├── ui.rs             # Ratatui widgets/layout rendering
-├── tools.rs          # Existing tools, adjusted to emit structured events instead of printing
-└── ids.rs            # ThreadId, AgentRunId, MessageId helpers if useful
+├── main.rs            # starts the TUI
+├── config.rs          # model, prompt, and retry constants
+├── events.rs          # runtime event sink helper
+├── permissions.rs     # agent profile and tool permission mode
+├── runtime.rs         # provider/agent/tool runtime orchestration
+├── app.rs             # app state, reducer/update logic, thread/agent/message models
+├── tui.rs             # terminal setup, event loop, input channel, prompt task spawning
+└── ui.rs              # Ratatui widgets/layout rendering
 ```
 
-This can be introduced incrementally. For the first pass, the existing `tools.rs` can stay mostly intact, but stdout printing from agent/subagent streams will need to be replaced or wrapped.
+Supporting crates:
 
-## Suggested dependencies
+```text
+crates/llm/          # Chat types, provider trait, tool trait/registry, ConversationStore
+crates/ollama/       # Direct Ollama /api/chat streaming provider
+crates/agent/        # Generic multi-turn agent loop and permission hook
+crates/agent-tools/  # Reusable filesystem/PDF tools
+```
 
-Likely additions:
+## Key dependencies
 
 ```toml
 ratatui = "0.29"
 crossterm = "0.28"
-tokio-util = "0.7" # optional, useful for cancellation tokens
-unicode-width = "0.2" # optional, helpful for input cursor positioning
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+pdf-extract = "0.10"
 ```
-
-`ratatui` + `crossterm` is the common Rust stack for this kind of terminal UI.
 
 ## Data model draft
 
-The TUI needs an app-owned model separate from Rig's internal conversation memory.
+The TUI has an app-owned model separate from `llm::ConversationStore`.
 
 ```rust
 struct AppState {
@@ -139,7 +142,7 @@ TUI event loop ────────────────┐
         ▼                      ▼
 Agent task(s) ───────────▶ mpsc channel ───────────▶ AppState update/reducer
         │                                             │
-        └──── Rig streaming events                    ▼
+        └──── llm/agent stream events                 ▼
                                                   Ratatui render
 ```
 
@@ -164,7 +167,7 @@ enum AppEvent {
 
 ### 1. Async agent streaming vs synchronous terminal rendering
 
-`ratatui` rendering itself is synchronous, while Rig agent streaming and tools are async.
+`ratatui` rendering itself is synchronous, while LLM streaming, agent loops, and tools are async.
 
 Recommended pattern:
 
@@ -179,25 +182,13 @@ Recommended pattern:
 
 Open choice below.
 
-### 2. Existing stream handlers print directly to stdout
+### 2. No direct stdout printing
 
-Current functions:
-
-- `stream_to_stdout_with_reasoning` in `main.rs`
-- `stream_agent_to_stdout` in `tools.rs`
-
-These are incompatible with a TUI because any direct `println!` corrupts the alternate screen.
-
-Needed change:
-
-- Replace stdout streaming with structured event emission.
-- The renderer decides how to display each event.
-
-There may still be value in keeping a non-TUI mode later, but the first TUI version can fully replace stdout output.
+Runtime code must emit structured events, not `print!` / `println!`. The renderer decides how to display each event. Direct stdout printing corrupts the alternate screen.
 
 ### 3. Subagent tree visibility
 
-Currently, subagents are invoked from tool calls. The top-level stream exposes a tool call named `subagent`, but nested subagent events are printed inside `tools.rs` and are not attached to an app model.
+Subagents are invoked from tool calls. The `subagent` tool in `runtime.rs` carries UI context and emits nested lifecycle/message events addressed by runtime key.
 
 To show subagents in the sidebar, the app needs stable IDs and lifecycle events:
 
@@ -206,21 +197,13 @@ To show subagents in the sidebar, the app needs stable IDs and lifecycle events:
 - subagent message deltas
 - subagent finished/errored
 
-This likely means `Subagent` and `WorkerAgent` tools need access to an event sink/context so they can emit events to the UI.
-
-Possible approaches:
-
-1. Global or shared app event sink captured by tool structs.
-2. Custom tool structs with context/state containing `mpsc::Sender<AppEvent>` and parent IDs.
-3. Keep tools pure and wrap subagent execution outside tool calls. This is harder because Rig owns tool invocation.
-
-Approach 2 is likely cleanest. I inspected `rig-core 0.38.1`: `AgentBuilder::tool(self, tool: impl Tool + 'static)` accepts concrete tool instances, so we can define custom tool structs that carry runtime fields such as an `mpsc::Sender<AppEvent>`, current `ThreadId`, parent `AgentRunId`, and ID allocator. We do not have to rely only on zero-sized `#[rig_tool]` structs.
+This is implemented with custom tool structs carrying event sender, current `ThreadId`, parent runtime key, depth, and shared model memory.
 
 ### 4. Conversation memory vs visible message history
 
-Rig's `InMemoryConversationMemory` stores conversation context for the model, but it is not enough for UI rendering.
+`llm::ConversationStore` stores model context, but it is not enough for UI rendering.
 
-The app should maintain its own visible history in `AppState`.
+The app maintains its own visible history in `AppState`.
 
 Potential issue: what exactly should count as a visible message?
 
@@ -314,7 +297,7 @@ Choices:
 - Persist visible conversations as JSON under a config/data directory.
 - Persist both visible history and enough agent context to resume conversations.
 
-Rig's memory may not be trivially serializable, so full resume is more involved than UI history persistence.
+Full resume requires serializing both visible history and enough `llm::ChatMessage` context to reconstruct model state.
 
 ### 12. Terminal lifecycle/error recovery
 
@@ -460,7 +443,7 @@ B. Persist visible message history only.
 C. Persist full resumable conversations.
 
 - Most useful long term.
-- Requires deeper integration with Rig memory.
+- Requires serializing both visible history and model conversation state.
 
 Recommendation: A for first pass.
 

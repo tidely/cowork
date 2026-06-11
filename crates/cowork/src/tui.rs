@@ -6,14 +6,13 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use llm::ConversationStore;
 use ratatui::{Terminal, backend::CrosstermBackend};
-use rig_core::memory::InMemoryConversationMemory;
 use tokio::{sync::mpsc, time};
 
 use crate::{
-    agent,
     app::{AgentEvent, AppState, PendingToolPermission, SubmitResult, ThreadId},
-    ui,
+    runtime, ui,
 };
 
 pub type RuntimeEventSender = mpsc::Sender<RuntimeEvent>;
@@ -28,10 +27,11 @@ pub enum RuntimeEvent {
     Tick,
 }
 
-pub async fn run(memory: InMemoryConversationMemory) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = TerminalGuard::new()?;
     let (events, mut receiver) = mpsc::channel(512);
     spawn_input_thread(events.clone());
+    let memory = ConversationStore::new();
 
     let mut app = AppState::new();
     terminal.draw(|frame| ui::render(frame, &app))?;
@@ -62,7 +62,7 @@ fn handle_runtime_event(
     event: RuntimeEvent,
     app: &mut AppState,
     events: &RuntimeEventSender,
-    memory: &InMemoryConversationMemory,
+    memory: &ConversationStore,
 ) {
     match event {
         RuntimeEvent::Terminal(Event::Key(key)) if key.kind == KeyEventKind::Press => {
@@ -72,7 +72,7 @@ fn handle_runtime_event(
                 prompt,
             } = app.handle_key(key)
             {
-                agent::spawn_prompt_task(
+                runtime::spawn_prompt_task(
                     thread_id,
                     prompt,
                     conversation_id,

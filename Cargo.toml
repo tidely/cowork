@@ -11,13 +11,18 @@ edition = "2024"
 [workspace.lints.clippy]
 
 [workspace.dependencies]
+agent = { path = "crates/agent" }
+agent-tools = { path = "crates/agent-tools" }
+llm = { path = "crates/llm" }
+ollama = { path = "crates/ollama" }
 tokio = { version = "1", features = ["full"] }
-# Switch to upstream after https://github.com/0xPlaygrounds/rig/pull/1586 is merged
-rig-core = { git = "https://github.com/tidely/rig.git", branch = "feat/streaming-tool-concurrency", package = "rig-core", features = ["pdf"] }
-rig-derive = { git = "https://github.com/tidely/rig.git", branch = "feat/streaming-tool-concurrency", package = "rig-derive" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+schemars = "1"
 futures = "0.3"
+async-stream = "0.3"
+reqwest = { version = "0.12", features = ["json", "stream"] }
+pdf-extract = "0.10"
 futures-util = "0.3"
 tokio-util = "0.7"
 ratatui = "0.29"
