@@ -151,6 +151,12 @@ impl ToolStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDisplay {
     pub call_id: String,
+    /// The raw tool name, e.g. `read_file`. Retained alongside the rendered
+    /// `summary` so the central display policy ([`tool_previews_result`]) can be
+    /// consulted at render time without re-parsing the summary string. Defaulted
+    /// for snapshots written before the field existed.
+    #[serde(default)]
+    pub name: String,
     /// Header label, e.g. `read_file /tmp` or `subagent <task>`.
     pub summary: String,
     /// Pretty-printed JSON arguments.
@@ -158,6 +164,14 @@ pub struct ToolDisplay {
     pub status: ToolStatus,
     pub result: Option<String>,
     pub collapsed: bool,
+}
+
+impl ToolDisplay {
+    /// Whether a collapsed, finished card should preview its result. Delegates to
+    /// the central, name-keyed display policy.
+    pub fn previews_result(&self) -> bool {
+        tool_previews_result(&self.name)
+    }
 }
 
 /// One visible entry in an agent's transcript. Each variant carries exactly the
@@ -197,6 +211,7 @@ impl Message {
             call_id: id,
             summary: tool_call_summary(&name, arguments),
             arguments: pretty_json(arguments),
+            name,
             status: ToolStatus::Running,
             result: None,
             collapsed: true,
@@ -1768,16 +1783,39 @@ fn pretty_json(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
+/// Central, name-keyed policy for how a tool call is presented in the transcript.
+/// Kept here rather than on the `llm::Tool` trait on purpose: the trait stays a
+/// pure capability seam (name/description/schema/call), and this is the one place
+/// the TUI matches over tools to tailor each card. New tools fall back to a bare
+/// name summary with the result previewed.
 fn tool_call_summary(name: &str, arguments: &Value) -> String {
     match name {
         "read_file" | "read_pdf" | "list_directory" | "edit_file" | "write_file" => {
             path_tool_summary(name, arguments)
         }
-        "subagent" => string_arg(arguments, "task")
-            .map(|task| format!("{name} {}", truncate_chars(task, 80)))
-            .unwrap_or_else(|| name.to_string()),
+        "subagent" => labeled_summary(name, arguments, "task"),
+        "terminal" => labeled_summary(name, arguments, "command"),
         _ => name.to_string(),
     }
+}
+
+/// Whether a collapsed, finished tool card should preview its result. Tools whose
+/// summary already names everything worth seeing — the file/dir path tools —
+/// suppress the preview, which was otherwise just the noisy first line of the
+/// file. Tools whose *output* is the payload (terminal, subagent) keep it.
+fn tool_previews_result(name: &str) -> bool {
+    !matches!(
+        name,
+        "read_file" | "read_pdf" | "list_directory" | "edit_file" | "write_file"
+    )
+}
+
+/// `name <truncated value of `key`>`, falling back to the bare name when the
+/// argument is missing.
+fn labeled_summary(name: &str, arguments: &Value, key: &str) -> String {
+    string_arg(arguments, key)
+        .map(|value| format!("{name} {}", truncate_chars(value, 80)))
+        .unwrap_or_else(|| name.to_string())
 }
 
 fn path_tool_summary(name: &str, arguments: &Value) -> String {
@@ -2021,6 +2059,58 @@ mod tests {
             last(&app).tool_summary(),
             Some("subagent review the parser module")
         );
+    }
+
+    #[test]
+    fn terminal_tool_call_summary_includes_command() {
+        let mut app = AppState::new();
+        app.apply_thread_event(
+            T,
+            ThreadEvent::Agent {
+                addr: AgentAddr::Main,
+                event: AgentNodeEvent::ToolCall {
+                    id: "t1".into(),
+                    name: "terminal".into(),
+                    arguments: json!({ "command": "cargo test -p cowork" }),
+                },
+            },
+        );
+        assert_eq!(
+            last(&app).tool_summary(),
+            Some("terminal cargo test -p cowork")
+        );
+    }
+
+    #[test]
+    fn path_tools_suppress_result_preview_but_output_tools_keep_it() {
+        // Path tools name their target in the summary, so the collapsed card
+        // omits the result; tools whose output is the payload preview it.
+        assert!(!tool_previews_result("read_file"));
+        assert!(!tool_previews_result("list_directory"));
+        assert!(!tool_previews_result("write_file"));
+        assert!(tool_previews_result("terminal"));
+        assert!(tool_previews_result("subagent"));
+        // Unknown tools default to previewing their result.
+        assert!(tool_previews_result("some_future_tool"));
+    }
+
+    #[test]
+    fn tool_display_exposes_name_for_the_preview_policy() {
+        let mut app = AppState::new();
+        app.apply_thread_event(
+            T,
+            ThreadEvent::Agent {
+                addr: AgentAddr::Main,
+                event: AgentNodeEvent::ToolCall {
+                    id: "t1".into(),
+                    name: "read_file".into(),
+                    arguments: json!({ "path": "/tmp" }),
+                },
+            },
+        );
+        let tool = last(&app).tool().expect("a tool-call message");
+        assert_eq!(tool.name, "read_file");
+        assert!(!tool.previews_result());
     }
 
     #[test]

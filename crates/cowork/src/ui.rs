@@ -407,19 +407,27 @@ fn append_tool_call_lines(
 
     if message.collapsed() {
         // While running show "running"; once done the colored marker carries the
-        // status, so preview the result instead of writing "finished".
+        // status. Whether to preview the result is a per-tool display decision:
+        // path tools already name their target in the header, so previewing the
+        // first line of file contents there is just noise (see
+        // `ToolDisplay::previews_result`).
         let preview = if done {
-            tool.result
-                .as_deref()
-                .filter(|result| !result.is_empty())
-                .map(collapsed_preview)
-                .unwrap_or_default()
+            tool.previews_result()
+                .then(|| {
+                    tool.result
+                        .as_deref()
+                        .filter(|result| !result.is_empty())
+                        .map(collapsed_preview)
+                })
+                .flatten()
         } else if tool.status == ToolStatus::AwaitingPermission {
-            "waiting for approval".to_string()
+            Some("waiting for approval".to_string())
         } else {
-            "running".to_string()
+            Some("running".to_string())
         };
-        push_body_line(lines, &preview, style);
+        if let Some(preview) = preview {
+            push_body_line(lines, &preview, style);
+        }
     } else {
         lines.push(Line::from(Span::styled(
             "│ Arguments",

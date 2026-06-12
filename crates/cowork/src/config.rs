@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-pub const MODEL: &str = "gemma4:12b-it-qat";
+pub const MODEL: &str = "gemma4:31b-it-qat";
 pub(crate) const AGENT_MAX_TURNS: usize = 1000;
 
 /// Backoffs between successive retries, slowest last. We make one more attempt

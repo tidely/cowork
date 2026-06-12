@@ -202,13 +202,14 @@ fn build_runtime(
         tools.insert(agent_tools::fs::ListDirectory),
         tools.insert(agent_tools::fs::EditFile),
         tools.insert(agent_tools::fs::WriteFile),
+        tools.insert(agent_tools::terminal::Terminal),
     ];
     if let Some(context) = subagent_context {
         registrations.push(tools.insert(SubagentTool::new(context)));
     }
 
     for result in registrations {
-        result.expect("filesystem tool names are unique");
+        result.expect("built-in tool names are unique");
     }
 
     let mut config = AgentConfig::new(MODEL);

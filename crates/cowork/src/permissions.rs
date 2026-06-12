@@ -46,7 +46,7 @@ impl AgentProfile {
     pub(crate) fn read_only() -> Self {
         Self {
             allowed_tools: always_allowed_read_and_delegate_tools(),
-            denied_tools: tool_names(["edit_file", "write_file"]),
+            denied_tools: tool_names(["edit_file", "write_file", "terminal"]),
             default_permission: ToolPermissionMode::Ask,
         }
     }
