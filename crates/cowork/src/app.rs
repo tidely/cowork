@@ -1,18 +1,94 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    fmt,
+};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use llm::TokenUsage;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 
-pub type ThreadId = usize;
-pub type AgentId = usize;
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct ThreadId(usize);
+
+impl ThreadId {
+    pub const fn new(value: usize) -> Self {
+        Self(value)
+    }
+
+    fn next(&mut self) -> Self {
+        let current = *self;
+        self.0 += 1;
+        current
+    }
+
+    fn display_number(self) -> usize {
+        self.0 + 1
+    }
+}
+
+impl fmt::Display for ThreadId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct AgentId(usize);
+
+impl AgentId {
+    pub const fn new(value: usize) -> Self {
+        Self(value)
+    }
+
+    fn next(&mut self) -> Self {
+        let current = *self;
+        self.0 += 1;
+        current
+    }
+}
+
+impl fmt::Display for AgentId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
 /// A random, per-spawn agent id (a UUIDv4 as a `u128`). Random rather than a
 /// counter so persisted `runtime-agent-{key}` conversation ids never collide,
 /// in a session or across sessions once persistence lands.
-pub type RuntimeAgentKey = u128;
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(transparent)]
+pub struct RuntimeAgentKey(u128);
 
-pub const MAIN_AGENT_ID: AgentId = 0;
+impl RuntimeAgentKey {
+    pub const fn new(value: u128) -> Self {
+        Self(value)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wrapping_add(self, rhs: u128) -> Self {
+        Self(self.0.wrapping_add(rhs))
+    }
+}
+
+impl fmt::Display for RuntimeAgentKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+pub const MAIN_AGENT_ID: AgentId = AgentId::new(0);
 
 /// Nesting depth of an agent in the hierarchy. The top-level assistant is 0;
 /// each `subagent` call spawns a child one level deeper. A plain count rather
@@ -21,7 +97,7 @@ pub type AgentDepth = usize;
 
 pub const MAIN_AGENT_DEPTH: AgentDepth = 0;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AgentStatus {
     Idle,
     Running,
@@ -30,7 +106,7 @@ pub enum AgentStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageRole {
     System,
     User,
@@ -55,7 +131,7 @@ impl MessageRole {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ToolStatus {
     AwaitingPermission,
     Running,
@@ -69,60 +145,166 @@ impl ToolStatus {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct Message {
-    pub role: MessageRole,
-    pub content: String,
+/// A tool-call card. Carries the call's display state structurally — the
+/// header summary and pretty-printed arguments, plus the live status and
+/// result — so nothing has to be packed into and re-parsed out of a string.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ToolDisplay {
+    pub call_id: String,
+    /// Header label, e.g. `read_file /tmp` or `subagent <task>`.
+    pub summary: String,
+    /// Pretty-printed JSON arguments.
+    pub arguments: String,
+    pub status: ToolStatus,
+    pub result: Option<String>,
     pub collapsed: bool,
-    pub tool_call_id: Option<String>,
-    pub tool_result: Option<String>,
-    pub tool_status: ToolStatus,
+}
+
+/// One visible entry in an agent's transcript. Each variant carries exactly the
+/// data its kind needs: only `Reasoning` and `ToolCall` are collapsible, and
+/// only `ToolCall` has a status/result — so a plain text message cannot express
+/// a tool status, and a `User` message cannot be "collapsed".
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum Message {
+    System(String),
+    User(String),
+    Assistant(String),
+    Reasoning { content: String, collapsed: bool },
+    ToolCall(ToolDisplay),
+    ToolResult(String),
+    Error(String),
 }
 
 impl Message {
-    fn new(role: MessageRole, content: impl Into<String>) -> Self {
-        Self {
-            role,
-            content: content.into(),
-            collapsed: false,
-            tool_call_id: None,
-            tool_result: None,
-            tool_status: ToolStatus::Running,
-        }
+    fn system(content: impl Into<String>) -> Self {
+        Message::System(content.into())
+    }
+
+    fn user(content: impl Into<String>) -> Self {
+        Message::User(content.into())
+    }
+
+    fn tool_result(content: impl Into<String>) -> Self {
+        Message::ToolResult(content.into())
+    }
+
+    fn error(content: impl Into<String>) -> Self {
+        Message::Error(content.into())
     }
 
     fn tool_call(id: String, name: String, arguments: &Value) -> Self {
-        Self {
-            role: MessageRole::ToolCall,
-            content: format!(
-                "{}\n{}",
-                tool_call_summary(&name, arguments),
-                pretty_json(arguments)
-            ),
+        Message::ToolCall(ToolDisplay {
+            call_id: id,
+            summary: tool_call_summary(&name, arguments),
+            arguments: pretty_json(arguments),
+            status: ToolStatus::Running,
+            result: None,
             collapsed: true,
-            tool_call_id: Some(id),
-            tool_result: None,
-            tool_status: ToolStatus::Running,
+        })
+    }
+
+    /// The kind discriminant, for styling, labels, and the streaming-delta
+    /// coalescing check.
+    pub fn role(&self) -> MessageRole {
+        match self {
+            Message::System(_) => MessageRole::System,
+            Message::User(_) => MessageRole::User,
+            Message::Assistant(_) => MessageRole::Assistant,
+            Message::Reasoning { .. } => MessageRole::Reasoning,
+            Message::ToolCall(_) => MessageRole::ToolCall,
+            Message::ToolResult(_) => MessageRole::ToolResult,
+            Message::Error(_) => MessageRole::Error,
+        }
+    }
+
+    /// The text body of a plain message; `None` for a tool call, which renders
+    /// from its structured fields instead.
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Message::System(content)
+            | Message::User(content)
+            | Message::Assistant(content)
+            | Message::ToolResult(content)
+            | Message::Error(content)
+            | Message::Reasoning { content, .. } => Some(content),
+            Message::ToolCall(_) => None,
+        }
+    }
+
+    /// The text body as a growable buffer, for appending streaming deltas.
+    fn text_mut(&mut self) -> Option<&mut String> {
+        match self {
+            Message::System(content)
+            | Message::User(content)
+            | Message::Assistant(content)
+            | Message::ToolResult(content)
+            | Message::Error(content)
+            | Message::Reasoning { content, .. } => Some(content),
+            Message::ToolCall(_) => None,
+        }
+    }
+
+    pub fn tool(&self) -> Option<&ToolDisplay> {
+        match self {
+            Message::ToolCall(tool) => Some(tool),
+            _ => None,
+        }
+    }
+
+    fn tool_mut(&mut self) -> Option<&mut ToolDisplay> {
+        match self {
+            Message::ToolCall(tool) => Some(tool),
+            _ => None,
+        }
+    }
+
+    /// Whether this message can be collapsed/expanded in the conversation view.
+    pub fn is_collapsible(&self) -> bool {
+        matches!(self, Message::Reasoning { .. } | Message::ToolCall(_))
+    }
+
+    pub fn collapsed(&self) -> bool {
+        match self {
+            Message::Reasoning { collapsed, .. } => *collapsed,
+            Message::ToolCall(tool) => tool.collapsed,
+            _ => false,
+        }
+    }
+
+    /// Set the collapsed flag; a no-op on a non-collapsible message.
+    fn set_collapsed(&mut self, value: bool) {
+        match self {
+            Message::Reasoning { collapsed, .. } => *collapsed = value,
+            Message::ToolCall(tool) => tool.collapsed = value,
+            _ => {}
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct TokenUsage {
-    pub input_tokens: u64,
-    pub output_tokens: u64,
-    pub total_tokens: u64,
-}
+#[cfg(test)]
+impl Message {
+    fn content(&self) -> &str {
+        self.text().unwrap_or_default()
+    }
 
-impl TokenUsage {
-    fn add(&mut self, other: TokenUsage) {
-        self.input_tokens += other.input_tokens;
-        self.output_tokens += other.output_tokens;
-        self.total_tokens += other.total_tokens;
+    fn tool_status(&self) -> ToolStatus {
+        self.tool().expect("a tool-call message").status
+    }
+
+    fn tool_result_text(&self) -> Option<&str> {
+        self.tool().and_then(|tool| tool.result.as_deref())
+    }
+
+    fn tool_call_id(&self) -> Option<&str> {
+        self.tool().map(|tool| tool.call_id.as_str())
+    }
+
+    fn tool_summary(&self) -> Option<&str> {
+        self.tool().map(|tool| tool.summary.as_str())
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentNode {
     pub id: AgentId,
     pub parent_id: Option<AgentId>,
@@ -135,7 +317,9 @@ pub struct AgentNode {
     pub messages: Vec<Message>,
     /// Number of messages present before the current run began. A retry rewinds
     /// the transcript to this point so a failed attempt's partial output does
-    /// not stack under the next attempt's.
+    /// not stack under the next attempt's. Per-run transient: never persisted,
+    /// and reset to the message count on restore.
+    #[serde(default, skip_serializing)]
     message_baseline: usize,
 }
 
@@ -157,7 +341,7 @@ impl AgentNode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ThreadState {
     pub id: ThreadId,
     pub title: String,
@@ -171,7 +355,7 @@ impl ThreadState {
     pub fn total_token_usage(&self) -> TokenUsage {
         let mut usage = self.main_agent.token_usage;
         for agent in &self.subagents {
-            usage.add(agent.token_usage);
+            usage += agent.token_usage;
         }
         usage
     }
@@ -293,69 +477,65 @@ pub enum AgentAddr {
 }
 
 #[derive(Debug, Clone)]
-pub enum AgentEvent {
+pub enum ThreadEvent {
     /// The top-level prompt run has begun.
-    Started,
+    MainStarted,
     /// A subagent stream has begun; creates its node in the tree.
-    Spawned {
+    SpawnedSubagent {
         key: RuntimeAgentKey,
         parent: Option<RuntimeAgentKey>,
         depth: AgentDepth,
         task: String,
         context: Option<String>,
     },
-    AssistantDelta {
+    /// An event for one visible agent node in the thread.
+    Agent {
         addr: AgentAddr,
-        delta: String,
-    },
-    ReasoningDelta {
-        addr: AgentAddr,
-        delta: String,
-    },
-    ToolCall {
-        addr: AgentAddr,
-        id: String,
-        name: String,
-        arguments: Value,
-    },
-    ToolResult {
-        addr: AgentAddr,
-        id: String,
-        content: String,
-        is_error: bool,
-    },
-    Usage {
-        addr: AgentAddr,
-        input_tokens: u64,
-        output_tokens: u64,
-        total_tokens: u64,
-    },
-    /// An agent finished. `result` is the subagent's returned text (shown as a
-    /// tool result); `None` marks the top-level agent done.
-    Finished {
-        addr: AgentAddr,
-        result: Option<String>,
-    },
-    Error {
-        addr: AgentAddr,
-        error: String,
+        event: AgentNodeEvent,
     },
     /// The top-level run was cancelled by the user. Marks the main agent and any
     /// still-running subagents of the thread as cancelled. Thread-wide, so it
     /// carries no agent address — the thread id routes it.
     Cancelled,
+}
+
+#[derive(Debug, Clone)]
+pub enum AgentNodeEvent {
+    AssistantDelta {
+        delta: String,
+    },
+    ReasoningDelta {
+        delta: String,
+    },
+    ToolCall {
+        id: String,
+        name: String,
+        arguments: Value,
+    },
+    ToolResult {
+        id: String,
+        content: String,
+        is_error: bool,
+    },
+    Usage(TokenUsage),
+    Finished(AgentCompletion),
+    Error(String),
     /// Rewind an agent's visible transcript to its pre-run baseline. Emitted
     /// before a retry so the partial output of the failed attempt is discarded.
-    Reset {
-        addr: AgentAddr,
-    },
+    Reset,
+}
+
+#[derive(Debug, Clone)]
+pub enum AgentCompletion {
+    Done,
+    Returned(String),
 }
 
 impl AppState {
     pub fn new() -> Self {
         Self {
             threads: vec![ThreadState {
-                id: 0,
+                id: ThreadId::new(0),
                 title: "Thread 1".to_string(),
                 conversation_id: "agent-thread-0".to_string(),
                 expanded: true,
@@ -363,7 +543,7 @@ impl AppState {
                 subagents: Vec::new(),
             }],
             selected: Selection {
-                thread_id: 0,
+                thread_id: ThreadId::new(0),
                 agent_id: MAIN_AGENT_ID,
             },
             focus: Focus::Input,
@@ -377,8 +557,69 @@ impl AppState {
             pending_tool_permissions: VecDeque::new(),
             always_allowed_tools: HashSet::new(),
             running_cancellations: HashMap::new(),
-            next_thread_id: 1,
-            next_agent_id: 1,
+            next_thread_id: ThreadId::new(1),
+            next_agent_id: AgentId::new(1),
+        }
+    }
+
+    /// Rebuild an app from a persisted session. Falls back to a fresh app when
+    /// the snapshot carries no threads. In-flight statuses are normalized so the
+    /// restored session is immediately usable (see [`normalize_after_restore`]).
+    pub fn restored(
+        threads: Vec<ThreadState>,
+        next_thread_id: ThreadId,
+        next_agent_id: AgentId,
+        always_allowed_tools: Vec<String>,
+    ) -> Self {
+        let mut app = Self::new();
+        let Some(first_thread_id) = threads.first().map(|thread| thread.id) else {
+            return app;
+        };
+
+        app.threads = threads;
+        app.next_thread_id = next_thread_id;
+        app.next_agent_id = next_agent_id;
+        app.always_allowed_tools = always_allowed_tools.into_iter().collect();
+        app.selected = Selection {
+            thread_id: first_thread_id,
+            agent_id: MAIN_AGENT_ID,
+        };
+        app.normalize_after_restore();
+        app
+    }
+
+    /// Clone of the persistable thread tree. The transient runtime state
+    /// (pending permissions, cancellation tokens, focus/scroll/input) is left
+    /// out — only the conversation tree and its metadata are snapshotted.
+    pub fn snapshot_threads(&self) -> Vec<ThreadState> {
+        self.threads.clone()
+    }
+
+    pub fn next_ids(&self) -> (ThreadId, AgentId) {
+        (self.next_thread_id, self.next_agent_id)
+    }
+
+    pub fn always_allowed_tools(&self) -> Vec<String> {
+        self.always_allowed_tools.iter().cloned().collect()
+    }
+
+    /// Whether any thread has a live run. Persistence skips snapshotting while a
+    /// run is in flight so a half-finished turn is never written to disk.
+    pub fn any_running(&self) -> bool {
+        self.threads
+            .iter()
+            .any(|thread| thread.main_agent.status == AgentStatus::Running)
+    }
+
+    /// Bring a freshly loaded tree to rest: a run that was in flight at save
+    /// time has no backing task after restart, so its non-terminal statuses are
+    /// settled and each agent's retry baseline is re-anchored to its transcript.
+    fn normalize_after_restore(&mut self) {
+        for thread in &mut self.threads {
+            normalize_restored_agent(&mut thread.main_agent, true);
+            for agent in &mut thread.subagents {
+                normalize_restored_agent(agent, false);
+            }
         }
     }
 
@@ -523,9 +764,9 @@ impl AppState {
         self.pending_tool_permissions.push_back(request);
     }
 
-    pub fn apply_agent_event(&mut self, thread_id: ThreadId, event: AgentEvent) {
+    pub fn apply_thread_event(&mut self, thread_id: ThreadId, event: ThreadEvent) {
         match event {
-            AgentEvent::Started => {
+            ThreadEvent::MainStarted => {
                 if let Some(agent) = self.agent_mut(thread_id, MAIN_AGENT_ID) {
                     agent.status = AgentStatus::Running;
                     // The user prompt is already appended; mark this as the
@@ -533,96 +774,17 @@ impl AppState {
                     agent.message_baseline = agent.messages.len();
                 }
             }
-            AgentEvent::Spawned {
+            ThreadEvent::SpawnedSubagent {
                 key,
                 parent,
                 depth,
                 task,
                 context,
             } => self.spawn_nested(thread_id, key, parent, depth, task, context),
-            AgentEvent::AssistantDelta { addr, delta } => {
-                if let Some(agent_id) = self.resolve_addr(thread_id, addr) {
-                    self.collapse_last_reasoning(thread_id, agent_id);
-                    self.append_delta(thread_id, agent_id, MessageRole::Assistant, &delta);
-                }
+            ThreadEvent::Agent { addr, event } => {
+                self.apply_agent_node_event(thread_id, addr, event);
             }
-            AgentEvent::ReasoningDelta { addr, delta } => {
-                if let Some(agent_id) = self.resolve_addr(thread_id, addr) {
-                    self.append_delta(thread_id, agent_id, MessageRole::Reasoning, &delta);
-                }
-            }
-            AgentEvent::ToolCall {
-                addr,
-                id,
-                name,
-                arguments,
-            } => {
-                if let Some(agent_id) = self.resolve_addr(thread_id, addr) {
-                    self.collapse_last_reasoning(thread_id, agent_id);
-                    if let Some(agent) = self.agent_mut(thread_id, agent_id) {
-                        agent
-                            .messages
-                            .push(Message::tool_call(id, name, &arguments));
-                    }
-                }
-            }
-            AgentEvent::ToolResult {
-                addr,
-                id,
-                content,
-                is_error,
-            } => {
-                if let Some(agent_id) = self.resolve_addr(thread_id, addr) {
-                    self.collapse_last_reasoning(thread_id, agent_id);
-                    self.apply_tool_result_to_agent(thread_id, agent_id, &id, &content, is_error);
-                }
-            }
-            AgentEvent::Usage {
-                addr,
-                input_tokens,
-                output_tokens,
-                total_tokens,
-            } => {
-                if let Some(agent_id) = self.resolve_addr(thread_id, addr) {
-                    self.collapse_last_reasoning(thread_id, agent_id);
-                    if let Some(agent) = self.agent_mut(thread_id, agent_id) {
-                        agent.token_usage.add(TokenUsage {
-                            input_tokens,
-                            output_tokens,
-                            total_tokens,
-                        });
-                    }
-                }
-            }
-            AgentEvent::Finished { addr, result } => {
-                if addr == AgentAddr::Main {
-                    self.running_cancellations.remove(&thread_id);
-                }
-                if let Some(agent_id) = self.resolve_addr(thread_id, addr)
-                    && let Some(agent) = self.agent_mut(thread_id, agent_id)
-                {
-                    agent.status = AgentStatus::Complete;
-                    collapse_reasoning(agent);
-                    if let Some(result) = result {
-                        agent
-                            .messages
-                            .push(Message::new(MessageRole::ToolResult, result));
-                    }
-                }
-            }
-            AgentEvent::Error { addr, error } => {
-                if addr == AgentAddr::Main {
-                    self.running_cancellations.remove(&thread_id);
-                }
-                if let Some(agent_id) = self.resolve_addr(thread_id, addr)
-                    && let Some(agent) = self.agent_mut(thread_id, agent_id)
-                {
-                    agent.status = AgentStatus::Error;
-                    collapse_reasoning(agent);
-                    agent.messages.push(Message::new(MessageRole::Error, error));
-                }
-            }
-            AgentEvent::Cancelled => {
+            ThreadEvent::Cancelled => {
                 // Cancellation is thread-wide: the dropped run leaves running
                 // subagents with no terminal event of their own, so sweep them
                 // all here and drop the run's token and pending prompts.
@@ -630,10 +792,79 @@ impl AppState {
                 self.discard_pending_permissions_for_thread(thread_id);
                 self.cancel_thread_agents(thread_id);
             }
-            AgentEvent::Reset { addr } => {
-                if let Some(agent_id) = self.resolve_addr(thread_id, addr)
-                    && let Some(agent) = self.agent_mut(thread_id, agent_id)
-                {
+        }
+    }
+
+    fn apply_agent_node_event(
+        &mut self,
+        thread_id: ThreadId,
+        addr: AgentAddr,
+        event: AgentNodeEvent,
+    ) {
+        if matches!(
+            event,
+            AgentNodeEvent::Finished(_) | AgentNodeEvent::Error(_)
+        ) && addr == AgentAddr::Main
+        {
+            self.running_cancellations.remove(&thread_id);
+        }
+
+        let Some(agent_id) = self.resolve_addr(thread_id, addr) else {
+            return;
+        };
+
+        match event {
+            AgentNodeEvent::AssistantDelta { delta } => {
+                self.collapse_last_reasoning(thread_id, agent_id);
+                self.append_delta(thread_id, agent_id, TextDeltaKind::Assistant, &delta);
+            }
+            AgentNodeEvent::ReasoningDelta { delta } => {
+                self.append_delta(thread_id, agent_id, TextDeltaKind::Reasoning, &delta);
+            }
+            AgentNodeEvent::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                self.collapse_last_reasoning(thread_id, agent_id);
+                if let Some(agent) = self.agent_mut(thread_id, agent_id) {
+                    agent
+                        .messages
+                        .push(Message::tool_call(id, name, &arguments));
+                }
+            }
+            AgentNodeEvent::ToolResult {
+                id,
+                content,
+                is_error,
+            } => {
+                self.collapse_last_reasoning(thread_id, agent_id);
+                self.apply_tool_result_to_agent(thread_id, agent_id, &id, &content, is_error);
+            }
+            AgentNodeEvent::Usage(usage) => {
+                self.collapse_last_reasoning(thread_id, agent_id);
+                if let Some(agent) = self.agent_mut(thread_id, agent_id) {
+                    agent.token_usage += usage;
+                }
+            }
+            AgentNodeEvent::Finished(completion) => {
+                if let Some(agent) = self.agent_mut(thread_id, agent_id) {
+                    agent.status = AgentStatus::Complete;
+                    collapse_reasoning(agent);
+                    if let AgentCompletion::Returned(result) = completion {
+                        agent.messages.push(Message::tool_result(result));
+                    }
+                }
+            }
+            AgentNodeEvent::Error(error) => {
+                if let Some(agent) = self.agent_mut(thread_id, agent_id) {
+                    agent.status = AgentStatus::Error;
+                    collapse_reasoning(agent);
+                    agent.messages.push(Message::error(error));
+                }
+            }
+            AgentNodeEvent::Reset => {
+                if let Some(agent) = self.agent_mut(thread_id, agent_id) {
                     agent.messages.truncate(agent.message_baseline);
                     agent.status = AgentStatus::Running;
                 }
@@ -748,9 +979,7 @@ impl AppState {
                     .messages
                     .iter()
                     .enumerate()
-                    .filter(|(_, message)| {
-                        matches!(message.role, MessageRole::Reasoning | MessageRole::ToolCall)
-                    })
+                    .filter(|(_, message)| message.is_collapsible())
                     .map(|(index, _)| index)
                     .collect()
             })
@@ -776,7 +1005,7 @@ impl AppState {
         if let Some(agent) = self.agent_mut(self.selected.thread_id, self.selected.agent_id)
             && let Some(message) = agent.messages.get_mut(index)
         {
-            message.collapsed = !message.collapsed;
+            message.set_collapsed(!message.collapsed());
         }
     }
 
@@ -856,7 +1085,7 @@ impl AppState {
         thread
             .main_agent
             .messages
-            .push(Message::new(MessageRole::User, prompt.clone()));
+            .push(Message::user(prompt.clone()));
         let conversation_id = thread.conversation_id.clone();
 
         self.selected.agent_id = MAIN_AGENT_ID;
@@ -955,11 +1184,10 @@ impl AppState {
     }
 
     fn create_thread(&mut self) {
-        let id = self.next_thread_id;
-        self.next_thread_id += 1;
+        let id = self.next_thread_id.next();
         self.threads.push(ThreadState {
             id,
-            title: format!("Thread {}", id + 1),
+            title: format!("Thread {}", id.display_number()),
             conversation_id: format!("agent-thread-{id}"),
             expanded: true,
             main_agent: AgentNode::main(),
@@ -998,7 +1226,7 @@ impl AppState {
         &mut self,
         thread_id: ThreadId,
         agent_id: AgentId,
-        role: MessageRole,
+        kind: TextDeltaKind,
         delta: &str,
     ) {
         if delta.is_empty() {
@@ -1010,13 +1238,14 @@ impl AppState {
         };
 
         if let Some(last) = agent.messages.last_mut()
-            && last.role == role
+            && last.role() == kind.message_role()
+            && let Some(content) = last.text_mut()
         {
-            last.content.push_str(delta);
+            content.push_str(delta);
             return;
         }
 
-        agent.messages.push(Message::new(role, delta));
+        agent.messages.push(kind.message(delta));
     }
 
     fn spawn_nested(
@@ -1032,16 +1261,12 @@ impl AppState {
             .and_then(|parent_key| self.agent_id_by_runtime_key(thread_id, parent_key))
             .unwrap_or(MAIN_AGENT_ID);
 
-        let id = self.next_agent_id;
-        self.next_agent_id += 1;
+        let id = self.next_agent_id.next();
         let label = truncate_chars(&task, 36);
 
-        let mut messages = vec![Message::new(MessageRole::User, task)];
+        let mut messages = vec![Message::user(task)];
         if let Some(context) = context.filter(|context| !context.trim().is_empty()) {
-            messages.push(Message::new(
-                MessageRole::System,
-                format!("Context:\n{}", context.trim()),
-            ));
+            messages.push(Message::system(format!("Context:\n{}", context.trim())));
         }
 
         if let Some(thread) = self.thread_mut(thread_id) {
@@ -1083,7 +1308,7 @@ impl AppState {
         if let Some(agent) = self.agent_mut(thread_id, agent_id) {
             agent
                 .messages
-                .push(Message::new(MessageRole::ToolResult, content.to_string()));
+                .push(Message::tool_result(content.to_string()));
         }
     }
 
@@ -1099,19 +1324,20 @@ impl AppState {
             return false;
         };
 
-        let Some(message) = agent
+        let Some(tool) = agent
             .messages
             .iter_mut()
             .rev()
-            .find(|message| message.tool_call_id.as_deref() == Some(tool_call_id))
+            .filter_map(|message| message.tool_mut())
+            .find(|tool| tool.call_id == tool_call_id)
         else {
             return false;
         };
 
         if let Some(result) = result {
-            message.tool_result = Some(result.to_string());
+            tool.result = Some(result.to_string());
         }
-        message.tool_status = status;
+        tool.status = status;
         true
     }
 
@@ -1121,9 +1347,9 @@ impl AppState {
                 .messages
                 .iter_mut()
                 .rev()
-                .find(|message| message.role == MessageRole::Reasoning)
+                .find(|message| message.role() == MessageRole::Reasoning)
         {
-            message.collapsed = true;
+            message.set_collapsed(true);
         }
     }
 
@@ -1133,9 +1359,9 @@ impl AppState {
                 .messages
                 .iter_mut()
                 .rev()
-                .find(|message| message.role == MessageRole::Reasoning)
+                .find(|message| message.role() == MessageRole::Reasoning)
         {
-            message.collapsed = !message.collapsed;
+            message.set_collapsed(!message.collapsed());
         }
     }
 
@@ -1227,16 +1453,62 @@ fn append_child_sidebar_items(
 }
 
 fn initial_main_messages() -> Vec<Message> {
-    vec![Message::new(
-        MessageRole::System,
-        crate::config::MAIN_AGENT_PREAMBLE,
-    )]
+    vec![Message::system(crate::config::MAIN_AGENT_PREAMBLE)]
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextDeltaKind {
+    Assistant,
+    Reasoning,
+}
+
+impl TextDeltaKind {
+    fn message_role(self) -> MessageRole {
+        match self {
+            TextDeltaKind::Assistant => MessageRole::Assistant,
+            TextDeltaKind::Reasoning => MessageRole::Reasoning,
+        }
+    }
+
+    fn message(self, content: impl Into<String>) -> Message {
+        match self {
+            TextDeltaKind::Assistant => Message::Assistant(content.into()),
+            TextDeltaKind::Reasoning => Message::Reasoning {
+                content: content.into(),
+                collapsed: false,
+            },
+        }
+    }
+}
+
+/// Settle a restored agent. A run interrupted by exit left it `Running` with no
+/// task to resume: the main agent drops to `Idle` so its thread accepts a new
+/// prompt, a subagent becomes `Cancelled`, and any tool call still awaiting
+/// permission or mid-execution is marked failed. The retry baseline is
+/// re-anchored to the loaded transcript, and reasoning is collapsed as at rest.
+fn normalize_restored_agent(agent: &mut AgentNode, is_main: bool) {
+    if agent.status == AgentStatus::Running {
+        agent.status = if is_main {
+            AgentStatus::Idle
+        } else {
+            AgentStatus::Cancelled
+        };
+    }
+    for message in &mut agent.messages {
+        if let Some(tool) = message.tool_mut()
+            && !tool.status.is_done()
+        {
+            tool.status = ToolStatus::Failed;
+        }
+    }
+    agent.message_baseline = agent.messages.len();
+    collapse_reasoning(agent);
 }
 
 fn collapse_reasoning(agent: &mut AgentNode) {
     for message in &mut agent.messages {
-        if message.role == MessageRole::Reasoning {
-            message.collapsed = true;
+        if message.role() == MessageRole::Reasoning {
+            message.set_collapsed(true);
         }
     }
 }
@@ -1299,7 +1571,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    const T: ThreadId = 0;
+    const T: ThreadId = ThreadId::new(0);
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1320,41 +1592,46 @@ mod tests {
     }
 
     // Event constructors for the top-level agent.
-    fn assistant(delta: &str) -> AgentEvent {
-        AgentEvent::AssistantDelta {
+    fn main_event(event: AgentNodeEvent) -> ThreadEvent {
+        ThreadEvent::Agent {
             addr: AgentAddr::Main,
-            delta: delta.into(),
+            event,
         }
     }
 
-    fn reasoning(delta: &str) -> AgentEvent {
-        AgentEvent::ReasoningDelta {
-            addr: AgentAddr::Main,
-            delta: delta.into(),
-        }
+    fn agent_event(addr: AgentAddr, event: AgentNodeEvent) -> ThreadEvent {
+        ThreadEvent::Agent { addr, event }
     }
 
-    fn tool_result(id: &str, content: &str) -> AgentEvent {
-        AgentEvent::ToolResult {
-            addr: AgentAddr::Main,
+    fn assistant(delta: &str) -> ThreadEvent {
+        main_event(AgentNodeEvent::AssistantDelta {
+            delta: delta.into(),
+        })
+    }
+
+    fn reasoning(delta: &str) -> ThreadEvent {
+        main_event(AgentNodeEvent::ReasoningDelta {
+            delta: delta.into(),
+        })
+    }
+
+    fn tool_result(id: &str, content: &str) -> ThreadEvent {
+        main_event(AgentNodeEvent::ToolResult {
             id: id.into(),
             content: content.into(),
             is_error: false,
-        }
+        })
     }
 
-    fn finished(result: Option<&str>) -> AgentEvent {
-        AgentEvent::Finished {
-            addr: AgentAddr::Main,
-            result: result.map(|s| s.into()),
-        }
+    fn finished(result: Option<&str>) -> ThreadEvent {
+        let completion = result
+            .map(|result| AgentCompletion::Returned(result.into()))
+            .unwrap_or(AgentCompletion::Done);
+        main_event(AgentNodeEvent::Finished(completion))
     }
 
-    fn error(msg: &str) -> AgentEvent {
-        AgentEvent::Error {
-            addr: AgentAddr::Main,
-            error: msg.into(),
-        }
+    fn error(msg: &str) -> ThreadEvent {
+        main_event(AgentNodeEvent::Error(msg.into()))
     }
 
     // ----- reducer: main agent -----
@@ -1364,14 +1641,14 @@ mod tests {
         let app = AppState::new();
         assert_eq!(app.threads[0].main_agent.status, AgentStatus::Idle);
         assert_eq!(main_messages(&app).len(), 1);
-        assert_eq!(main_messages(&app)[0].role, MessageRole::System);
+        assert_eq!(main_messages(&app)[0].role(), MessageRole::System);
     }
 
     #[test]
     fn started_sets_running_without_visible_message() {
         let mut app = AppState::new();
         let message_count = main_messages(&app).len();
-        app.apply_agent_event(T, AgentEvent::Started);
+        app.apply_thread_event(T, ThreadEvent::MainStarted);
         assert_eq!(app.threads[0].main_agent.status, AgentStatus::Running);
         assert_eq!(main_messages(&app).len(), message_count);
     }
@@ -1379,74 +1656,78 @@ mod tests {
     #[test]
     fn assistant_deltas_accumulate_into_one_message() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, assistant("Hel"));
-        app.apply_agent_event(T, assistant("lo"));
-        assert_eq!(last(&app).role, MessageRole::Assistant);
-        assert_eq!(last(&app).content, "Hello");
+        app.apply_thread_event(T, assistant("Hel"));
+        app.apply_thread_event(T, assistant("lo"));
+        assert_eq!(last(&app).role(), MessageRole::Assistant);
+        assert_eq!(last(&app).content(), "Hello");
     }
 
     #[test]
     fn assistant_after_reasoning_collapses_the_reasoning() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, reasoning("thinking"));
-        assert!(!main_messages(&app)[1].collapsed);
-        app.apply_agent_event(T, assistant("answer"));
-        assert!(main_messages(&app)[1].collapsed, "reasoning collapses");
-        assert_eq!(last(&app).role, MessageRole::Assistant);
+        app.apply_thread_event(T, reasoning("thinking"));
+        assert!(!main_messages(&app)[1].collapsed());
+        app.apply_thread_event(T, assistant("answer"));
+        assert!(main_messages(&app)[1].collapsed(), "reasoning collapses");
+        assert_eq!(last(&app).role(), MessageRole::Assistant);
     }
 
     #[test]
     fn finished_sets_complete_and_collapses_reasoning_without_visible_message() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, reasoning("x"));
+        app.apply_thread_event(T, reasoning("x"));
         let message_count = main_messages(&app).len();
-        app.apply_agent_event(T, finished(None));
+        app.apply_thread_event(T, finished(None));
         assert_eq!(app.threads[0].main_agent.status, AgentStatus::Complete);
-        assert!(main_messages(&app)[1].collapsed);
+        assert!(main_messages(&app)[1].collapsed());
         assert_eq!(main_messages(&app).len(), message_count);
     }
 
     #[test]
     fn error_sets_error_status_and_message() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, error("boom"));
+        app.apply_thread_event(T, error("boom"));
         assert_eq!(app.threads[0].main_agent.status, AgentStatus::Error);
-        assert_eq!(last(&app).role, MessageRole::Error);
-        assert_eq!(last(&app).content, "boom");
+        assert_eq!(last(&app).role(), MessageRole::Error);
+        assert_eq!(last(&app).content(), "boom");
     }
 
     #[test]
     fn tool_call_appends_running_tool_message() {
         let mut app = AppState::new();
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolCall {
+            ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id: "t1".into(),
-                name: "read_file".into(),
-                arguments: json!({ "path": "/tmp" }),
+                event: AgentNodeEvent::ToolCall {
+                    id: "t1".into(),
+                    name: "read_file".into(),
+                    arguments: json!({ "path": "/tmp" }),
+                },
             },
         );
-        assert_eq!(last(&app).role, MessageRole::ToolCall);
-        assert_eq!(last(&app).tool_call_id.as_deref(), Some("t1"));
-        assert_eq!(last(&app).tool_status, ToolStatus::Running);
-        assert_eq!(last(&app).content.lines().next(), Some("read_file /tmp"));
+        assert_eq!(last(&app).role(), MessageRole::ToolCall);
+        assert_eq!(last(&app).tool_call_id(), Some("t1"));
+        assert_eq!(last(&app).tool_status(), ToolStatus::Running);
+        assert_eq!(last(&app).tool_summary(), Some("read_file /tmp"));
     }
 
     #[test]
     fn path_tool_call_summary_includes_path() {
         let mut app = AppState::new();
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolCall {
+            ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id: "t1".into(),
-                name: "list_directory".into(),
-                arguments: json!({ "path": "/workspace/src" }),
+                event: AgentNodeEvent::ToolCall {
+                    id: "t1".into(),
+                    name: "list_directory".into(),
+                    arguments: json!({ "path": "/workspace/src" }),
+                },
             },
         );
         assert_eq!(
-            last(&app).content.lines().next(),
+            last(&app).tool_summary(),
             Some("list_directory /workspace/src")
         );
     }
@@ -1454,17 +1735,16 @@ mod tests {
     #[test]
     fn write_file_tool_call_summary_includes_path() {
         let mut app = AppState::new();
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolCall {
-                addr: AgentAddr::Main,
+            ThreadEvent::Agent { addr: AgentAddr::Main, event: AgentNodeEvent::ToolCall {
                 id: "t1".into(),
                 name: "write_file".into(),
                 arguments: json!({ "path": "/workspace/src/new.rs", "content": "", "overwrite": false }),
-            },
+             } },
         );
         assert_eq!(
-            last(&app).content.lines().next(),
+            last(&app).tool_summary(),
             Some("write_file /workspace/src/new.rs")
         );
     }
@@ -1472,17 +1752,16 @@ mod tests {
     #[test]
     fn subagent_tool_call_summary_includes_task() {
         let mut app = AppState::new();
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolCall {
-                addr: AgentAddr::Main,
+            ThreadEvent::Agent { addr: AgentAddr::Main, event: AgentNodeEvent::ToolCall {
                 id: "t1".into(),
                 name: "subagent".into(),
                 arguments: json!({ "task": "review the parser module", "context": "src/parser.rs" }),
-            },
+             } },
         );
         assert_eq!(
-            last(&app).content.lines().next(),
+            last(&app).tool_summary(),
             Some("subagent review the parser module")
         );
     }
@@ -1490,38 +1769,44 @@ mod tests {
     #[test]
     fn tool_result_success_marks_finished() {
         let mut app = AppState::new();
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolCall {
+            ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id: "t1".into(),
-                name: "read_file".into(),
-                arguments: json!({}),
+                event: AgentNodeEvent::ToolCall {
+                    id: "t1".into(),
+                    name: "read_file".into(),
+                    arguments: json!({}),
+                },
             },
         );
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolResult {
+            ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id: "t1".into(),
-                content: "file contents".into(),
-                is_error: false,
+                event: AgentNodeEvent::ToolResult {
+                    id: "t1".into(),
+                    content: "file contents".into(),
+                    is_error: false,
+                },
             },
         );
-        assert_eq!(last(&app).tool_status, ToolStatus::Finished);
-        assert_eq!(last(&app).tool_result.as_deref(), Some("file contents"));
+        assert_eq!(last(&app).tool_status(), ToolStatus::Finished);
+        assert_eq!(last(&app).tool_result_text(), Some("file contents"));
     }
 
     #[tokio::test]
     async fn permission_request_marks_tool_call_and_accept_resumes_it() {
         let mut app = AppState::new();
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolCall {
+            ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id: "t1".into(),
-                name: "edit_file".into(),
-                arguments: json!({ "path": "/tmp/a" }),
+                event: AgentNodeEvent::ToolCall {
+                    id: "t1".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({ "path": "/tmp/a" }),
+                },
             },
         );
         let (respond_to, response) = oneshot::channel();
@@ -1534,7 +1819,7 @@ mod tests {
             json!({ "path": "/tmp/a" }),
             respond_to,
         ));
-        assert_eq!(last(&app).tool_status, ToolStatus::AwaitingPermission);
+        assert_eq!(last(&app).tool_status(), ToolStatus::AwaitingPermission);
         assert_eq!(
             app.pending_tool_permission().unwrap().summary(),
             "edit_file /tmp/a"
@@ -1543,20 +1828,22 @@ mod tests {
         app.handle_key(key(KeyCode::Char('a')));
 
         assert_eq!(response.await.unwrap(), ToolPermissionResponse::Allow);
-        assert_eq!(last(&app).tool_status, ToolStatus::Running);
+        assert_eq!(last(&app).tool_status(), ToolStatus::Running);
         assert!(app.pending_tool_permission().is_none());
     }
 
     #[tokio::test]
     async fn accept_once_does_not_allow_future_calls_for_same_tool() {
         let mut app = AppState::new();
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolCall {
+            ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id: "t1".into(),
-                name: "edit_file".into(),
-                arguments: json!({ "path": "/tmp/a" }),
+                event: AgentNodeEvent::ToolCall {
+                    id: "t1".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({ "path": "/tmp/a" }),
+                },
             },
         );
         let (respond_to, response) = oneshot::channel();
@@ -1572,13 +1859,15 @@ mod tests {
         app.handle_key(key(KeyCode::Char('a')));
         assert_eq!(response.await.unwrap(), ToolPermissionResponse::Allow);
 
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolCall {
+            ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id: "t2".into(),
-                name: "edit_file".into(),
-                arguments: json!({ "path": "/tmp/b" }),
+                event: AgentNodeEvent::ToolCall {
+                    id: "t2".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({ "path": "/tmp/b" }),
+                },
             },
         );
         let (respond_to, mut response) = oneshot::channel();
@@ -1598,13 +1887,15 @@ mod tests {
     #[tokio::test]
     async fn accept_always_allows_same_tool_only() {
         let mut app = AppState::new();
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolCall {
+            ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id: "t1".into(),
-                name: "edit_file".into(),
-                arguments: json!({ "path": "/tmp/a" }),
+                event: AgentNodeEvent::ToolCall {
+                    id: "t1".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({ "path": "/tmp/a" }),
+                },
             },
         );
         let (respond_to, response) = oneshot::channel();
@@ -1621,13 +1912,15 @@ mod tests {
         assert_eq!(response.await.unwrap(), ToolPermissionResponse::AllowAlways);
         assert!(app.pending_tool_permission().is_none());
 
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolCall {
+            ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id: "t2".into(),
-                name: "edit_file".into(),
-                arguments: json!({ "path": "/tmp/b" }),
+                event: AgentNodeEvent::ToolCall {
+                    id: "t2".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({ "path": "/tmp/b" }),
+                },
             },
         );
         let (respond_to, response) = oneshot::channel();
@@ -1642,13 +1935,15 @@ mod tests {
         assert_eq!(response.await.unwrap(), ToolPermissionResponse::AllowAlways);
         assert!(app.pending_tool_permission().is_none());
 
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolCall {
+            ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id: "t3".into(),
-                name: "write_file".into(),
-                arguments: json!({ "path": "/tmp/c", "content": "", "overwrite": false }),
+                event: AgentNodeEvent::ToolCall {
+                    id: "t3".into(),
+                    name: "write_file".into(),
+                    arguments: json!({ "path": "/tmp/c", "content": "", "overwrite": false }),
+                },
             },
         );
         let (respond_to, mut response) = oneshot::channel();
@@ -1671,13 +1966,15 @@ mod tests {
     #[tokio::test]
     async fn rejecting_permission_marks_tool_call_failed() {
         let mut app = AppState::new();
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolCall {
+            ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id: "t1".into(),
-                name: "edit_file".into(),
-                arguments: json!({ "path": "/tmp/a" }),
+                event: AgentNodeEvent::ToolCall {
+                    id: "t1".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({ "path": "/tmp/a" }),
+                },
             },
         );
         let (respond_to, response) = oneshot::channel();
@@ -1695,99 +1992,107 @@ mod tests {
         match response.await.unwrap() {
             ToolPermissionResponse::Reject { reason } => {
                 assert!(reason.contains("edit_file"));
-                assert_eq!(last(&app).tool_result.as_deref(), Some(reason.as_str()));
+                assert_eq!(last(&app).tool_result_text(), Some(reason.as_str()));
             }
             other => panic!("unexpected response: {other:?}"),
         }
-        assert_eq!(last(&app).tool_status, ToolStatus::Failed);
+        assert_eq!(last(&app).tool_status(), ToolStatus::Failed);
         assert!(app.pending_tool_permission().is_none());
     }
 
     #[test]
     fn tool_result_status_follows_is_error_flag_not_content() {
         let mut app = AppState::new();
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolCall {
+            ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id: "t1".into(),
-                name: "read_file".into(),
-                arguments: json!({}),
+                event: AgentNodeEvent::ToolCall {
+                    id: "t1".into(),
+                    name: "read_file".into(),
+                    arguments: json!({}),
+                },
             },
         );
         // The status comes from the `is_error` flag now, not by sniffing the
         // content: a successful result is finished even if its text happens to
         // look like an error string.
-        app.apply_agent_event(T, tool_result("t1", "ToolCallError: no such file"));
-        assert_eq!(last(&app).tool_status, ToolStatus::Finished);
+        app.apply_thread_event(T, tool_result("t1", "ToolCallError: no such file"));
+        assert_eq!(last(&app).tool_status(), ToolStatus::Finished);
     }
 
     #[test]
     fn explicit_tool_result_error_marks_failed_without_legacy_prefix() {
         let mut app = AppState::new();
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolCall {
+            ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id: "t1".into(),
-                name: "edit_file".into(),
-                arguments: json!({}),
+                event: AgentNodeEvent::ToolCall {
+                    id: "t1".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({}),
+                },
             },
         );
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolResult {
+            ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id: "t1".into(),
-                content: "old_text was not found in the file".into(),
-                is_error: true,
+                event: AgentNodeEvent::ToolResult {
+                    id: "t1".into(),
+                    content: "old_text was not found in the file".into(),
+                    is_error: true,
+                },
             },
         );
-        assert_eq!(last(&app).tool_status, ToolStatus::Failed);
+        assert_eq!(last(&app).tool_status(), ToolStatus::Failed);
     }
 
     #[test]
     fn parallel_tool_results_mark_each_matching_call_finished() {
         let mut app = AppState::new();
         for id in ["t1", "t2", "t3"] {
-            app.apply_agent_event(
+            app.apply_thread_event(
                 T,
-                AgentEvent::ToolCall {
+                ThreadEvent::Agent {
                     addr: AgentAddr::Main,
-                    id: id.into(),
-                    name: "read_file".into(),
-                    arguments: json!({ "path": id }),
+                    event: AgentNodeEvent::ToolCall {
+                        id: id.into(),
+                        name: "read_file".into(),
+                        arguments: json!({ "path": id }),
+                    },
                 },
             );
         }
 
         // Parallel calls may complete in any order; each result must update its
         // own call rather than only the most recent visible tool call.
-        app.apply_agent_event(T, tool_result("t2", "second"));
-        app.apply_agent_event(T, tool_result("t1", "first"));
-        app.apply_agent_event(T, tool_result("t3", "third"));
+        app.apply_thread_event(T, tool_result("t2", "second"));
+        app.apply_thread_event(T, tool_result("t1", "first"));
+        app.apply_thread_event(T, tool_result("t3", "third"));
 
         let tool_calls: Vec<_> = main_messages(&app)
             .iter()
-            .filter(|message| message.role == MessageRole::ToolCall)
+            .filter(|message| message.role() == MessageRole::ToolCall)
             .collect();
         assert_eq!(tool_calls.len(), 3);
         assert!(
             tool_calls
                 .iter()
-                .all(|message| message.tool_status == ToolStatus::Finished)
+                .all(|message| message.tool_status() == ToolStatus::Finished)
         );
-        assert_eq!(tool_calls[0].tool_result.as_deref(), Some("first"));
-        assert_eq!(tool_calls[1].tool_result.as_deref(), Some("second"));
-        assert_eq!(tool_calls[2].tool_result.as_deref(), Some("third"));
+        assert_eq!(tool_calls[0].tool_result_text(), Some("first"));
+        assert_eq!(tool_calls[1].tool_result_text(), Some("second"));
+        assert_eq!(tool_calls[2].tool_result_text(), Some("third"));
     }
 
     #[test]
     fn tool_result_without_matching_call_is_appended() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, tool_result("missing", "orphan"));
-        assert_eq!(last(&app).role, MessageRole::ToolResult);
-        assert_eq!(last(&app).content, "orphan");
+        app.apply_thread_event(T, tool_result("missing", "orphan"));
+        assert_eq!(last(&app).role(), MessageRole::ToolResult);
+        assert_eq!(last(&app).content(), "orphan");
     }
 
     // ----- reducer: nested agents -----
@@ -1797,8 +2102,8 @@ mod tests {
         parent: Option<RuntimeAgentKey>,
         depth: AgentDepth,
         task: &str,
-    ) -> AgentEvent {
-        AgentEvent::Spawned {
+    ) -> ThreadEvent {
+        ThreadEvent::SpawnedSubagent {
             key,
             parent,
             depth,
@@ -1807,24 +2112,26 @@ mod tests {
         }
     }
 
-    fn nested_assistant(key: RuntimeAgentKey, delta: &str) -> AgentEvent {
-        AgentEvent::AssistantDelta {
+    fn nested_assistant(key: RuntimeAgentKey, delta: &str) -> ThreadEvent {
+        ThreadEvent::Agent {
             addr: AgentAddr::Runtime(key),
-            delta: delta.into(),
+            event: AgentNodeEvent::AssistantDelta {
+                delta: delta.into(),
+            },
         }
     }
 
-    fn nested_finished(key: RuntimeAgentKey, result: &str) -> AgentEvent {
-        AgentEvent::Finished {
+    fn nested_finished(key: RuntimeAgentKey, result: &str) -> ThreadEvent {
+        ThreadEvent::Agent {
             addr: AgentAddr::Runtime(key),
-            result: Some(result.into()),
+            event: AgentNodeEvent::Finished(AgentCompletion::Returned(result.into())),
         }
     }
 
-    fn nested_error(key: RuntimeAgentKey, error: &str) -> AgentEvent {
-        AgentEvent::Error {
+    fn nested_error(key: RuntimeAgentKey, error: &str) -> ThreadEvent {
+        ThreadEvent::Agent {
             addr: AgentAddr::Runtime(key),
-            error: error.into(),
+            event: AgentNodeEvent::Error(error.into()),
         }
     }
 
@@ -1833,24 +2140,29 @@ mod tests {
         input_tokens: u64,
         output_tokens: u64,
         total_tokens: u64,
-    ) -> AgentEvent {
-        AgentEvent::Usage {
+    ) -> ThreadEvent {
+        agent_event(
             addr,
-            input_tokens,
-            output_tokens,
-            total_tokens,
-        }
+            AgentNodeEvent::Usage(TokenUsage {
+                input_tokens,
+                output_tokens,
+                total_tokens,
+            }),
+        )
     }
 
     #[test]
     fn nested_started_creates_subagent_under_main() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, nested_started(1, None, 1, "do thing"));
+        app.apply_thread_event(
+            T,
+            nested_started(RuntimeAgentKey::new(1), None, 1, "do thing"),
+        );
 
         let subs = &app.threads[0].subagents;
         assert_eq!(subs.len(), 1);
         assert_eq!(subs[0].parent_id, Some(MAIN_AGENT_ID));
-        assert_eq!(subs[0].runtime_key, Some(1));
+        assert_eq!(subs[0].runtime_key, Some(RuntimeAgentKey::new(1)));
         assert_eq!(subs[0].status, AgentStatus::Running);
         assert_eq!(subs[0].depth, 1);
         assert_eq!(subs[0].label, "subagent: do thing");
@@ -1858,17 +2170,17 @@ mod tests {
             app.threads[0].expanded,
             "thread expands to reveal the subagent"
         );
-        assert_eq!(subs[0].messages[0].role, MessageRole::User);
-        assert_eq!(subs[0].messages[0].content, "do thing");
+        assert_eq!(subs[0].messages[0].role(), MessageRole::User);
+        assert_eq!(subs[0].messages[0].content(), "do thing");
     }
 
     #[test]
     fn nested_started_with_context_adds_system_message() {
         let mut app = AppState::new();
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::Spawned {
-                key: 1,
+            ThreadEvent::SpawnedSubagent {
+                key: RuntimeAgentKey::new(1),
                 parent: None,
                 depth: 1,
                 task: "task".into(),
@@ -1879,21 +2191,32 @@ mod tests {
         assert!(
             messages
                 .iter()
-                .any(|m| m.role == MessageRole::System && m.content.contains("important ctx"))
+                .any(|m| m.role() == MessageRole::System && m.content().contains("important ctx"))
         );
     }
 
     #[test]
     fn worker_nests_under_its_parent_subagent() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, nested_started(1, None, 1, "parent"));
+        app.apply_thread_event(
+            T,
+            nested_started(RuntimeAgentKey::new(1), None, 1, "parent"),
+        );
         let parent_id = app.threads[0].subagents[0].id;
-        app.apply_agent_event(T, nested_started(2, Some(1), 2, "child"));
+        app.apply_thread_event(
+            T,
+            nested_started(
+                RuntimeAgentKey::new(2),
+                Some(RuntimeAgentKey::new(1)),
+                2,
+                "child",
+            ),
+        );
 
         let worker = app.threads[0]
             .subagents
             .iter()
-            .find(|a| a.runtime_key == Some(2))
+            .find(|a| a.runtime_key == Some(RuntimeAgentKey::new(2)))
             .expect("worker node");
         assert_eq!(worker.parent_id, Some(parent_id));
         assert_eq!(worker.depth, 2);
@@ -1904,9 +2227,25 @@ mod tests {
         let mut app = AppState::new();
         // main(0) -> a(1) -> b(2) -> c(3): the tree nests past the old two-level
         // cap, each child one level deeper than its parent.
-        app.apply_agent_event(T, nested_started(1, None, 1, "a"));
-        app.apply_agent_event(T, nested_started(2, Some(1), 2, "b"));
-        app.apply_agent_event(T, nested_started(3, Some(2), 3, "c"));
+        app.apply_thread_event(T, nested_started(RuntimeAgentKey::new(1), None, 1, "a"));
+        app.apply_thread_event(
+            T,
+            nested_started(
+                RuntimeAgentKey::new(2),
+                Some(RuntimeAgentKey::new(1)),
+                2,
+                "b",
+            ),
+        );
+        app.apply_thread_event(
+            T,
+            nested_started(
+                RuntimeAgentKey::new(3),
+                Some(RuntimeAgentKey::new(2)),
+                3,
+                "c",
+            ),
+        );
 
         let subs = &app.threads[0].subagents;
         let find = |key| {
@@ -1914,55 +2253,81 @@ mod tests {
                 .find(|a| a.runtime_key == Some(key))
                 .expect("node")
         };
-        assert_eq!(find(1).depth, 1);
-        assert_eq!(find(2).depth, 2);
-        assert_eq!(find(3).depth, 3);
-        assert_eq!(find(2).parent_id, Some(find(1).id));
-        assert_eq!(find(3).parent_id, Some(find(2).id));
+        assert_eq!(find(RuntimeAgentKey::new(1)).depth, 1);
+        assert_eq!(find(RuntimeAgentKey::new(2)).depth, 2);
+        assert_eq!(find(RuntimeAgentKey::new(3)).depth, 3);
+        assert_eq!(
+            find(RuntimeAgentKey::new(2)).parent_id,
+            Some(find(RuntimeAgentKey::new(1)).id)
+        );
+        assert_eq!(
+            find(RuntimeAgentKey::new(3)).parent_id,
+            Some(find(RuntimeAgentKey::new(2)).id)
+        );
     }
 
     #[test]
     fn nested_deltas_and_completion_target_the_right_node() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, nested_started(1, None, 1, "task"));
-        app.apply_agent_event(T, nested_assistant(1, "hi"));
-        app.apply_agent_event(T, nested_finished(1, "done"));
+        app.apply_thread_event(T, nested_started(RuntimeAgentKey::new(1), None, 1, "task"));
+        app.apply_thread_event(T, nested_assistant(RuntimeAgentKey::new(1), "hi"));
+        app.apply_thread_event(T, nested_finished(RuntimeAgentKey::new(1), "done"));
 
         let node = &app.threads[0].subagents[0];
         assert_eq!(node.status, AgentStatus::Complete);
         assert!(
             node.messages
                 .iter()
-                .any(|m| m.role == MessageRole::Assistant && m.content == "hi")
+                .any(|m| m.role() == MessageRole::Assistant && m.content() == "hi")
         );
-        assert_eq!(node.messages.last().unwrap().role, MessageRole::ToolResult);
-        assert_eq!(node.messages.last().unwrap().content, "done");
+        assert_eq!(
+            node.messages.last().unwrap().role(),
+            MessageRole::ToolResult
+        );
+        assert_eq!(node.messages.last().unwrap().content(), "done");
     }
 
     #[test]
     fn nested_error_marks_node_error() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, nested_started(1, None, 1, "task"));
-        app.apply_agent_event(T, nested_error(1, "bad"));
+        app.apply_thread_event(T, nested_started(RuntimeAgentKey::new(1), None, 1, "task"));
+        app.apply_thread_event(T, nested_error(RuntimeAgentKey::new(1), "bad"));
         assert_eq!(app.threads[0].subagents[0].status, AgentStatus::Error);
     }
 
     #[test]
     fn nested_event_for_unknown_key_is_ignored() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, nested_assistant(99, "x"));
+        app.apply_thread_event(T, nested_assistant(RuntimeAgentKey::new(99), "x"));
         assert_eq!(app.threads[0].subagents.len(), 0);
     }
 
     #[test]
     fn thread_token_usage_includes_nested_agents_recursively() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, nested_started(1, None, 1, "subagent"));
-        app.apply_agent_event(T, nested_started(2, Some(1), 2, "worker"));
+        app.apply_thread_event(
+            T,
+            nested_started(RuntimeAgentKey::new(1), None, 1, "subagent"),
+        );
+        app.apply_thread_event(
+            T,
+            nested_started(
+                RuntimeAgentKey::new(2),
+                Some(RuntimeAgentKey::new(1)),
+                2,
+                "worker",
+            ),
+        );
 
-        app.apply_agent_event(T, usage(AgentAddr::Main, 10, 5, 15));
-        app.apply_agent_event(T, usage(AgentAddr::Runtime(1), 20, 7, 27));
-        app.apply_agent_event(T, usage(AgentAddr::Runtime(2), 3, 4, 7));
+        app.apply_thread_event(T, usage(AgentAddr::Main, 10, 5, 15));
+        app.apply_thread_event(
+            T,
+            usage(AgentAddr::Runtime(RuntimeAgentKey::new(1)), 20, 7, 27),
+        );
+        app.apply_thread_event(
+            T,
+            usage(AgentAddr::Runtime(RuntimeAgentKey::new(2)), 3, 4, 7),
+        );
 
         let total = app.threads[0].total_token_usage();
         assert_eq!(total.input_tokens, 33);
@@ -1975,8 +2340,16 @@ mod tests {
     #[test]
     fn sidebar_items_reflect_nesting_depth() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, nested_started(1, None, 1, "sub"));
-        app.apply_agent_event(T, nested_started(2, Some(1), 2, "work"));
+        app.apply_thread_event(T, nested_started(RuntimeAgentKey::new(1), None, 1, "sub"));
+        app.apply_thread_event(
+            T,
+            nested_started(
+                RuntimeAgentKey::new(2),
+                Some(RuntimeAgentKey::new(1)),
+                2,
+                "work",
+            ),
+        );
         // Expand the subagent so its worker child is rendered.
         app.threads[0]
             .subagents
@@ -1990,15 +2363,17 @@ mod tests {
     #[test]
     fn collapsible_indices_cover_reasoning_and_tool_calls_only() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, reasoning("r"));
-        app.apply_agent_event(T, assistant("a"));
-        app.apply_agent_event(
+        app.apply_thread_event(T, reasoning("r"));
+        app.apply_thread_event(T, assistant("a"));
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolCall {
+            ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id: "t".into(),
-                name: "n".into(),
-                arguments: json!({}),
+                event: AgentNodeEvent::ToolCall {
+                    id: "t".into(),
+                    name: "n".into(),
+                    arguments: json!({}),
+                },
             },
         );
         // messages: [System(0), Reasoning(1), Assistant(2), ToolCall(3)]
@@ -2051,8 +2426,8 @@ mod tests {
         }
         assert_eq!(app.input.value, "");
         assert_eq!(app.threads[0].main_agent.status, AgentStatus::Running);
-        assert_eq!(last(&app).role, MessageRole::User);
-        assert_eq!(last(&app).content, "hello");
+        assert_eq!(last(&app).role(), MessageRole::User);
+        assert_eq!(last(&app).content(), "hello");
         assert_eq!(app.threads[0].title, "hello");
     }
 
@@ -2099,11 +2474,11 @@ mod tests {
     fn cancelled_event_marks_running_agents_and_reenables_submit() {
         let mut app = AppState::new();
         let _ = submit(&mut app, "go");
-        app.apply_agent_event(T, nested_started(1, None, 1, "sub"));
+        app.apply_thread_event(T, nested_started(RuntimeAgentKey::new(1), None, 1, "sub"));
         assert_eq!(app.threads[0].main_agent.status, AgentStatus::Running);
         assert_eq!(app.threads[0].subagents[0].status, AgentStatus::Running);
 
-        app.apply_agent_event(T, AgentEvent::Cancelled);
+        app.apply_thread_event(T, ThreadEvent::Cancelled);
 
         assert_eq!(app.threads[0].main_agent.status, AgentStatus::Cancelled);
         assert_eq!(
@@ -2121,11 +2496,11 @@ mod tests {
     fn cancelled_event_leaves_already_finished_agents_untouched() {
         let mut app = AppState::new();
         let _ = submit(&mut app, "go");
-        app.apply_agent_event(T, nested_started(1, None, 1, "sub"));
-        app.apply_agent_event(T, nested_finished(1, "done"));
+        app.apply_thread_event(T, nested_started(RuntimeAgentKey::new(1), None, 1, "sub"));
+        app.apply_thread_event(T, nested_finished(RuntimeAgentKey::new(1), "done"));
         assert_eq!(app.threads[0].subagents[0].status, AgentStatus::Complete);
 
-        app.apply_agent_event(T, AgentEvent::Cancelled);
+        app.apply_thread_event(T, ThreadEvent::Cancelled);
 
         assert_eq!(
             app.threads[0].subagents[0].status,
@@ -2138,13 +2513,15 @@ mod tests {
     async fn cancelling_drops_pending_permissions_for_the_thread() {
         let mut app = AppState::new();
         let _ = submit(&mut app, "go");
-        app.apply_agent_event(
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolCall {
+            ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id: "t1".into(),
-                name: "edit_file".into(),
-                arguments: json!({ "path": "/tmp/a" }),
+                event: AgentNodeEvent::ToolCall {
+                    id: "t1".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({ "path": "/tmp/a" }),
+                },
             },
         );
         let (respond_to, _response) = oneshot::channel();
@@ -2158,24 +2535,112 @@ mod tests {
         ));
         assert!(app.pending_tool_permission().is_some());
 
-        app.apply_agent_event(T, AgentEvent::Cancelled);
+        app.apply_thread_event(T, ThreadEvent::Cancelled);
         assert!(
             app.pending_tool_permission().is_none(),
             "a cancelled run's pending prompts are discarded"
         );
     }
 
+    // ----- persistence restore -----
+
+    #[test]
+    fn restore_with_no_threads_falls_back_to_fresh_app() {
+        let app = AppState::restored(
+            Vec::new(),
+            ThreadId::new(5),
+            AgentId::new(9),
+            vec!["edit_file".into()],
+        );
+        assert_eq!(app.threads.len(), 1);
+        assert_eq!(app.threads[0].main_agent.status, AgentStatus::Idle);
+    }
+
+    #[test]
+    fn restore_settles_in_flight_run_and_reanchors_baseline() {
+        let mut app = AppState::new();
+        let _ = submit(&mut app, "go");
+        app.apply_thread_event(T, nested_started(RuntimeAgentKey::new(1), None, 1, "sub"));
+        app.apply_thread_event(
+            T,
+            ThreadEvent::Agent {
+                addr: AgentAddr::Main,
+                event: AgentNodeEvent::ToolCall {
+                    id: "t1".into(),
+                    name: "edit_file".into(),
+                    arguments: json!({ "path": "/tmp/a" }),
+                },
+            },
+        );
+        assert!(app.active_agent_running());
+
+        let (next_thread_id, next_agent_id) = app.next_ids();
+        let restored = AppState::restored(
+            app.snapshot_threads(),
+            next_thread_id,
+            next_agent_id,
+            app.always_allowed_tools(),
+        );
+
+        let main = &restored.threads[0].main_agent;
+        assert_eq!(
+            main.status,
+            AgentStatus::Idle,
+            "main run no longer in flight"
+        );
+        assert_eq!(
+            restored.threads[0].subagents[0].status,
+            AgentStatus::Cancelled,
+            "an orphaned subagent is cancelled"
+        );
+        let tool = main
+            .messages
+            .iter()
+            .find(|message| message.role() == MessageRole::ToolCall)
+            .expect("the tool call survives the round-trip");
+        assert_eq!(
+            tool.tool_status(),
+            ToolStatus::Failed,
+            "an interrupted tool call is marked failed"
+        );
+        assert_eq!(
+            main.message_baseline,
+            main.messages.len(),
+            "the retry baseline is re-anchored to the loaded transcript"
+        );
+        assert!(
+            !restored.active_agent_running(),
+            "the restored session accepts a new prompt"
+        );
+    }
+
+    #[test]
+    fn restored_node_serialization_omits_the_transient_baseline() {
+        // `message_baseline` is per-run state, not session state: it must not be
+        // written, and a node loaded without it still deserializes.
+        let node = AgentNode::main();
+        let json = serde_json::to_string(&node).expect("serialize");
+        assert!(
+            !json.contains("message_baseline"),
+            "baseline is not persisted"
+        );
+        let back: AgentNode = serde_json::from_str(&json).expect("deserialize without baseline");
+        assert_eq!(back.message_baseline, 0, "absent baseline defaults to zero");
+    }
+
     #[test]
     fn conversation_focus_navigates_and_toggles_collapsibles() {
         let mut app = AppState::new();
-        app.apply_agent_event(T, reasoning("r"));
-        app.apply_agent_event(
+        app.apply_thread_event(T, reasoning("r"));
+        app.apply_thread_event(
             T,
-            AgentEvent::ToolCall {
+            ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id: "t".into(),
-                name: "n".into(),
-                arguments: json!({}),
+                event: AgentNodeEvent::ToolCall {
+                    id: "t".into(),
+                    name: "n".into(),
+                    arguments: json!({}),
+                },
             },
         );
         app.focus = Focus::Conversation;
@@ -2190,9 +2655,9 @@ mod tests {
         assert_eq!(app.conversation_cursor, 0);
 
         let index = app.selected_collapsible_message_index().unwrap();
-        let before = app.threads[0].main_agent.messages[index].collapsed;
+        let before = app.threads[0].main_agent.messages[index].collapsed();
         app.handle_key(key(KeyCode::Enter));
-        let after = app.threads[0].main_agent.messages[index].collapsed;
+        let after = app.threads[0].main_agent.messages[index].collapsed();
         assert_ne!(before, after, "Enter toggles the selected collapsible");
     }
 }

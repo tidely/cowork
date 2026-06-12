@@ -1,11 +1,11 @@
-use futures::FutureExt;
+use std::borrow::Cow;
+
+use async_trait::async_trait;
 use llm::{Tool, ToolError, ToolOutput, parse_args, schema_for};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::{MAX_READ_BYTES, ToolIoError, resolve_path};
-
-pub const MAX_PDF_BYTES: u64 = 25 * 1024 * 1024;
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 pub struct ReadPdfInput {
@@ -16,30 +16,25 @@ pub struct ReadPdfInput {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ReadPdf;
 
+#[async_trait]
 impl Tool for ReadPdf {
-    fn name(&self) -> &'static str {
-        "read_pdf"
+    fn name(&self) -> Cow<'static, str> {
+        "read_pdf".into()
     }
 
-    fn description(&self) -> &'static str {
-        "Convert a local PDF file into markdown text."
+    fn description(&self) -> Cow<'static, str> {
+        "Convert a local PDF file into markdown text.".into()
     }
 
     fn parameters_schema(&self) -> Result<serde_json::Value, ToolError> {
         schema_for::<ReadPdfInput>()
     }
 
-    fn call(
-        &self,
-        arguments: serde_json::Value,
-    ) -> futures::future::BoxFuture<'_, Result<ToolOutput, ToolError>> {
-        async move {
-            let input = parse_args(arguments)?;
-            read_pdf(input)
-                .map(ToolOutput::text)
-                .map_err(|error| ToolError::Execution(error.to_string()))
-        }
-        .boxed()
+    async fn call(&self, arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        let input = parse_args(arguments)?;
+        read_pdf(input)
+            .map(ToolOutput::text)
+            .map_err(|error| ToolError::Execution(error.to_string()))
     }
 }
 
@@ -49,15 +44,6 @@ pub fn read_pdf(input: ReadPdfInput) -> Result<String, ToolIoError> {
 
     if !metadata.is_file() {
         return Err(std::io::Error::other(format!("{} is not a file", path.display())).into());
-    }
-
-    if metadata.len() > MAX_PDF_BYTES {
-        return Err(std::io::Error::other(format!(
-            "{} is too large to convert as PDF ({} bytes, max {MAX_PDF_BYTES})",
-            path.display(),
-            metadata.len()
-        ))
-        .into());
     }
 
     let bytes = std::fs::read(&path)?;
@@ -126,46 +112,13 @@ mod tests {
 
     #[test]
     fn read_pdf_rejects_non_file_paths() {
-        let dir = unique_temp_dir("non-file");
+        let dir = tempfile::tempdir().expect("create temp dir");
 
         let error = read_pdf(ReadPdfInput {
-            path: dir.to_string_lossy().to_string(),
+            path: dir.path().to_string_lossy().to_string(),
         })
         .expect_err("directory is rejected");
 
         assert!(error.to_string().contains("is not a file"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn read_pdf_rejects_large_files() {
-        let dir = unique_temp_dir("large");
-        let path = dir.join("large.pdf");
-        std::fs::write(&path, vec![b'%'; MAX_PDF_BYTES as usize + 1]).expect("seed file");
-
-        let error = read_pdf(ReadPdfInput {
-            path: path.to_string_lossy().to_string(),
-        })
-        .expect_err("large PDF is rejected before parsing");
-
-        assert!(error.to_string().contains("too large to convert as PDF"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    fn unique_temp_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "agent-tools-read-pdf-test-{name}-{}-{}",
-            std::process::id(),
-            unique_id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
-    }
-
-    fn unique_id() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos()
     }
 }

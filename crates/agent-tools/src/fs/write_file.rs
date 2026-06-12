@@ -1,4 +1,6 @@
-use futures::FutureExt;
+use std::borrow::Cow;
+
+use async_trait::async_trait;
 use llm::{Tool, ToolError, ToolOutput, parse_args, schema_for};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,30 +20,25 @@ pub struct WriteFileInput {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct WriteFile;
 
+#[async_trait]
 impl Tool for WriteFile {
-    fn name(&self) -> &'static str {
-        "write_file"
+    fn name(&self) -> Cow<'static, str> {
+        "write_file".into()
     }
 
-    fn description(&self) -> &'static str {
-        "Create a text file, or overwrite an existing text file when explicitly allowed."
+    fn description(&self) -> Cow<'static, str> {
+        "Create a text file, or overwrite an existing text file when explicitly allowed.".into()
     }
 
     fn parameters_schema(&self) -> Result<serde_json::Value, ToolError> {
         schema_for::<WriteFileInput>()
     }
 
-    fn call(
-        &self,
-        arguments: serde_json::Value,
-    ) -> futures::future::BoxFuture<'_, Result<ToolOutput, ToolError>> {
-        async move {
-            let input = parse_args(arguments)?;
-            write_file(input)
-                .map(ToolOutput::text)
-                .map_err(|error| ToolError::Execution(error.to_string()))
-        }
-        .boxed()
+    async fn call(&self, arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        let input = parse_args(arguments)?;
+        write_file(input)
+            .map(ToolOutput::text)
+            .map_err(|error| ToolError::Execution(error.to_string()))
     }
 }
 
@@ -79,8 +76,8 @@ mod tests {
 
     #[test]
     fn write_file_creates_new_file() {
-        let path = unique_temp_path("new.txt");
-        let _ = std::fs::remove_file(&path);
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("new.txt");
 
         let result = write_file(WriteFileInput {
             path: path.to_string_lossy().to_string(),
@@ -91,12 +88,12 @@ mod tests {
 
         assert!(result.contains("Wrote"));
         assert_eq!(std::fs::read_to_string(&path).expect("read file"), "hello");
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn write_file_refuses_to_overwrite_without_flag() {
-        let path = unique_temp_path("existing.txt");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("existing.txt");
         std::fs::write(&path, "original").expect("seed file");
 
         let error = write_file(WriteFileInput {
@@ -111,12 +108,12 @@ mod tests {
             std::fs::read_to_string(&path).expect("read file"),
             "original"
         );
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn write_file_overwrites_when_allowed() {
-        let path = unique_temp_path("overwrite.txt");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("overwrite.txt");
         std::fs::write(&path, "original").expect("seed file");
 
         write_file(WriteFileInput {
@@ -130,12 +127,12 @@ mod tests {
             std::fs::read_to_string(&path).expect("read file"),
             "updated"
         );
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn write_file_rejects_missing_parent() {
-        let path = unique_temp_path("missing-parent").join("file.txt");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("missing-parent").join("file.txt");
 
         let error = write_file(WriteFileInput {
             path: path.to_string_lossy().to_string(),
@@ -145,22 +142,5 @@ mod tests {
         .expect_err("missing parent is rejected");
 
         assert!(error.to_string().contains("parent directory"));
-    }
-
-    fn unique_temp_path(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "agent-tools-write-file-test-{}-{}",
-            std::process::id(),
-            unique_id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir.join(name)
-    }
-
-    fn unique_id() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos()
     }
 }

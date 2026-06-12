@@ -1,6 +1,7 @@
 use std::{fmt, sync::Arc};
 
-use futures::{StreamExt, future::BoxFuture};
+use async_trait::async_trait;
+use futures::StreamExt;
 use llm::{
     ChatMessage, ChatRequest, ConversationMemory, FinishReason, LlmError, Provider, StreamEvent,
     TokenUsage, ToolArgumentParseError, ToolCall, ToolError, ToolOutput, ToolRegistry,
@@ -63,7 +64,6 @@ impl AgentRuntime {
         events: &mut impl EventSink,
     ) -> Result<String, AgentRunError> {
         let prompt = prompt.into();
-        events.emit(AgentEvent::Started).await;
 
         let mut history = self.memory.load(conversation_id).await;
         let user_message = ChatMessage::user(prompt);
@@ -108,21 +108,10 @@ impl AgentRuntime {
             // no tool calls to continue from, the partial text is not a real
             // answer, so surface it rather than returning it as if finished.
             if matches!(turn.finish_reason, Some(FinishReason::Length)) && !has_tool_activity {
-                let error = AgentRunError::Truncated;
-                events
-                    .emit(AgentEvent::Error {
-                        error: error.to_string(),
-                    })
-                    .await;
-                return Err(error);
+                return Err(AgentRunError::Truncated);
             }
 
             if !has_tool_activity {
-                events
-                    .emit(AgentEvent::Finished {
-                        response: turn.assistant_text.clone(),
-                    })
-                    .await;
                 return Ok(turn.assistant_text);
             }
 
@@ -141,15 +130,9 @@ impl AgentRuntime {
             }
         }
 
-        let error = AgentRunError::MaxTurns {
+        Err(AgentRunError::MaxTurns {
             max_turns: self.config.max_turns,
-        };
-        events
-            .emit(AgentEvent::Error {
-                error: error.to_string(),
-            })
-            .await;
-        Err(error)
+        })
     }
 
     async fn run_turn(
@@ -177,41 +160,47 @@ impl AgentRuntime {
         while let Some(event) = stream.next().await {
             match event? {
                 StreamEvent::Queued { position } => {
-                    events.emit(AgentEvent::Queued { position }).await;
+                    events.emit(AgentStreamEvent::Queued { position }).await;
                 }
                 StreamEvent::Started => {
-                    events.emit(AgentEvent::ProviderStarted).await;
+                    events.emit(AgentStreamEvent::ProviderStarted).await;
                 }
                 StreamEvent::TextDelta(delta) => {
                     output.assistant_text.push_str(&delta);
-                    events.emit(AgentEvent::AssistantDelta { delta }).await;
+                    events
+                        .emit(AgentStreamEvent::AssistantDelta { delta })
+                        .await;
                 }
                 StreamEvent::ReasoningDelta(delta) => {
                     output.reasoning.push_str(&delta);
-                    events.emit(AgentEvent::ReasoningDelta { delta }).await;
+                    events
+                        .emit(AgentStreamEvent::ReasoningDelta { delta })
+                        .await;
                 }
                 StreamEvent::ToolCallStarted { id, name } => {
-                    events.emit(AgentEvent::ToolCallStarted { id, name }).await;
+                    events
+                        .emit(AgentStreamEvent::ToolCallStarted { id, name })
+                        .await;
                 }
                 StreamEvent::ToolCallArgumentDelta { id, delta } => {
                     events
-                        .emit(AgentEvent::ToolCallArgumentDelta { id, delta })
+                        .emit(AgentStreamEvent::ToolCallArgumentDelta { id, delta })
                         .await;
                 }
                 StreamEvent::ToolCallFinished(call) => {
                     events
-                        .emit(AgentEvent::ToolCallFinished(call.clone()))
+                        .emit(AgentStreamEvent::ToolCallFinished(call.clone()))
                         .await;
                     output.tool_calls.push(call);
                 }
                 StreamEvent::ToolCallArgumentParseError(error) => {
                     events
-                        .emit(AgentEvent::ToolCallArgumentParseError(error.clone()))
+                        .emit(AgentStreamEvent::ToolCallArgumentParseError(error.clone()))
                         .await;
                     output.argument_parse_errors.push(error);
                 }
                 StreamEvent::Usage(usage) => {
-                    events.emit(AgentEvent::Usage(usage)).await;
+                    events.emit(AgentStreamEvent::Usage(usage)).await;
                 }
                 StreamEvent::Finished { reason } => {
                     output.finish_reason = Some(reason);
@@ -249,7 +238,7 @@ impl AgentRuntime {
             };
 
             events
-                .emit(AgentEvent::ToolResult {
+                .emit(AgentStreamEvent::ToolResult {
                     call: call.clone(),
                     output: output.clone(),
                 })
@@ -281,7 +270,7 @@ impl AgentRuntime {
             let output = ToolOutput::error(argument_parse_error_message(&error));
 
             events
-                .emit(AgentEvent::ToolResult {
+                .emit(AgentStreamEvent::ToolResult {
                     call: call.clone(),
                     output: output.clone(),
                 })
@@ -328,8 +317,7 @@ struct TurnOutput {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum AgentEvent {
-    Started,
+pub enum AgentStreamEvent {
     Queued { position: usize },
     ProviderStarted,
     AssistantDelta { delta: String },
@@ -340,12 +328,11 @@ pub enum AgentEvent {
     ToolCallArgumentParseError(ToolArgumentParseError),
     ToolResult { call: ToolCall, output: ToolOutput },
     Usage(TokenUsage),
-    Finished { response: String },
-    Error { error: String },
 }
 
+#[async_trait]
 pub trait EventSink {
-    fn emit(&mut self, event: AgentEvent) -> BoxFuture<'_, ()>;
+    async fn emit(&mut self, event: AgentStreamEvent);
 }
 
 /// Decision returned by a [`ToolPermissionPolicy`] before a tool runs.
@@ -358,27 +345,28 @@ pub enum ToolPermission {
 /// Consulted once per tool call, before execution. A simple async hook rather
 /// than a policy framework: it returns allow, or deny with a reason the agent
 /// loop surfaces to the model as an error tool result.
+#[async_trait]
 pub trait ToolPermissionPolicy: Send + Sync {
-    fn decide(&self, call: &ToolCall) -> BoxFuture<'_, ToolPermission>;
+    async fn decide(&self, call: &ToolCall) -> ToolPermission;
 }
 
 /// Default policy: every tool call is allowed. Used when none is configured.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AllowAll;
 
+#[async_trait]
 impl ToolPermissionPolicy for AllowAll {
-    fn decide(&self, _call: &ToolCall) -> BoxFuture<'_, ToolPermission> {
-        Box::pin(async { ToolPermission::Allow })
+    async fn decide(&self, _call: &ToolCall) -> ToolPermission {
+        ToolPermission::Allow
     }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NoopEventSink;
 
+#[async_trait]
 impl EventSink for NoopEventSink {
-    fn emit(&mut self, _event: AgentEvent) -> BoxFuture<'_, ()> {
-        Box::pin(async {})
-    }
+    async fn emit(&mut self, _event: AgentStreamEvent) {}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -429,10 +417,14 @@ mod tests {
     //! denial must skip the tool and feed the reason back as an error result,
     //! while the default policy runs tools untouched.
     use super::*;
+    use async_trait::async_trait;
     use futures::stream;
     use llm::{ConversationStore, LlmStream, Tool};
     use serde_json::{Value, json};
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::{
+        borrow::Cow,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     /// Emits one `writer` tool call on the first turn, then a plain text finish
     /// so the loop terminates after the tool result is fed back.
@@ -440,32 +432,31 @@ mod tests {
         turn: AtomicUsize,
     }
 
+    #[async_trait]
     impl Provider for ScriptedProvider {
-        fn stream_chat(&self, _request: ChatRequest) -> BoxFuture<'_, Result<LlmStream, LlmError>> {
+        async fn stream_chat(&self, _request: ChatRequest) -> Result<LlmStream, LlmError> {
             let turn = self.turn.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move {
-                let events: Vec<Result<StreamEvent, LlmError>> = if turn == 0 {
-                    vec![
-                        Ok(StreamEvent::ToolCallFinished(ToolCall {
-                            id: "call-1".into(),
-                            name: "writer".into(),
-                            raw_arguments: "{}".into(),
-                            arguments: json!({}),
-                        })),
-                        Ok(StreamEvent::Finished {
-                            reason: FinishReason::ToolCalls,
-                        }),
-                    ]
-                } else {
-                    vec![
-                        Ok(StreamEvent::TextDelta("done".into())),
-                        Ok(StreamEvent::Finished {
-                            reason: FinishReason::Stop,
-                        }),
-                    ]
-                };
-                Ok(Box::pin(stream::iter(events)) as LlmStream)
-            })
+            let events: Vec<Result<StreamEvent, LlmError>> = if turn == 0 {
+                vec![
+                    Ok(StreamEvent::ToolCallFinished(ToolCall {
+                        id: "call-1".into(),
+                        name: "writer".into(),
+                        raw_arguments: "{}".into(),
+                        arguments: json!({}),
+                    })),
+                    Ok(StreamEvent::Finished {
+                        reason: FinishReason::ToolCalls,
+                    }),
+                ]
+            } else {
+                vec![
+                    Ok(StreamEvent::TextDelta("done".into())),
+                    Ok(StreamEvent::Finished {
+                        reason: FinishReason::Stop,
+                    }),
+                ]
+            };
+            Ok(Box::pin(stream::iter(events)) as LlmStream)
         }
     }
 
@@ -474,35 +465,34 @@ mod tests {
         called: Arc<AtomicBool>,
     }
 
+    #[async_trait]
     impl Tool for FlagTool {
-        fn name(&self) -> &'static str {
-            "writer"
+        fn name(&self) -> Cow<'static, str> {
+            "writer".into()
         }
 
-        fn description(&self) -> &'static str {
-            "test tool"
+        fn description(&self) -> Cow<'static, str> {
+            "test tool".into()
         }
 
         fn parameters_schema(&self) -> Result<Value, ToolError> {
             Ok(json!({ "type": "object", "properties": {} }))
         }
 
-        fn call(&self, _arguments: Value) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
+        async fn call(&self, _arguments: Value) -> Result<ToolOutput, ToolError> {
             self.called.store(true, Ordering::SeqCst);
-            Box::pin(async { Ok(ToolOutput::text("wrote")) })
+            Ok(ToolOutput::text("wrote"))
         }
     }
 
     struct DenyAll;
 
+    #[async_trait]
     impl ToolPermissionPolicy for DenyAll {
-        fn decide(&self, call: &ToolCall) -> BoxFuture<'_, ToolPermission> {
-            let name = call.name.clone();
-            Box::pin(async move {
-                ToolPermission::Deny {
-                    reason: format!("denied: {name}"),
-                }
-            })
+        async fn decide(&self, call: &ToolCall) -> ToolPermission {
+            ToolPermission::Deny {
+                reason: format!("denied: {}", call.name),
+            }
         }
     }
 
@@ -576,8 +566,9 @@ mod tests {
         }
     }
 
+    #[async_trait]
     impl Provider for ScriptProvider {
-        fn stream_chat(&self, _request: ChatRequest) -> BoxFuture<'_, Result<LlmStream, LlmError>> {
+        async fn stream_chat(&self, _request: ChatRequest) -> Result<LlmStream, LlmError> {
             let turn = self.turns.lock().unwrap().pop_front().unwrap_or_else(|| {
                 vec![
                     StreamEvent::TextDelta("done".into()),
@@ -586,10 +577,8 @@ mod tests {
                     },
                 ]
             });
-            Box::pin(async move {
-                let events: Vec<Result<StreamEvent, LlmError>> = turn.into_iter().map(Ok).collect();
-                Ok(Box::pin(stream::iter(events)) as LlmStream)
-            })
+            let events: Vec<Result<StreamEvent, LlmError>> = turn.into_iter().map(Ok).collect();
+            Ok(Box::pin(stream::iter(events)) as LlmStream)
         }
     }
 

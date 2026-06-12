@@ -1,14 +1,14 @@
 //! Adapter that runs a top-level prompt through the new in-workspace agent
 //! stack (`agent::AgentRuntime` + `ollama::OllamaProvider` + `llm` memory/tools)
-//! and forwards its generic events into the app's `AgentEvent` tree.
+//! and forwards its generic stream events into the app's `ThreadEvent` tree.
 //!
 //! This owns prompt execution for the TUI: top-level agent plus recursive
 //! subagents, deterministic filesystem/PDF tools, and profile-driven permission
 //! prompts.
 
-use std::{sync::Arc, time::Duration};
+use std::{borrow::Cow, sync::Arc, time::Duration};
 
-use futures::future::BoxFuture;
+use async_trait::async_trait;
 use llm::{
     ChatMessage, ConversationMemory, ConversationStore, Tool, ToolCall, ToolError, ToolOutput,
     ToolRegistry, parse_args,
@@ -17,41 +17,44 @@ use ollama::OllamaProvider;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    app::{AgentAddr, AgentDepth, AgentEvent, RuntimeAgentKey, ThreadId, ToolPermissionResponse},
+    app::{
+        AgentAddr, AgentCompletion, AgentDepth, AgentNodeEvent, RuntimeAgentKey, ThreadEvent,
+        ThreadId, ToolPermissionResponse,
+    },
     config::{
         AGENT_MAX_TURNS, MAIN_AGENT_PREAMBLE, MODEL, PROMPT_RETRY_ATTEMPTS, PROMPT_RETRY_BACKOFFS,
     },
-    events::AgentEventSink,
+    events::ThreadEventSink,
     permissions::{AgentProfile, ToolPermissionMode},
     tui::RuntimeEventSender,
 };
 
 use agent::{
-    AgentConfig, AgentEvent as RuntimeAgentEvent, AgentRunError, AgentRuntime, EventSink,
+    AgentConfig, AgentRunError, AgentRuntime, AgentStreamEvent as CoreAgentEvent, EventSink,
     ToolPermission, ToolPermissionPolicy,
 };
 
 const MAX_AGENT_DEPTH: AgentDepth = 4;
 
-/// Bridges the generic `agent::EventSink` to the app's runtime channel. Generic
-/// events are translated to `app::AgentEvent`s addressed to one agent node and
-/// forwarded through the existing `AgentEventSink`.
-pub(crate) struct ChannelEventSink {
-    inner: AgentEventSink,
+/// Bridges the generic `agent::EventSink` to the app's runtime channel. Core
+/// stream events are translated to addressed `app::AgentNodeEvent`s and forwarded
+/// as `ThreadEvent::Agent`.
+pub(crate) struct AgentNodeEventSink {
+    inner: ThreadEventSink,
     addr: AgentAddr,
 }
 
-impl ChannelEventSink {
+impl AgentNodeEventSink {
     fn new(events: RuntimeEventSender, thread_id: ThreadId, addr: AgentAddr) -> Self {
         Self {
-            inner: AgentEventSink::new(events, thread_id),
+            inner: ThreadEventSink::new(events, thread_id),
             addr,
         }
     }
 
-    /// A sink for the lifecycle events the spawner emits directly (Started, and
-    /// the terminal Finished/Error derived from the run result).
-    fn lifecycle(&self) -> AgentEventSink {
+    /// A thread-level sender for events that are not core stream events, such as
+    /// permission requests or run lifecycle transitions.
+    fn thread_sink(&self) -> ThreadEventSink {
         self.inner.clone()
     }
 
@@ -59,73 +62,64 @@ impl ChannelEventSink {
     /// before a retry so the next attempt's output does not stack on top of the
     /// failed attempt's partial output. Model memory is reset separately.
     async fn reset(&mut self) {
-        self.inner.send(AgentEvent::Reset { addr: self.addr }).await;
+        self.send(AgentNodeEvent::Reset).await;
+    }
+
+    async fn send(&mut self, event: AgentNodeEvent) {
+        self.inner
+            .send(ThreadEvent::Agent {
+                addr: self.addr,
+                event,
+            })
+            .await;
     }
 }
 
-impl EventSink for ChannelEventSink {
-    fn emit(&mut self, event: RuntimeAgentEvent) -> BoxFuture<'_, ()> {
-        Box::pin(async move {
-            if let Some(app_event) = map_event(event, self.addr) {
-                self.inner.send(app_event).await;
-            }
-        })
+#[async_trait]
+impl EventSink for AgentNodeEventSink {
+    async fn emit(&mut self, event: CoreAgentEvent) {
+        if let Some(app_event) = map_event(event, self.addr) {
+            self.inner.send(app_event).await;
+        }
     }
 }
 
-/// Translate a generic runtime event into an app event addressed to one agent
-/// node. Pure (no I/O) so the mapping is unit-tested directly.
-///
-/// Lifecycle events (`Started`/`Finished`/`Error`) return `None`: the spawner
-/// owns those, emitting `Finished`/`Error` from the run's result so a provider
-/// error that bubbles out of the run is reported exactly once. Provider/queue
-/// notices and incremental tool-call deltas have no distinct UI today.
-fn map_event(event: RuntimeAgentEvent, addr: AgentAddr) -> Option<AgentEvent> {
-    match event {
-        RuntimeAgentEvent::AssistantDelta { delta } => {
-            Some(AgentEvent::AssistantDelta { addr, delta })
-        }
-        RuntimeAgentEvent::ReasoningDelta { delta } => {
-            Some(AgentEvent::ReasoningDelta { addr, delta })
-        }
-        RuntimeAgentEvent::ToolCallFinished(call) => Some(AgentEvent::ToolCall {
-            addr,
+/// Translate a core stream event into a thread event addressed to one visible
+/// agent node. Pure (no I/O) so the mapping is unit-tested directly. Provider,
+/// queue, and incremental tool-call notices have no distinct UI today.
+fn map_event(event: CoreAgentEvent, addr: AgentAddr) -> Option<ThreadEvent> {
+    let event = match event {
+        CoreAgentEvent::AssistantDelta { delta } => AgentNodeEvent::AssistantDelta { delta },
+        CoreAgentEvent::ReasoningDelta { delta } => AgentNodeEvent::ReasoningDelta { delta },
+        CoreAgentEvent::ToolCallFinished(call) => AgentNodeEvent::ToolCall {
             id: call.id,
             name: call.name,
             arguments: call.arguments,
-        }),
-        RuntimeAgentEvent::ToolResult { call, output } => Some(AgentEvent::ToolResult {
-            addr,
+        },
+        CoreAgentEvent::ToolResult { call, output } => AgentNodeEvent::ToolResult {
             id: call.id,
             content: output.content,
             is_error: output.is_error,
-        }),
+        },
         // A call whose arguments failed to parse still gets a tool-call card so
         // the run loop's follow-up error result (matched by id) has something to
         // mark failed, rather than dangling as a bare result.
-        RuntimeAgentEvent::ToolCallArgumentParseError(error) => Some(AgentEvent::ToolCall {
-            addr,
+        CoreAgentEvent::ToolCallArgumentParseError(error) => AgentNodeEvent::ToolCall {
             id: error.id,
             name: error.name,
             arguments: serde_json::json!({
                 "raw_arguments": error.raw_arguments,
                 "parse_error": error.error,
             }),
-        }),
-        RuntimeAgentEvent::Usage(usage) => Some(AgentEvent::Usage {
-            addr,
-            input_tokens: usage.input_tokens,
-            output_tokens: usage.output_tokens,
-            total_tokens: usage.total_tokens,
-        }),
-        RuntimeAgentEvent::Started
-        | RuntimeAgentEvent::Queued { .. }
-        | RuntimeAgentEvent::ProviderStarted
-        | RuntimeAgentEvent::ToolCallStarted { .. }
-        | RuntimeAgentEvent::ToolCallArgumentDelta { .. }
-        | RuntimeAgentEvent::Finished { .. }
-        | RuntimeAgentEvent::Error { .. } => None,
-    }
+        },
+        CoreAgentEvent::Usage(usage) => AgentNodeEvent::Usage(usage),
+        CoreAgentEvent::Queued { .. }
+        | CoreAgentEvent::ProviderStarted
+        | CoreAgentEvent::ToolCallStarted { .. }
+        | CoreAgentEvent::ToolCallArgumentDelta { .. } => return None,
+    };
+
+    Some(ThreadEvent::Agent { addr, event })
 }
 
 /// Applies the active [`AgentProfile`] before each tool call: read/delegate tools
@@ -133,13 +127,13 @@ fn map_event(event: RuntimeAgentEvent, addr: AgentAddr) -> Option<AgentEvent> {
 /// through the app's permission UI.
 struct UiPermissionPolicy {
     /// Cloned per request; `request_tool_permission` needs `&mut` on a sink.
-    sink: AgentEventSink,
+    sink: ThreadEventSink,
     profile: AgentProfile,
     addr: AgentAddr,
 }
 
 impl UiPermissionPolicy {
-    fn new(sink: AgentEventSink, profile: AgentProfile, addr: AgentAddr) -> Self {
+    fn new(sink: ThreadEventSink, profile: AgentProfile, addr: AgentAddr) -> Self {
         Self {
             sink,
             profile,
@@ -148,22 +142,28 @@ impl UiPermissionPolicy {
     }
 }
 
+#[async_trait]
 impl ToolPermissionPolicy for UiPermissionPolicy {
-    fn decide(&self, call: &ToolCall) -> BoxFuture<'_, ToolPermission> {
-        let id = call.id.clone();
-        let name = call.name.clone();
-        let arguments = call.arguments.clone();
-        let mode = self.profile.permission_for_tool(&name);
-        let mut sink = self.sink.clone();
+    async fn decide(&self, call: &ToolCall) -> ToolPermission {
+        let mode = self.profile.permission_for_tool(&call.name);
 
-        Box::pin(async move {
-            match mode {
-                ToolPermissionMode::Allow => ToolPermission::Allow,
-                ToolPermissionMode::Deny => ToolPermission::Deny {
-                    reason: format!("Tool call rejected by active profile: {name} is not allowed"),
-                },
-                ToolPermissionMode::Ask => match sink
-                    .request_tool_permission(self.addr, id, name, arguments)
+        match mode {
+            ToolPermissionMode::Allow => ToolPermission::Allow,
+            ToolPermissionMode::Deny => ToolPermission::Deny {
+                reason: format!(
+                    "Tool call rejected by active profile: {} is not allowed",
+                    call.name
+                ),
+            },
+            ToolPermissionMode::Ask => {
+                let mut sink = self.sink.clone();
+                match sink
+                    .request_tool_permission(
+                        self.addr,
+                        call.id.clone(),
+                        call.name.clone(),
+                        call.arguments.clone(),
+                    )
                     .await
                 {
                     Some(ToolPermissionResponse::Allow | ToolPermissionResponse::AllowAlways) => {
@@ -176,9 +176,9 @@ impl ToolPermissionPolicy for UiPermissionPolicy {
                         reason: "Tool call rejected because the permission UI is unavailable"
                             .into(),
                     },
-                },
+                }
             }
-        })
+        }
     }
 }
 
@@ -216,6 +216,43 @@ fn build_runtime(
     AgentRuntime::new(provider, Arc::new(store), tools, config).with_permission(permission)
 }
 
+struct VisibleAgentRun {
+    thread_id: ThreadId,
+    addr: AgentAddr,
+    prompt: String,
+    conversation_id: String,
+    preamble: &'static str,
+    subagent_context: Option<SubagentContext>,
+}
+
+async fn run_visible_agent(
+    spec: VisibleAgentRun,
+    store: ConversationStore,
+    events: RuntimeEventSender,
+) -> Result<String, AgentRunError> {
+    let mut sink = AgentNodeEventSink::new(events.clone(), spec.thread_id, spec.addr);
+    let permission = Arc::new(UiPermissionPolicy::new(
+        sink.thread_sink(),
+        AgentProfile::from_env(),
+        spec.addr,
+    ));
+    let runtime = build_runtime(
+        store.clone(),
+        permission,
+        spec.preamble,
+        spec.subagent_context,
+    );
+
+    run_prompt_with_retries(
+        &spec.prompt,
+        &spec.conversation_id,
+        &store,
+        &runtime,
+        &mut sink,
+    )
+    .await
+}
+
 /// Run `prompt` in a background task, forwarding events to the UI for
 /// `thread_id`. Emits `Started` up front and a terminal `Finished`/`Error` from
 /// the run result.
@@ -228,21 +265,21 @@ pub(crate) fn spawn_prompt_task(
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
-        let mut sink = ChannelEventSink::new(events.clone(), thread_id, AgentAddr::Main);
-        let mut lifecycle = sink.lifecycle();
-        lifecycle.send(AgentEvent::Started).await;
+        let mut lifecycle = ThreadEventSink::new(events.clone(), thread_id);
+        lifecycle.send(ThreadEvent::MainStarted).await;
 
-        let permission = Arc::new(UiPermissionPolicy::new(
-            sink.lifecycle(),
-            AgentProfile::from_env(),
-            AgentAddr::Main,
-        ));
-        let runtime = build_runtime(
-            store.clone(),
-            permission,
-            MAIN_AGENT_PREAMBLE,
-            Some(SubagentContext::root(thread_id, events, store.clone())),
-        );
+        let run = VisibleAgentRun {
+            thread_id,
+            addr: AgentAddr::Main,
+            prompt,
+            conversation_id,
+            preamble: MAIN_AGENT_PREAMBLE,
+            subagent_context: Some(SubagentContext::root(
+                thread_id,
+                events.clone(),
+                store.clone(),
+            )),
+        };
 
         // Race the whole run (retries, sleeps, and the nested subagent tree)
         // against cancellation. Losing the race drops the run future, which
@@ -250,21 +287,19 @@ pub(crate) fn spawn_prompt_task(
         let outcome = tokio::select! {
             biased;
             _ = cancel.cancelled() => None,
-            result = run_prompt_with_retries(
-                &prompt, &conversation_id, &store, &runtime, &mut sink,
-            ) => Some(result),
+            result = run_visible_agent(run, store, events) => Some(result),
         };
 
         let terminal = match outcome {
-            Some(Ok(_)) => AgentEvent::Finished {
+            Some(Ok(_)) => ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                result: None,
+                event: AgentNodeEvent::Finished(AgentCompletion::Done),
             },
-            Some(Err(error)) => AgentEvent::Error {
+            Some(Err(error)) => ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                error: error.to_string(),
+                event: AgentNodeEvent::Error(error.to_string()),
             },
-            None => AgentEvent::Cancelled,
+            None => ThreadEvent::Cancelled,
         };
         lifecycle.send(terminal).await;
     });
@@ -275,7 +310,7 @@ async fn run_prompt_with_retries(
     conversation_id: &str,
     store: &ConversationStore,
     runtime: &AgentRuntime,
-    sink: &mut ChannelEventSink,
+    sink: &mut AgentNodeEventSink,
 ) -> Result<String, AgentRunError> {
     let initial_history = store.load(conversation_id).await;
 
@@ -389,13 +424,14 @@ struct SubagentInput {
     context: Option<String>,
 }
 
+#[async_trait]
 impl Tool for SubagentTool {
-    fn name(&self) -> &'static str {
-        "subagent"
+    fn name(&self) -> Cow<'static, str> {
+        "subagent".into()
     }
 
-    fn description(&self) -> &'static str {
-        "Spawn a child agent to own one bounded, independent sub-task. Do not use it for simple one- or two-tool steps, single-file inspection, straightforward path reads/listing, or work that needs your continuous shared context. Give the child a clear goal, goal context, exact scope boundaries, known paths/resources, constraints, expected output shape, and failure policy. If a file/path/resource is missing, too large, inaccessible, ambiguous, or otherwise blocks the task, tell the child to stop and report the blocker rather than explore elsewhere or spawn recovery agents. Only delegate fan-out when there are multiple known independent chunks whose context can be discarded after a concise result."
+    fn description(&self) -> Cow<'static, str> {
+        "Spawn a child agent to own one bounded, independent sub-task. Do not use it for simple one- or two-tool steps, single-file inspection, straightforward path reads/listing, or work that needs your continuous shared context. Give the child a clear goal, goal context, exact scope boundaries, known paths/resources, constraints, expected output shape, and failure policy. If a file/path/resource is missing, too large, inaccessible, ambiguous, or otherwise blocks the task, tell the child to stop and report the blocker rather than explore elsewhere or spawn recovery agents. Only delegate fan-out when there are multiple known independent chunks whose context can be discarded after a concise result.".into()
     }
 
     fn parameters_schema(&self) -> Result<serde_json::Value, ToolError> {
@@ -416,19 +452,12 @@ impl Tool for SubagentTool {
         }))
     }
 
-    fn call(&self, arguments: serde_json::Value) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
-        let input: SubagentInput = match parse_args(arguments) {
-            Ok(input) => input,
-            Err(error) => return Box::pin(async move { Err(error) }),
-        };
-        let context = self.context.clone();
-
-        Box::pin(async move {
-            match run_child_agent(context, input.task, input.context).await {
-                Ok(response) => Ok(ToolOutput::text(response)),
-                Err(error) => Ok(ToolOutput::error(error)),
-            }
-        })
+    async fn call(&self, arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        let input: SubagentInput = parse_args(arguments)?;
+        match run_child_agent(self.context.clone(), input.task, input.context).await {
+            Ok(response) => Ok(ToolOutput::text(response)),
+            Err(error) => Ok(ToolOutput::error(error)),
+        }
     }
 }
 
@@ -437,7 +466,7 @@ impl Tool for SubagentTool {
 /// `runtime-agent-{key}` conversation ids stay distinct across sessions once
 /// persistence lands, instead of restarting at the same values every run.
 fn next_runtime_agent_key() -> RuntimeAgentKey {
-    uuid::Uuid::new_v4().as_u128()
+    RuntimeAgentKey::new(uuid::Uuid::new_v4().as_u128())
 }
 
 fn subagent_preamble(can_delegate: bool) -> &'static str {
@@ -479,9 +508,9 @@ async fn run_child_agent(
     let prompt = subagent_prompt(&task, context.as_deref());
 
     let mut lifecycle =
-        AgentEventSink::new(parent_context.events.clone(), parent_context.thread_id);
+        ThreadEventSink::new(parent_context.events.clone(), parent_context.thread_id);
     lifecycle
-        .send(AgentEvent::Spawned {
+        .send(ThreadEvent::SpawnedSubagent {
             key,
             parent: parent_context.parent_key,
             depth: child_depth,
@@ -491,30 +520,19 @@ async fn run_child_agent(
         .await;
 
     let can_delegate = child_depth < MAX_AGENT_DEPTH;
-    let permission = Arc::new(UiPermissionPolicy::new(
-        lifecycle.clone(),
-        AgentProfile::from_env(),
-        child_addr,
-    ));
-    let runtime = build_runtime(
-        parent_context.store.clone(),
-        permission,
-        subagent_preamble(can_delegate),
-        can_delegate.then(|| parent_context.child_context(key, child_depth)),
-    );
-    let mut sink = ChannelEventSink::new(
-        parent_context.events.clone(),
-        parent_context.thread_id,
-        child_addr,
-    );
-    let conversation_id = format!("runtime-agent-{key}");
+    let run = VisibleAgentRun {
+        thread_id: parent_context.thread_id,
+        addr: child_addr,
+        prompt,
+        conversation_id: format!("runtime-agent-{key}"),
+        preamble: subagent_preamble(can_delegate),
+        subagent_context: can_delegate.then(|| parent_context.child_context(key, child_depth)),
+    };
 
-    let result = run_prompt_with_retries(
-        &prompt,
-        &conversation_id,
-        &parent_context.store,
-        &runtime,
-        &mut sink,
+    let result = run_visible_agent(
+        run,
+        parent_context.store.clone(),
+        parent_context.events.clone(),
     )
     .await
     .map_err(|error| format!("subagent failed: {error}"))
@@ -523,17 +541,17 @@ async fn run_child_agent(
     match &result {
         Ok(response) => {
             lifecycle
-                .send(AgentEvent::Finished {
+                .send(ThreadEvent::Agent {
                     addr: child_addr,
-                    result: Some(response.clone()),
+                    event: AgentNodeEvent::Finished(AgentCompletion::Returned(response.clone())),
                 })
                 .await;
         }
         Err(error) => {
             lifecycle
-                .send(AgentEvent::Error {
+                .send(ThreadEvent::Agent {
                     addr: child_addr,
-                    error: error.clone(),
+                    event: AgentNodeEvent::Error(error.clone()),
                 })
                 .await;
         }
@@ -574,7 +592,11 @@ mod tests {
     fn policy(profile: AgentProfile) -> (UiPermissionPolicy, mpsc::Receiver<RuntimeEvent>) {
         let (sender, receiver) = mpsc::channel(8);
         (
-            UiPermissionPolicy::new(AgentEventSink::new(sender, 11), profile, AgentAddr::Main),
+            UiPermissionPolicy::new(
+                ThreadEventSink::new(sender, ThreadId::new(11)),
+                profile,
+                AgentAddr::Main,
+            ),
             receiver,
         )
     }
@@ -582,24 +604,24 @@ mod tests {
     #[test]
     fn assistant_and_reasoning_map_to_main_deltas() {
         match map_event(
-            RuntimeAgentEvent::AssistantDelta { delta: "hi".into() },
+            CoreAgentEvent::AssistantDelta { delta: "hi".into() },
             AgentAddr::Main,
         ) {
-            Some(AgentEvent::AssistantDelta {
+            Some(ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                delta,
+                event: AgentNodeEvent::AssistantDelta { delta },
             }) => assert_eq!(delta, "hi"),
             other => panic!("unexpected: {other:?}"),
         }
         match map_event(
-            RuntimeAgentEvent::ReasoningDelta {
+            CoreAgentEvent::ReasoningDelta {
                 delta: "think".into(),
             },
             AgentAddr::Main,
         ) {
-            Some(AgentEvent::ReasoningDelta {
+            Some(ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                delta,
+                event: AgentNodeEvent::ReasoningDelta { delta },
             }) => assert_eq!(delta, "think"),
             other => panic!("unexpected: {other:?}"),
         }
@@ -608,15 +630,15 @@ mod tests {
     #[test]
     fn events_can_target_runtime_agent_nodes() {
         match map_event(
-            RuntimeAgentEvent::AssistantDelta {
+            CoreAgentEvent::AssistantDelta {
                 delta: "child".into(),
             },
-            AgentAddr::Runtime(42),
+            AgentAddr::Runtime(RuntimeAgentKey::new(42)),
         ) {
-            Some(AgentEvent::AssistantDelta {
-                addr: AgentAddr::Runtime(42),
-                delta,
-            }) => assert_eq!(delta, "child"),
+            Some(ThreadEvent::Agent {
+                addr: AgentAddr::Runtime(key),
+                event: AgentNodeEvent::AssistantDelta { delta },
+            }) if key == RuntimeAgentKey::new(42) => assert_eq!(delta, "child"),
             other => panic!("unexpected: {other:?}"),
         }
     }
@@ -624,14 +646,17 @@ mod tests {
     #[test]
     fn finished_tool_call_maps_to_tool_call_event() {
         match map_event(
-            RuntimeAgentEvent::ToolCallFinished(tool_call()),
+            CoreAgentEvent::ToolCallFinished(tool_call()),
             AgentAddr::Main,
         ) {
-            Some(AgentEvent::ToolCall {
+            Some(ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id,
-                name,
-                arguments,
+                event:
+                    AgentNodeEvent::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    },
             }) => {
                 assert_eq!(id, "call-1");
                 assert_eq!(name, "read_file");
@@ -643,16 +668,19 @@ mod tests {
 
     #[test]
     fn tool_result_maps_to_call_id_and_content() {
-        let event = RuntimeAgentEvent::ToolResult {
+        let event = CoreAgentEvent::ToolResult {
             call: tool_call(),
             output: ToolOutput::text("file contents"),
         };
         match map_event(event, AgentAddr::Main) {
-            Some(AgentEvent::ToolResult {
+            Some(ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id,
-                content,
-                is_error,
+                event:
+                    AgentNodeEvent::ToolResult {
+                        id,
+                        content,
+                        is_error,
+                    },
             }) => {
                 assert_eq!(id, "call-1");
                 assert_eq!(content, "file contents");
@@ -678,18 +706,21 @@ mod tests {
 
     #[test]
     fn argument_parse_error_maps_to_a_tool_call_card() {
-        let event = RuntimeAgentEvent::ToolCallArgumentParseError(ToolArgumentParseError {
+        let event = CoreAgentEvent::ToolCallArgumentParseError(ToolArgumentParseError {
             id: "call-1".into(),
             name: "read_file".into(),
             raw_arguments: "{bad".into(),
             error: "eof".into(),
         });
         match map_event(event, AgentAddr::Main) {
-            Some(AgentEvent::ToolCall {
+            Some(ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                id,
-                name,
-                arguments,
+                event:
+                    AgentNodeEvent::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    },
             }) => {
                 assert_eq!(id, "call-1");
                 assert_eq!(name, "read_file");
@@ -702,15 +733,16 @@ mod tests {
 
     #[test]
     fn usage_carries_token_counts() {
-        let event = RuntimeAgentEvent::Usage(TokenUsage::from_input_output(10, 5));
+        let event = CoreAgentEvent::Usage(TokenUsage::from_input_output(10, 5));
         match map_event(event, AgentAddr::Main) {
-            Some(AgentEvent::Usage {
+            Some(ThreadEvent::Agent {
                 addr: AgentAddr::Main,
-                input_tokens,
-                output_tokens,
-                total_tokens,
+                event: AgentNodeEvent::Usage(usage),
             }) => {
-                assert_eq!((input_tokens, output_tokens, total_tokens), (10, 5, 15));
+                assert_eq!(
+                    (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+                    (10, 5, 15)
+                );
             }
             other => panic!("unexpected: {other:?}"),
         }
@@ -756,24 +788,17 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_and_incremental_events_are_dropped() {
+    fn provider_and_incremental_tool_events_are_dropped() {
         let dropped = [
-            RuntimeAgentEvent::Started,
-            RuntimeAgentEvent::Queued { position: 1 },
-            RuntimeAgentEvent::ProviderStarted,
-            RuntimeAgentEvent::ToolCallStarted {
+            CoreAgentEvent::Queued { position: 1 },
+            CoreAgentEvent::ProviderStarted,
+            CoreAgentEvent::ToolCallStarted {
                 id: "call-1".into(),
                 name: "read_file".into(),
             },
-            RuntimeAgentEvent::ToolCallArgumentDelta {
+            CoreAgentEvent::ToolCallArgumentDelta {
                 id: "call-1".into(),
                 delta: "{".into(),
-            },
-            RuntimeAgentEvent::Finished {
-                response: "done".into(),
-            },
-            RuntimeAgentEvent::Error {
-                error: "boom".into(),
             },
         ];
         for event in dropped {

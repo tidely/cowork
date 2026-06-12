@@ -2,6 +2,7 @@ mod app;
 mod config;
 mod events;
 mod permissions;
+mod persistence;
 mod runtime;
 mod tui;
 mod ui;

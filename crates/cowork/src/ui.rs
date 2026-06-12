@@ -7,7 +7,7 @@ use ratatui::{
 };
 
 use crate::app::{
-    AgentDepth, AgentStatus, AppState, Focus, Message, MessageRole, TokenUsage, ToolStatus,
+    AgentDepth, AgentStatus, AppState, Focus, Message, MessageRole, ToolDisplay, ToolStatus,
 };
 
 pub fn render(frame: &mut Frame<'_>, app: &AppState) {
@@ -345,122 +345,101 @@ fn render_input(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
 }
 
 fn append_message_lines(lines: &mut Vec<Line<'static>>, message: &Message, selected: bool) {
-    if message.role == MessageRole::ToolCall {
-        append_tool_call_lines(lines, message, selected);
+    if let Some(tool) = message.tool() {
+        append_tool_call_lines(lines, message, tool, selected);
         return;
     }
 
-    let style = message_style(message.role);
-    let marker = if message.role == MessageRole::Reasoning {
-        if message.collapsed { "▸ " } else { "▾ " }
+    let role = message.role();
+    let style = message_style(role);
+    let marker = if role == MessageRole::Reasoning {
+        if message.collapsed() { "▸ " } else { "▾ " }
     } else {
         ""
     };
     lines.push(Line::from(Span::styled(
-        format!("┌─ {marker}{} ", message.role.label()),
+        format!("┌─ {marker}{} ", role.label()),
         header_style(style, selected),
     )));
 
-    if message.collapsed {
-        lines.push(Line::from(vec![
-            Span::styled("│ ", style),
-            Span::styled(collapsed_preview(&message.content), style),
-        ]));
-    } else if message.content.is_empty() {
+    let content = message.text().unwrap_or_default();
+    if message.collapsed() {
+        push_body_line(lines, &collapsed_preview(content), style);
+    } else if content.is_empty() {
         lines.push(Line::from("│"));
     } else {
-        for content_line in message.content.lines() {
-            lines.push(Line::from(vec![
-                Span::styled("│ ", style),
-                Span::styled(content_line.to_string(), style),
-            ]));
-        }
+        push_body_lines(lines, content, style);
     }
 
     lines.push(Line::from(Span::styled("└", style)));
     lines.push(Line::from(""));
 }
 
-fn append_tool_call_lines(lines: &mut Vec<Line<'static>>, message: &Message, selected: bool) {
-    let done = message.tool_status.is_done();
-    let style = match message.tool_status {
+fn append_tool_call_lines(
+    lines: &mut Vec<Line<'static>>,
+    message: &Message,
+    tool: &ToolDisplay,
+    selected: bool,
+) {
+    let done = tool.status.is_done();
+    let style = match tool.status {
         ToolStatus::Failed => Style::default().fg(Color::Red),
         ToolStatus::Finished => Style::default().fg(Color::Green),
         ToolStatus::AwaitingPermission | ToolStatus::Running => {
             message_style(MessageRole::ToolCall)
         }
     };
-    let marker = if message.collapsed { "▸" } else { "▾" };
-    let status = match message.tool_status {
+    let marker = if message.collapsed() { "▸" } else { "▾" };
+    let status = match tool.status {
         ToolStatus::Failed => "✗",
         ToolStatus::Finished => "✓",
         ToolStatus::AwaitingPermission => "?",
         ToolStatus::Running => "◐",
     };
-    let tool_name = tool_call_name(&message.content);
 
     lines.push(Line::from(Span::styled(
-        format!("┌─ {marker} Tool call {status} {tool_name}"),
+        format!("┌─ {marker} Tool call {status} {}", tool.summary),
         header_style(style, selected),
     )));
 
-    if message.collapsed {
+    if message.collapsed() {
         // While running show "running"; once done the colored marker carries the
         // status, so preview the result instead of writing "finished".
         let preview = if done {
-            message
-                .tool_result
+            tool.result
                 .as_deref()
                 .filter(|result| !result.is_empty())
                 .map(collapsed_preview)
                 .unwrap_or_default()
-        } else if message.tool_status == ToolStatus::AwaitingPermission {
+        } else if tool.status == ToolStatus::AwaitingPermission {
             "waiting for approval".to_string()
         } else {
             "running".to_string()
         };
-        lines.push(Line::from(vec![
-            Span::styled("│ ", style),
-            Span::styled(preview, style),
-        ]));
+        push_body_line(lines, &preview, style);
     } else {
         lines.push(Line::from(Span::styled(
             "│ Arguments",
             style.add_modifier(Modifier::BOLD),
         )));
-        for content_line in tool_call_arguments(&message.content).lines() {
-            lines.push(Line::from(vec![
-                Span::styled("│ ", style),
-                Span::styled(content_line.to_string(), style),
-            ]));
-        }
+        push_body_lines(lines, &tool.arguments, style);
 
         lines.push(Line::from(Span::styled("│", style)));
         lines.push(Line::from(Span::styled(
             "│ Result",
             style.add_modifier(Modifier::BOLD),
         )));
-        match message.tool_result.as_deref() {
-            Some(result) if !result.is_empty() => {
-                for result_line in result.lines() {
-                    lines.push(Line::from(vec![
-                        Span::styled("│ ", style),
-                        Span::styled(result_line.to_string(), style),
-                    ]));
-                }
-            }
+        match tool.result.as_deref() {
+            Some(result) if !result.is_empty() => push_body_lines(lines, result, style),
             _ => {
                 let label = if done {
                     "(no output)"
-                } else if message.tool_status == ToolStatus::AwaitingPermission {
+                } else if tool.status == ToolStatus::AwaitingPermission {
                     "waiting for approval"
                 } else {
                     "running"
                 };
-                lines.push(Line::from(vec![
-                    Span::styled("│ ", style),
-                    Span::styled(label.to_string(), style),
-                ]));
+                push_body_line(lines, label, style);
             }
         }
     }
@@ -469,15 +448,19 @@ fn append_tool_call_lines(lines: &mut Vec<Line<'static>>, message: &Message, sel
     lines.push(Line::from(""));
 }
 
-fn tool_call_name(content: &str) -> &str {
-    content.lines().next().unwrap_or("unknown")
+/// Push a single card body line: the `│ ` gutter followed by `text`.
+fn push_body_line(lines: &mut Vec<Line<'static>>, text: &str, style: Style) {
+    lines.push(Line::from(vec![
+        Span::styled("│ ", style),
+        Span::styled(text.to_string(), style),
+    ]));
 }
 
-fn tool_call_arguments(content: &str) -> &str {
-    content
-        .split_once('\n')
-        .map(|(_, arguments)| arguments)
-        .unwrap_or("")
+/// Push one card body line per line of `text` (none for empty text).
+fn push_body_lines(lines: &mut Vec<Line<'static>>, text: &str, style: Style) {
+    for line in text.lines() {
+        push_body_line(lines, line, style);
+    }
 }
 
 fn collapsed_preview(content: &str) -> String {
@@ -553,7 +536,7 @@ fn depth_label(depth: AgentDepth) -> String {
     }
 }
 
-fn token_usage_label(usage: TokenUsage) -> String {
+fn token_usage_label(usage: llm::TokenUsage) -> String {
     format!(
         "{} (in {}, out {})",
         usage.total_tokens, usage.input_tokens, usage.output_tokens

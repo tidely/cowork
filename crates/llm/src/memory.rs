@@ -1,16 +1,17 @@
 use std::{collections::HashMap, sync::Arc};
 
-use futures::future::{BoxFuture, FutureExt};
+use async_trait::async_trait;
 use tokio::sync::RwLock;
 
 use crate::ChatMessage;
 
+#[async_trait]
 pub trait ConversationMemory: Send + Sync {
-    fn load(&self, conversation_id: &str) -> BoxFuture<'_, Vec<ChatMessage>>;
+    async fn load(&self, conversation_id: &str) -> Vec<ChatMessage>;
 
-    fn append(&self, conversation_id: &str, messages: Vec<ChatMessage>) -> BoxFuture<'_, ()>;
+    async fn append(&self, conversation_id: &str, messages: Vec<ChatMessage>);
 
-    fn replace(&self, conversation_id: &str, messages: Vec<ChatMessage>) -> BoxFuture<'_, ()>;
+    async fn replace(&self, conversation_id: &str, messages: Vec<ChatMessage>);
 }
 
 #[derive(Clone, Default)]
@@ -22,43 +23,46 @@ impl ConversationStore {
     pub fn new() -> Self {
         Self::default()
     }
+
+    /// Rebuild a store from a previously persisted snapshot of every
+    /// conversation's model context.
+    pub fn from_conversations(conversations: HashMap<String, Vec<ChatMessage>>) -> Self {
+        Self {
+            conversations: Arc::new(RwLock::new(conversations)),
+        }
+    }
+
+    /// A clone of every conversation's model context, for persistence. The
+    /// `conversations` field is private, so this is the only export seam.
+    pub async fn export(&self) -> HashMap<String, Vec<ChatMessage>> {
+        self.conversations.read().await.clone()
+    }
 }
 
+#[async_trait]
 impl ConversationMemory for ConversationStore {
-    fn load(&self, conversation_id: &str) -> BoxFuture<'_, Vec<ChatMessage>> {
-        let conversation_id = conversation_id.to_string();
-        async move {
-            self.conversations
-                .read()
-                .await
-                .get(&conversation_id)
-                .cloned()
-                .unwrap_or_default()
-        }
-        .boxed()
+    async fn load(&self, conversation_id: &str) -> Vec<ChatMessage> {
+        self.conversations
+            .read()
+            .await
+            .get(conversation_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
-    fn append(&self, conversation_id: &str, messages: Vec<ChatMessage>) -> BoxFuture<'_, ()> {
-        let conversation_id = conversation_id.to_string();
-        async move {
-            self.conversations
-                .write()
-                .await
-                .entry(conversation_id)
-                .or_default()
-                .extend(messages);
-        }
-        .boxed()
+    async fn append(&self, conversation_id: &str, messages: Vec<ChatMessage>) {
+        self.conversations
+            .write()
+            .await
+            .entry(conversation_id.to_string())
+            .or_default()
+            .extend(messages);
     }
 
-    fn replace(&self, conversation_id: &str, messages: Vec<ChatMessage>) -> BoxFuture<'_, ()> {
-        let conversation_id = conversation_id.to_string();
-        async move {
-            self.conversations
-                .write()
-                .await
-                .insert(conversation_id, messages);
-        }
-        .boxed()
+    async fn replace(&self, conversation_id: &str, messages: Vec<ChatMessage>) {
+        self.conversations
+            .write()
+            .await
+            .insert(conversation_id.to_string(), messages);
     }
 }

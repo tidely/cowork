@@ -1,9 +1,11 @@
-use futures::{future::BoxFuture, stream::BoxStream};
+use async_trait::async_trait;
+use futures::stream::BoxStream;
 
 use crate::{ChatRequest, LlmError, StreamEvent};
 
 pub type LlmStream = BoxStream<'static, Result<StreamEvent, LlmError>>;
 
+#[async_trait]
 pub trait Provider: Send + Sync {
-    fn stream_chat(&self, request: ChatRequest) -> BoxFuture<'_, Result<LlmStream, LlmError>>;
+    async fn stream_chat(&self, request: ChatRequest) -> Result<LlmStream, LlmError>;
 }

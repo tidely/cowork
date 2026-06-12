@@ -1,4 +1,4 @@
-use std::fmt;
+use std::{fmt, ops::AddAssign};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -153,6 +153,14 @@ impl TokenUsage {
             output_tokens,
             total_tokens: input_tokens + output_tokens,
         }
+    }
+}
+
+impl AddAssign<TokenUsage> for TokenUsage {
+    fn add_assign(&mut self, rhs: TokenUsage) {
+        self.input_tokens += rhs.input_tokens;
+        self.output_tokens += rhs.output_tokens;
+        self.total_tokens += rhs.total_tokens;
     }
 }
 

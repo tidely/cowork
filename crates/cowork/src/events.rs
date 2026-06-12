@@ -2,17 +2,17 @@ use futures::SinkExt;
 use tokio_util::sync::PollSender;
 
 use crate::{
-    app::{AgentAddr, AgentEvent, PendingToolPermission, ThreadId, ToolPermissionResponse},
+    app::{AgentAddr, PendingToolPermission, ThreadEvent, ThreadId, ToolPermissionResponse},
     tui::{RuntimeEvent, RuntimeEventSender},
 };
 
 #[derive(Clone)]
-pub(crate) struct AgentEventSink {
+pub(crate) struct ThreadEventSink {
     events: PollSender<RuntimeEvent>,
     thread_id: ThreadId,
 }
 
-impl AgentEventSink {
+impl ThreadEventSink {
     pub(crate) fn new(events: RuntimeEventSender, thread_id: ThreadId) -> Self {
         Self {
             events: PollSender::new(events),
@@ -20,7 +20,7 @@ impl AgentEventSink {
         }
     }
 
-    pub(crate) async fn send(&mut self, event: AgentEvent) {
+    pub(crate) async fn send(&mut self, event: ThreadEvent) {
         let _ = self
             .events
             .send(RuntimeEvent::Agent(self.thread_id, event))

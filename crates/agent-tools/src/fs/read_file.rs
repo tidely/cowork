@@ -1,4 +1,6 @@
-use futures::FutureExt;
+use std::borrow::Cow;
+
+use async_trait::async_trait;
 use llm::{Tool, ToolError, ToolOutput, parse_args, schema_for};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -16,30 +18,25 @@ pub struct ReadFileInput {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ReadFile;
 
+#[async_trait]
 impl Tool for ReadFile {
-    fn name(&self) -> &'static str {
-        "read_file"
+    fn name(&self) -> Cow<'static, str> {
+        "read_file".into()
     }
 
-    fn description(&self) -> &'static str {
-        "Read a UTF-8 text file from disk."
+    fn description(&self) -> Cow<'static, str> {
+        "Read a UTF-8 text file from disk.".into()
     }
 
     fn parameters_schema(&self) -> Result<serde_json::Value, ToolError> {
         schema_for::<ReadFileInput>()
     }
 
-    fn call(
-        &self,
-        arguments: serde_json::Value,
-    ) -> futures::future::BoxFuture<'_, Result<ToolOutput, ToolError>> {
-        async move {
-            let input = parse_args(arguments)?;
-            read_file(input)
-                .map(ToolOutput::text)
-                .map_err(|error| ToolError::Execution(error.to_string()))
-        }
-        .boxed()
+    async fn call(&self, arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        let input = parse_args(arguments)?;
+        read_file(input)
+            .map(ToolOutput::text)
+            .map_err(|error| ToolError::Execution(error.to_string()))
     }
 }
 
@@ -69,7 +66,8 @@ mod tests {
 
     #[test]
     fn read_file_reads_small_utf8_file() {
-        let path = unique_temp_path("read.txt");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("read.txt");
         std::fs::write(&path, "hello").expect("seed file");
 
         let output = read_file(ReadFileInput {
@@ -78,12 +76,12 @@ mod tests {
         .expect("read succeeds");
 
         assert_eq!(output, "hello");
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn read_file_rejects_large_files() {
-        let path = unique_temp_path("large.txt");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("large.txt");
         std::fs::write(&path, vec![b'x'; MAX_READ_BYTES as usize + 1]).expect("seed file");
 
         let error = read_file(ReadFileInput {
@@ -92,23 +90,5 @@ mod tests {
         .expect_err("large file is rejected");
 
         assert!(error.to_string().contains("too large to read"));
-        let _ = std::fs::remove_file(path);
-    }
-
-    fn unique_temp_path(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "agent-tools-read-file-test-{}-{}",
-            std::process::id(),
-            unique_id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir.join(name)
-    }
-
-    fn unique_id() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos()
     }
 }

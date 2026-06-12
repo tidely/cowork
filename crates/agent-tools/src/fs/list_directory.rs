@@ -1,4 +1,6 @@
-use futures::FutureExt;
+use std::borrow::Cow;
+
+use async_trait::async_trait;
 use llm::{Tool, ToolError, ToolOutput, parse_args, schema_for};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -14,30 +16,25 @@ pub struct ListDirectoryInput {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ListDirectory;
 
+#[async_trait]
 impl Tool for ListDirectory {
-    fn name(&self) -> &'static str {
-        "list_directory"
+    fn name(&self) -> Cow<'static, str> {
+        "list_directory".into()
     }
 
-    fn description(&self) -> &'static str {
-        "List files and directories inside a directory."
+    fn description(&self) -> Cow<'static, str> {
+        "List files and directories inside a directory.".into()
     }
 
     fn parameters_schema(&self) -> Result<serde_json::Value, ToolError> {
         schema_for::<ListDirectoryInput>()
     }
 
-    fn call(
-        &self,
-        arguments: serde_json::Value,
-    ) -> futures::future::BoxFuture<'_, Result<ToolOutput, ToolError>> {
-        async move {
-            let input = parse_args(arguments)?;
-            list_directory(input)
-                .map(ToolOutput::text)
-                .map_err(|error| ToolError::Execution(error.to_string()))
-        }
-        .boxed()
+    async fn call(&self, arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        let input = parse_args(arguments)?;
+        list_directory(input)
+            .map(ToolOutput::text)
+            .map_err(|error| ToolError::Execution(error.to_string()))
     }
 }
 
@@ -86,48 +83,29 @@ mod tests {
 
     #[test]
     fn list_directory_sorts_entries_and_marks_directories() {
-        let dir = unique_temp_dir();
-        std::fs::write(dir.join("b.txt"), "bb").expect("seed b");
-        std::fs::write(dir.join("a.txt"), "a").expect("seed a");
-        std::fs::create_dir(dir.join("child")).expect("seed child");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        std::fs::write(dir.path().join("b.txt"), "bb").expect("seed b");
+        std::fs::write(dir.path().join("a.txt"), "a").expect("seed a");
+        std::fs::create_dir(dir.path().join("child")).expect("seed child");
 
         let output = list_directory(ListDirectoryInput {
-            path: dir.to_string_lossy().to_string(),
+            path: dir.path().to_string_lossy().to_string(),
         })
         .expect("list succeeds");
 
         let lines = output.lines().collect::<Vec<_>>();
         assert_eq!(lines, vec!["a.txt (1 bytes)", "b.txt (2 bytes)", "child/"]);
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn list_directory_reports_empty_directory() {
-        let dir = unique_temp_dir();
+        let dir = tempfile::tempdir().expect("create temp dir");
 
         let output = list_directory(ListDirectoryInput {
-            path: dir.to_string_lossy().to_string(),
+            path: dir.path().to_string_lossy().to_string(),
         })
         .expect("list succeeds");
 
         assert!(output.contains("is empty"));
-        let _ = std::fs::remove_dir_all(dir);
-    }
-
-    fn unique_temp_dir() -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "agent-tools-list-directory-test-{}-{}",
-            std::process::id(),
-            unique_id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir
-    }
-
-    fn unique_id() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos()
     }
 }

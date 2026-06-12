@@ -1,4 +1,5 @@
-use futures::{FutureExt, StreamExt, future::BoxFuture};
+use async_trait::async_trait;
+use futures::StreamExt;
 use llm::{
     ChatMessage, ChatRequest, FinishReason, LlmError, LlmStream, Provider, StreamEvent, TokenUsage,
     ToolArgumentParseError, ToolCall, ToolDefinition,
@@ -36,34 +37,30 @@ impl Default for OllamaProvider {
     }
 }
 
+#[async_trait]
 impl Provider for OllamaProvider {
-    fn stream_chat(&self, request: ChatRequest) -> BoxFuture<'_, Result<LlmStream, LlmError>> {
-        let client = self.client.clone();
-        let url = self.chat_url();
+    async fn stream_chat(&self, request: ChatRequest) -> Result<LlmStream, LlmError> {
+        let response = self
+            .client
+            .post(self.chat_url())
+            .json(&ollama_request(request))
+            .send()
+            .await
+            .map_err(|error| LlmError::Transport(error.to_string()))?;
 
-        async move {
-            let response = client
-                .post(url)
-                .json(&ollama_request(request))
-                .send()
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
                 .await
-                .map_err(|error| LlmError::Transport(error.to_string()))?;
-
-            let status = response.status();
-            if !status.is_success() {
-                let body = response
-                    .text()
-                    .await
-                    .unwrap_or_else(|error| format!("failed to read error body: {error}"));
-                return Err(LlmError::HttpStatus {
-                    status: status.as_u16(),
-                    body,
-                });
-            }
-
-            Ok(Box::pin(stream_response(response)) as LlmStream)
+                .unwrap_or_else(|error| format!("failed to read error body: {error}"));
+            return Err(LlmError::HttpStatus {
+                status: status.as_u16(),
+                body,
+            });
         }
-        .boxed()
+
+        Ok(Box::pin(stream_response(response)) as LlmStream)
     }
 }
 

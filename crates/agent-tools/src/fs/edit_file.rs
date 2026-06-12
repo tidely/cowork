@@ -1,4 +1,6 @@
-use futures::FutureExt;
+use std::borrow::Cow;
+
+use async_trait::async_trait;
 use llm::{Tool, ToolError, ToolOutput, parse_args, schema_for};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -18,30 +20,25 @@ pub struct EditFileInput {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EditFile;
 
+#[async_trait]
 impl Tool for EditFile {
-    fn name(&self) -> &'static str {
-        "edit_file"
+    fn name(&self) -> Cow<'static, str> {
+        "edit_file".into()
     }
 
-    fn description(&self) -> &'static str {
-        "Edit a text file by replacing one exact text span with another."
+    fn description(&self) -> Cow<'static, str> {
+        "Edit a text file by replacing one exact text span with another.".into()
     }
 
     fn parameters_schema(&self) -> Result<serde_json::Value, ToolError> {
         schema_for::<EditFileInput>()
     }
 
-    fn call(
-        &self,
-        arguments: serde_json::Value,
-    ) -> futures::future::BoxFuture<'_, Result<ToolOutput, ToolError>> {
-        async move {
-            let input = parse_args(arguments)?;
-            edit_file(input)
-                .map(ToolOutput::text)
-                .map_err(|error| ToolError::Execution(error.to_string()))
-        }
-        .boxed()
+    async fn call(&self, arguments: serde_json::Value) -> Result<ToolOutput, ToolError> {
+        let input = parse_args(arguments)?;
+        edit_file(input)
+            .map(ToolOutput::text)
+            .map_err(|error| ToolError::Execution(error.to_string()))
     }
 }
 
@@ -74,7 +71,8 @@ mod tests {
 
     #[test]
     fn edit_file_replaces_one_exact_span() {
-        let path = unique_temp_path("edit.txt");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("edit.txt");
         std::fs::write(&path, "hello world").expect("seed file");
 
         let output = edit_file(EditFileInput {
@@ -89,12 +87,12 @@ mod tests {
             std::fs::read_to_string(&path).expect("read file"),
             "hello there"
         );
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn edit_file_rejects_missing_span() {
-        let path = unique_temp_path("missing.txt");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("missing.txt");
         std::fs::write(&path, "hello world").expect("seed file");
 
         let error = edit_file(EditFileInput {
@@ -109,12 +107,12 @@ mod tests {
             std::fs::read_to_string(&path).expect("read file"),
             "hello world"
         );
-        let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn edit_file_rejects_ambiguous_span() {
-        let path = unique_temp_path("ambiguous.txt");
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("ambiguous.txt");
         std::fs::write(&path, "x x").expect("seed file");
 
         let error = edit_file(EditFileInput {
@@ -126,23 +124,5 @@ mod tests {
 
         assert!(error.to_string().contains("appears 2 times"));
         assert_eq!(std::fs::read_to_string(&path).expect("read file"), "x x");
-        let _ = std::fs::remove_file(path);
-    }
-
-    fn unique_temp_path(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "agent-tools-edit-file-test-{}-{}",
-            std::process::id(),
-            unique_id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir.join(name)
-    }
-
-    fn unique_id() -> u128 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos()
     }
 }

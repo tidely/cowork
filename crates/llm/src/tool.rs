@@ -1,16 +1,17 @@
-use std::{collections::BTreeMap, fmt, sync::Arc};
+use std::{borrow::Cow, collections::BTreeMap, fmt, sync::Arc};
 
-use futures::future::BoxFuture;
+use async_trait::async_trait;
 use schemars::{JsonSchema, schema_for};
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::{ToolCall, ToolDefinition};
 
+#[async_trait]
 pub trait Tool: Send + Sync {
-    fn name(&self) -> &'static str;
+    fn name(&self) -> Cow<'static, str>;
 
-    fn description(&self) -> &'static str;
+    fn description(&self) -> Cow<'static, str>;
 
     fn parameters_schema(&self) -> Result<Value, ToolError>;
 
@@ -18,12 +19,12 @@ pub trait Tool: Send + Sync {
         false
     }
 
-    fn call(&self, arguments: Value) -> BoxFuture<'_, Result<ToolOutput, ToolError>>;
+    async fn call(&self, arguments: Value) -> Result<ToolOutput, ToolError>;
 
     fn definition(&self) -> Result<ToolDefinition, ToolError> {
         Ok(ToolDefinition {
-            name: self.name().to_string(),
-            description: self.description().to_string(),
+            name: self.name().into_owned(),
+            description: self.description().into_owned(),
             parameters: self.parameters_schema()?,
             supports_argument_streaming: self.supports_argument_streaming(),
         })
@@ -105,7 +106,7 @@ impl ToolRegistry {
     }
 
     pub fn insert_arc(&mut self, tool: Arc<dyn Tool>) -> Result<(), ToolError> {
-        let name = tool.name().to_string();
+        let name = tool.name().into_owned();
         if self.tools.contains_key(&name) {
             return Err(ToolError::DuplicateTool(name));
         }
@@ -175,23 +176,36 @@ mod tests {
 
     /// A tool whose name is whatever it was constructed with, so a registry can
     /// be populated out of alphabetical order.
-    struct NamedTool(&'static str);
+    struct NamedTool {
+        name: Cow<'static, str>,
+        description: Cow<'static, str>,
+    }
 
+    impl NamedTool {
+        fn borrowed(name: &'static str) -> Self {
+            Self {
+                name: Cow::Borrowed(name),
+                description: Cow::Borrowed("test tool"),
+            }
+        }
+    }
+
+    #[async_trait]
     impl Tool for NamedTool {
-        fn name(&self) -> &'static str {
-            self.0
+        fn name(&self) -> Cow<'static, str> {
+            self.name.clone()
         }
 
-        fn description(&self) -> &'static str {
-            "test tool"
+        fn description(&self) -> Cow<'static, str> {
+            self.description.clone()
         }
 
         fn parameters_schema(&self) -> Result<Value, ToolError> {
             Ok(json!({ "type": "object", "properties": {} }))
         }
 
-        fn call(&self, _arguments: Value) -> BoxFuture<'_, Result<ToolOutput, ToolError>> {
-            Box::pin(async { Ok(ToolOutput::text("ok")) })
+        async fn call(&self, _arguments: Value) -> Result<ToolOutput, ToolError> {
+            Ok(ToolOutput::text("ok"))
         }
     }
 
@@ -201,7 +215,9 @@ mod tests {
         // Insert out of order; the registry must still emit them name-sorted so
         // the model sees a deterministic tool list every turn.
         for name in ["write_file", "edit_file", "read_file", "list_directory"] {
-            registry.insert(NamedTool(name)).expect("unique tool");
+            registry
+                .insert(NamedTool::borrowed(name))
+                .expect("unique tool");
         }
 
         let names: Vec<String> = registry
@@ -215,5 +231,24 @@ mod tests {
             names,
             ["edit_file", "list_directory", "read_file", "write_file"]
         );
+    }
+
+    #[test]
+    fn definitions_accept_owned_tool_metadata() {
+        let name = String::from("dynamic_tool");
+        let description = format!("generated description for {name}");
+        let mut registry = ToolRegistry::new();
+
+        registry
+            .insert(NamedTool {
+                name: Cow::Owned(name),
+                description: Cow::Owned(description.clone()),
+            })
+            .expect("unique tool");
+
+        let definitions = registry.definitions().expect("definitions build");
+
+        assert_eq!(definitions[0].name, "dynamic_tool");
+        assert_eq!(definitions[0].description, description);
     }
 }

@@ -447,6 +447,48 @@ C. Persist full resumable conversations.
 
 Recommendation: A for first pass.
 
+**Decided: C, via the cheapest mechanism (`crates/cowork/src/persistence.rs`).**
+
+The two stores are not interchangeable: the thread tree's topology and per-agent
+metadata (parent, depth, label, status, token usage) live only in `AppState`,
+while the faithful model turns needed to resume a run live only in
+`ConversationStore`. Persisting one alone gives either flat un-resumable
+transcripts or a tree with no way to continue it, so both are written.
+
+Mechanism:
+
+- One `session.json` under the platform data dir (`$COWORK_DATA_DIR`, else
+  `~/Library/Application Support/cowork` on macOS, else `$XDG_DATA_HOME`/`~/.local/share`).
+  No new heavy deps — `serde_json` was already present; the data dir is resolved
+  by hand rather than pulling in `directories`.
+- A `SessionSnapshot` holds the serialized thread tree plus the
+  `HashMap<String, Vec<ChatMessage>>` exported from the store. Display message
+  text is duplicated across the two (it appears once as `ChatMessage`, once as a
+  display `Message`); accepted for now, see follow-ups.
+- Atomic writes (temp file + rename) so a crash never corrupts an existing
+  snapshot. A corrupt or version-mismatched file is ignored on load, not
+  clobbered.
+- Saves are debounced onto the existing 250 ms tick and skipped while any run is
+  in flight, so a half-finished turn is never persisted; the settling terminal
+  event clears `Running` and the next tick captures the final state. A
+  force-quit also flushes.
+- On load, `AppState::restored` normalizes interrupted state — a `Running` main
+  agent drops to `Idle` (so its thread accepts a new prompt), a `Running`
+  subagent becomes `Cancelled`, in-flight tool calls become `Failed`, and each
+  agent's retry baseline is re-anchored to the loaded transcript.
+
+Deferred follow-ups (option 4 in the original analysis):
+
+- Move model-context persistence to the `ConversationMemory` trait seam
+  (`load`/`append`/`replace` are already async) as a write-through decorator,
+  for crash durability *during* a long run. A whole-file snapshot handles the
+  retry path's `replace`-to-rewind trivially; an append log would need
+  compaction, so snapshot was chosen first.
+- Re-derive display `Message`s from `ChatMessage`s on load via a projection
+  function, eliminating the text duplication. The reducer currently only builds
+  `Message`s from live events, so this needs a new replay path.
+- SQLite/embedded-KV only once multi-thread search or metadata queries are real.
+
 ### Decision 7: Terminal input strategy
 
 Options:
