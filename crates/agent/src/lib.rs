@@ -63,6 +63,22 @@ impl AgentRuntime {
         prompt: impl Into<String>,
         events: &mut impl EventSink,
     ) -> Result<String, AgentRunError> {
+        self.run_with_user_messages(conversation_id, prompt, events, Vec::new)
+            .await
+    }
+
+    /// Run an agent while allowing the caller to inject additional user messages
+    /// between model/tool turns. Messages returned by `drain_user_messages` are
+    /// appended to model memory and included in the next provider request; this is
+    /// intentionally turn-boundary based, so an in-flight provider stream or tool
+    /// call is not interrupted.
+    pub async fn run_with_user_messages(
+        &self,
+        conversation_id: &str,
+        prompt: impl Into<String>,
+        events: &mut impl EventSink,
+        mut drain_user_messages: impl FnMut() -> Vec<String> + Send,
+    ) -> Result<String, AgentRunError> {
         let prompt = prompt.into();
 
         let mut history = self.memory.load(conversation_id).await;
@@ -73,6 +89,15 @@ impl AgentRuntime {
         history.push(user_message);
 
         for turn_index in 0..self.config.max_turns {
+            append_user_messages(
+                self.memory.as_ref(),
+                conversation_id,
+                &mut history,
+                events,
+                drain_user_messages(),
+            )
+            .await;
+
             let turn = self.run_turn(&history, events).await?;
 
             let reasoning = if turn.reasoning.is_empty() {
@@ -111,7 +136,19 @@ impl AgentRuntime {
                 return Err(AgentRunError::Truncated);
             }
 
+            let received_user_messages = append_user_messages(
+                self.memory.as_ref(),
+                conversation_id,
+                &mut history,
+                events,
+                drain_user_messages(),
+            )
+            .await;
+
             if !has_tool_activity {
+                if received_user_messages {
+                    continue;
+                }
                 return Ok(turn.assistant_text);
             }
 
@@ -124,6 +161,14 @@ impl AgentRuntime {
                 .append(conversation_id, tool_messages.clone())
                 .await;
             history.extend(tool_messages);
+            append_user_messages(
+                self.memory.as_ref(),
+                conversation_id,
+                &mut history,
+                events,
+                drain_user_messages(),
+            )
+            .await;
 
             if turn_index + 1 == self.config.max_turns {
                 break;
@@ -288,6 +333,38 @@ impl AgentRuntime {
     }
 }
 
+async fn append_user_messages(
+    memory: &dyn ConversationMemory,
+    conversation_id: &str,
+    history: &mut Vec<ChatMessage>,
+    events: &mut impl EventSink,
+    messages: Vec<String>,
+) -> bool {
+    let messages: Vec<String> = messages
+        .into_iter()
+        .map(|message| message.trim().to_string())
+        .filter(|message| !message.is_empty())
+        .collect();
+
+    if messages.is_empty() {
+        return false;
+    }
+
+    let chat_messages: Vec<ChatMessage> = messages.iter().cloned().map(ChatMessage::user).collect();
+    memory.append(conversation_id, chat_messages.clone()).await;
+    history.extend(chat_messages);
+
+    // Surface each injected message to the caller at this turn boundary, so a UI
+    // can show it exactly where the model receives it — between turns — rather
+    // than mid-stream, which would split a streaming reasoning/assistant block.
+    for text in messages {
+        events
+            .emit(AgentStreamEvent::UserMessageInjected { text })
+            .await;
+    }
+    true
+}
+
 /// Synthetic [`ToolCall`] standing in for a call whose arguments failed to
 /// parse, so the assistant turn and its error result reference the same id.
 fn argument_parse_error_call(error: &ToolArgumentParseError) -> ToolCall {
@@ -318,15 +395,36 @@ struct TurnOutput {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AgentStreamEvent {
-    Queued { position: usize },
+    Queued {
+        position: usize,
+    },
     ProviderStarted,
-    AssistantDelta { delta: String },
-    ReasoningDelta { delta: String },
-    ToolCallStarted { id: String, name: String },
-    ToolCallArgumentDelta { id: String, delta: String },
+    AssistantDelta {
+        delta: String,
+    },
+    ReasoningDelta {
+        delta: String,
+    },
+    /// A queued user message was injected into the conversation at a turn
+    /// boundary. Emitted so the UI can render it where the model actually
+    /// receives it, instead of the caller surfacing it mid-stream.
+    UserMessageInjected {
+        text: String,
+    },
+    ToolCallStarted {
+        id: String,
+        name: String,
+    },
+    ToolCallArgumentDelta {
+        id: String,
+        delta: String,
+    },
     ToolCallFinished(ToolCall),
     ToolCallArgumentParseError(ToolArgumentParseError),
-    ToolResult { call: ToolCall, output: ToolOutput },
+    ToolResult {
+        call: ToolCall,
+        output: ToolOutput,
+    },
     Usage(TokenUsage),
 }
 

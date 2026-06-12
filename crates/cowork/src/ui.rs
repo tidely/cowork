@@ -288,11 +288,14 @@ fn wrapped_line_count(lines: &[Line<'_>], width: usize) -> usize {
 
 fn render_input(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     let running = app.active_agent_running();
+    let messaging_subagent = app.selected_subagent_accepts_messages();
     let permission = app.pending_tool_permission();
     let title = if permission.is_some() {
         " Tool permission — a accept  A always for tool  r reject "
+    } else if messaging_subagent {
+        " Message selected subagent — Enter queues  Ctrl+X cancels subagent "
     } else if running {
-        " Prompt — running · Ctrl+X cancels thread "
+        " Prompt — running · Enter queues a message · Ctrl+X cancels thread "
     } else {
         " Prompt — Tab cycles focus "
     };
@@ -301,10 +304,10 @@ fn render_input(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
     } else {
         Style::default().fg(Color::DarkGray)
     };
+    // The input always accepts text now (a running main agent queues the
+    // message), so it is only dimmed while a permission prompt owns the box.
     let input_style = if permission.is_some() {
         Style::default().fg(Color::Yellow)
-    } else if running {
-        Style::default().fg(Color::DarkGray)
     } else {
         Style::default().fg(Color::White)
     };
@@ -334,7 +337,7 @@ fn render_input(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
         );
     frame.render_widget(paragraph, area);
 
-    if app.focus == Focus::Input && !running && permission.is_none() {
+    if app.focus == Focus::Input && app.input_accepts_text() && permission.is_none() {
         let cursor_offset = (cursor_chars - scroll) as u16;
         let x = area
             .x

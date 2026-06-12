@@ -97,6 +97,7 @@ fn handle_runtime_event(
                 conversation_id,
                 prompt,
                 cancel,
+                queued_messages,
             } = app.handle_key(key)
             {
                 runtime::spawn_prompt_task(
@@ -106,6 +107,7 @@ fn handle_runtime_event(
                     memory.clone(),
                     events.clone(),
                     cancel,
+                    queued_messages,
                 );
             }
             true

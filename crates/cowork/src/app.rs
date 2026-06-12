@@ -7,7 +7,7 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use llm::TokenUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::oneshot;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 #[derive(
@@ -403,9 +403,11 @@ pub struct AppState {
     pub conversation_cursor: usize,
     pending_tool_permissions: VecDeque<PendingToolPermission>,
     always_allowed_tools: HashSet<String>,
-    /// Cancellation token for each thread's in-flight run, so the cancel keybind
-    /// can stop a specific thread. Removed when the run reaches a terminal state.
-    running_cancellations: HashMap<ThreadId, CancellationToken>,
+    /// Live control handles (cancel token + message queue) for every running
+    /// agent, the main agent included. Keyed by address so the cancel keybind and
+    /// the outgoing-message queue share one lookup. Transient runtime state, not
+    /// persisted; an entry is removed when its agent reaches a terminal state.
+    agent_controls: HashMap<(ThreadId, AgentAddr), AgentControl>,
     next_thread_id: ThreadId,
     next_agent_id: AgentId,
 }
@@ -420,6 +422,9 @@ pub enum SubmitResult {
         /// Cancellation token for this run; the runtime races it so the cancel
         /// keybind can stop the thread.
         cancel: CancellationToken,
+        /// Receiver the run drains between turns for messages queued while it is
+        /// in flight. The matching sender lives in `agent_controls`.
+        queued_messages: mpsc::UnboundedReceiver<String>,
     },
 }
 
@@ -428,6 +433,31 @@ pub enum ToolPermissionResponse {
     Allow,
     AllowAlways,
     Reject { reason: String },
+}
+
+/// Live control handles for one running agent — the main agent or a subagent.
+/// `cancel` stops the run; `queue` carries user messages to be delivered at the
+/// next turn boundary (the unified path for both a mid-run prompt to the main
+/// agent and a message to a subagent). Transient runtime state, never persisted.
+#[derive(Debug, Clone)]
+pub struct AgentControl {
+    cancel: CancellationToken,
+    queue: mpsc::UnboundedSender<String>,
+}
+
+impl AgentControl {
+    pub(crate) fn new(cancel: CancellationToken, queue: mpsc::UnboundedSender<String>) -> Self {
+        Self { cancel, queue }
+    }
+
+    fn cancel(&self) {
+        self.cancel.cancel();
+    }
+
+    /// Queue a user message for delivery at the run's next turn boundary.
+    fn enqueue(&self, message: String) -> Result<(), mpsc::error::SendError<String>> {
+        self.queue.send(message)
+    }
 }
 
 #[derive(Debug)]
@@ -470,7 +500,7 @@ impl PendingToolPermission {
 
 /// Identifies which agent within a thread an event targets. The top-level agent
 /// is `Main`; spawned subagents are addressed by their runtime key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum AgentAddr {
     Main,
     Runtime(RuntimeAgentKey),
@@ -487,6 +517,7 @@ pub enum ThreadEvent {
         depth: AgentDepth,
         task: String,
         context: Option<String>,
+        control: AgentControl,
     },
     /// An event for one visible agent node in the thread.
     Agent {
@@ -499,6 +530,15 @@ pub enum ThreadEvent {
     Cancelled,
 }
 
+struct SpawnNested {
+    key: RuntimeAgentKey,
+    parent: Option<RuntimeAgentKey>,
+    depth: AgentDepth,
+    task: String,
+    context: Option<String>,
+    control: AgentControl,
+}
+
 #[derive(Debug, Clone)]
 pub enum AgentNodeEvent {
     AssistantDelta {
@@ -506,6 +546,13 @@ pub enum AgentNodeEvent {
     },
     ReasoningDelta {
         delta: String,
+    },
+    /// A queued user message reached the conversation at a turn boundary. Pushed
+    /// into the visible transcript here so it lands between turns rather than
+    /// mid-stream. The model context already holds it (the agent loop appended
+    /// it before emitting this), so this is display-only.
+    UserMessage {
+        text: String,
     },
     ToolCall {
         id: String,
@@ -519,6 +566,7 @@ pub enum AgentNodeEvent {
     },
     Usage(TokenUsage),
     Finished(AgentCompletion),
+    Cancelled(String),
     Error(String),
     /// Rewind an agent's visible transcript to its pre-run baseline. Emitted
     /// before a retry so the partial output of the failed attempt is discarded.
@@ -556,7 +604,7 @@ impl AppState {
             conversation_cursor: 0,
             pending_tool_permissions: VecDeque::new(),
             always_allowed_tools: HashSet::new(),
-            running_cancellations: HashMap::new(),
+            agent_controls: HashMap::new(),
             next_thread_id: ThreadId::new(1),
             next_agent_id: AgentId::new(1),
         }
@@ -626,6 +674,27 @@ impl AppState {
     pub fn active_agent_running(&self) -> bool {
         self.agent(self.selected.thread_id, MAIN_AGENT_ID)
             .is_some_and(|agent| agent.status == AgentStatus::Running)
+    }
+
+    pub fn selected_subagent_accepts_messages(&self) -> bool {
+        if self.selected.agent_id == MAIN_AGENT_ID {
+            return false;
+        }
+        let Some(agent) = self.selected_agent() else {
+            return false;
+        };
+        agent.status == AgentStatus::Running
+            && agent.runtime_key.is_some_and(|key| {
+                self.agent_controls
+                    .contains_key(&(self.selected.thread_id, AgentAddr::Runtime(key)))
+            })
+    }
+
+    /// Whether the input box should accept typing. The main agent always accepts
+    /// it (idle starts a run, running queues a message); a subagent only while it
+    /// is running and reachable.
+    pub fn input_accepts_text(&self) -> bool {
+        self.selected.agent_id == MAIN_AGENT_ID || self.selected_subagent_accepts_messages()
     }
 
     pub fn selected_agent(&self) -> Option<&AgentNode> {
@@ -702,7 +771,7 @@ impl AppState {
                 SubmitResult::None
             }
             KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.cancel_selected_thread();
+                self.cancel_selected_agent();
                 SubmitResult::None
             }
             KeyCode::Char('[') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -780,17 +849,29 @@ impl AppState {
                 depth,
                 task,
                 context,
-            } => self.spawn_nested(thread_id, key, parent, depth, task, context),
+                control,
+            } => self.spawn_nested(
+                thread_id,
+                SpawnNested {
+                    key,
+                    parent,
+                    depth,
+                    task,
+                    context,
+                    control,
+                },
+            ),
             ThreadEvent::Agent { addr, event } => {
                 self.apply_agent_node_event(thread_id, addr, event);
             }
             ThreadEvent::Cancelled => {
                 // Cancellation is thread-wide: the dropped run leaves running
                 // subagents with no terminal event of their own, so sweep them
-                // all here and drop the run's token and pending prompts.
-                self.running_cancellations.remove(&thread_id);
+                // all here and drop the run's controls and pending prompts.
                 self.discard_pending_permissions_for_thread(thread_id);
                 self.cancel_thread_agents(thread_id);
+                self.agent_controls
+                    .retain(|(control_thread_id, _), _| *control_thread_id != thread_id);
             }
         }
     }
@@ -801,14 +882,6 @@ impl AppState {
         addr: AgentAddr,
         event: AgentNodeEvent,
     ) {
-        if matches!(
-            event,
-            AgentNodeEvent::Finished(_) | AgentNodeEvent::Error(_)
-        ) && addr == AgentAddr::Main
-        {
-            self.running_cancellations.remove(&thread_id);
-        }
-
         let Some(agent_id) = self.resolve_addr(thread_id, addr) else {
             return;
         };
@@ -820,6 +893,14 @@ impl AppState {
             }
             AgentNodeEvent::ReasoningDelta { delta } => {
                 self.append_delta(thread_id, agent_id, TextDeltaKind::Reasoning, &delta);
+            }
+            AgentNodeEvent::UserMessage { text } => {
+                // Lands at a turn boundary, so collapse any in-progress reasoning
+                // and append the user bubble after it — never mid-stream.
+                self.collapse_last_reasoning(thread_id, agent_id);
+                if let Some(agent) = self.agent_mut(thread_id, agent_id) {
+                    agent.messages.push(Message::user(text));
+                }
             }
             AgentNodeEvent::ToolCall {
                 id,
@@ -855,6 +936,11 @@ impl AppState {
                         agent.messages.push(Message::tool_result(result));
                     }
                 }
+                self.remove_agent_control(thread_id, addr);
+            }
+            AgentNodeEvent::Cancelled(reason) => {
+                self.cancel_agent_subtree(thread_id, agent_id, &reason);
+                self.remove_agent_controls_for_subtree(thread_id, agent_id);
             }
             AgentNodeEvent::Error(error) => {
                 if let Some(agent) = self.agent_mut(thread_id, agent_id) {
@@ -862,6 +948,7 @@ impl AppState {
                     collapse_reasoning(agent);
                     agent.messages.push(Message::error(error));
                 }
+                self.remove_agent_control(thread_id, addr);
             }
             AgentNodeEvent::Reset => {
                 if let Some(agent) = self.agent_mut(thread_id, agent_id) {
@@ -1072,7 +1159,19 @@ impl AppState {
 
     fn submit_prompt(&mut self) -> SubmitResult {
         let prompt = self.input.value.trim().to_string();
-        if prompt.is_empty() || self.active_agent_running() {
+        if prompt.is_empty() {
+            return SubmitResult::None;
+        }
+
+        if self.selected.agent_id != MAIN_AGENT_ID {
+            self.enqueue_subagent_message(prompt);
+            return SubmitResult::None;
+        }
+
+        // A message typed while the main agent is running is queued for delivery
+        // at the next turn boundary, not started as a competing run.
+        if self.active_agent_running() {
+            self.enqueue_main_message(prompt);
             return SubmitResult::None;
         }
 
@@ -1095,14 +1194,80 @@ impl AppState {
         self.conversation_cursor = 0;
 
         let cancel = CancellationToken::new();
-        self.running_cancellations
-            .insert(self.selected.thread_id, cancel.clone());
+        let (queue_tx, queue_rx) = mpsc::unbounded_channel();
+        self.agent_controls.insert(
+            (self.selected.thread_id, AgentAddr::Main),
+            AgentControl::new(cancel.clone(), queue_tx),
+        );
 
         SubmitResult::Submitted {
             thread_id: self.selected.thread_id,
             conversation_id,
             prompt,
             cancel,
+            queued_messages: queue_rx,
+        }
+    }
+
+    /// Queue a message for the running main agent. Best-effort: if the run has
+    /// already ended the send fails and the message is dropped. No visible
+    /// message is pushed here — the agent loop emits a [`AgentNodeEvent::UserMessage`]
+    /// when it injects the message at a turn boundary, so a streaming block is
+    /// never split.
+    fn enqueue_main_message(&mut self, prompt: String) {
+        let thread_id = self.selected.thread_id;
+        let Some(control) = self
+            .agent_controls
+            .get(&(thread_id, AgentAddr::Main))
+            .cloned()
+        else {
+            return;
+        };
+        if control.enqueue(prompt).is_ok() {
+            self.input.value.clear();
+            self.input.cursor = 0;
+            self.conversation_scroll = 0;
+            self.conversation_cursor = 0;
+        }
+    }
+
+    fn enqueue_subagent_message(&mut self, prompt: String) {
+        let thread_id = self.selected.thread_id;
+        let agent_id = self.selected.agent_id;
+        let Some(key) = self
+            .agent(thread_id, agent_id)
+            .filter(|agent| agent.status == AgentStatus::Running)
+            .and_then(|agent| agent.runtime_key)
+        else {
+            return;
+        };
+
+        let Some(control) = self
+            .agent_controls
+            .get(&(thread_id, AgentAddr::Runtime(key)))
+            .cloned()
+        else {
+            return;
+        };
+
+        // No visible message is pushed here — the subagent loop emits a
+        // `UserMessage` event when it injects the message at a turn boundary, so
+        // it lands between turns rather than splitting a streaming block.
+        match control.enqueue(prompt) {
+            Ok(()) => {
+                self.input.value.clear();
+                self.input.cursor = 0;
+                self.conversation_scroll = 0;
+                self.conversation_cursor = 0;
+            }
+            Err(_) => {
+                if let Some(agent) = self.agent_mut(thread_id, agent_id) {
+                    agent
+                        .messages
+                        .push(Message::error("subagent is no longer accepting messages"));
+                }
+                self.remove_agent_control(thread_id, AgentAddr::Runtime(key));
+            }
         }
     }
 
@@ -1146,19 +1311,29 @@ impl AppState {
         }
     }
 
-    /// Cancel the in-flight run for the selected thread. Cancelling the token
-    /// stops the backend; the resulting terminal `Cancelled` event sweeps the
-    /// agent statuses. A no-op when the thread has no active run.
-    fn cancel_selected_thread(&mut self) {
+    /// Cancel the selected running agent. For a subagent this cancels only that
+    /// child run so its parent receives a failed `subagent` tool result and can
+    /// continue. For the main agent this cancels the whole thread.
+    fn cancel_selected_agent(&mut self) {
         let thread_id = self.selected.thread_id;
-        let is_running = self
-            .agent(thread_id, MAIN_AGENT_ID)
-            .is_some_and(|agent| agent.status == AgentStatus::Running);
-        if !is_running {
-            return;
-        }
-        if let Some(token) = self.running_cancellations.get(&thread_id) {
-            token.cancel();
+        let addr = if self.selected.agent_id == MAIN_AGENT_ID {
+            AgentAddr::Main
+        } else {
+            let Some(key) = self
+                .agent(thread_id, self.selected.agent_id)
+                .filter(|agent| agent.status == AgentStatus::Running)
+                .and_then(|agent| agent.runtime_key)
+            else {
+                return;
+            };
+            AgentAddr::Runtime(key)
+        };
+
+        // A control is only present while the agent is running, so its presence
+        // is the running check; cancelling the main agent tears down the whole
+        // thread, a subagent only its own subtree (the token's wiring differs).
+        if let Some(control) = self.agent_controls.get(&(thread_id, addr)) {
+            control.cancel();
         }
     }
 
@@ -1170,8 +1345,7 @@ impl AppState {
         };
         for agent in std::iter::once(&mut thread.main_agent).chain(thread.subagents.iter_mut()) {
             if agent.status == AgentStatus::Running {
-                collapse_reasoning(agent);
-                agent.status = AgentStatus::Cancelled;
+                settle_cancelled_agent(agent, "cancelled by user");
             }
         }
     }
@@ -1248,15 +1422,16 @@ impl AppState {
         agent.messages.push(kind.message(delta));
     }
 
-    fn spawn_nested(
-        &mut self,
-        thread_id: ThreadId,
-        key: RuntimeAgentKey,
-        parent: Option<RuntimeAgentKey>,
-        depth: AgentDepth,
-        task: String,
-        context: Option<String>,
-    ) {
+    fn spawn_nested(&mut self, thread_id: ThreadId, spawned: SpawnNested) {
+        let SpawnNested {
+            key,
+            parent,
+            depth,
+            task,
+            context,
+            control,
+        } = spawned;
+
         let parent_id = parent
             .and_then(|parent_key| self.agent_id_by_runtime_key(thread_id, parent_key))
             .unwrap_or(MAIN_AGENT_ID);
@@ -1268,6 +1443,9 @@ impl AppState {
         if let Some(context) = context.filter(|context| !context.trim().is_empty()) {
             messages.push(Message::system(format!("Context:\n{}", context.trim())));
         }
+
+        self.agent_controls
+            .insert((thread_id, AgentAddr::Runtime(key)), control);
 
         if let Some(thread) = self.thread_mut(thread_id) {
             thread.expanded = true;
@@ -1403,6 +1581,44 @@ impl AppState {
             .map(|agent| agent.id)
     }
 
+    fn remove_agent_control(&mut self, thread_id: ThreadId, addr: AgentAddr) {
+        self.agent_controls.remove(&(thread_id, addr));
+    }
+
+    fn remove_agent_controls_for_subtree(&mut self, thread_id: ThreadId, root: AgentId) {
+        let keys: HashSet<_> = self
+            .thread(thread_id)
+            .map(|thread| descendant_agent_ids(thread, root))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|agent_id| self.agent(thread_id, agent_id)?.runtime_key)
+            .collect();
+
+        self.agent_controls.retain(|(control_thread_id, addr), _| {
+            *control_thread_id != thread_id
+                || !matches!(addr, AgentAddr::Runtime(key) if keys.contains(key))
+        });
+    }
+
+    fn cancel_agent_subtree(&mut self, thread_id: ThreadId, root: AgentId, reason: &str) {
+        let agent_ids = self
+            .thread(thread_id)
+            .map(|thread| descendant_agent_ids(thread, root))
+            .unwrap_or_default();
+
+        for agent_id in agent_ids {
+            if let Some(agent) = self.agent_mut(thread_id, agent_id)
+                && agent.status == AgentStatus::Running
+            {
+                settle_cancelled_agent(agent, reason);
+            }
+        }
+    }
+
+    fn thread(&self, thread_id: ThreadId) -> Option<&ThreadState> {
+        self.threads.iter().find(|thread| thread.id == thread_id)
+    }
+
     fn thread_mut(&mut self, thread_id: ThreadId) -> Option<&mut ThreadState> {
         self.threads
             .iter_mut()
@@ -1450,6 +1666,37 @@ fn append_child_sidebar_items(
             append_child_sidebar_items(items, thread, child.id, depth + 1, selected);
         }
     }
+}
+
+fn descendant_agent_ids(thread: &ThreadState, root: AgentId) -> Vec<AgentId> {
+    let mut ids = vec![root];
+    let mut index = 0;
+    while index < ids.len() {
+        let parent = ids[index];
+        ids.extend(
+            thread
+                .subagents
+                .iter()
+                .filter(|agent| agent.parent_id == Some(parent))
+                .map(|agent| agent.id),
+        );
+        index += 1;
+    }
+    ids
+}
+
+fn settle_cancelled_agent(agent: &mut AgentNode, reason: &str) {
+    collapse_reasoning(agent);
+    agent.status = AgentStatus::Cancelled;
+    for message in &mut agent.messages {
+        if let Some(tool) = message.tool_mut()
+            && !tool.status.is_done()
+        {
+            tool.status = ToolStatus::Failed;
+            tool.result = Some(reason.to_string());
+        }
+    }
+    agent.messages.push(Message::error(reason));
 }
 
 fn initial_main_messages() -> Vec<Message> {
@@ -1589,6 +1836,16 @@ mod tests {
         for ch in text.chars() {
             app.handle_key(key(KeyCode::Char(ch)));
         }
+    }
+
+    fn subagent_control() -> AgentControl {
+        let (queue, _receiver) = mpsc::unbounded_channel();
+        AgentControl::new(CancellationToken::new(), queue)
+    }
+
+    fn subagent_control_with_receiver() -> (AgentControl, mpsc::UnboundedReceiver<String>) {
+        let (queue, receiver) = mpsc::unbounded_channel();
+        (AgentControl::new(CancellationToken::new(), queue), receiver)
     }
 
     // Event constructors for the top-level agent.
@@ -2109,6 +2366,7 @@ mod tests {
             depth,
             task: task.into(),
             context: None,
+            control: subagent_control(),
         }
     }
 
@@ -2185,6 +2443,7 @@ mod tests {
                 depth: 1,
                 task: "task".into(),
                 context: Some("important ctx".into()),
+                control: subagent_control(),
             },
         );
         let messages = &app.threads[0].subagents[0].messages;
@@ -2293,6 +2552,200 @@ mod tests {
         app.apply_thread_event(T, nested_started(RuntimeAgentKey::new(1), None, 1, "task"));
         app.apply_thread_event(T, nested_error(RuntimeAgentKey::new(1), "bad"));
         assert_eq!(app.threads[0].subagents[0].status, AgentStatus::Error);
+    }
+
+    #[test]
+    fn cancelling_selected_subagent_cancels_only_its_control() {
+        let mut app = AppState::new();
+        let main_cancel = submit(&mut app, "go");
+        let subagent_cancel = CancellationToken::new();
+        let (queue, _receiver) = mpsc::unbounded_channel();
+        app.apply_thread_event(
+            T,
+            ThreadEvent::SpawnedSubagent {
+                key: RuntimeAgentKey::new(1),
+                parent: None,
+                depth: 1,
+                task: "sub".into(),
+                context: None,
+                control: AgentControl::new(subagent_cancel.clone(), queue),
+            },
+        );
+        app.selected.agent_id = app.threads[0].subagents[0].id;
+
+        app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
+
+        assert!(subagent_cancel.is_cancelled());
+        assert!(
+            !main_cancel.is_cancelled(),
+            "targeted subagent cancel must let the parent run continue"
+        );
+    }
+
+    #[test]
+    fn cancelled_subagent_marks_subtree_and_running_tools_failed() {
+        let mut app = AppState::new();
+        app.apply_thread_event(T, nested_started(RuntimeAgentKey::new(1), None, 1, "sub"));
+        app.apply_thread_event(
+            T,
+            agent_event(
+                AgentAddr::Runtime(RuntimeAgentKey::new(1)),
+                AgentNodeEvent::ToolCall {
+                    id: "child-tool".into(),
+                    name: "read_file".into(),
+                    arguments: json!({ "path": "/tmp/a" }),
+                },
+            ),
+        );
+
+        app.apply_thread_event(
+            T,
+            agent_event(
+                AgentAddr::Runtime(RuntimeAgentKey::new(1)),
+                AgentNodeEvent::Cancelled("subagent cancelled by user".into()),
+            ),
+        );
+
+        let child = &app.threads[0].subagents[0];
+        assert_eq!(child.status, AgentStatus::Cancelled);
+        let tool = child
+            .messages
+            .iter()
+            .find(|message| message.tool_call_id() == Some("child-tool"))
+            .expect("running tool card");
+        assert_eq!(tool.tool_status(), ToolStatus::Failed);
+        assert_eq!(
+            tool.tool_result_text(),
+            Some("subagent cancelled by user"),
+            "cancelled tools show a terminal result"
+        );
+    }
+
+    #[test]
+    fn input_to_selected_running_subagent_queues_a_message_without_a_visible_message() {
+        let mut app = AppState::new();
+        let (control, mut receiver) = subagent_control_with_receiver();
+        app.apply_thread_event(
+            T,
+            ThreadEvent::SpawnedSubagent {
+                key: RuntimeAgentKey::new(1),
+                parent: None,
+                depth: 1,
+                task: "sub".into(),
+                context: None,
+                control,
+            },
+        );
+        let subagent_id = app.threads[0].subagents[0].id;
+        app.selected.agent_id = subagent_id;
+        type_str(&mut app, "focus on tests");
+
+        app.handle_key(key(KeyCode::Enter));
+
+        // The message is queued for the run, the input clears, but no visible
+        // bubble appears yet — it lands when the loop injects it at a boundary.
+        assert_eq!(receiver.try_recv().unwrap(), "focus on tests");
+        assert_eq!(app.input.value, "");
+        assert!(
+            app.threads[0].subagents[0]
+                .messages
+                .iter()
+                .all(|message| message.text() != Some("focus on tests")),
+            "no visible message until the boundary event arrives"
+        );
+
+        // The agent loop reports the injection at a turn boundary; only now does
+        // the user bubble appear in the transcript.
+        app.apply_thread_event(
+            T,
+            agent_event(
+                AgentAddr::Runtime(RuntimeAgentKey::new(1)),
+                AgentNodeEvent::UserMessage {
+                    text: "focus on tests".into(),
+                },
+            ),
+        );
+        assert!(
+            app.threads[0].subagents[0]
+                .messages
+                .iter()
+                .any(|message| message.role() == MessageRole::User
+                    && message.content() == "focus on tests")
+        );
+    }
+
+    #[test]
+    fn message_to_running_main_agent_is_queued_not_started_as_a_new_run() {
+        let mut app = AppState::new();
+        type_str(&mut app, "first");
+        // Keep the queue receiver alive, as the runtime does, so the enqueue
+        // succeeds (a dropped receiver would fail the send).
+        let (cancel, mut queued_messages) = match app.handle_key(key(KeyCode::Enter)) {
+            SubmitResult::Submitted {
+                cancel,
+                queued_messages,
+                ..
+            } => (cancel, queued_messages),
+            other => panic!("expected Submitted, got {other:?}"),
+        };
+        assert!(app.active_agent_running());
+
+        // Typing while the main agent runs queues a message instead of being
+        // rejected; the run keeps going and no second run is started.
+        type_str(&mut app, "second");
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter)),
+            SubmitResult::None
+        ));
+        assert_eq!(app.input.value, "");
+        assert_eq!(queued_messages.try_recv().unwrap(), "second");
+        assert!(!cancel.is_cancelled());
+        assert!(app.active_agent_running());
+
+        // No visible bubble for the queued message yet — it appears only when the
+        // loop injects it at a turn boundary.
+        assert!(
+            main_messages(&app)
+                .iter()
+                .all(|message| message.text() != Some("second")),
+            "queued message is not shown until injected"
+        );
+
+        app.apply_thread_event(
+            T,
+            main_event(AgentNodeEvent::UserMessage {
+                text: "second".into(),
+            }),
+        );
+        assert_eq!(last(&app).role(), MessageRole::User);
+        assert_eq!(last(&app).content(), "second");
+    }
+
+    #[test]
+    fn user_message_event_lands_after_in_progress_reasoning() {
+        let mut app = AppState::new();
+        let _ = submit(&mut app, "go");
+        // messages: [System(0), User(1) "go", Reasoning(2)]
+        app.apply_thread_event(T, reasoning("pondering"));
+        assert!(!main_messages(&app)[2].collapsed());
+
+        app.apply_thread_event(
+            T,
+            main_event(AgentNodeEvent::UserMessage {
+                text: "actually, do this".into(),
+            }),
+        );
+
+        // The streaming reasoning block is collapsed and the user bubble appended
+        // after it as a single new message — the reasoning is not split in two.
+        assert!(main_messages(&app)[2].collapsed());
+        let reasoning_blocks = main_messages(&app)
+            .iter()
+            .filter(|message| message.role() == MessageRole::Reasoning)
+            .count();
+        assert_eq!(reasoning_blocks, 1, "reasoning is not split");
+        assert_eq!(last(&app).role(), MessageRole::User);
+        assert_eq!(last(&app).content(), "actually, do this");
     }
 
     #[test]

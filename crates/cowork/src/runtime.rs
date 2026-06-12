@@ -14,12 +14,13 @@ use llm::{
     ToolRegistry, parse_args,
 };
 use ollama::OllamaProvider;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     app::{
-        AgentAddr, AgentCompletion, AgentDepth, AgentNodeEvent, RuntimeAgentKey, ThreadEvent,
-        ThreadId, ToolPermissionResponse,
+        AgentAddr, AgentCompletion, AgentControl, AgentDepth, AgentNodeEvent, RuntimeAgentKey,
+        ThreadEvent, ThreadId, ToolPermissionResponse,
     },
     config::{
         AGENT_MAX_TURNS, MAIN_AGENT_PREAMBLE, MODEL, PROMPT_RETRY_ATTEMPTS, PROMPT_RETRY_BACKOFFS,
@@ -91,6 +92,7 @@ fn map_event(event: CoreAgentEvent, addr: AgentAddr) -> Option<ThreadEvent> {
     let event = match event {
         CoreAgentEvent::AssistantDelta { delta } => AgentNodeEvent::AssistantDelta { delta },
         CoreAgentEvent::ReasoningDelta { delta } => AgentNodeEvent::ReasoningDelta { delta },
+        CoreAgentEvent::UserMessageInjected { text } => AgentNodeEvent::UserMessage { text },
         CoreAgentEvent::ToolCallFinished(call) => AgentNodeEvent::ToolCall {
             id: call.id,
             name: call.name,
@@ -223,10 +225,11 @@ struct VisibleAgentRun {
     conversation_id: String,
     preamble: &'static str,
     subagent_context: Option<SubagentContext>,
+    queued_messages: Option<mpsc::UnboundedReceiver<String>>,
 }
 
 async fn run_visible_agent(
-    spec: VisibleAgentRun,
+    mut spec: VisibleAgentRun,
     store: ConversationStore,
     events: RuntimeEventSender,
 ) -> Result<String, AgentRunError> {
@@ -249,6 +252,7 @@ async fn run_visible_agent(
         &store,
         &runtime,
         &mut sink,
+        spec.queued_messages.as_mut(),
     )
     .await
 }
@@ -263,6 +267,7 @@ pub(crate) fn spawn_prompt_task(
     store: ConversationStore,
     events: RuntimeEventSender,
     cancel: CancellationToken,
+    queued_messages: mpsc::UnboundedReceiver<String>,
 ) {
     tokio::spawn(async move {
         let mut lifecycle = ThreadEventSink::new(events.clone(), thread_id);
@@ -279,6 +284,9 @@ pub(crate) fn spawn_prompt_task(
                 events.clone(),
                 store.clone(),
             )),
+            // The main agent now has a queue too: messages typed while it runs
+            // are drained between turns, exactly like a subagent's queue.
+            queued_messages: Some(queued_messages),
         };
 
         // Race the whole run (retries, sleeps, and the nested subagent tree)
@@ -311,6 +319,7 @@ async fn run_prompt_with_retries(
     store: &ConversationStore,
     runtime: &AgentRuntime,
     sink: &mut AgentNodeEventSink,
+    mut queued_messages: Option<&mut mpsc::UnboundedReceiver<String>>,
 ) -> Result<String, AgentRunError> {
     let initial_history = store.load(conversation_id).await;
 
@@ -320,7 +329,9 @@ async fn run_prompt_with_retries(
             .await;
 
         let error = match runtime
-            .run(conversation_id, prompt.to_string(), &mut *sink)
+            .run_with_user_messages(conversation_id, prompt.to_string(), &mut *sink, || {
+                drain_queued_messages(queued_messages.as_deref_mut())
+            })
             .await
         {
             Ok(response) => return Ok(response),
@@ -340,6 +351,18 @@ async fn run_prompt_with_retries(
     }
 
     unreachable!("retry loop always returns")
+}
+
+fn drain_queued_messages(receiver: Option<&mut mpsc::UnboundedReceiver<String>>) -> Vec<String> {
+    let Some(receiver) = receiver else {
+        return Vec::new();
+    };
+
+    let mut messages = Vec::new();
+    while let Ok(message) = receiver.try_recv() {
+        messages.push(message);
+    }
+    messages
 }
 
 fn retry_backoff(attempt: usize, error: &AgentRunError) -> Option<Duration> {
@@ -507,6 +530,9 @@ async fn run_child_agent(
     let child_addr = AgentAddr::Runtime(key);
     let prompt = subagent_prompt(&task, context.as_deref());
 
+    let cancel = CancellationToken::new();
+    let (queue_tx, queue_rx) = mpsc::unbounded_channel();
+
     let mut lifecycle =
         ThreadEventSink::new(parent_context.events.clone(), parent_context.thread_id);
     lifecycle
@@ -516,6 +542,7 @@ async fn run_child_agent(
             depth: child_depth,
             task,
             context,
+            control: AgentControl::new(cancel.clone(), queue_tx),
         })
         .await;
 
@@ -527,16 +554,20 @@ async fn run_child_agent(
         conversation_id: format!("runtime-agent-{key}"),
         preamble: subagent_preamble(can_delegate),
         subagent_context: can_delegate.then(|| parent_context.child_context(key, child_depth)),
+        queued_messages: Some(queue_rx),
     };
 
-    let result = run_visible_agent(
-        run,
-        parent_context.store.clone(),
-        parent_context.events.clone(),
-    )
-    .await
-    .map_err(|error| format!("subagent failed: {error}"))
-    .and_then(require_nested_response);
+    let result = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Err("subagent cancelled by user".to_string()),
+        result = run_visible_agent(
+            run,
+            parent_context.store.clone(),
+            parent_context.events.clone(),
+        ) => result
+            .map_err(|error| format!("subagent failed: {error}"))
+            .and_then(require_nested_response),
+    };
 
     match &result {
         Ok(response) => {
@@ -544,6 +575,14 @@ async fn run_child_agent(
                 .send(ThreadEvent::Agent {
                     addr: child_addr,
                     event: AgentNodeEvent::Finished(AgentCompletion::Returned(response.clone())),
+                })
+                .await;
+        }
+        Err(error) if error == "subagent cancelled by user" => {
+            lifecycle
+                .send(ThreadEvent::Agent {
+                    addr: child_addr,
+                    event: AgentNodeEvent::Cancelled(error.clone()),
                 })
                 .await;
         }

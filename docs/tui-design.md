@@ -233,7 +233,15 @@ Options:
 - Allow typing but queue the prompt until the current run finishes.
 - Allow concurrent prompts/runs in the same thread.
 
-For a first implementation, disabling submission while a run is active is simplest and safest.
+**Resolved: queue at turn boundaries.** A message typed while an agent runs is
+enqueued on that agent's `AgentControl.queue` and drained by the agent loop
+between turns (never mid-stream, so the provider stream / tool call in flight is
+not interrupted). This unifies what used to be two paths — "subagent guidance"
+and a main-agent prompt — into one outgoing-message queue keyed by `AgentAddr`.
+Concurrent runs in a thread are still ruled out by the single-instance Ollama
+constraint. The queued message is surfaced in the transcript only when the loop
+injects it (`AgentStreamEvent::UserMessageInjected` → `AgentNodeEvent::UserMessage`),
+so it appears between turns rather than splitting a streaming block.
 
 ### 7. Cancellation
 
