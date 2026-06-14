@@ -1,6 +1,3 @@
-use futures::SinkExt;
-use tokio_util::sync::PollSender;
-
 use crate::{
     app::{AgentAddr, PendingToolPermission, ThreadEvent, ThreadId, ToolPermissionResponse},
     tui::{RuntimeEvent, RuntimeEventSender},
@@ -8,19 +5,16 @@ use crate::{
 
 #[derive(Clone)]
 pub(crate) struct ThreadEventSink {
-    events: PollSender<RuntimeEvent>,
+    events: RuntimeEventSender,
     thread_id: ThreadId,
 }
 
 impl ThreadEventSink {
     pub(crate) fn new(events: RuntimeEventSender, thread_id: ThreadId) -> Self {
-        Self {
-            events: PollSender::new(events),
-            thread_id,
-        }
+        Self { events, thread_id }
     }
 
-    pub(crate) async fn send(&mut self, event: ThreadEvent) {
+    pub(crate) async fn send(&self, event: ThreadEvent) {
         let _ = self
             .events
             .send(RuntimeEvent::Agent(self.thread_id, event))
@@ -28,7 +22,7 @@ impl ThreadEventSink {
     }
 
     pub(crate) async fn request_tool_permission(
-        &mut self,
+        &self,
         addr: AgentAddr,
         id: String,
         name: String,

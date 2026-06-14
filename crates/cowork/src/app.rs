@@ -63,8 +63,8 @@ impl fmt::Display for AgentId {
 }
 
 /// A random, per-spawn agent id (a UUIDv4 as a `u128`). Random rather than a
-/// counter so persisted `runtime-agent-{key}` conversation ids never collide,
-/// in a session or across sessions once persistence lands.
+/// counter so persisted `runtime-agent-{key}` conversation ids never collide
+/// within a session or across restored sessions.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -398,12 +398,12 @@ pub struct InputState {
 #[derive(Debug, Clone)]
 pub struct SidebarItem {
     pub thread_id: ThreadId,
-    pub agent_id: Option<AgentId>,
+    pub agent_id: AgentId,
     pub label: String,
     pub depth: usize,
     pub expanded: bool,
     pub selected: bool,
-    pub status: Option<AgentStatus>,
+    pub status: AgentStatus,
     pub has_children: bool,
 }
 
@@ -454,7 +454,7 @@ pub enum ToolPermissionResponse {
 /// `cancel` stops the run; `queue` carries user messages to be delivered at the
 /// next turn boundary (the unified path for both a mid-run prompt to the main
 /// agent and a message to a subagent). Transient runtime state, never persisted.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AgentControl {
     cancel: CancellationToken,
     queue: mpsc::UnboundedSender<String>,
@@ -521,7 +521,7 @@ pub enum AgentAddr {
     Runtime(RuntimeAgentKey),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum ThreadEvent {
     /// The top-level prompt run has begun.
     MainStarted,
@@ -554,7 +554,7 @@ struct SpawnNested {
     control: AgentControl,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub enum AgentNodeEvent {
     AssistantDelta {
         delta: String,
@@ -686,7 +686,7 @@ impl AppState {
         }
     }
 
-    pub fn active_agent_running(&self) -> bool {
+    pub fn main_agent_running(&self) -> bool {
         self.agent(self.selected.thread_id, MAIN_AGENT_ID)
             .is_some_and(|agent| agent.status == AgentStatus::Running)
     }
@@ -731,13 +731,13 @@ impl AppState {
         for thread in &self.threads {
             items.push(SidebarItem {
                 thread_id: thread.id,
-                agent_id: Some(MAIN_AGENT_ID),
+                agent_id: MAIN_AGENT_ID,
                 label: thread.title.clone(),
                 depth: 0,
                 expanded: thread.expanded,
                 selected: self.selected.thread_id == thread.id
                     && self.selected.agent_id == MAIN_AGENT_ID,
-                status: Some(thread.main_agent.status),
+                status: thread.main_agent.status,
                 has_children: thread
                     .subagents
                     .iter()
@@ -1062,7 +1062,7 @@ impl AppState {
                 self.conversation_cursor = self.conversation_cursor.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                let count = self.collapsible_message_indices().len();
+                let count = self.collapsible_message_count();
                 if count > 0 {
                     self.conversation_cursor = (self.conversation_cursor + 1).min(count - 1);
                 }
@@ -1074,29 +1074,29 @@ impl AppState {
     }
 
     /// Indices into the selected agent's messages that can be collapsed/expanded.
-    pub fn collapsible_message_indices(&self) -> Vec<usize> {
-        self.selected_agent()
-            .map(|agent| {
-                agent
-                    .messages
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, message)| message.is_collapsible())
-                    .map(|(index, _)| index)
-                    .collect()
-            })
-            .unwrap_or_default()
+    fn collapsible_message_indices_iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.selected_agent().into_iter().flat_map(|agent| {
+            agent
+                .messages
+                .iter()
+                .enumerate()
+                .filter(|(_, message)| message.is_collapsible())
+                .map(|(index, _)| index)
+        })
+    }
+
+    fn collapsible_message_count(&self) -> usize {
+        self.collapsible_message_indices_iter().count()
     }
 
     /// Message index of the collapsible currently selected in conversation focus.
     pub fn selected_collapsible_message_index(&self) -> Option<usize> {
-        self.collapsible_message_indices()
-            .get(self.conversation_cursor)
-            .copied()
+        self.collapsible_message_indices_iter()
+            .nth(self.conversation_cursor)
     }
 
     fn clamp_conversation_cursor(&mut self) {
-        let count = self.collapsible_message_indices().len();
+        let count = self.collapsible_message_count();
         self.conversation_cursor = self.conversation_cursor.min(count.saturating_sub(1));
     }
 
@@ -1185,7 +1185,7 @@ impl AppState {
 
         // A message typed while the main agent is running is queued for delivery
         // at the next turn boundary, not started as a competing run.
-        if self.active_agent_running() {
+        if self.main_agent_running() {
             self.enqueue_main_message(prompt);
             return SubmitResult::None;
         }
@@ -1231,14 +1231,11 @@ impl AppState {
     /// never split.
     fn enqueue_main_message(&mut self, prompt: String) {
         let thread_id = self.selected.thread_id;
-        let Some(control) = self
+        let result = self
             .agent_controls
             .get(&(thread_id, AgentAddr::Main))
-            .cloned()
-        else {
-            return;
-        };
-        if control.enqueue(prompt).is_ok() {
+            .map(|control| control.enqueue(prompt));
+        if matches!(result, Some(Ok(()))) {
             self.input.value.clear();
             self.input.cursor = 0;
             self.conversation_scroll = 0;
@@ -1257,10 +1254,10 @@ impl AppState {
             return;
         };
 
-        let Some(control) = self
+        let Some(result) = self
             .agent_controls
             .get(&(thread_id, AgentAddr::Runtime(key)))
-            .cloned()
+            .map(|control| control.enqueue(prompt))
         else {
             return;
         };
@@ -1268,7 +1265,7 @@ impl AppState {
         // No visible message is pushed here — the subagent loop emits a
         // `UserMessage` event when it injects the message at a turn boundary, so
         // it lands between turns rather than splitting a streaming block.
-        match control.enqueue(prompt) {
+        match result {
             Ok(()) => {
                 self.input.value.clear();
                 self.input.cursor = 0;
@@ -1299,7 +1296,7 @@ impl AppState {
         let next = (current as isize + direction).clamp(0, items.len() as isize - 1) as usize;
         let item = &items[next];
         self.selected.thread_id = item.thread_id;
-        self.selected.agent_id = item.agent_id.unwrap_or(MAIN_AGENT_ID);
+        self.selected.agent_id = item.agent_id;
         self.conversation_scroll = 0;
         self.conversation_cursor = 0;
     }
@@ -1654,12 +1651,12 @@ fn append_agent_sidebar_item(
         .any(|child| child.parent_id == Some(agent.id));
     items.push(SidebarItem {
         thread_id: thread.id,
-        agent_id: Some(agent.id),
+        agent_id: agent.id,
         label: agent.label.clone(),
         depth,
         expanded: agent.expanded,
         selected: selected.thread_id == thread.id && selected.agent_id == agent.id,
-        status: Some(agent.status),
+        status: agent.status,
         has_children,
     });
 }
@@ -2778,7 +2775,7 @@ mod tests {
             } => (cancel, queued_messages),
             other => panic!("expected Submitted, got {other:?}"),
         };
-        assert!(app.active_agent_running());
+        assert!(app.main_agent_running());
 
         // Typing while the main agent runs queues a message instead of being
         // rejected; the run keeps going and no second run is started.
@@ -2790,7 +2787,7 @@ mod tests {
         assert_eq!(app.input.value, "");
         assert_eq!(queued_messages.try_recv().unwrap(), "second");
         assert!(!cancel.is_cancelled());
-        assert!(app.active_agent_running());
+        assert!(app.main_agent_running());
 
         // No visible bubble for the queued message yet — it appears only when the
         // loop injects it at a turn boundary.
@@ -2920,7 +2917,8 @@ mod tests {
             },
         );
         // messages: [System(0), Reasoning(1), Assistant(2), ToolCall(3)]
-        assert_eq!(app.collapsible_message_indices(), vec![1, 3]);
+        let indices: Vec<_> = app.collapsible_message_indices_iter().collect();
+        assert_eq!(indices, vec![1, 3]);
         assert_eq!(app.selected_collapsible_message_index(), Some(1));
     }
 
@@ -2999,7 +2997,7 @@ mod tests {
         let mut app = AppState::new();
         let cancel = submit(&mut app, "do work");
         assert!(!cancel.is_cancelled());
-        assert!(app.active_agent_running());
+        assert!(app.main_agent_running());
 
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
         assert!(cancel.is_cancelled(), "Ctrl+X cancels the run's token");
@@ -3030,7 +3028,7 @@ mod tests {
             "a running subagent is swept even though it sent no terminal event"
         );
         assert!(
-            !app.active_agent_running(),
+            !app.main_agent_running(),
             "the thread accepts a new prompt after cancellation"
         );
     }
@@ -3115,7 +3113,7 @@ mod tests {
                 },
             },
         );
-        assert!(app.active_agent_running());
+        assert!(app.main_agent_running());
 
         let (next_thread_id, next_agent_id) = app.next_ids();
         let restored = AppState::restored(
@@ -3152,7 +3150,7 @@ mod tests {
             "the retry baseline is re-anchored to the loaded transcript"
         );
         assert!(
-            !restored.active_agent_running(),
+            !restored.main_agent_running(),
             "the restored session accepts a new prompt"
         );
     }

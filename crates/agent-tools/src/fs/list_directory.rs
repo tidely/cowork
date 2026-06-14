@@ -54,7 +54,7 @@ pub fn list_directory(input: ListDirectoryInput) -> Result<String, ToolIoError> 
 
             Ok((
                 entry.file_name().to_string_lossy().to_string(),
-                kind.to_string(),
+                kind,
                 metadata.len(),
             ))
         })
@@ -68,7 +68,7 @@ pub fn list_directory(input: ListDirectoryInput) -> Result<String, ToolIoError> 
 
     Ok(entries
         .into_iter()
-        .map(|(name, kind, size)| match kind.as_str() {
+        .map(|(name, kind, size)| match kind {
             "dir" => format!("{name}/"),
             "file" => format!("{name} ({size} bytes)"),
             _ => format!("{name} ({kind})"),

@@ -59,10 +59,10 @@ fn data_dir() -> Option<PathBuf> {
     let home = PathBuf::from(env::var_os("HOME")?);
     if cfg!(target_os = "macos") {
         Some(home.join("Library/Application Support/cowork"))
+    } else if let Some(base) = env::var_os("XDG_DATA_HOME") {
+        Some(PathBuf::from(base).join("cowork"))
     } else {
-        env::var_os("XDG_DATA_HOME")
-            .map(|base| PathBuf::from(base).join("cowork"))
-            .or_else(|| Some(home.join(".local/share/cowork")))
+        Some(home.join(".local/share/cowork"))
     }
 }
 

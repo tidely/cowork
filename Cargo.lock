@@ -32,10 +32,8 @@ dependencies = [
 name = "agent"
 version = "0.1.0"
 dependencies = [
- "async-stream",
  "async-trait",
  "futures",
- "futures-util",
  "llm",
  "serde_json",
  "tokio",
@@ -46,7 +44,6 @@ name = "agent-tools"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "futures",
  "llm",
  "pdf-extract",
  "schemars",
@@ -265,8 +262,6 @@ dependencies = [
  "agent-tools",
  "async-trait",
  "crossterm",
- "futures",
- "futures-util",
  "llm",
  "ollama",
  "ratatui",
@@ -1173,7 +1168,6 @@ dependencies = [
  "async-stream",
  "async-trait",
  "futures",
- "futures-util",
  "llm",
  "reqwest",
  "serde",

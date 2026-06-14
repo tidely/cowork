@@ -77,16 +77,16 @@ impl AgentNodeEventSink {
 #[async_trait]
 impl EventSink for AgentNodeEventSink {
     async fn emit(&mut self, event: CoreAgentEvent) {
-        if let Some(app_event) = map_event(event, self.addr) {
-            self.inner.send(app_event).await;
+        if let Some(event) = map_event(event) {
+            self.send(event).await;
         }
     }
 }
 
-/// Translate a core stream event into a thread event addressed to one visible
-/// agent node. Pure (no I/O) so the mapping is unit-tested directly. Provider,
-/// queue, and incremental tool-call notices have no distinct UI today.
-fn map_event(event: CoreAgentEvent, addr: AgentAddr) -> Option<ThreadEvent> {
+/// Translate a core stream event into a visible agent node event. Pure (no I/O)
+/// so the mapping is unit-tested directly. Provider, queue, and incremental
+/// tool-call notices have no distinct UI today.
+fn map_event(event: CoreAgentEvent) -> Option<AgentNodeEvent> {
     let event = match event {
         CoreAgentEvent::AssistantDelta { delta } => AgentNodeEvent::AssistantDelta { delta },
         CoreAgentEvent::ReasoningDelta { delta } => AgentNodeEvent::ReasoningDelta { delta },
@@ -119,14 +119,13 @@ fn map_event(event: CoreAgentEvent, addr: AgentAddr) -> Option<ThreadEvent> {
         | CoreAgentEvent::ToolCallArgumentDelta { .. } => return None,
     };
 
-    Some(ThreadEvent::Agent { addr, event })
+    Some(event)
 }
 
 /// Applies the active [`AgentProfile`] before each tool call: read/delegate tools
 /// run, profile-denied tools are refused without a prompt, and the rest route
 /// through the app's permission UI.
 struct UiPermissionPolicy {
-    /// Cloned per request; `request_tool_permission` needs `&mut` on a sink.
     sink: ThreadEventSink,
     profile: AgentProfile,
     addr: AgentAddr,
@@ -156,8 +155,8 @@ impl ToolPermissionPolicy for UiPermissionPolicy {
                 ),
             },
             ToolPermissionMode::Ask => {
-                let mut sink = self.sink.clone();
-                match sink
+                match self
+                    .sink
                     .request_tool_permission(
                         self.addr,
                         call.id.clone(),
@@ -194,20 +193,14 @@ fn build_runtime(
     let provider = Arc::new(OllamaProvider::from_env());
 
     let mut tools = ToolRegistry::new();
-    let mut registrations = vec![
-        tools.insert(agent_tools::fs::ReadFile),
-        tools.insert(agent_tools::fs::ReadPdf),
-        tools.insert(agent_tools::fs::ListDirectory),
-        tools.insert(agent_tools::fs::EditFile),
-        tools.insert(agent_tools::fs::WriteFile),
-        tools.insert(agent_tools::terminal::Terminal),
-    ];
+    insert_builtin_tool(&mut tools, agent_tools::fs::ReadFile);
+    insert_builtin_tool(&mut tools, agent_tools::fs::ReadPdf);
+    insert_builtin_tool(&mut tools, agent_tools::fs::ListDirectory);
+    insert_builtin_tool(&mut tools, agent_tools::fs::EditFile);
+    insert_builtin_tool(&mut tools, agent_tools::fs::WriteFile);
+    insert_builtin_tool(&mut tools, agent_tools::terminal::Terminal);
     if let Some(context) = subagent_context {
-        registrations.push(tools.insert(SubagentTool::new(context)));
-    }
-
-    for result in registrations {
-        result.expect("built-in tool names are unique");
+        insert_builtin_tool(&mut tools, SubagentTool::new(context));
     }
 
     let mut config = AgentConfig::new(MODEL);
@@ -215,6 +208,10 @@ fn build_runtime(
     config.max_turns = AGENT_MAX_TURNS;
 
     AgentRuntime::new(provider, Arc::new(store), tools, config).with_permission(permission)
+}
+
+fn insert_builtin_tool(tools: &mut ToolRegistry, tool: impl Tool + 'static) {
+    tools.insert(tool).expect("built-in tool names are unique");
 }
 
 struct VisibleAgentRun {
@@ -269,7 +266,7 @@ pub(crate) fn spawn_prompt_task(
     queued_messages: mpsc::UnboundedReceiver<String>,
 ) {
     tokio::spawn(async move {
-        let mut lifecycle = ThreadEventSink::new(events.clone(), thread_id);
+        let lifecycle = ThreadEventSink::new(events.clone(), thread_id);
         lifecycle.send(ThreadEvent::MainStarted).await;
 
         let run = VisibleAgentRun {
@@ -475,8 +472,8 @@ impl Tool for SubagentTool {
 
 /// A random, effectively-collision-free id for a spawned agent (a UUIDv4 as a
 /// `u128`). Random rather than a growing counter so persisted
-/// `runtime-agent-{key}` conversation ids stay distinct across sessions once
-/// persistence lands, instead of restarting at the same values every run.
+/// `runtime-agent-{key}` conversation ids stay distinct across restored
+/// sessions instead of restarting at the same values every run.
 fn next_runtime_agent_key() -> RuntimeAgentKey {
     RuntimeAgentKey::new(uuid::Uuid::new_v4().as_u128())
 }
@@ -522,8 +519,7 @@ async fn run_child_agent(
     let cancel = CancellationToken::new();
     let (queue_tx, queue_rx) = mpsc::unbounded_channel();
 
-    let mut lifecycle =
-        ThreadEventSink::new(parent_context.events.clone(), parent_context.thread_id);
+    let lifecycle = ThreadEventSink::new(parent_context.events.clone(), parent_context.thread_id);
     lifecycle
         .send(ThreadEvent::SpawnedSubagent {
             key,
@@ -631,60 +627,49 @@ mod tests {
 
     #[test]
     fn assistant_and_reasoning_map_to_main_deltas() {
-        match map_event(
-            CoreAgentEvent::AssistantDelta { delta: "hi".into() },
-            AgentAddr::Main,
-        ) {
-            Some(ThreadEvent::Agent {
-                addr: AgentAddr::Main,
-                event: AgentNodeEvent::AssistantDelta { delta },
-            }) => assert_eq!(delta, "hi"),
+        match map_event(CoreAgentEvent::AssistantDelta { delta: "hi".into() }) {
+            Some(AgentNodeEvent::AssistantDelta { delta }) => assert_eq!(delta, "hi"),
             other => panic!("unexpected: {other:?}"),
         }
-        match map_event(
-            CoreAgentEvent::ReasoningDelta {
-                delta: "think".into(),
-            },
-            AgentAddr::Main,
-        ) {
-            Some(ThreadEvent::Agent {
-                addr: AgentAddr::Main,
-                event: AgentNodeEvent::ReasoningDelta { delta },
-            }) => assert_eq!(delta, "think"),
+        match map_event(CoreAgentEvent::ReasoningDelta {
+            delta: "think".into(),
+        }) {
+            Some(AgentNodeEvent::ReasoningDelta { delta }) => assert_eq!(delta, "think"),
             other => panic!("unexpected: {other:?}"),
         }
     }
 
-    #[test]
-    fn events_can_target_runtime_agent_nodes() {
-        match map_event(
-            CoreAgentEvent::AssistantDelta {
-                delta: "child".into(),
-            },
-            AgentAddr::Runtime(RuntimeAgentKey::new(42)),
-        ) {
-            Some(ThreadEvent::Agent {
-                addr: AgentAddr::Runtime(key),
-                event: AgentNodeEvent::AssistantDelta { delta },
-            }) if key == RuntimeAgentKey::new(42) => assert_eq!(delta, "child"),
+    #[tokio::test]
+    async fn event_sink_routes_events_to_runtime_agent_nodes() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let thread_id = ThreadId::new(7);
+        let key = RuntimeAgentKey::new(42);
+        let mut sink = AgentNodeEventSink::new(sender, thread_id, AgentAddr::Runtime(key));
+
+        sink.emit(CoreAgentEvent::AssistantDelta {
+            delta: "child".into(),
+        })
+        .await;
+
+        match receiver.recv().await {
+            Some(RuntimeEvent::Agent(
+                id,
+                ThreadEvent::Agent {
+                    addr: AgentAddr::Runtime(event_key),
+                    event: AgentNodeEvent::AssistantDelta { delta },
+                },
+            )) if id == thread_id && event_key == key => assert_eq!(delta, "child"),
             other => panic!("unexpected: {other:?}"),
         }
     }
 
     #[test]
     fn finished_tool_call_maps_to_tool_call_event() {
-        match map_event(
-            CoreAgentEvent::ToolCallFinished(tool_call()),
-            AgentAddr::Main,
-        ) {
-            Some(ThreadEvent::Agent {
-                addr: AgentAddr::Main,
-                event:
-                    AgentNodeEvent::ToolCall {
-                        id,
-                        name,
-                        arguments,
-                    },
+        match map_event(CoreAgentEvent::ToolCallFinished(tool_call())) {
+            Some(AgentNodeEvent::ToolCall {
+                id,
+                name,
+                arguments,
             }) => {
                 assert_eq!(id, "call-1");
                 assert_eq!(name, "read_file");
@@ -700,15 +685,11 @@ mod tests {
             call: tool_call(),
             output: ToolOutput::text("file contents"),
         };
-        match map_event(event, AgentAddr::Main) {
-            Some(ThreadEvent::Agent {
-                addr: AgentAddr::Main,
-                event:
-                    AgentNodeEvent::ToolResult {
-                        id,
-                        content,
-                        is_error,
-                    },
+        match map_event(event) {
+            Some(AgentNodeEvent::ToolResult {
+                id,
+                content,
+                is_error,
             }) => {
                 assert_eq!(id, "call-1");
                 assert_eq!(content, "file contents");
@@ -740,15 +721,11 @@ mod tests {
             raw_arguments: "{bad".into(),
             error: "eof".into(),
         });
-        match map_event(event, AgentAddr::Main) {
-            Some(ThreadEvent::Agent {
-                addr: AgentAddr::Main,
-                event:
-                    AgentNodeEvent::ToolCall {
-                        id,
-                        name,
-                        arguments,
-                    },
+        match map_event(event) {
+            Some(AgentNodeEvent::ToolCall {
+                id,
+                name,
+                arguments,
             }) => {
                 assert_eq!(id, "call-1");
                 assert_eq!(name, "read_file");
@@ -762,11 +739,8 @@ mod tests {
     #[test]
     fn usage_carries_token_counts() {
         let event = CoreAgentEvent::Usage(TokenUsage::from_input_output(10, 5));
-        match map_event(event, AgentAddr::Main) {
-            Some(ThreadEvent::Agent {
-                addr: AgentAddr::Main,
-                event: AgentNodeEvent::Usage(usage),
-            }) => {
+        match map_event(event) {
+            Some(AgentNodeEvent::Usage(usage)) => {
                 assert_eq!(
                     (usage.input_tokens, usage.output_tokens, usage.total_tokens),
                     (10, 5, 15)
@@ -834,7 +808,7 @@ mod tests {
         ];
         for event in dropped {
             assert!(
-                map_event(event.clone(), AgentAddr::Main).is_none(),
+                map_event(event.clone()).is_none(),
                 "expected drop: {event:?}"
             );
         }

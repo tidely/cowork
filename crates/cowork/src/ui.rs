@@ -49,8 +49,8 @@ fn render_sidebar(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(match item.status {
-                Some(AgentStatus::Running) => Color::Yellow,
-                Some(AgentStatus::Error) => Color::Red,
+                AgentStatus::Running => Color::Yellow,
+                AgentStatus::Error => Color::Red,
                 _ => Color::White,
             })
         };
@@ -287,7 +287,7 @@ fn wrapped_line_count(lines: &[Line<'_>], width: usize) -> usize {
 }
 
 fn render_input(frame: &mut Frame<'_>, app: &AppState, area: Rect) {
-    let running = app.active_agent_running();
+    let running = app.main_agent_running();
     let messaging_subagent = app.selected_subagent_accepts_messages();
     let permission = app.pending_tool_permission();
     let title = if permission.is_some() {
@@ -508,14 +508,13 @@ fn message_style(role: MessageRole) -> Style {
     }
 }
 
-fn status_icon(status: Option<AgentStatus>) -> &'static str {
+fn status_icon(status: AgentStatus) -> &'static str {
     match status {
-        Some(AgentStatus::Idle) => "○",
-        Some(AgentStatus::Running) => "◐",
-        Some(AgentStatus::Complete) => "●",
-        Some(AgentStatus::Error) => "!",
-        Some(AgentStatus::Cancelled) => "✕",
-        None => " ",
+        AgentStatus::Idle => "○",
+        AgentStatus::Running => "◐",
+        AgentStatus::Complete => "●",
+        AgentStatus::Error => "!",
+        AgentStatus::Cancelled => "✕",
     }
 }
 

@@ -8,7 +8,6 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
-futures.workspace = true
 llm.workspace = true
 pdf-extract.workspace = true
 schemars.workspace = true
