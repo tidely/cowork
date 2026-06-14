@@ -12,6 +12,7 @@ use tokio::{sync::mpsc, time};
 
 use crate::{
     app::{AppState, PendingToolPermission, SubmitResult, ThreadEvent, ThreadId},
+    cli::RunOptions,
     persistence, runtime, ui,
 };
 
@@ -26,12 +27,14 @@ pub enum RuntimeEvent {
     ToolPermissionRequest(PendingToolPermission),
 }
 
-pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
+pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> {
     let mut terminal = TerminalGuard::new()?;
     let (events, mut receiver) = mpsc::channel(512);
     spawn_input_thread(events.clone());
 
-    let session_path = persistence::session_path();
+    let session_path = (!options.temporary)
+        .then(persistence::session_path)
+        .flatten();
     let (mut app, memory) = match session_path.as_deref().and_then(persistence::load) {
         Some(snapshot) => (
             AppState::restored(
@@ -44,6 +47,16 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         ),
         None => (AppState::new(), ConversationStore::new()),
     };
+
+    if let Some(prompt) = options.initial_prompt {
+        spawn_submitted_prompt(
+            app.submit_prompt_text(prompt),
+            &events,
+            &memory,
+            &options.model,
+        );
+    }
+
     terminal.draw(|frame| ui::render(frame, &app))?;
 
     // Snapshots are debounced onto the tick and only written while no run is in
@@ -61,7 +74,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             }
             event = receiver.recv() => {
                 let Some(event) = event else { break; };
-                if handle_runtime_event(event, &mut app, &events, &memory) {
+                if handle_runtime_event(event, &mut app, &events, &memory, &options.model) {
                     dirty = true;
                 }
             }
@@ -89,27 +102,11 @@ fn handle_runtime_event(
     app: &mut AppState,
     events: &RuntimeEventSender,
     memory: &ConversationStore,
+    model: &str,
 ) -> bool {
     match event {
         RuntimeEvent::Terminal(Event::Key(key)) if key.kind == KeyEventKind::Press => {
-            if let SubmitResult::Submitted {
-                thread_id,
-                conversation_id,
-                prompt,
-                cancel,
-                queued_messages,
-            } = app.handle_key(key)
-            {
-                runtime::spawn_prompt_task(
-                    thread_id,
-                    prompt,
-                    conversation_id,
-                    memory.clone(),
-                    events.clone(),
-                    cancel,
-                    queued_messages,
-                );
-            }
+            spawn_submitted_prompt(app.handle_key(key), events, memory, model);
             true
         }
         RuntimeEvent::Terminal(_) => false,
@@ -122,6 +119,35 @@ fn handle_runtime_event(
             true
         }
     }
+}
+
+fn spawn_submitted_prompt(
+    result: SubmitResult,
+    events: &RuntimeEventSender,
+    memory: &ConversationStore,
+    model: &str,
+) {
+    let SubmitResult::Submitted {
+        thread_id,
+        conversation_id,
+        prompt,
+        cancel,
+        queued_messages,
+    } = result
+    else {
+        return;
+    };
+
+    runtime::spawn_prompt_task(runtime::PromptTask {
+        thread_id,
+        prompt,
+        conversation_id,
+        store: memory.clone(),
+        events: events.clone(),
+        model: model.to_string(),
+        cancel,
+        queued_messages,
+    });
 }
 
 fn spawn_input_thread(events: RuntimeEventSender) {

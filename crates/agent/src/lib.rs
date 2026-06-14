@@ -3,8 +3,8 @@ use std::{fmt, sync::Arc};
 use async_trait::async_trait;
 use futures::StreamExt;
 use llm::{
-    ChatMessage, ChatRequest, ConversationMemory, FinishReason, LlmError, Provider, StreamEvent,
-    TokenUsage, ToolArgumentParseError, ToolCall, ToolError, ToolOutput, ToolRegistry,
+    ChatMessage, ChatRequest, ConversationId, ConversationMemory, FinishReason, LlmError, Provider,
+    StreamEvent, TokenUsage, ToolArgumentParseError, ToolCall, ToolError, ToolOutput, ToolRegistry,
 };
 use serde_json::Value;
 
@@ -59,7 +59,7 @@ impl AgentRuntime {
 
     pub async fn run(
         &self,
-        conversation_id: &str,
+        conversation_id: ConversationId,
         prompt: impl Into<String>,
         events: &mut impl EventSink,
     ) -> Result<String, AgentRunError> {
@@ -74,7 +74,7 @@ impl AgentRuntime {
     /// call is not interrupted.
     pub async fn run_with_user_messages(
         &self,
-        conversation_id: &str,
+        conversation_id: ConversationId,
         prompt: impl Into<String>,
         events: &mut impl EventSink,
         mut drain_user_messages: impl FnMut() -> Vec<String> + Send,
@@ -335,7 +335,7 @@ impl AgentRuntime {
 
 async fn append_user_messages(
     memory: &dyn ConversationMemory,
-    conversation_id: &str,
+    conversation_id: ConversationId,
     history: &mut Vec<ChatMessage>,
     events: &mut impl EventSink,
     messages: Vec<String>,
@@ -615,7 +615,7 @@ mod tests {
             scripted_runtime(called.clone(), memory.clone()).with_permission(Arc::new(DenyAll));
 
         let response = runtime
-            .run("conv", "go", &mut NoopEventSink)
+            .run(ConversationId::new(1), "go", &mut NoopEventSink)
             .await
             .expect("run completes");
 
@@ -623,7 +623,7 @@ mod tests {
         assert!(!called.load(Ordering::SeqCst), "denied tool must not run");
 
         let tool_message = memory
-            .load("conv")
+            .load(ConversationId::new(1))
             .await
             .into_iter()
             .find_map(|message| match message {
@@ -643,7 +643,7 @@ mod tests {
         let runtime = scripted_runtime(called.clone(), Arc::new(ConversationStore::new()));
 
         runtime
-            .run("conv", "go", &mut NoopEventSink)
+            .run(ConversationId::new(1), "go", &mut NoopEventSink)
             .await
             .expect("run completes");
 
@@ -724,7 +724,7 @@ mod tests {
             AgentConfig::new("test-model"),
         );
         let response = runtime
-            .run("conv", "go", &mut NoopEventSink)
+            .run(ConversationId::new(1), "go", &mut NoopEventSink)
             .await
             .expect("run continues past the malformed call");
 
@@ -734,7 +734,7 @@ mod tests {
             "a call with unparseable arguments must not execute the tool"
         );
 
-        let history = memory.load("conv").await;
+        let history = memory.load(ConversationId::new(1)).await;
         let tool_result = history
             .iter()
             .find_map(|message| match message {
@@ -784,14 +784,14 @@ mod tests {
         );
 
         let error = runtime
-            .run("conv", "go", &mut NoopEventSink)
+            .run(ConversationId::new(1), "go", &mut NoopEventSink)
             .await
             .expect_err("a cut-off response is not a completed answer");
         assert_eq!(error, AgentRunError::Truncated);
 
         // The partial text is still preserved in memory; truncation does not
         // discard what the model did produce.
-        let history = memory.load("conv").await;
+        let history = memory.load(ConversationId::new(1)).await;
         assert!(
             history.iter().any(|message| matches!(
                 message,

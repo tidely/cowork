@@ -4,7 +4,7 @@ use std::{
 };
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-use llm::TokenUsage;
+use llm::{ConversationId, TokenUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
@@ -63,8 +63,8 @@ impl fmt::Display for AgentId {
 }
 
 /// A random, per-spawn agent id (a UUIDv4 as a `u128`). Random rather than a
-/// counter so persisted `runtime-agent-{key}` conversation ids never collide
-/// within a session or across restored sessions.
+/// counter so persisted subagent conversation ids never collide within a
+/// session or across restored sessions.
 #[derive(
     Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 )]
@@ -72,8 +72,21 @@ impl fmt::Display for AgentId {
 pub struct RuntimeAgentKey(u128);
 
 impl RuntimeAgentKey {
+    #[cfg(test)]
     pub const fn new(value: u128) -> Self {
         Self(value)
+    }
+
+    /// A random, effectively-collision-free id for a spawned agent (a UUIDv4 as a
+    /// `u128`). Random rather than a growing counter so persisted subagent
+    /// conversation ids stay distinct across restored sessions instead of
+    /// restarting at the same values every run.
+    pub fn random() -> Self {
+        Self(uuid::Uuid::new_v4().as_u128())
+    }
+
+    pub const fn as_u128(self) -> u128 {
+        self.0
     }
 
     #[cfg(test)]
@@ -120,13 +133,13 @@ pub enum MessageRole {
 impl MessageRole {
     pub fn label(self) -> &'static str {
         match self {
-            MessageRole::System => "System",
-            MessageRole::User => "User",
-            MessageRole::Assistant => "Assistant",
-            MessageRole::Reasoning => "Thinking",
-            MessageRole::ToolCall => "Tool call",
-            MessageRole::ToolResult => "Tool result",
-            MessageRole::Error => "Error",
+            Self::System => "System",
+            Self::User => "User",
+            Self::Assistant => "Assistant",
+            Self::Reasoning => "Thinking",
+            Self::ToolCall => "Tool call",
+            Self::ToolResult => "Tool result",
+            Self::Error => "Error",
         }
     }
 }
@@ -360,7 +373,7 @@ impl AgentNode {
 pub struct ThreadState {
     pub id: ThreadId,
     pub title: String,
-    pub conversation_id: String,
+    pub conversation_id: ConversationId,
     pub expanded: bool,
     pub main_agent: AgentNode,
     pub subagents: Vec<AgentNode>,
@@ -432,7 +445,7 @@ pub enum SubmitResult {
     None,
     Submitted {
         thread_id: ThreadId,
-        conversation_id: String,
+        conversation_id: ConversationId,
         prompt: String,
         /// Cancellation token for this run; the runtime races it so the cancel
         /// keybind can stop the thread.
@@ -600,7 +613,7 @@ impl AppState {
             threads: vec![ThreadState {
                 id: ThreadId::new(0),
                 title: "Thread 1".to_string(),
-                conversation_id: "agent-thread-0".to_string(),
+                conversation_id: ConversationId::random(),
                 expanded: true,
                 main_agent: AgentNode::main(),
                 subagents: Vec::new(),
@@ -1113,7 +1126,7 @@ impl AppState {
 
     fn handle_input_key(&mut self, key: KeyEvent) -> SubmitResult {
         match key.code {
-            KeyCode::Enter => self.submit_prompt(),
+            KeyCode::Enter => self.submit_prompt_text(self.input.value.clone()),
             KeyCode::Char(ch) => {
                 self.input.value.insert(self.input.cursor, ch);
                 self.input.cursor += ch.len_utf8();
@@ -1172,8 +1185,8 @@ impl AppState {
         }
     }
 
-    fn submit_prompt(&mut self) -> SubmitResult {
-        let prompt = self.input.value.trim().to_string();
+    pub fn submit_prompt_text(&mut self, prompt: String) -> SubmitResult {
+        let prompt = prompt.trim().to_string();
         if prompt.is_empty() {
             return SubmitResult::None;
         }
@@ -1200,7 +1213,7 @@ impl AppState {
             .main_agent
             .messages
             .push(Message::user(prompt.clone()));
-        let conversation_id = thread.conversation_id.clone();
+        let conversation_id = thread.conversation_id;
 
         self.selected.agent_id = MAIN_AGENT_ID;
         self.input.value.clear();
@@ -1374,7 +1387,7 @@ impl AppState {
         self.threads.push(ThreadState {
             id,
             title: format!("Thread {}", id.display_number()),
-            conversation_id: format!("agent-thread-{id}"),
+            conversation_id: ConversationId::random(),
             expanded: true,
             main_agent: AgentNode::main(),
             subagents: Vec::new(),

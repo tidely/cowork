@@ -285,7 +285,7 @@ First pass can implement simple global conversation scroll.
 
 ### 10. Thread naming
 
-Currently there is one hardcoded conversation ID: `agent-thread-0`.
+Threads and subagents now use random numeric `ConversationId` values.
 
 The sidebar implies multiple threads.
 
@@ -470,9 +470,9 @@ Mechanism:
   No new heavy deps — `serde_json` was already present; the data dir is resolved
   by hand rather than pulling in `directories`.
 - A `SessionSnapshot` holds the serialized thread tree plus the
-  `HashMap<String, Vec<ChatMessage>>` exported from the store. Display message
-  text is duplicated across the two (it appears once as `ChatMessage`, once as a
-  display `Message`); accepted for now, see follow-ups.
+  `HashMap<ConversationId, Vec<ChatMessage>>` exported from the store. Display
+  message text is duplicated across the two (it appears once as `ChatMessage`,
+  once as a display `Message`); accepted for now, see follow-ups.
 - Atomic writes (temp file + rename) so a crash never corrupts an existing
   snapshot. A corrupt or version-mismatched file is ignored on load, not
   clobbered.

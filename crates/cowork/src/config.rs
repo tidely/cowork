@@ -1,8 +1,5 @@
 use std::time::Duration;
 
-pub const MODEL: &str = "gemma4:12b-it-qat";
-pub(crate) const AGENT_MAX_TURNS: usize = 1000;
-
 /// Delay before each prompt attempt. The first attempt starts immediately;
 /// later entries are retry backoffs. A failure on the final entry gives up.
 pub(crate) const PROMPT_RETRY_DELAYS: [Duration; 5] = [

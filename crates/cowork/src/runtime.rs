@@ -10,8 +10,8 @@ use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
 use llm::{
-    ChatMessage, ConversationMemory, ConversationStore, Tool, ToolCall, ToolError, ToolOutput,
-    ToolRegistry, parse_args,
+    ChatMessage, ConversationId, ConversationMemory, ConversationStore, Tool, ToolCall, ToolError,
+    ToolOutput, ToolRegistry, parse_args,
 };
 use ollama::OllamaProvider;
 use tokio::sync::mpsc;
@@ -22,7 +22,7 @@ use crate::{
         AgentAddr, AgentCompletion, AgentControl, AgentDepth, AgentNodeEvent, RuntimeAgentKey,
         ThreadEvent, ThreadId, ToolPermissionResponse,
     },
-    config::{AGENT_MAX_TURNS, MAIN_AGENT_PREAMBLE, MODEL, PROMPT_RETRY_DELAYS},
+    config::{MAIN_AGENT_PREAMBLE, PROMPT_RETRY_DELAYS},
     events::ThreadEventSink,
     permissions::{AgentProfile, ToolPermissionMode},
     tui::RuntimeEventSender,
@@ -187,6 +187,7 @@ impl ToolPermissionPolicy for UiPermissionPolicy {
 fn build_runtime(
     store: ConversationStore,
     permission: Arc<dyn ToolPermissionPolicy>,
+    model: &str,
     preamble: &'static str,
     subagent_context: Option<SubagentContext>,
 ) -> AgentRuntime {
@@ -203,9 +204,8 @@ fn build_runtime(
         insert_builtin_tool(&mut tools, SubagentTool::new(context));
     }
 
-    let mut config = AgentConfig::new(MODEL);
+    let mut config = AgentConfig::new(model);
     config.preamble = Some(preamble.to_string());
-    config.max_turns = AGENT_MAX_TURNS;
 
     AgentRuntime::new(provider, Arc::new(store), tools, config).with_permission(permission)
 }
@@ -218,7 +218,8 @@ struct VisibleAgentRun {
     thread_id: ThreadId,
     addr: AgentAddr,
     prompt: String,
-    conversation_id: String,
+    conversation_id: ConversationId,
+    model: String,
     preamble: &'static str,
     subagent_context: Option<SubagentContext>,
     queued_messages: mpsc::UnboundedReceiver<String>,
@@ -238,13 +239,14 @@ async fn run_visible_agent(
     let runtime = build_runtime(
         store.clone(),
         permission,
+        &spec.model,
         spec.preamble,
         spec.subagent_context,
     );
 
     run_prompt_with_retries(
         &spec.prompt,
-        &spec.conversation_id,
+        spec.conversation_id,
         &store,
         &runtime,
         &mut sink,
@@ -253,19 +255,32 @@ async fn run_visible_agent(
     .await
 }
 
-/// Run `prompt` in a background task, forwarding events to the UI for
-/// `thread_id`. Emits `Started` up front and a terminal `Finished`/`Error` from
-/// the run result.
-pub(crate) fn spawn_prompt_task(
-    thread_id: ThreadId,
-    prompt: String,
-    conversation_id: String,
-    store: ConversationStore,
-    events: RuntimeEventSender,
-    cancel: CancellationToken,
-    queued_messages: mpsc::UnboundedReceiver<String>,
-) {
+pub(crate) struct PromptTask {
+    pub(crate) thread_id: ThreadId,
+    pub(crate) prompt: String,
+    pub(crate) conversation_id: ConversationId,
+    pub(crate) store: ConversationStore,
+    pub(crate) events: RuntimeEventSender,
+    pub(crate) model: String,
+    pub(crate) cancel: CancellationToken,
+    pub(crate) queued_messages: mpsc::UnboundedReceiver<String>,
+}
+
+/// Run a prompt in a background task, forwarding events to the UI. Emits
+/// `Started` up front and a terminal `Finished`/`Error` from the run result.
+pub(crate) fn spawn_prompt_task(task: PromptTask) {
     tokio::spawn(async move {
+        let PromptTask {
+            thread_id,
+            prompt,
+            conversation_id,
+            store,
+            events,
+            model,
+            cancel,
+            queued_messages,
+        } = task;
+
         let lifecycle = ThreadEventSink::new(events.clone(), thread_id);
         lifecycle.send(ThreadEvent::MainStarted).await;
 
@@ -274,11 +289,13 @@ pub(crate) fn spawn_prompt_task(
             addr: AgentAddr::Main,
             prompt,
             conversation_id,
+            model: model.clone(),
             preamble: MAIN_AGENT_PREAMBLE,
             subagent_context: Some(SubagentContext::root(
                 thread_id,
                 events.clone(),
                 store.clone(),
+                model,
             )),
             // The main agent now has a queue too: messages typed while it runs
             // are drained between turns, exactly like a subagent's queue.
@@ -311,7 +328,7 @@ pub(crate) fn spawn_prompt_task(
 
 async fn run_prompt_with_retries(
     prompt: &str,
-    conversation_id: &str,
+    conversation_id: ConversationId,
     store: &ConversationStore,
     runtime: &AgentRuntime,
     sink: &mut AgentNodeEventSink,
@@ -365,7 +382,7 @@ fn is_retryable_agent_error(error: &AgentRunError) -> bool {
 
 async fn remember_failed_prompt(
     store: &ConversationStore,
-    conversation_id: &str,
+    conversation_id: ConversationId,
     prompt: &str,
     error: &AgentRunError,
 ) {
@@ -389,16 +406,23 @@ struct SubagentContext {
     depth: AgentDepth,
     events: RuntimeEventSender,
     store: ConversationStore,
+    model: String,
 }
 
 impl SubagentContext {
-    fn root(thread_id: ThreadId, events: RuntimeEventSender, store: ConversationStore) -> Self {
+    fn root(
+        thread_id: ThreadId,
+        events: RuntimeEventSender,
+        store: ConversationStore,
+        model: String,
+    ) -> Self {
         Self {
             thread_id,
             parent_key: None,
             depth: 0,
             events,
             store,
+            model,
         }
     }
 
@@ -412,6 +436,7 @@ impl SubagentContext {
             depth,
             events: self.events.clone(),
             store: self.store.clone(),
+            model: self.model.clone(),
         }
     }
 }
@@ -470,14 +495,6 @@ impl Tool for SubagentTool {
     }
 }
 
-/// A random, effectively-collision-free id for a spawned agent (a UUIDv4 as a
-/// `u128`). Random rather than a growing counter so persisted
-/// `runtime-agent-{key}` conversation ids stay distinct across restored
-/// sessions instead of restarting at the same values every run.
-fn next_runtime_agent_key() -> RuntimeAgentKey {
-    RuntimeAgentKey::new(uuid::Uuid::new_v4().as_u128())
-}
-
 fn subagent_preamble(can_delegate: bool) -> &'static str {
     if can_delegate {
         include_str!("../prompts/subagent-delegating.md")
@@ -511,7 +528,7 @@ async fn run_child_agent(
     task: String,
     context: Option<String>,
 ) -> Result<String, String> {
-    let key = next_runtime_agent_key();
+    let key = RuntimeAgentKey::random();
     let child_depth = parent_context.depth + 1;
     let child_addr = AgentAddr::Runtime(key);
     let prompt = subagent_prompt(&task, context.as_deref());
@@ -536,7 +553,8 @@ async fn run_child_agent(
         thread_id: parent_context.thread_id,
         addr: child_addr,
         prompt,
-        conversation_id: format!("runtime-agent-{key}"),
+        conversation_id: ConversationId::new(key.as_u128()),
+        model: parent_context.model.clone(),
         preamble: subagent_preamble(can_delegate),
         subagent_context: can_delegate.then(|| parent_context.child_context(key, child_depth)),
         queued_messages: queue_rx,
@@ -701,7 +719,7 @@ mod tests {
 
     #[test]
     fn runtime_agent_keys_are_unique_and_non_sequential() {
-        let keys: Vec<RuntimeAgentKey> = (0..100).map(|_| next_runtime_agent_key()).collect();
+        let keys: Vec<RuntimeAgentKey> = (0..100).map(|_| RuntimeAgentKey::random()).collect();
         let unique: std::collections::HashSet<_> = keys.iter().copied().collect();
         assert_eq!(unique.len(), keys.len(), "ids must not collide");
         // A growing counter would have produced a contiguous run; random ids
@@ -775,15 +793,16 @@ mod tests {
 
     #[tokio::test]
     async fn failed_prompt_note_is_recorded_in_conversation_memory() {
+        let conversation_id = ConversationId::new(1);
         let store = ConversationStore::new();
         store
-            .append("conv", vec![ChatMessage::user("earlier")])
+            .append(conversation_id, vec![ChatMessage::user("earlier")])
             .await;
         let error = AgentRunError::Llm(LlmError::Transport("network down".into()));
 
-        remember_failed_prompt(&store, "conv", "try this", &error).await;
+        remember_failed_prompt(&store, conversation_id, "try this", &error).await;
 
-        let history = store.load("conv").await;
+        let history = store.load(conversation_id).await;
         assert_eq!(history.len(), 3);
         assert!(matches!(history[0], ChatMessage::User { ref content } if content == "earlier"));
         assert!(matches!(history[1], ChatMessage::User { ref content } if content == "try this"));

@@ -17,7 +17,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use llm::{ChatMessage, ConversationStore};
+use llm::{ChatMessage, ConversationId, ConversationStore};
 use serde::{Deserialize, Serialize};
 
 use crate::app::{AgentId, AppState, ThreadId, ThreadState};
@@ -36,10 +36,9 @@ pub struct SessionSnapshot {
     pub next_agent_id: AgentId,
     #[serde(default)]
     pub always_allowed_tools: Vec<String>,
-    /// Every conversation's model context, keyed by conversation id
-    /// (`agent-thread-{id}` / `runtime-agent-{key}`).
+    /// Every conversation's model context, keyed by conversation id.
     #[serde(default)]
-    pub conversations: HashMap<String, Vec<ChatMessage>>,
+    pub conversations: HashMap<ConversationId, Vec<ChatMessage>>,
 }
 
 /// Path to the session file, or `None` when no data directory can be resolved
@@ -126,7 +125,7 @@ mod tests {
     async fn snapshot_round_trips_tree_and_conversations() {
         let app = AppState::new();
         let mut conversations = HashMap::new();
-        conversations.insert("agent-thread-0".to_string(), vec![ChatMessage::user("hi")]);
+        conversations.insert(ConversationId::new(1), vec![ChatMessage::user("hi")]);
         let store = ConversationStore::from_conversations(conversations);
 
         let dir = temp_dir("round-trip");
@@ -136,7 +135,7 @@ mod tests {
         let loaded = load(&path).expect("snapshot loads");
         assert_eq!(loaded.version, SNAPSHOT_VERSION);
         assert_eq!(loaded.threads.len(), 1);
-        assert_eq!(loaded.conversations["agent-thread-0"].len(), 1);
+        assert_eq!(loaded.conversations[&ConversationId::new(1)].len(), 1);
 
         let _ = fs::remove_dir_all(&dir);
     }

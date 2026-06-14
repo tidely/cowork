@@ -29,4 +29,5 @@ tokio-util = "0.7"
 ratatui = "0.29"
 crossterm = "0.28"
 uuid = { version = "1", features = ["v4"] }
+clap = { version = "4", features = ["derive"] }
 tempfile = "3"

@@ -19,3 +19,4 @@ tokio-util.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
 uuid.workspace = true
+clap.workspace = true
