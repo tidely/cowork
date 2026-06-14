@@ -16,6 +16,13 @@ pub struct ListDirectoryInput {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ListDirectory;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryKind {
+    Directory,
+    File,
+    Other,
+}
+
 #[async_trait]
 impl Tool for ListDirectory {
     fn name(&self) -> Cow<'static, str> {
@@ -45,11 +52,11 @@ pub fn list_directory(input: ListDirectoryInput) -> Result<String, ToolIoError> 
             let entry = entry?;
             let metadata = entry.metadata()?;
             let kind = if metadata.is_dir() {
-                "dir"
+                EntryKind::Directory
             } else if metadata.is_file() {
-                "file"
+                EntryKind::File
             } else {
-                "other"
+                EntryKind::Other
             };
 
             Ok((
@@ -69,9 +76,9 @@ pub fn list_directory(input: ListDirectoryInput) -> Result<String, ToolIoError> 
     Ok(entries
         .into_iter()
         .map(|(name, kind, size)| match kind {
-            "dir" => format!("{name}/"),
-            "file" => format!("{name} ({size} bytes)"),
-            _ => format!("{name} ({kind})"),
+            EntryKind::Directory => format!("{name}/"),
+            EntryKind::File => format!("{name} ({size} bytes)"),
+            EntryKind::Other => format!("{name} (other)"),
         })
         .collect::<Vec<_>>()
         .join("\n"))
