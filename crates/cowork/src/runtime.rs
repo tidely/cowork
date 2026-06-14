@@ -6,7 +6,7 @@
 //! subagents, deterministic filesystem/PDF tools, and profile-driven permission
 //! prompts.
 
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
 use llm::{
@@ -22,9 +22,7 @@ use crate::{
         AgentAddr, AgentCompletion, AgentControl, AgentDepth, AgentNodeEvent, RuntimeAgentKey,
         ThreadEvent, ThreadId, ToolPermissionResponse,
     },
-    config::{
-        AGENT_MAX_TURNS, MAIN_AGENT_PREAMBLE, MODEL, PROMPT_RETRY_ATTEMPTS, PROMPT_RETRY_BACKOFFS,
-    },
+    config::{AGENT_MAX_TURNS, MAIN_AGENT_PREAMBLE, MODEL, PROMPT_RETRY_DELAYS},
     events::ThreadEventSink,
     permissions::{AgentProfile, ToolPermissionMode},
     tui::RuntimeEventSender,
@@ -226,7 +224,7 @@ struct VisibleAgentRun {
     conversation_id: String,
     preamble: &'static str,
     subagent_context: Option<SubagentContext>,
-    queued_messages: Option<mpsc::UnboundedReceiver<String>>,
+    queued_messages: mpsc::UnboundedReceiver<String>,
 }
 
 async fn run_visible_agent(
@@ -253,7 +251,7 @@ async fn run_visible_agent(
         &store,
         &runtime,
         &mut sink,
-        spec.queued_messages.as_mut(),
+        &mut spec.queued_messages,
     )
     .await
 }
@@ -287,7 +285,7 @@ pub(crate) fn spawn_prompt_task(
             )),
             // The main agent now has a queue too: messages typed while it runs
             // are drained between turns, exactly like a subagent's queue.
-            queued_messages: Some(queued_messages),
+            queued_messages,
         };
 
         // Race the whole run (retries, sleeps, and the nested subagent tree)
@@ -320,18 +318,21 @@ async fn run_prompt_with_retries(
     store: &ConversationStore,
     runtime: &AgentRuntime,
     sink: &mut AgentNodeEventSink,
-    mut queued_messages: Option<&mut mpsc::UnboundedReceiver<String>>,
+    queued_messages: &mut mpsc::UnboundedReceiver<String>,
 ) -> Result<String, AgentRunError> {
     let initial_history = store.load(conversation_id).await;
 
-    for attempt in 1..=PROMPT_RETRY_ATTEMPTS {
+    let mut delays = PROMPT_RETRY_DELAYS.into_iter().peekable();
+    while let Some(delay) = delays.next() {
+        tokio::time::sleep(delay).await;
+
         store
             .replace(conversation_id, initial_history.clone())
             .await;
 
         let error = match runtime
             .run_with_user_messages(conversation_id, prompt.to_string(), &mut *sink, || {
-                drain_queued_messages(queued_messages.as_deref_mut())
+                drain_queued_messages(queued_messages)
             })
             .await
         {
@@ -339,39 +340,26 @@ async fn run_prompt_with_retries(
             Err(error) => error,
         };
 
-        let Some(backoff) = retry_backoff(attempt, &error) else {
+        if !is_retryable_agent_error(&error) || delays.peek().is_none() {
             store.replace(conversation_id, initial_history).await;
             remember_failed_prompt(store, conversation_id, prompt, &error).await;
             return Err(error);
-        };
+        }
 
         // Model memory is rewound at the top of the next iteration; rewind the
         // visible transcript to match so the retry starts from a clean slate.
         sink.reset().await;
-        tokio::time::sleep(backoff).await;
     }
 
-    unreachable!("retry loop always returns")
+    unreachable!("retry schedule always contains at least one attempt")
 }
 
-fn drain_queued_messages(receiver: Option<&mut mpsc::UnboundedReceiver<String>>) -> Vec<String> {
-    let Some(receiver) = receiver else {
-        return Vec::new();
-    };
-
+fn drain_queued_messages(receiver: &mut mpsc::UnboundedReceiver<String>) -> Vec<String> {
     let mut messages = Vec::new();
     while let Ok(message) = receiver.try_recv() {
         messages.push(message);
     }
     messages
-}
-
-fn retry_backoff(attempt: usize, error: &AgentRunError) -> Option<Duration> {
-    if is_retryable_agent_error(error) {
-        PROMPT_RETRY_BACKOFFS.get(attempt - 1).copied()
-    } else {
-        None
-    }
 }
 
 fn is_retryable_agent_error(error: &AgentRunError) -> bool {
@@ -555,7 +543,7 @@ async fn run_child_agent(
         conversation_id: format!("runtime-agent-{key}"),
         preamble: subagent_preamble(can_delegate),
         subagent_context: can_delegate.then(|| parent_context.child_context(key, child_depth)),
-        queued_messages: Some(queue_rx),
+        queued_messages: queue_rx,
     };
 
     let result = tokio::select! {
@@ -789,23 +777,26 @@ mod tests {
     }
 
     #[test]
-    fn retry_backoff_uses_shared_schedule_for_retryable_llm_errors() {
-        let transient = AgentRunError::Llm(LlmError::Transport("connection reset".into()));
-
-        assert_eq!(retry_backoff(1, &transient), Some(Duration::from_secs(1)));
-        assert_eq!(retry_backoff(4, &transient), Some(Duration::from_secs(30)));
-        assert_eq!(retry_backoff(PROMPT_RETRY_ATTEMPTS, &transient), None);
+    fn prompt_retry_delays_include_initial_immediate_attempt() {
+        assert_eq!(PROMPT_RETRY_DELAYS[0], std::time::Duration::ZERO);
+        assert_eq!(PROMPT_RETRY_DELAYS[1], std::time::Duration::from_secs(1));
+        assert_eq!(
+            PROMPT_RETRY_DELAYS[PROMPT_RETRY_DELAYS.len() - 1],
+            std::time::Duration::from_secs(30)
+        );
     }
 
     #[test]
-    fn retry_backoff_rejects_deterministic_agent_errors() {
+    fn retryable_prompt_errors_are_limited_to_retryable_llm_errors() {
+        let transient = AgentRunError::Llm(LlmError::Transport("connection reset".into()));
         let decode = AgentRunError::Llm(LlmError::Decode("bad json".into()));
         let tool_setup = AgentRunError::ToolSetup(ToolError::UnknownTool("missing".into()));
         let max_turns = AgentRunError::MaxTurns { max_turns: 1 };
 
-        assert_eq!(retry_backoff(1, &decode), None);
-        assert_eq!(retry_backoff(1, &tool_setup), None);
-        assert_eq!(retry_backoff(1, &max_turns), None);
+        assert!(is_retryable_agent_error(&transient));
+        assert!(!is_retryable_agent_error(&decode));
+        assert!(!is_retryable_agent_error(&tool_setup));
+        assert!(!is_retryable_agent_error(&max_turns));
     }
 
     #[tokio::test]
