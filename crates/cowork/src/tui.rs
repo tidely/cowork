@@ -40,7 +40,6 @@ pub async fn run(options: RunOptions) -> Result<(), Box<dyn std::error::Error>> 
             AppState::restored(
                 snapshot.threads,
                 snapshot.next_thread_id,
-                snapshot.next_agent_id,
                 snapshot.always_allowed_tools,
             ),
             ConversationStore::from_conversations(snapshot.conversations),

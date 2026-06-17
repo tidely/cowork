@@ -80,7 +80,7 @@ Defined in `crates/cowork/src/app.rs`.
 - error
 - retry reset
 
-This keeps thread-wide concerns separate from agent-node concerns. `AppState::apply_thread_event` handles the thread event, and `apply_agent_node_event` resolves the `AgentAddr` exactly once before mutating the target node.
+This keeps thread-wide concerns separate from agent-node concerns. `AppState::apply_thread_event` handles the thread event, and `apply_agent_node_event` mutates the target node addressed by its `AgentAddr`. The `AgentAddr` (`Main` or the subagent's random `RuntimeAgentKey`) *is* the node's identity everywhere — in the tree, selection, sidebar, and control map — so an addressed event maps straight to its node with no separate id lookup.
 
 ## Top-level prompt flow
 

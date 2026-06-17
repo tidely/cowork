@@ -20,11 +20,11 @@ use std::{
 use llm::{ChatMessage, ConversationId, ConversationStore};
 use serde::{Deserialize, Serialize};
 
-use crate::app::{AgentId, AppState, ThreadId, ThreadState};
+use crate::app::{AppState, ThreadId, ThreadState};
 
 /// Bumped when the on-disk shape changes incompatibly; an older `version` is
 /// ignored on load (the session starts fresh) rather than mis-parsed.
-const SNAPSHOT_VERSION: u32 = 1;
+const SNAPSHOT_VERSION: u32 = 2;
 
 const SESSION_FILE: &str = "session.json";
 
@@ -33,7 +33,6 @@ pub struct SessionSnapshot {
     pub version: u32,
     pub threads: Vec<ThreadState>,
     pub next_thread_id: ThreadId,
-    pub next_agent_id: AgentId,
     #[serde(default)]
     pub always_allowed_tools: Vec<String>,
     /// Every conversation's model context, keyed by conversation id.
@@ -83,12 +82,10 @@ pub async fn save(path: Option<&Path>, app: &AppState, store: &ConversationStore
         return;
     };
 
-    let (next_thread_id, next_agent_id) = app.next_ids();
     let snapshot = SessionSnapshot {
         version: SNAPSHOT_VERSION,
         threads: app.snapshot_threads(),
-        next_thread_id,
-        next_agent_id,
+        next_thread_id: app.next_thread_id(),
         always_allowed_tools: app.always_allowed_tools(),
         conversations: store.export().await,
     };
@@ -147,7 +144,7 @@ mod tests {
         let path = dir.join(SESSION_FILE);
         fs::write(
             &path,
-            br#"{"version":999,"threads":[],"next_thread_id":1,"next_agent_id":1}"#,
+            br#"{"version":999,"threads":[],"next_thread_id":1}"#,
         )
         .unwrap();
 
