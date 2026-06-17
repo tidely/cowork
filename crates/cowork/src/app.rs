@@ -38,30 +38,6 @@ impl fmt::Display for ThreadId {
     }
 }
 
-#[derive(
-    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
-)]
-#[serde(transparent)]
-pub struct AgentId(usize);
-
-impl AgentId {
-    pub const fn new(value: usize) -> Self {
-        Self(value)
-    }
-
-    fn next(&mut self) -> Self {
-        let current = *self;
-        self.0 += 1;
-        current
-    }
-}
-
-impl fmt::Display for AgentId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(f)
-    }
-}
-
 /// A random, per-spawn agent id (a UUIDv4 as a `u128`). Random rather than a
 /// counter so persisted subagent conversation ids never collide within a
 /// session or across restored sessions.
@@ -101,7 +77,16 @@ impl fmt::Display for RuntimeAgentKey {
     }
 }
 
-pub const MAIN_AGENT_ID: AgentId = AgentId::new(0);
+/// Identifies an agent within a thread, and is the agent's identity everywhere:
+/// in the tree, in selection, in the sidebar, and as the routing address on
+/// events. The top-level agent is `Main`; each spawned subagent is its random
+/// per-spawn [`RuntimeAgentKey`] (which is also its model conversation id), so an
+/// event addressed by key maps directly to its node with no separate lookup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum AgentAddr {
+    Main,
+    Runtime(RuntimeAgentKey),
+}
 
 /// Nesting depth of an agent in the hierarchy. The top-level assistant is 0;
 /// each `subagent` call spawns a child one level deeper. A plain count rather
@@ -334,9 +319,8 @@ impl Message {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentNode {
-    pub id: AgentId,
-    pub parent_id: Option<AgentId>,
-    pub runtime_key: Option<RuntimeAgentKey>,
+    pub addr: AgentAddr,
+    pub parent: Option<AgentAddr>,
     pub label: String,
     pub depth: AgentDepth,
     pub status: AgentStatus,
@@ -355,9 +339,8 @@ impl AgentNode {
     fn main() -> Self {
         let messages = initial_main_messages();
         Self {
-            id: MAIN_AGENT_ID,
-            parent_id: None,
-            runtime_key: None,
+            addr: AgentAddr::Main,
+            parent: None,
             label: "Main Agent".to_string(),
             depth: MAIN_AGENT_DEPTH,
             status: AgentStatus::Idle,
@@ -399,7 +382,7 @@ pub enum Focus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Selection {
     pub thread_id: ThreadId,
-    pub agent_id: AgentId,
+    pub addr: AgentAddr,
 }
 
 #[derive(Debug, Clone)]
@@ -411,7 +394,7 @@ pub struct InputState {
 #[derive(Debug, Clone)]
 pub struct SidebarItem {
     pub thread_id: ThreadId,
-    pub agent_id: AgentId,
+    pub addr: AgentAddr,
     pub label: String,
     pub depth: usize,
     pub expanded: bool,
@@ -437,7 +420,6 @@ pub struct AppState {
     /// persisted; an entry is removed when its agent reaches a terminal state.
     agent_controls: HashMap<(ThreadId, AgentAddr), AgentControl>,
     next_thread_id: ThreadId,
-    next_agent_id: AgentId,
 }
 
 #[derive(Debug)]
@@ -526,14 +508,6 @@ impl PendingToolPermission {
     }
 }
 
-/// Identifies which agent within a thread an event targets. The top-level agent
-/// is `Main`; spawned subagents are addressed by their runtime key.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum AgentAddr {
-    Main,
-    Runtime(RuntimeAgentKey),
-}
-
 #[derive(Debug)]
 pub enum ThreadEvent {
     /// The top-level prompt run has begun.
@@ -620,7 +594,7 @@ impl AppState {
             }],
             selected: Selection {
                 thread_id: ThreadId::new(0),
-                agent_id: MAIN_AGENT_ID,
+                addr: AgentAddr::Main,
             },
             focus: Focus::Input,
             input: InputState {
@@ -634,7 +608,6 @@ impl AppState {
             always_allowed_tools: HashSet::new(),
             agent_controls: HashMap::new(),
             next_thread_id: ThreadId::new(1),
-            next_agent_id: AgentId::new(1),
         }
     }
 
@@ -644,7 +617,6 @@ impl AppState {
     pub fn restored(
         threads: Vec<ThreadState>,
         next_thread_id: ThreadId,
-        next_agent_id: AgentId,
         always_allowed_tools: Vec<String>,
     ) -> Self {
         let mut app = Self::new();
@@ -654,11 +626,10 @@ impl AppState {
 
         app.threads = threads;
         app.next_thread_id = next_thread_id;
-        app.next_agent_id = next_agent_id;
         app.always_allowed_tools = always_allowed_tools.into_iter().collect();
         app.selected = Selection {
             thread_id: first_thread_id,
-            agent_id: MAIN_AGENT_ID,
+            addr: AgentAddr::Main,
         };
         app.normalize_after_restore();
         app
@@ -671,8 +642,8 @@ impl AppState {
         self.threads.clone()
     }
 
-    pub fn next_ids(&self) -> (ThreadId, AgentId) {
-        (self.next_thread_id, self.next_agent_id)
+    pub fn next_thread_id(&self) -> ThreadId {
+        self.next_thread_id
     }
 
     pub fn always_allowed_tools(&self) -> Vec<String> {
@@ -700,33 +671,32 @@ impl AppState {
     }
 
     pub fn main_agent_running(&self) -> bool {
-        self.agent(self.selected.thread_id, MAIN_AGENT_ID)
+        self.agent(self.selected.thread_id, AgentAddr::Main)
             .is_some_and(|agent| agent.status == AgentStatus::Running)
     }
 
     pub fn selected_subagent_accepts_messages(&self) -> bool {
-        if self.selected.agent_id == MAIN_AGENT_ID {
+        if self.selected.addr == AgentAddr::Main {
             return false;
         }
         let Some(agent) = self.selected_agent() else {
             return false;
         };
         agent.status == AgentStatus::Running
-            && agent.runtime_key.is_some_and(|key| {
-                self.agent_controls
-                    .contains_key(&(self.selected.thread_id, AgentAddr::Runtime(key)))
-            })
+            && self
+                .agent_controls
+                .contains_key(&(self.selected.thread_id, agent.addr))
     }
 
     /// Whether the input box should accept typing. The main agent always accepts
     /// it (idle starts a run, running queues a message); a subagent only while it
     /// is running and reachable.
     pub fn input_accepts_text(&self) -> bool {
-        self.selected.agent_id == MAIN_AGENT_ID || self.selected_subagent_accepts_messages()
+        self.selected.addr == AgentAddr::Main || self.selected_subagent_accepts_messages()
     }
 
     pub fn selected_agent(&self) -> Option<&AgentNode> {
-        self.agent(self.selected.thread_id, self.selected.agent_id)
+        self.agent(self.selected.thread_id, self.selected.addr)
     }
 
     pub fn selected_thread(&self) -> Option<&ThreadState> {
@@ -744,21 +714,21 @@ impl AppState {
         for thread in &self.threads {
             items.push(SidebarItem {
                 thread_id: thread.id,
-                agent_id: MAIN_AGENT_ID,
+                addr: AgentAddr::Main,
                 label: thread.title.clone(),
                 depth: 0,
                 expanded: thread.expanded,
                 selected: self.selected.thread_id == thread.id
-                    && self.selected.agent_id == MAIN_AGENT_ID,
+                    && self.selected.addr == AgentAddr::Main,
                 status: thread.main_agent.status,
                 has_children: thread
                     .subagents
                     .iter()
-                    .any(|agent| agent.parent_id == Some(MAIN_AGENT_ID)),
+                    .any(|agent| agent.parent == Some(AgentAddr::Main)),
             });
 
             if thread.expanded {
-                append_child_sidebar_items(&mut items, thread, MAIN_AGENT_ID, 1, self.selected);
+                append_child_sidebar_items(&mut items, thread, AgentAddr::Main, 1, self.selected);
             }
         }
         items
@@ -843,16 +813,16 @@ impl AppState {
             return;
         }
 
-        if let Some(agent_id) = self.resolve_addr(request.thread_id, request.addr) {
+        if self.agent(request.thread_id, request.addr).is_some() {
             self.selected = Selection {
                 thread_id: request.thread_id,
-                agent_id,
+                addr: request.addr,
             };
             self.focus = Focus::Conversation;
-            self.collapse_last_reasoning(request.thread_id, agent_id);
+            self.collapse_last_reasoning(request.thread_id, request.addr);
             self.set_tool_status(
                 request.thread_id,
-                agent_id,
+                request.addr,
                 &request.id,
                 ToolStatus::AwaitingPermission,
                 None,
@@ -864,7 +834,7 @@ impl AppState {
     pub fn apply_thread_event(&mut self, thread_id: ThreadId, event: ThreadEvent) {
         match event {
             ThreadEvent::MainStarted => {
-                if let Some(agent) = self.agent_mut(thread_id, MAIN_AGENT_ID) {
+                if let Some(agent) = self.agent_mut(thread_id, AgentAddr::Main) {
                     agent.status = AgentStatus::Running;
                     // The user prompt is already appended; mark this as the
                     // rewind point so a retry keeps the prompt but drops output.
@@ -910,23 +880,25 @@ impl AppState {
         addr: AgentAddr,
         event: AgentNodeEvent,
     ) {
-        let Some(agent_id) = self.resolve_addr(thread_id, addr) else {
+        // An event for a runtime key with no live node (e.g. one already removed)
+        // is ignored, matching the old address-resolution guard.
+        if self.agent(thread_id, addr).is_none() {
             return;
-        };
+        }
 
         match event {
             AgentNodeEvent::AssistantDelta { delta } => {
-                self.collapse_last_reasoning(thread_id, agent_id);
-                self.append_delta(thread_id, agent_id, TextDeltaKind::Assistant, &delta);
+                self.collapse_last_reasoning(thread_id, addr);
+                self.append_delta(thread_id, addr, TextDeltaKind::Assistant, &delta);
             }
             AgentNodeEvent::ReasoningDelta { delta } => {
-                self.append_delta(thread_id, agent_id, TextDeltaKind::Reasoning, &delta);
+                self.append_delta(thread_id, addr, TextDeltaKind::Reasoning, &delta);
             }
             AgentNodeEvent::UserMessage { text } => {
                 // Lands at a turn boundary, so collapse any in-progress reasoning
                 // and append the user bubble after it — never mid-stream.
-                self.collapse_last_reasoning(thread_id, agent_id);
-                if let Some(agent) = self.agent_mut(thread_id, agent_id) {
+                self.collapse_last_reasoning(thread_id, addr);
+                if let Some(agent) = self.agent_mut(thread_id, addr) {
                     agent.messages.push(Message::user(text));
                 }
             }
@@ -935,8 +907,8 @@ impl AppState {
                 name,
                 arguments,
             } => {
-                self.collapse_last_reasoning(thread_id, agent_id);
-                if let Some(agent) = self.agent_mut(thread_id, agent_id) {
+                self.collapse_last_reasoning(thread_id, addr);
+                if let Some(agent) = self.agent_mut(thread_id, addr) {
                     agent
                         .messages
                         .push(Message::tool_call(id, name, &arguments));
@@ -947,17 +919,17 @@ impl AppState {
                 content,
                 is_error,
             } => {
-                self.collapse_last_reasoning(thread_id, agent_id);
-                self.apply_tool_result_to_agent(thread_id, agent_id, &id, &content, is_error);
+                self.collapse_last_reasoning(thread_id, addr);
+                self.apply_tool_result_to_agent(thread_id, addr, &id, &content, is_error);
             }
             AgentNodeEvent::Usage(usage) => {
-                self.collapse_last_reasoning(thread_id, agent_id);
-                if let Some(agent) = self.agent_mut(thread_id, agent_id) {
+                self.collapse_last_reasoning(thread_id, addr);
+                if let Some(agent) = self.agent_mut(thread_id, addr) {
                     agent.token_usage += usage;
                 }
             }
             AgentNodeEvent::Finished(completion) => {
-                if let Some(agent) = self.agent_mut(thread_id, agent_id) {
+                if let Some(agent) = self.agent_mut(thread_id, addr) {
                     agent.status = AgentStatus::Complete;
                     collapse_reasoning(agent);
                     if let AgentCompletion::Returned(result) = completion {
@@ -967,11 +939,11 @@ impl AppState {
                 self.remove_agent_control(thread_id, addr);
             }
             AgentNodeEvent::Cancelled(reason) => {
-                self.cancel_agent_subtree(thread_id, agent_id, &reason);
-                self.remove_agent_controls_for_subtree(thread_id, agent_id);
+                self.cancel_agent_subtree(thread_id, addr, &reason);
+                self.remove_agent_controls_for_subtree(thread_id, addr);
             }
             AgentNodeEvent::Error(error) => {
-                if let Some(agent) = self.agent_mut(thread_id, agent_id) {
+                if let Some(agent) = self.agent_mut(thread_id, addr) {
                     agent.status = AgentStatus::Error;
                     collapse_reasoning(agent);
                     agent.messages.push(Message::error(error));
@@ -979,7 +951,7 @@ impl AppState {
                 self.remove_agent_control(thread_id, addr);
             }
             AgentNodeEvent::Reset => {
-                if let Some(agent) = self.agent_mut(thread_id, agent_id) {
+                if let Some(agent) = self.agent_mut(thread_id, addr) {
                     agent.messages.truncate(agent.message_baseline);
                     agent.status = AgentStatus::Running;
                 }
@@ -1032,28 +1004,18 @@ impl AppState {
         request: PendingToolPermission,
         response: ToolPermissionResponse,
     ) {
-        if let Some(agent_id) = self.resolve_addr(request.thread_id, request.addr) {
-            let (status, result) = match &response {
-                ToolPermissionResponse::Allow | ToolPermissionResponse::AllowAlways => {
-                    (ToolStatus::Running, None)
-                }
-                ToolPermissionResponse::Reject { reason } => {
-                    (ToolStatus::Failed, Some(reason.as_str()))
-                }
-            };
-            self.set_tool_status(request.thread_id, agent_id, &request.id, status, result);
-        }
+        let (status, result) = match &response {
+            ToolPermissionResponse::Allow | ToolPermissionResponse::AllowAlways => {
+                (ToolStatus::Running, None)
+            }
+            ToolPermissionResponse::Reject { reason } => {
+                (ToolStatus::Failed, Some(reason.as_str()))
+            }
+        };
+        // A no-op if the addressed node is gone; the response is still delivered.
+        self.set_tool_status(request.thread_id, request.addr, &request.id, status, result);
 
         request.respond(response);
-    }
-
-    /// Resolves an event address to a concrete agent id within the thread.
-    /// Returns `None` for a runtime key that no longer maps to a live node.
-    fn resolve_addr(&self, thread_id: ThreadId, addr: AgentAddr) -> Option<AgentId> {
-        match addr {
-            AgentAddr::Main => Some(MAIN_AGENT_ID),
-            AgentAddr::Runtime(key) => self.agent_id_by_runtime_key(thread_id, key),
-        }
     }
 
     fn handle_sidebar_key(&mut self, key: KeyEvent) -> SubmitResult {
@@ -1117,7 +1079,7 @@ impl AppState {
         let Some(index) = self.selected_collapsible_message_index() else {
             return;
         };
-        if let Some(agent) = self.agent_mut(self.selected.thread_id, self.selected.agent_id)
+        if let Some(agent) = self.agent_mut(self.selected.thread_id, self.selected.addr)
             && let Some(message) = agent.messages.get_mut(index)
         {
             message.set_collapsed(!message.collapsed());
@@ -1191,7 +1153,7 @@ impl AppState {
             return SubmitResult::None;
         }
 
-        if self.selected.agent_id != MAIN_AGENT_ID {
+        if self.selected.addr != AgentAddr::Main {
             self.enqueue_subagent_message(prompt);
             return SubmitResult::None;
         }
@@ -1215,7 +1177,7 @@ impl AppState {
             .push(Message::user(prompt.clone()));
         let conversation_id = thread.conversation_id;
 
-        self.selected.agent_id = MAIN_AGENT_ID;
+        self.selected.addr = AgentAddr::Main;
         self.input.value.clear();
         self.input.cursor = 0;
         self.conversation_scroll = 0;
@@ -1258,18 +1220,17 @@ impl AppState {
 
     fn enqueue_subagent_message(&mut self, prompt: String) {
         let thread_id = self.selected.thread_id;
-        let agent_id = self.selected.agent_id;
-        let Some(key) = self
-            .agent(thread_id, agent_id)
-            .filter(|agent| agent.status == AgentStatus::Running)
-            .and_then(|agent| agent.runtime_key)
-        else {
+        let addr = self.selected.addr;
+        let is_running = self
+            .agent(thread_id, addr)
+            .is_some_and(|agent| agent.status == AgentStatus::Running);
+        if !is_running {
             return;
-        };
+        }
 
         let Some(result) = self
             .agent_controls
-            .get(&(thread_id, AgentAddr::Runtime(key)))
+            .get(&(thread_id, addr))
             .map(|control| control.enqueue(prompt))
         else {
             return;
@@ -1286,12 +1247,12 @@ impl AppState {
                 self.conversation_cursor = 0;
             }
             Err(_) => {
-                if let Some(agent) = self.agent_mut(thread_id, agent_id) {
+                if let Some(agent) = self.agent_mut(thread_id, addr) {
                     agent
                         .messages
                         .push(Message::error("subagent is no longer accepting messages"));
                 }
-                self.remove_agent_control(thread_id, AgentAddr::Runtime(key));
+                self.remove_agent_control(thread_id, addr);
             }
         }
     }
@@ -1309,29 +1270,27 @@ impl AppState {
         let next = (current as isize + direction).clamp(0, items.len() as isize - 1) as usize;
         let item = &items[next];
         self.selected.thread_id = item.thread_id;
-        self.selected.agent_id = item.agent_id;
+        self.selected.addr = item.addr;
         self.conversation_scroll = 0;
         self.conversation_cursor = 0;
     }
 
     fn expand_selected_sidebar_item(&mut self) {
-        if self.selected.agent_id == MAIN_AGENT_ID {
+        if self.selected.addr == AgentAddr::Main {
             if let Some(thread) = self.thread_mut(self.selected.thread_id) {
                 thread.expanded = true;
             }
-        } else if let Some(agent) = self.agent_mut(self.selected.thread_id, self.selected.agent_id)
-        {
+        } else if let Some(agent) = self.agent_mut(self.selected.thread_id, self.selected.addr) {
             agent.expanded = true;
         }
     }
 
     fn collapse_selected_sidebar_item(&mut self) {
-        if self.selected.agent_id == MAIN_AGENT_ID {
+        if self.selected.addr == AgentAddr::Main {
             if let Some(thread) = self.thread_mut(self.selected.thread_id) {
                 thread.expanded = false;
             }
-        } else if let Some(agent) = self.agent_mut(self.selected.thread_id, self.selected.agent_id)
-        {
+        } else if let Some(agent) = self.agent_mut(self.selected.thread_id, self.selected.addr) {
             agent.expanded = false;
         }
     }
@@ -1341,18 +1300,16 @@ impl AppState {
     /// continue. For the main agent this cancels the whole thread.
     fn cancel_selected_agent(&mut self) {
         let thread_id = self.selected.thread_id;
-        let addr = if self.selected.agent_id == MAIN_AGENT_ID {
-            AgentAddr::Main
-        } else {
-            let Some(key) = self
-                .agent(thread_id, self.selected.agent_id)
-                .filter(|agent| agent.status == AgentStatus::Running)
-                .and_then(|agent| agent.runtime_key)
-            else {
-                return;
-            };
-            AgentAddr::Runtime(key)
-        };
+        let addr = self.selected.addr;
+        // A subagent is only cancellable while running; the main agent relies on
+        // its control's presence below as the running check.
+        if addr != AgentAddr::Main
+            && !self
+                .agent(thread_id, addr)
+                .is_some_and(|agent| agent.status == AgentStatus::Running)
+        {
+            return;
+        }
 
         // A control is only present while the agent is running, so its presence
         // is the running check; cancelling the main agent tears down the whole
@@ -1394,7 +1351,7 @@ impl AppState {
         });
         self.selected = Selection {
             thread_id: id,
-            agent_id: MAIN_AGENT_ID,
+            addr: AgentAddr::Main,
         };
         self.focus = Focus::Input;
         self.conversation_scroll = 0;
@@ -1424,7 +1381,7 @@ impl AppState {
     fn append_delta(
         &mut self,
         thread_id: ThreadId,
-        agent_id: AgentId,
+        addr: AgentAddr,
         kind: TextDeltaKind,
         delta: &str,
     ) {
@@ -1432,7 +1389,7 @@ impl AppState {
             return;
         }
 
-        let Some(agent) = self.agent_mut(thread_id, agent_id) else {
+        let Some(agent) = self.agent_mut(thread_id, addr) else {
             return;
         };
 
@@ -1457,11 +1414,20 @@ impl AppState {
             control,
         } = spawned;
 
-        let parent_id = parent
-            .and_then(|parent_key| self.agent_id_by_runtime_key(thread_id, parent_key))
-            .unwrap_or(MAIN_AGENT_ID);
+        // The parent address is the spawning agent: a runtime key if it is a
+        // subagent (falling back to main if that node is already gone), else main.
+        let parent_addr = match parent {
+            Some(parent_key)
+                if self
+                    .agent(thread_id, AgentAddr::Runtime(parent_key))
+                    .is_some() =>
+            {
+                AgentAddr::Runtime(parent_key)
+            }
+            _ => AgentAddr::Main,
+        };
 
-        let id = self.next_agent_id.next();
+        let addr = AgentAddr::Runtime(key);
         let label = truncate_chars(&task, 36);
 
         let mut messages = vec![Message::user(task)];
@@ -1469,15 +1435,13 @@ impl AppState {
             messages.push(Message::system(format!("Context:\n{}", context.trim())));
         }
 
-        self.agent_controls
-            .insert((thread_id, AgentAddr::Runtime(key)), control);
+        self.agent_controls.insert((thread_id, addr), control);
 
         if let Some(thread) = self.thread_mut(thread_id) {
             thread.expanded = true;
             thread.subagents.push(AgentNode {
-                id,
-                parent_id: Some(parent_id),
-                runtime_key: Some(key),
+                addr,
+                parent: Some(parent_addr),
                 label: format!("subagent: {label}"),
                 depth,
                 status: AgentStatus::Running,
@@ -1494,7 +1458,7 @@ impl AppState {
     fn apply_tool_result_to_agent(
         &mut self,
         thread_id: ThreadId,
-        agent_id: AgentId,
+        addr: AgentAddr,
         tool_call_id: &str,
         content: &str,
         is_error: bool,
@@ -1504,11 +1468,11 @@ impl AppState {
         } else {
             ToolStatus::Finished
         };
-        if self.set_tool_status(thread_id, agent_id, tool_call_id, status, Some(content)) {
+        if self.set_tool_status(thread_id, addr, tool_call_id, status, Some(content)) {
             return;
         }
 
-        if let Some(agent) = self.agent_mut(thread_id, agent_id) {
+        if let Some(agent) = self.agent_mut(thread_id, addr) {
             agent
                 .messages
                 .push(Message::tool_result(content.to_string()));
@@ -1518,12 +1482,12 @@ impl AppState {
     fn set_tool_status(
         &mut self,
         thread_id: ThreadId,
-        agent_id: AgentId,
+        addr: AgentAddr,
         tool_call_id: &str,
         status: ToolStatus,
         result: Option<&str>,
     ) -> bool {
-        let Some(agent) = self.agent_mut(thread_id, agent_id) else {
+        let Some(agent) = self.agent_mut(thread_id, addr) else {
             return false;
         };
 
@@ -1544,8 +1508,8 @@ impl AppState {
         true
     }
 
-    fn collapse_last_reasoning(&mut self, thread_id: ThreadId, agent_id: AgentId) {
-        if let Some(agent) = self.agent_mut(thread_id, agent_id)
+    fn collapse_last_reasoning(&mut self, thread_id: ThreadId, addr: AgentAddr) {
+        if let Some(agent) = self.agent_mut(thread_id, addr)
             && let Some(message) = agent
                 .messages
                 .iter_mut()
@@ -1557,7 +1521,7 @@ impl AppState {
     }
 
     fn toggle_last_reasoning(&mut self) {
-        if let Some(agent) = self.agent_mut(self.selected.thread_id, self.selected.agent_id)
+        if let Some(agent) = self.agent_mut(self.selected.thread_id, self.selected.addr)
             && let Some(message) = agent
                 .messages
                 .iter_mut()
@@ -1568,71 +1532,50 @@ impl AppState {
         }
     }
 
-    fn agent(&self, thread_id: ThreadId, agent_id: AgentId) -> Option<&AgentNode> {
+    fn agent(&self, thread_id: ThreadId, addr: AgentAddr) -> Option<&AgentNode> {
         let thread = self.threads.iter().find(|thread| thread.id == thread_id)?;
-        if agent_id == MAIN_AGENT_ID {
-            Some(&thread.main_agent)
-        } else {
-            thread.subagents.iter().find(|agent| agent.id == agent_id)
+        match addr {
+            AgentAddr::Main => Some(&thread.main_agent),
+            AgentAddr::Runtime(_) => thread.subagents.iter().find(|agent| agent.addr == addr),
         }
     }
 
-    fn agent_mut(&mut self, thread_id: ThreadId, agent_id: AgentId) -> Option<&mut AgentNode> {
+    fn agent_mut(&mut self, thread_id: ThreadId, addr: AgentAddr) -> Option<&mut AgentNode> {
         let thread = self
             .threads
             .iter_mut()
             .find(|thread| thread.id == thread_id)?;
-        if agent_id == MAIN_AGENT_ID {
-            Some(&mut thread.main_agent)
-        } else {
-            thread
-                .subagents
-                .iter_mut()
-                .find(|agent| agent.id == agent_id)
+        match addr {
+            AgentAddr::Main => Some(&mut thread.main_agent),
+            AgentAddr::Runtime(_) => thread.subagents.iter_mut().find(|agent| agent.addr == addr),
         }
-    }
-
-    fn agent_id_by_runtime_key(
-        &self,
-        thread_id: ThreadId,
-        key: RuntimeAgentKey,
-    ) -> Option<AgentId> {
-        self.threads
-            .iter()
-            .find(|thread| thread.id == thread_id)?
-            .subagents
-            .iter()
-            .find(|agent| agent.runtime_key == Some(key))
-            .map(|agent| agent.id)
     }
 
     fn remove_agent_control(&mut self, thread_id: ThreadId, addr: AgentAddr) {
         self.agent_controls.remove(&(thread_id, addr));
     }
 
-    fn remove_agent_controls_for_subtree(&mut self, thread_id: ThreadId, root: AgentId) {
-        let keys: HashSet<_> = self
+    fn remove_agent_controls_for_subtree(&mut self, thread_id: ThreadId, root: AgentAddr) {
+        let addrs: HashSet<_> = self
             .thread(thread_id)
-            .map(|thread| descendant_agent_ids(thread, root))
+            .map(|thread| descendant_agent_addrs(thread, root))
             .unwrap_or_default()
             .into_iter()
-            .filter_map(|agent_id| self.agent(thread_id, agent_id)?.runtime_key)
             .collect();
 
         self.agent_controls.retain(|(control_thread_id, addr), _| {
-            *control_thread_id != thread_id
-                || !matches!(addr, AgentAddr::Runtime(key) if keys.contains(key))
+            *control_thread_id != thread_id || !addrs.contains(addr)
         });
     }
 
-    fn cancel_agent_subtree(&mut self, thread_id: ThreadId, root: AgentId, reason: &str) {
-        let agent_ids = self
+    fn cancel_agent_subtree(&mut self, thread_id: ThreadId, root: AgentAddr, reason: &str) {
+        let addrs = self
             .thread(thread_id)
-            .map(|thread| descendant_agent_ids(thread, root))
+            .map(|thread| descendant_agent_addrs(thread, root))
             .unwrap_or_default();
 
-        for agent_id in agent_ids {
-            if let Some(agent) = self.agent_mut(thread_id, agent_id)
+        for addr in addrs {
+            if let Some(agent) = self.agent_mut(thread_id, addr)
                 && agent.status == AgentStatus::Running
             {
                 settle_cancelled_agent(agent, reason);
@@ -1661,14 +1604,14 @@ fn append_agent_sidebar_item(
     let has_children = thread
         .subagents
         .iter()
-        .any(|child| child.parent_id == Some(agent.id));
+        .any(|child| child.parent == Some(agent.addr));
     items.push(SidebarItem {
         thread_id: thread.id,
-        agent_id: agent.id,
+        addr: agent.addr,
         label: agent.label.clone(),
         depth,
         expanded: agent.expanded,
-        selected: selected.thread_id == thread.id && selected.agent_id == agent.id,
+        selected: selected.thread_id == thread.id && selected.addr == agent.addr,
         status: agent.status,
         has_children,
     });
@@ -1677,37 +1620,37 @@ fn append_agent_sidebar_item(
 fn append_child_sidebar_items(
     items: &mut Vec<SidebarItem>,
     thread: &ThreadState,
-    parent_id: AgentId,
+    parent: AgentAddr,
     depth: usize,
     selected: Selection,
 ) {
     for child in thread
         .subagents
         .iter()
-        .filter(|agent| agent.parent_id == Some(parent_id))
+        .filter(|agent| agent.parent == Some(parent))
     {
         append_agent_sidebar_item(items, thread, child, depth, selected);
         if child.expanded {
-            append_child_sidebar_items(items, thread, child.id, depth + 1, selected);
+            append_child_sidebar_items(items, thread, child.addr, depth + 1, selected);
         }
     }
 }
 
-fn descendant_agent_ids(thread: &ThreadState, root: AgentId) -> Vec<AgentId> {
-    let mut ids = vec![root];
+fn descendant_agent_addrs(thread: &ThreadState, root: AgentAddr) -> Vec<AgentAddr> {
+    let mut addrs = vec![root];
     let mut index = 0;
-    while index < ids.len() {
-        let parent = ids[index];
-        ids.extend(
+    while index < addrs.len() {
+        let parent = addrs[index];
+        addrs.extend(
             thread
                 .subagents
                 .iter()
-                .filter(|agent| agent.parent_id == Some(parent))
-                .map(|agent| agent.id),
+                .filter(|agent| agent.parent == Some(parent))
+                .map(|agent| agent.addr),
         );
         index += 1;
     }
-    ids
+    addrs
 }
 
 fn settle_cancelled_agent(agent: &mut AgentNode, reason: &str) {
@@ -2519,8 +2462,8 @@ mod tests {
 
         let subs = &app.threads[0].subagents;
         assert_eq!(subs.len(), 1);
-        assert_eq!(subs[0].parent_id, Some(MAIN_AGENT_ID));
-        assert_eq!(subs[0].runtime_key, Some(RuntimeAgentKey::new(1)));
+        assert_eq!(subs[0].parent, Some(AgentAddr::Main));
+        assert_eq!(subs[0].addr, AgentAddr::Runtime(RuntimeAgentKey::new(1)));
         assert_eq!(subs[0].status, AgentStatus::Running);
         assert_eq!(subs[0].depth, 1);
         assert_eq!(subs[0].label, "subagent: do thing");
@@ -2561,7 +2504,7 @@ mod tests {
             T,
             nested_started(RuntimeAgentKey::new(1), None, 1, "parent"),
         );
-        let parent_id = app.threads[0].subagents[0].id;
+        let parent_addr = app.threads[0].subagents[0].addr;
         app.apply_thread_event(
             T,
             nested_started(
@@ -2575,9 +2518,9 @@ mod tests {
         let worker = app.threads[0]
             .subagents
             .iter()
-            .find(|a| a.runtime_key == Some(RuntimeAgentKey::new(2)))
+            .find(|a| a.addr == AgentAddr::Runtime(RuntimeAgentKey::new(2)))
             .expect("worker node");
-        assert_eq!(worker.parent_id, Some(parent_id));
+        assert_eq!(worker.parent, Some(parent_addr));
         assert_eq!(worker.depth, 2);
     }
 
@@ -2609,19 +2552,19 @@ mod tests {
         let subs = &app.threads[0].subagents;
         let find = |key| {
             subs.iter()
-                .find(|a| a.runtime_key == Some(key))
+                .find(|a| a.addr == AgentAddr::Runtime(key))
                 .expect("node")
         };
         assert_eq!(find(RuntimeAgentKey::new(1)).depth, 1);
         assert_eq!(find(RuntimeAgentKey::new(2)).depth, 2);
         assert_eq!(find(RuntimeAgentKey::new(3)).depth, 3);
         assert_eq!(
-            find(RuntimeAgentKey::new(2)).parent_id,
-            Some(find(RuntimeAgentKey::new(1)).id)
+            find(RuntimeAgentKey::new(2)).parent,
+            Some(find(RuntimeAgentKey::new(1)).addr)
         );
         assert_eq!(
-            find(RuntimeAgentKey::new(3)).parent_id,
-            Some(find(RuntimeAgentKey::new(2)).id)
+            find(RuntimeAgentKey::new(3)).parent,
+            Some(find(RuntimeAgentKey::new(2)).addr)
         );
     }
 
@@ -2671,7 +2614,7 @@ mod tests {
                 control: AgentControl::new(subagent_cancel.clone(), queue),
             },
         );
-        app.selected.agent_id = app.threads[0].subagents[0].id;
+        app.selected.addr = app.threads[0].subagents[0].addr;
 
         app.handle_key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::CONTROL));
 
@@ -2736,8 +2679,8 @@ mod tests {
                 control,
             },
         );
-        let subagent_id = app.threads[0].subagents[0].id;
-        app.selected.agent_id = subagent_id;
+        let subagent_addr = app.threads[0].subagents[0].addr;
+        app.selected.addr = subagent_addr;
         type_str(&mut app, "focus on tests");
 
         app.handle_key(key(KeyCode::Enter));
@@ -3100,12 +3043,7 @@ mod tests {
 
     #[test]
     fn restore_with_no_threads_falls_back_to_fresh_app() {
-        let app = AppState::restored(
-            Vec::new(),
-            ThreadId::new(5),
-            AgentId::new(9),
-            vec!["edit_file".into()],
-        );
+        let app = AppState::restored(Vec::new(), ThreadId::new(5), vec!["edit_file".into()]);
         assert_eq!(app.threads.len(), 1);
         assert_eq!(app.threads[0].main_agent.status, AgentStatus::Idle);
     }
@@ -3128,11 +3066,9 @@ mod tests {
         );
         assert!(app.main_agent_running());
 
-        let (next_thread_id, next_agent_id) = app.next_ids();
         let restored = AppState::restored(
             app.snapshot_threads(),
-            next_thread_id,
-            next_agent_id,
+            app.next_thread_id(),
             app.always_allowed_tools(),
         );
 
