@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::process::Stdio;
 
 use async_trait::async_trait;
 use llm::{Tool, ToolError, ToolOutput, parse_args, schema_for};
@@ -115,6 +116,13 @@ pub async fn run_terminal(command: &str) -> std::io::Result<TerminalResult> {
 /// Build the platform shell invocation. `kill_on_drop` is set so that dropping
 /// the call future (e.g. when the agent run is cancelled) tears down the child
 /// process instead of leaving it running detached.
+///
+/// stdin is explicitly redirected to null. This is a non-interactive,
+/// output-capturing tool, and `tokio::process::Command::output` — unlike its
+/// `std` counterpart — leaves stdin *inherited*. Without this, the child would
+/// share the TUI's console stdin: a command that reads stdin (`more`, `sort`
+/// with no file, a `cmd` confirmation prompt, ...) would block forever waiting
+/// for input the raw-mode TUI never delivers, hanging the whole agent run.
 fn shell_command(command: &str) -> Command {
     let mut shell = if cfg!(windows) {
         let mut shell = Command::new("cmd");
@@ -126,6 +134,7 @@ fn shell_command(command: &str) -> Command {
         shell
     };
     shell.arg(command);
+    shell.stdin(Stdio::null());
     shell.kill_on_drop(true);
     shell
 }
@@ -154,6 +163,22 @@ mod tests {
 
         assert_eq!(result.exit_code, Some(3));
         assert!(result.is_failure());
+    }
+
+    #[tokio::test]
+    async fn stdin_reading_command_does_not_block() {
+        // The child must get EOF on stdin rather than inheriting the parent's,
+        // otherwise a command that reads stdin would hang waiting for input.
+        // `sort`/`more` read stdin on both platforms when given no file.
+        let command = if cfg!(windows) { "more" } else { "cat" };
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), run_terminal(command))
+                .await
+                .expect("command must not block on stdin")
+                .expect("command runs");
+
+        assert_eq!(result.exit_code, Some(0));
     }
 
     #[tokio::test]

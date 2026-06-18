@@ -142,11 +142,7 @@ mod tests {
         let dir = temp_dir("version");
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(SESSION_FILE);
-        fs::write(
-            &path,
-            br#"{"version":999,"threads":[],"next_thread_id":1}"#,
-        )
-        .unwrap();
+        fs::write(&path, br#"{"version":999,"threads":[],"next_thread_id":1}"#).unwrap();
 
         assert!(load(&path).is_none(), "a future version is not loaded");
         assert!(path.exists(), "the unreadable file is left intact");
