@@ -487,9 +487,8 @@ impl fmt::Display for AgentRunError {
             Self::MaxTurns { max_turns } => {
                 write!(f, "agent reached the maximum turn limit ({max_turns})")
             }
-            Self::Truncated => write!(
-                f,
-                "the model response was cut off at the output-length limit before completion"
+            Self::Truncated => f.write_str(
+                "the model response was cut off at the output-length limit before completion",
             ),
         }
     }

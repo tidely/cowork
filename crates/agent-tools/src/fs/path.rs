@@ -46,7 +46,7 @@ impl fmt::Display for PathError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::HomeDirectoryUnavailable => {
-                write!(f, "home directory environment variables are not set")
+                f.write_str("home directory environment variables are not set")
             }
             Self::CurrentDirectoryUnavailable(error) => {
                 write!(f, "current directory is unavailable: {error}")
