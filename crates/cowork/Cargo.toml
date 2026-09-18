@@ -7,5 +7,9 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
+futures.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
+rig.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

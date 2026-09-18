@@ -13,4 +13,7 @@ edition = "2024"
 [workspace.dependencies]
 gpui = { git = "https://github.com/zed-industries/zed/", rev = "78648aaf7de5400d049122b5a834e22e6525668b" }
 gpui_platform = { git = "https://github.com/zed-industries/zed/", rev = "78648aaf7de5400d049122b5a834e22e6525668b", features = ["font-kit", "wayland", "x11"]}
+futures = "0.3"
 rig = { git = "https://github.com/0xPlaygrounds/rig", rev = "2d16c1b25f6749b3a2cd841beddf767106495069" }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
