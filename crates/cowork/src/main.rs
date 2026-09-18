@@ -54,6 +54,7 @@ struct Thread {
     summary: ThreadSummary,
     messages: Vec<TimelineMessage>,
     generating: bool,
+    collaborating: bool,
 }
 
 struct ThreadStore {
@@ -129,6 +130,13 @@ impl Cowork {
     }
 
     fn render_top_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let active_thread = self
+            .active_thread_id
+            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx));
+        let collaborating = active_thread
+            .as_ref()
+            .is_some_and(|thread| thread.read(cx).collaborating);
+
         div()
             .h(TOP_BAR_HEIGHT)
             .w_full()
@@ -143,29 +151,68 @@ impl Cowork {
                 div()
                     .h_full()
                     .flex()
-                    .font_family("Segoe Fluent Icons")
-                    .child(Self::render_caption_button(
-                        "minimize-window",
-                        "\u{e921}",
-                        WindowControlArea::Min,
-                        false,
-                    ))
-                    .child(Self::render_caption_button(
-                        "maximize-window",
-                        if window.is_maximized() {
-                            "\u{e923}"
-                        } else {
-                            "\u{e922}"
-                        },
-                        WindowControlArea::Max,
-                        false,
-                    ))
-                    .child(Self::render_caption_button(
-                        "close-window",
-                        "\u{e8bb}",
-                        WindowControlArea::Close,
-                        true,
-                    )),
+                    .items_center()
+                    .child(
+                        div()
+                            .id("toggle-sharing")
+                            .h(px(28.))
+                            .px_3()
+                            .mr_2()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .occlude()
+                            .text_sm()
+                            .text_color(rgb(0x71717a))
+                            .when(active_thread.is_some(), |this| {
+                                this.cursor_pointer()
+                                    .text_color(rgb(0xd4d4d8))
+                                    .hover(|this| this.bg(rgb(0x2d2d30)))
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let Some(thread_id) = this.active_thread_id else {
+                                    return;
+                                };
+                                let Some(thread) = this.thread_store.read(cx).thread(thread_id, cx)
+                                else {
+                                    return;
+                                };
+                                thread.update(cx, |thread, _| {
+                                    thread.collaborating = !thread.collaborating;
+                                });
+                                cx.notify();
+                            }))
+                            .child(if collaborating { "Unshare" } else { "Share" }),
+                    )
+                    .child(
+                        div()
+                            .h_full()
+                            .flex()
+                            .font_family("Segoe Fluent Icons")
+                            .child(Self::render_caption_button(
+                                "minimize-window",
+                                "\u{e921}",
+                                WindowControlArea::Min,
+                                false,
+                            ))
+                            .child(Self::render_caption_button(
+                                "maximize-window",
+                                if window.is_maximized() {
+                                    "\u{e923}"
+                                } else {
+                                    "\u{e922}"
+                                },
+                                WindowControlArea::Max,
+                                false,
+                            ))
+                            .child(Self::render_caption_button(
+                                "close-window",
+                                "\u{e8bb}",
+                                WindowControlArea::Close,
+                                true,
+                            )),
+                    ),
             )
     }
 
@@ -183,14 +230,46 @@ impl Cowork {
         cx.notify();
     }
 
+    fn render_sidebar_thread(
+        &self,
+        thread: &ThreadSummary,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let thread_id = thread.id;
+        div()
+            .id(thread_id.to_string())
+            .h(px(30.))
+            .w_full()
+            .px_2()
+            .flex()
+            .items_center()
+            .rounded_md()
+            .cursor_pointer()
+            .when(self.active_thread_id == Some(thread.id), |this| {
+                this.bg(rgb(0x2d2d30))
+            })
+            .hover(|this| this.bg(rgb(0x3a3a3e)))
+            .on_click(cx.listener(move |this, _, window, cx| {
+                this.open_thread(thread_id, window, cx);
+            }))
+            .text_sm()
+            .text_color(rgb(0xd4d4d8))
+            .truncate()
+            .child(thread.title.clone())
+            .into_any_element()
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let threads = self
+        let (collaborating_threads, recent_threads): (Vec<_>, Vec<_>) = self
             .thread_store
             .read(cx)
             .threads
             .iter()
-            .map(|thread| thread.read(cx).summary.clone())
-            .collect::<Vec<_>>();
+            .map(|thread| {
+                let thread = thread.read(cx);
+                (thread.summary.clone(), thread.collaborating)
+            })
+            .partition(|(_, collaborating)| *collaborating);
         let recents_arrow = div()
             .size(px(16.))
             .flex()
@@ -253,6 +332,25 @@ impl Cowork {
                     )
                     .child(
                         div()
+                            .h(px(44.))
+                            .flex_none()
+                            .flex()
+                            .items_end()
+                            .px_3()
+                            .pb_2()
+                            .text_sm()
+                            .text_color(rgb(0x71717a))
+                            .child("Collaborating"),
+                    )
+                    .child(
+                        div().flex_none().px_2().children(
+                            collaborating_threads
+                                .iter()
+                                .map(|(thread, _)| self.render_sidebar_thread(thread, cx)),
+                        ),
+                    )
+                    .child(
+                        div()
                             .id("toggle-recents")
                             .h(px(44.))
                             .flex_none()
@@ -273,31 +371,13 @@ impl Cowork {
                             .child(recents_arrow),
                     )
                     .when(self.recents_open, |this| {
-                        this.child(div().flex_1().min_h_0().overflow_hidden().px_2().children(
-                            threads.iter().map(|thread| {
-                                let thread_id = thread.id;
-                                div()
-                                    .id(thread_id.to_string())
-                                    .h(px(30.))
-                                    .w_full()
-                                    .px_2()
-                                    .flex()
-                                    .items_center()
-                                    .rounded_md()
-                                    .cursor_pointer()
-                                    .when(self.active_thread_id == Some(thread.id), |this| {
-                                        this.bg(rgb(0x2d2d30))
-                                    })
-                                    .hover(|this| this.bg(rgb(0x3a3a3e)))
-                                    .on_click(cx.listener(move |this, _, window, cx| {
-                                        this.open_thread(thread_id, window, cx);
-                                    }))
-                                    .text_sm()
-                                    .text_color(rgb(0xd4d4d8))
-                                    .truncate()
-                                    .child(thread.title.clone())
-                            }),
-                        ))
+                        this.child(
+                            div().flex_1().min_h_0().overflow_hidden().px_2().children(
+                                recent_threads
+                                    .iter()
+                                    .map(|(thread, _)| self.render_sidebar_thread(thread, cx)),
+                            ),
+                        )
                     }),
             )
     }
@@ -551,6 +631,7 @@ impl Cowork {
                 },
                 messages: Vec::new(),
                 generating: false,
+                collaborating: false,
             });
             self.thread_store.update(cx, |store, _| {
                 store.threads.insert(0, thread.clone());
