@@ -1,11 +1,13 @@
+mod composer;
+
 use std::{sync::OnceLock, time::Duration};
 
+use composer::{Composer, ComposerEvent};
 use futures::StreamExt;
 use gpui::{
-    Animation, AnimationExt, App, AppContext, Bounds, Context, CursorStyle, FocusHandle,
-    IntoElement, KeyDownEvent, Render, ScrollHandle, SpringAnimation, SpringConfig,
-    TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowOptions, div, prelude::*, px,
-    rgb, size,
+    Animation, AnimationExt, App, AppContext, Bounds, Context, Entity, Focusable, IntoElement,
+    Render, ScrollHandle, SpringAnimation, SpringConfig, Subscription, TitlebarOptions, Window,
+    WindowBounds, WindowControlArea, WindowOptions, div, prelude::*, px, rgb, size,
 };
 use rig::{
     agent::MultiTurnStreamItem,
@@ -16,6 +18,7 @@ use rig::{
 };
 use serde_json::json;
 use tokio::{runtime::Runtime, sync::mpsc};
+use uuid::Uuid;
 
 const SIDEBAR_WIDTH: gpui::Pixels = px(275.);
 const TOP_BAR_HEIGHT: gpui::Pixels = px(40.);
@@ -23,21 +26,6 @@ const OLLAMA_MODEL: &str = "qwen3.8:27b";
 const OLLAMA_CONTEXT_TOKENS: u64 = 131_072;
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
-
-const PLACEHOLDER_THREADS: &[&str] = &[
-    "Assess media support",
-    "Check browser support",
-    "Complete assignment",
-    "Fix smoke screen",
-    "Check Rust availability",
-    "Restrict main branch merges",
-    "Schedule Rust checks",
-    "Review pull request",
-    "Implement indexing type",
-    "Generalize animated blocks",
-    "Design checkpoint blocks",
-    "Review current changes",
-];
 
 #[derive(Clone, Copy)]
 enum MessageAuthor {
@@ -53,6 +41,31 @@ struct TimelineMessage {
     failed: bool,
 }
 
+#[derive(Clone)]
+struct ThreadSummary {
+    id: Uuid,
+    title: String,
+}
+
+struct Thread {
+    summary: ThreadSummary,
+    messages: Vec<TimelineMessage>,
+    generating: bool,
+}
+
+struct ThreadStore {
+    threads: Vec<Entity<Thread>>,
+}
+
+impl ThreadStore {
+    fn thread(&self, thread_id: Uuid, cx: &App) -> Option<Entity<Thread>> {
+        self.threads
+            .iter()
+            .find(|thread| thread.read(cx).summary.id == thread_id)
+            .cloned()
+    }
+}
+
 enum AgentEvent {
     Text(String),
     Finished,
@@ -62,13 +75,12 @@ enum AgentEvent {
 struct Cowork {
     sidebar_open: bool,
     recents_open: bool,
-    composer_text: String,
-    composer_focus_handle: FocusHandle,
+    composer: Entity<Composer>,
     timeline_scroll_handle: ScrollHandle,
-    messages: Vec<TimelineMessage>,
-    generating: bool,
-    conversation_generation: u64,
+    thread_store: Entity<ThreadStore>,
+    active_thread_id: Option<Uuid>,
     tokio_handle: tokio::runtime::Handle,
+    _subscriptions: Vec<Subscription>,
 }
 
 impl Cowork {
@@ -155,7 +167,26 @@ impl Cowork {
             )
     }
 
+    fn open_thread(&mut self, thread_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        if self.thread_store.read(cx).thread(thread_id, cx).is_none() {
+            return;
+        }
+
+        self.composer.update(cx, Composer::reset);
+        self.active_thread_id = Some(thread_id);
+        self.timeline_scroll_handle.scroll_to_bottom();
+        self.composer.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
     fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let threads = self
+            .thread_store
+            .read(cx)
+            .threads
+            .iter()
+            .map(|thread| thread.read(cx).summary.clone())
+            .collect::<Vec<_>>();
         let recents_arrow = div()
             .size(px(16.))
             .flex()
@@ -199,15 +230,14 @@ impl Cowork {
                             .gap_2()
                             .rounded_md()
                             .cursor_pointer()
-                            .bg(rgb(0x2d2d30))
+                            .when(self.active_thread_id.is_none(), |this| {
+                                this.bg(rgb(0x2d2d30))
+                            })
                             .hover(|this| this.bg(rgb(0x3a3a3e)))
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.messages.clear();
-                                this.composer_text.clear();
-                                this.generating = false;
-                                this.conversation_generation =
-                                    this.conversation_generation.wrapping_add(1);
-                                this.composer_focus_handle.focus(window, cx);
+                                this.composer.update(cx, Composer::reset);
+                                this.active_thread_id = None;
+                                this.composer.focus_handle(cx).focus(window, cx);
                                 cx.notify();
                             }))
                             .text_sm()
@@ -237,29 +267,31 @@ impl Cowork {
                             .child(recents_arrow),
                     )
                     .when(self.recents_open, |this| {
-                        this.child(
-                            div().flex_1().min_h_0().overflow_hidden().px_2().children(
-                                PLACEHOLDER_THREADS
-                                    .iter()
-                                    .enumerate()
-                                    .map(|(index, title)| {
-                                        div()
-                                            .id(("placeholder-thread", index))
-                                            .h(px(30.))
-                                            .w_full()
-                                            .px_2()
-                                            .flex()
-                                            .items_center()
-                                            .rounded_md()
-                                            .cursor_pointer()
-                                            .hover(|this| this.bg(rgb(0x2d2d30)))
-                                            .text_sm()
-                                            .text_color(rgb(0xd4d4d8))
-                                            .truncate()
-                                            .child(*title)
-                                    }),
-                            ),
-                        )
+                        this.child(div().flex_1().min_h_0().overflow_hidden().px_2().children(
+                            threads.iter().map(|thread| {
+                                let thread_id = thread.id;
+                                div()
+                                    .id(thread_id.to_string())
+                                    .h(px(30.))
+                                    .w_full()
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .when(self.active_thread_id == Some(thread.id), |this| {
+                                        this.bg(rgb(0x2d2d30))
+                                    })
+                                    .hover(|this| this.bg(rgb(0x3a3a3e)))
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_thread(thread_id, window, cx);
+                                    }))
+                                    .text_sm()
+                                    .text_color(rgb(0xd4d4d8))
+                                    .truncate()
+                                    .child(thread.title.clone())
+                            }),
+                        ))
                     }),
             )
     }
@@ -334,8 +366,8 @@ impl Cowork {
             .child(div().w(px(40.)).flex_none())
     }
 
-    fn rig_history(&self) -> Vec<RigMessage> {
-        self.messages
+    fn rig_history(messages: &[TimelineMessage]) -> Vec<RigMessage> {
+        messages
             .iter()
             .filter(|message| message.complete && !message.failed)
             .map(|message| match message.author {
@@ -347,20 +379,27 @@ impl Cowork {
 
     fn start_generation(
         &mut self,
+        thread_id: Uuid,
         prompt: String,
         history: Vec<RigMessage>,
         cx: &mut Context<Self>,
     ) {
-        let message_index = self.messages.len();
-        self.messages.push(TimelineMessage {
-            author: MessageAuthor::Agent,
-            text: String::new(),
-            complete: false,
-            failed: false,
+        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+            return;
+        };
+        let message_index = thread.update(cx, |thread, _| {
+            let message_index = thread.messages.len();
+            thread.messages.push(TimelineMessage {
+                author: MessageAuthor::Agent,
+                text: String::new(),
+                complete: false,
+                failed: false,
+            });
+            thread.generating = true;
+            message_index
         });
-        self.generating = true;
 
-        let conversation_generation = self.conversation_generation;
+        let thread = thread.clone();
         let (sender, mut receiver) = mpsc::channel(128);
         self.tokio_handle.spawn(async move {
             let client = match Ollama::new().bound() {
@@ -384,9 +423,6 @@ impl Cowork {
                 }))
                 .build();
             let mut stream = agent.prompt(prompt).history(&history).stream();
-
-            // Reduce memory usage during streaming by dropping owned copy of history
-            drop(history);
 
             while let Some(item) = stream.next().await {
                 match item {
@@ -419,22 +455,18 @@ impl Cowork {
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = receiver.recv().await {
-                let result = this.update(cx, |this, cx| {
-                    if this.conversation_generation != conversation_generation {
-                        return true;
-                    }
-
-                    let Some(message) = this.messages.get_mut(message_index) else {
+                let finished = thread.update(cx, |thread, _| {
+                    let Some(message) = thread.messages.get_mut(message_index) else {
                         return true;
                     };
-                    let finished = match event {
+                    match event {
                         AgentEvent::Text(text) => {
                             message.text.push_str(&text);
                             false
                         }
                         AgentEvent::Finished => {
                             message.complete = true;
-                            this.generating = false;
+                            thread.generating = false;
                             true
                         }
                         AgentEvent::Failed(error) => {
@@ -443,106 +475,99 @@ impl Cowork {
                             if message.text.is_empty() {
                                 message.text = format!("Unable to generate a response: {error}");
                             }
-                            this.generating = false;
+                            thread.generating = false;
                             true
                         }
-                    };
-                    this.timeline_scroll_handle.scroll_to_bottom();
-                    cx.notify();
-                    finished
+                    }
                 });
 
-                match result {
-                    Ok(true) | Err(_) => break,
-                    Ok(false) => {}
+                let result = this.update(cx, |this, cx| {
+                    if this.active_thread_id == Some(thread_id) {
+                        this.timeline_scroll_handle.scroll_to_bottom();
+                        cx.notify();
+                    }
+                });
+                if result.is_err() || finished {
+                    break;
                 }
             }
         })
         .detach();
     }
 
-    fn submit_composer(&mut self, cx: &mut Context<Self>) {
-        if self.generating || self.composer_text.trim().is_empty() {
+    fn thread_title(prompt: &str) -> String {
+        let normalized_prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut characters = normalized_prompt.chars();
+        let mut title = characters.by_ref().take(32).collect::<String>();
+        if characters.next().is_some() {
+            title.push('…');
+        }
+        title
+    }
+
+    fn submit_composer(&mut self, composer: &Entity<Composer>, cx: &mut Context<Self>) {
+        let prompt = composer.read(cx).text().to_string();
+        if prompt.trim().is_empty() {
             return;
         }
 
-        let history = self.rig_history();
-        let prompt = std::mem::take(&mut self.composer_text);
-        self.messages.push(TimelineMessage {
-            author: MessageAuthor::User,
-            text: prompt.clone(),
-            complete: true,
-            failed: false,
+        let active_thread = self
+            .active_thread_id
+            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx));
+        if active_thread
+            .as_ref()
+            .is_some_and(|thread| thread.read(cx).generating)
+        {
+            return;
+        }
+        let history = active_thread
+            .as_ref()
+            .map(|thread| Self::rig_history(&thread.read(cx).messages))
+            .unwrap_or_default();
+        composer.update(cx, Composer::reset);
+
+        let (thread_id, thread) = if let Some(thread) = active_thread {
+            (thread.read(cx).summary.id, thread)
+        } else {
+            let thread_id = Uuid::new_v4();
+            let thread = cx.new(|_| Thread {
+                summary: ThreadSummary {
+                    id: thread_id,
+                    title: Self::thread_title(&prompt),
+                },
+                messages: Vec::new(),
+                generating: false,
+            });
+            self.thread_store.update(cx, |store, _| {
+                store.threads.insert(0, thread.clone());
+            });
+            self.active_thread_id = Some(thread_id);
+            (thread_id, thread)
+        };
+
+        thread.update(cx, |thread, _| {
+            thread.messages.push(TimelineMessage {
+                author: MessageAuthor::User,
+                text: prompt.clone(),
+                complete: true,
+                failed: false,
+            });
         });
-        self.start_generation(prompt, history, cx);
+        self.start_generation(thread_id, prompt, history, cx);
         self.timeline_scroll_handle.scroll_to_bottom();
     }
 
-    fn on_composer_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let keystroke = &event.keystroke;
-        let submit = keystroke.key == "enter"
-            && (keystroke.modifiers.control || keystroke.modifiers.platform);
-        let handled = if submit {
-            self.submit_composer(cx);
-            true
-        } else {
-            match keystroke.key.as_str() {
-                "backspace" => {
-                    self.composer_text.pop();
-                    true
-                }
-                "enter" => {
-                    self.composer_text.push('\n');
-                    true
-                }
-                _ if !keystroke.modifiers.control && !keystroke.modifiers.platform => {
-                    if let Some(text) = keystroke.key_char.as_deref() {
-                        self.composer_text.push_str(text);
-                        true
-                    } else {
-                        false
-                    }
-                }
-                _ => false,
-            }
-        };
-
-        if handled {
-            cx.stop_propagation();
-            cx.notify();
-        }
-    }
-
     fn render_main_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mut composer_lines = self.composer_text.split('\n').collect::<Vec<_>>();
-        let active_line = composer_lines.pop().unwrap_or_default().to_string();
-        let completed_lines = composer_lines
-            .into_iter()
-            .map(|line| line.to_string())
-            .collect::<Vec<_>>();
-
-        let timeline_messages = self
-            .messages
+        let messages = self
+            .active_thread_id
+            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
+            .map(|thread| thread.read(cx).messages.clone())
+            .unwrap_or_default();
+        let timeline_messages = messages
             .iter()
             .enumerate()
             .map(|(index, message)| Self::render_timeline_message(index, message))
             .collect::<Vec<_>>();
-
-        let caret = div()
-            .w(px(2.))
-            .h(px(18.))
-            .flex_none()
-            .bg(rgb(0x60a5fa))
-            .with_animation(
-                "composer-caret",
-                Animation::new(Duration::from_millis(900)).repeat(),
-                |caret, delta| caret.opacity(if delta < 0.5 { 1. } else { 0. }),
-            );
 
         div()
             .id("main-editor")
@@ -591,33 +616,10 @@ impl Cowork {
                                             .min_h(px(110.))
                                             .flex_1()
                                             .min_w_0()
-                                            .flex()
-                                            .flex_col()
-                                            .items_start()
-                                            .track_focus(&self.composer_focus_handle)
-                                            .cursor(CursorStyle::IBeam)
                                             .on_click(cx.listener(|this, _, window, cx| {
-                                                this.composer_focus_handle.focus(window, cx);
+                                                this.composer.focus_handle(cx).focus(window, cx);
                                             }))
-                                            .on_key_down(cx.listener(Self::on_composer_key_down))
-                                            .text_color(rgb(0xe4e4e7))
-                                            .children(completed_lines.into_iter().map(|line| {
-                                                div().min_h(px(20.)).w_full().child(
-                                                    if line.is_empty() {
-                                                        " ".to_string()
-                                                    } else {
-                                                        line
-                                                    },
-                                                )
-                                            }))
-                                            .child(
-                                                div()
-                                                    .min_h(px(20.))
-                                                    .flex()
-                                                    .items_center()
-                                                    .child(active_line)
-                                                    .child(caret),
-                                            ),
+                                            .child(self.composer.clone()),
                                     )
                                     .child(div().w(px(40.)).flex_none()),
                             ),
@@ -686,6 +688,7 @@ fn main() {
     }
 
     gpui_platform::application().run(move |cx: &mut App| {
+        composer::init(cx);
         let window_options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                 None,
@@ -702,19 +705,27 @@ fn main() {
 
         if let Err(error) = cx.open_window(window_options, move |window, cx| {
             let tokio_handle = tokio_handle.clone();
+            let thread_store = cx.new(|_| ThreadStore {
+                threads: Vec::new(),
+            });
+            let composer = cx.new(Composer::new);
+            composer.focus_handle(cx).focus(window, cx);
             cx.new(|cx| {
-                let composer_focus_handle = cx.focus_handle();
-                composer_focus_handle.focus(window, cx);
+                let subscription = cx.subscribe(
+                    &composer,
+                    |this: &mut Cowork, composer, event: &ComposerEvent, cx| match event {
+                        ComposerEvent::Submit => this.submit_composer(&composer, cx),
+                    },
+                );
                 Cowork {
                     sidebar_open: true,
                     recents_open: true,
-                    composer_text: String::new(),
-                    composer_focus_handle,
+                    composer,
                     timeline_scroll_handle: ScrollHandle::new(),
-                    messages: Vec::new(),
-                    generating: false,
-                    conversation_generation: 0,
+                    thread_store,
+                    active_thread_id: None,
                     tokio_handle,
+                    _subscriptions: vec![subscription],
                 }
             })
         }) {

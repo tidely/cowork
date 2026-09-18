@@ -1721,6 +1721,8 @@ dependencies = [
  "rig",
  "serde_json",
  "tokio",
+ "unicode-segmentation",
+ "uuid",
 ]
 
 [[package]]
