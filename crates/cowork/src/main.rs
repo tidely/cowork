@@ -2,14 +2,16 @@ use std::{sync::OnceLock, time::Duration};
 
 use futures::StreamExt;
 use gpui::{
-    Animation, AnimationExt, App, AppContext, Bounds, Context, Entity, Focusable, IntoElement,
-    KeyBinding, Render, ScrollHandle, SpringAnimation, SpringConfig, TitlebarOptions, Window,
-    WindowBounds, WindowControlArea, WindowOptions, actions, div, prelude::*, px, rgb, size,
+    Animation, AnimationExt, App, AppContext, Bounds, ClipboardItem, Context, Entity, Focusable,
+    IntoElement, KeyBinding, Render, ScrollHandle, SpringAnimation, SpringConfig, TitlebarOptions,
+    Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, prelude::*, px, rgb,
+    size,
 };
 use gpui_base::{
     SelectableText, TextSelectionLayer, Textarea,
     input::{InputEditorStyle, TextareaState},
 };
+use iroh::{Endpoint, endpoint::presets};
 use rig::{
     agent::MultiTurnStreamItem,
     completion::Message as RigMessage,
@@ -50,11 +52,41 @@ struct ThreadSummary {
     title: String,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SharingStatus {
+    NotShared,
+    Sharing,
+    Shared,
+    Failed,
+}
+
+enum ThreadSharing {
+    NotShared,
+    Sharing,
+    Shared(Endpoint),
+    Failed,
+}
+
+impl ThreadSharing {
+    fn status(&self) -> SharingStatus {
+        match self {
+            Self::NotShared => SharingStatus::NotShared,
+            Self::Sharing => SharingStatus::Sharing,
+            Self::Shared(_) => SharingStatus::Shared,
+            Self::Failed => SharingStatus::Failed,
+        }
+    }
+
+    fn is_collaborating(&self) -> bool {
+        matches!(self, Self::Sharing | Self::Shared(_))
+    }
+}
+
 struct Thread {
     summary: ThreadSummary,
     messages: Vec<TimelineMessage>,
     generating: bool,
-    collaborating: bool,
+    sharing: ThreadSharing,
 }
 
 struct ThreadStore {
@@ -129,13 +161,103 @@ impl Cowork {
             .child("▥")
     }
 
+    fn start_sharing(&mut self, thread: Entity<Thread>, cx: &mut Context<Self>) {
+        thread.update(cx, |thread, _| {
+            thread.sharing = ThreadSharing::Sharing;
+        });
+        cx.notify();
+
+        let (sender, mut receiver) = mpsc::channel(1);
+        self.tokio_handle.spawn(async move {
+            let result = Endpoint::builder(presets::N0)
+                .bind()
+                .await
+                .map_err(|error| error.to_string());
+            if sender.send(result).await.is_err() {
+                return;
+            }
+        });
+
+        cx.spawn(async move |this, cx| {
+            let Some(result) = receiver.recv().await else {
+                return;
+            };
+
+            match result {
+                Ok(endpoint) => {
+                    let endpoint_id = endpoint.id().to_string();
+                    thread.update(cx, |thread, _| {
+                        thread.sharing = ThreadSharing::Shared(endpoint);
+                    });
+                    if this
+                        .update(cx, |_, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(endpoint_id));
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("failed to share thread: {error}");
+                    thread.update(cx, |thread, _| {
+                        thread.sharing = ThreadSharing::Failed;
+                    });
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        return;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn toggle_sharing(&mut self, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.active_thread_id else {
+            return;
+        };
+        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+            return;
+        };
+
+        match thread.read(cx).sharing.status() {
+            SharingStatus::NotShared | SharingStatus::Failed => self.start_sharing(thread, cx),
+            SharingStatus::Sharing => {}
+            SharingStatus::Shared => {
+                let endpoint = thread.update(cx, |thread, _| {
+                    let ThreadSharing::Shared(endpoint) =
+                        std::mem::replace(&mut thread.sharing, ThreadSharing::NotShared)
+                    else {
+                        return None;
+                    };
+                    Some(endpoint)
+                });
+                if let Some(endpoint) = endpoint {
+                    self.tokio_handle.spawn(async move {
+                        endpoint.close().await;
+                    });
+                }
+                cx.notify();
+            }
+        }
+    }
+
     fn render_top_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_thread = self
             .active_thread_id
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx));
-        let collaborating = active_thread
+        let sharing_status = active_thread
             .as_ref()
-            .is_some_and(|thread| thread.read(cx).collaborating);
+            .map(|thread| thread.read(cx).sharing.status())
+            .unwrap_or(SharingStatus::NotShared);
+        let share_label = match sharing_status {
+            SharingStatus::NotShared => "Share",
+            SharingStatus::Sharing => "Sharing…",
+            SharingStatus::Shared => "Unshare",
+            SharingStatus::Failed => "Retry share",
+        };
+        let sharing_enabled = active_thread.is_some() && sharing_status != SharingStatus::Sharing;
 
         div()
             .h(TOP_BAR_HEIGHT)
@@ -165,25 +287,18 @@ impl Cowork {
                             .occlude()
                             .text_sm()
                             .text_color(rgb(0x71717a))
-                            .when(active_thread.is_some(), |this| {
+                            .when(sharing_enabled, |this| {
                                 this.cursor_pointer()
                                     .text_color(rgb(0xd4d4d8))
                                     .hover(|this| this.bg(rgb(0x2d2d30)))
                             })
+                            .when(sharing_status == SharingStatus::Failed, |this| {
+                                this.text_color(rgb(0xf87171))
+                            })
                             .on_click(cx.listener(|this, _, _, cx| {
-                                let Some(thread_id) = this.active_thread_id else {
-                                    return;
-                                };
-                                let Some(thread) = this.thread_store.read(cx).thread(thread_id, cx)
-                                else {
-                                    return;
-                                };
-                                thread.update(cx, |thread, _| {
-                                    thread.collaborating = !thread.collaborating;
-                                });
-                                cx.notify();
+                                this.toggle_sharing(cx);
                             }))
-                            .child(if collaborating { "Unshare" } else { "Share" }),
+                            .child(share_label),
                     )
                     .child(
                         div()
@@ -267,7 +382,7 @@ impl Cowork {
             .iter()
             .map(|thread| {
                 let thread = thread.read(cx);
-                (thread.summary.clone(), thread.collaborating)
+                (thread.summary.clone(), thread.sharing.is_collaborating())
             })
             .partition(|(_, collaborating)| *collaborating);
         let recents_arrow = div()
@@ -631,7 +746,7 @@ impl Cowork {
                 },
                 messages: Vec::new(),
                 generating: false,
-                collaborating: false,
+                sharing: ThreadSharing::NotShared,
             });
             self.thread_store.update(cx, |store, _| {
                 store.threads.insert(0, thread.clone());
