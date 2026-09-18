@@ -1,18 +1,23 @@
-mod app;
-mod cli;
-mod config;
-mod events;
-mod permissions;
-mod persistence;
-mod runtime;
-mod tui;
-mod ui;
+use gpui::{App, AppContext, Context, IntoElement, Render, Window, WindowOptions, actions, div};
 
-use clap::Parser;
+struct Sidebar {}
 
-use cli::RunOptions;
+impl Render for Sidebar {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+    }
+}
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tui::run(RunOptions::parse()).await
+actions!(window, [Quit]);
+
+fn main() {
+    gpui_platform::application().run(|cx: &mut App| {
+        cx.open_window(WindowOptions::default(), |_window, cx| {
+            cx.new(|_cx| Sidebar {})
+        })
+        .unwrap();
+
+        cx.activate(true);
+        cx.on_action(|_: &Quit, cx| cx.quit());
+    });
 }

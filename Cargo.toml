@@ -11,23 +11,6 @@ edition = "2024"
 [workspace.lints.clippy]
 
 [workspace.dependencies]
-agent = { path = "crates/agent" }
-agent-tools = { path = "crates/agent-tools" }
-llm = { path = "crates/llm" }
-ollama = { path = "crates/ollama" }
-tokio = { version = "1", features = ["full"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-schemars = "1"
-futures = "0.3"
-async-trait = "0.1"
-async-stream = "0.3"
-reqwest = { version = "0.12", features = ["json", "stream"] }
-pdf-extract = "0.10"
-futures-util = "0.3"
-tokio-util = "0.7"
-ratatui = "0.29"
-crossterm = "0.28"
-uuid = { version = "1", features = ["v4"] }
-clap = { version = "4", features = ["derive"] }
-tempfile = "3"
+gpui = { git = "https://github.com/zed-industries/zed/", rev = "78648aaf7de5400d049122b5a834e22e6525668b" }
+gpui_platform = { git = "https://github.com/zed-industries/zed/", rev = "78648aaf7de5400d049122b5a834e22e6525668b", features = ["font-kit", "wayland", "x11"]}
+rig = { git = "https://github.com/0xPlaygrounds/rig", rev = "2d16c1b25f6749b3a2cd841beddf767106495069" }

@@ -7,16 +7,5 @@ edition.workspace = true
 workspace = true
 
 [dependencies]
-async-trait.workspace = true
-agent.workspace = true
-agent-tools.workspace = true
-llm.workspace = true
-ollama.workspace = true
-tokio.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tokio-util.workspace = true
-ratatui.workspace = true
-crossterm.workspace = true
-uuid.workspace = true
-clap.workspace = true
+gpui.workspace = true
+gpui_platform.workspace = true
