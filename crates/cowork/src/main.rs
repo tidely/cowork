@@ -6,7 +6,10 @@ use gpui::{
     KeyBinding, Render, ScrollHandle, SpringAnimation, SpringConfig, TitlebarOptions, Window,
     WindowBounds, WindowControlArea, WindowOptions, actions, div, prelude::*, px, rgb, size,
 };
-use gpui_base::{SelectableText, TextSelectionLayer, Textarea, input::TextareaState};
+use gpui_base::{
+    SelectableText, TextSelectionLayer, Textarea,
+    input::{InputEditorStyle, TextareaState},
+};
 use rig::{
     agent::MultiTurnStreamItem,
     completion::Message as RigMessage,
@@ -737,7 +740,14 @@ fn main() {
             let thread_store = cx.new(|_| ThreadStore {
                 threads: Vec::new(),
             });
-            let composer = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 8));
+            let composer = cx.new(|cx| {
+                let mut composer = TextareaState::new(window, cx).auto_grow(1, 8);
+                composer.set_editor_style(InputEditorStyle {
+                    caret: rgb(0xffffff).into(),
+                    ..Default::default()
+                });
+                composer
+            });
             composer.focus_handle(cx).focus(window, cx);
             cx.new(|_| Cowork {
                 sidebar_open: true,
