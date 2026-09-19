@@ -3,9 +3,10 @@ use std::{borrow::Cow, sync::OnceLock, time::Duration};
 use futures::StreamExt;
 use gpui::{
     Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClipboardItem, Context, Entity,
-    Focusable, IntoElement, KeyBinding, Render, ScrollHandle, SharedString, SpringAnimation,
-    SpringConfig, TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowOptions, actions,
-    div, img, prelude::*, px, rgb, size,
+    Focusable, IntoElement, KeyBinding, MouseButton, MouseUpEvent, PlatformInput, Render,
+    ScrollHandle, SharedString, SpringAnimation, SpringConfig, Subscription, TitlebarOptions,
+    Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, img, prelude::*, px, rgb,
+    size,
 };
 use gpui_base::{
     SelectableText, TextSelectionLayer, TextView, TextViewStyle, Textarea,
@@ -138,9 +139,22 @@ struct Cowork {
     thread_store: Entity<ThreadStore>,
     active_thread_id: Option<Uuid>,
     tokio_handle: tokio::runtime::Handle,
+    _window_activation_subscription: Subscription,
 }
 
 impl Cowork {
+    fn end_stale_mouse_drag(window: &mut Window, cx: &mut App) {
+        window.dispatch_event(
+            PlatformInput::MouseUp(MouseUpEvent {
+                button: MouseButton::Left,
+                position: window.mouse_position(),
+                modifiers: window.modifiers(),
+                click_count: 1,
+            }),
+            cx,
+        );
+    }
+
     fn render_caption_button(
         id: &'static str,
         icon: &'static str,
@@ -816,6 +830,18 @@ impl Cowork {
         self.submit_composer(&self.composer.clone(), window, cx);
     }
 
+    fn render_composer_input(composer: &Entity<TextareaState>) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("composer")
+            .debug_selector(|| "composer".to_owned())
+            .min_h(px(110.))
+            .flex_1()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(Textarea::new(composer))
+    }
+
     fn render_main_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let active_thread_id = self.active_thread_id;
         let messages = active_thread_id
@@ -873,16 +899,11 @@ impl Cowork {
                                             .child(Self::render_avatar(MessageAuthor::User)),
                                     )
                                     .child(
-                                        div()
-                                            .id("composer")
-                                            .min_h(px(110.))
-                                            .flex_1()
-                                            .min_w_0()
+                                        Self::render_composer_input(&self.composer)
                                             .on_click(cx.listener(|this, _, window, cx| {
                                                 this.composer.focus_handle(cx).focus(window, cx);
                                             }))
-                                            .on_action(cx.listener(Self::submit_composer_action))
-                                            .child(Textarea::new(&self.composer)),
+                                            .on_action(cx.listener(Self::submit_composer_action)),
                                     )
                                     .child(div().w(px(40.)).flex_none()),
                             ),
@@ -979,7 +1000,7 @@ fn main() {
                     threads: Vec::new(),
                 });
                 let composer = cx.new(|cx| {
-                    let mut composer = TextareaState::new(window, cx).auto_grow(1, 8);
+                    let mut composer = TextareaState::new(window, cx).auto_grow(1, usize::MAX);
                     composer.set_editor_style(InputEditorStyle {
                         caret: rgb(0xffffff).into(),
                         ..Default::default()
@@ -987,14 +1008,23 @@ fn main() {
                     composer
                 });
                 composer.focus_handle(cx).focus(window, cx);
-                cx.new(|_| Cowork {
-                    sidebar_open: true,
-                    recents_open: true,
-                    composer,
-                    timeline_scroll_handle: ScrollHandle::new(),
-                    thread_store,
-                    active_thread_id: None,
-                    tokio_handle,
+                cx.new(|cx| {
+                    let window_activation_subscription =
+                        cx.observe_window_activation(window, |_, window, _cx| {
+                            if window.is_window_active() {
+                                window.on_next_frame(Cowork::end_stale_mouse_drag);
+                            }
+                        });
+                    Cowork {
+                        sidebar_open: true,
+                        recents_open: true,
+                        composer,
+                        timeline_scroll_handle: ScrollHandle::new(),
+                        thread_store,
+                        active_thread_id: None,
+                        tokio_handle,
+                        _window_activation_subscription: window_activation_subscription,
+                    }
                 })
             }) {
                 eprintln!("failed to open Cowork window: {error}");
@@ -1004,4 +1034,89 @@ fn main() {
 
             cx.activate(true);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct ComposerTestView {
+        composer: Entity<TextareaState>,
+    }
+
+    impl Render for ComposerTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .flex()
+                .items_start()
+                .child(Cowork::render_composer_input(&self.composer))
+        }
+    }
+
+    struct MouseDragTestView {
+        editor: Entity<TextareaState>,
+    }
+
+    impl Render for MouseDragTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().size_full().child(Textarea::new(&self.editor))
+        }
+    }
+
+    #[gpui::test]
+    fn composer_grows_beyond_four_lines(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_base::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let composer = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, usize::MAX));
+            ComposerTestView { composer }
+        });
+        let composer = view.read_with(cx, |view, _| view.composer.clone());
+
+        cx.update(|window, cx| {
+            composer.update(cx, |composer, cx| {
+                composer.set_value("1\n2\n3\n4\n5\n6\n7\n8\n9\n10", window, cx);
+            });
+        });
+        cx.run_until_parked();
+
+        let composer_bounds = cx
+            .debug_bounds("composer")
+            .expect("composer should be rendered");
+        assert!(
+            composer_bounds.size.height >= px(200.),
+            "ten text lines should expand the composer, got {composer_bounds:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn synthetic_mouse_up_ends_a_stale_text_drag(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_base::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let editor = cx.new(|cx| {
+                let mut editor = TextareaState::new(window, cx);
+                editor.set_value("selectable text", window, cx);
+                editor
+            });
+            editor.focus_handle(cx).focus(window, cx);
+            MouseDragTestView { editor }
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        cx.simulate_mouse_down(
+            gpui::point(px(8.), px(8.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.update(Cowork::end_stale_mouse_drag);
+        cx.simulate_mouse_move(
+            gpui::point(px(120.), px(8.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+
+        assert!(view.read_with(cx, |view, cx| {
+            view.editor.read(cx).selected_range().is_empty()
+        }));
+    }
 }
