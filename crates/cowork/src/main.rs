@@ -4,9 +4,9 @@ use futures::StreamExt;
 use gpui::{
     Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClipboardItem, Context, Entity,
     Focusable, FontStyle, FontWeight, HighlightStyle, IntoElement, KeyBinding, MouseButton,
-    MouseUpEvent, PlatformInput, Render, ScrollHandle, SharedString, SpringAnimation, SpringConfig,
-    Subscription, TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowOptions, actions,
-    div, img, prelude::*, px, rgb, rgba, size,
+    MouseDownEvent, MouseUpEvent, PlatformInput, QuitMode, Render, ScrollHandle, SharedString,
+    SpringAnimation, SpringConfig, Subscription, TitlebarOptions, Window, WindowBounds,
+    WindowControlArea, WindowOptions, actions, div, img, point, prelude::*, px, rgb, rgba, size,
 };
 use gpui_base::{
     SelectableText, TextSelectionLayer, TextView, TextViewDefaults, TextViewStyle, Textarea,
@@ -33,6 +33,10 @@ use uuid::Uuid;
 
 const SIDEBAR_WIDTH: gpui::Pixels = px(275.);
 const TOP_BAR_HEIGHT: gpui::Pixels = px(40.);
+const MACOS_TRAFFIC_LIGHT_X_INSET: gpui::Pixels = px(12.);
+const MACOS_TRAFFIC_LIGHT_SIZE: gpui::Pixels = px(14.);
+const MACOS_TRAFFIC_LIGHT_SPACING: gpui::Pixels = px(6.);
+const MACOS_TRAFFIC_LIGHT_TRAILING_GAP: gpui::Pixels = px(12.);
 const OLLAMA_MODEL: &str = "qwen3.8:27b";
 const OLLAMA_CONTEXT_TOKENS: u64 = 131_072;
 const OLLAMA_AVATAR_PATH: &str = "providers/ollama.png";
@@ -40,6 +44,20 @@ const OLLAMA_AVATAR_PATH: &str = "providers/ollama.png";
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static SYNTAX_THEME: OnceLock<Option<Theme>> = OnceLock::new();
+
+fn macos_traffic_light_position() -> gpui::Point<gpui::Pixels> {
+    point(
+        MACOS_TRAFFIC_LIGHT_X_INSET,
+        (TOP_BAR_HEIGHT - MACOS_TRAFFIC_LIGHT_SIZE) / 2.,
+    )
+}
+
+fn macos_sidebar_toggle_margin() -> gpui::Pixels {
+    MACOS_TRAFFIC_LIGHT_X_INSET
+        + MACOS_TRAFFIC_LIGHT_SIZE * 3.
+        + MACOS_TRAFFIC_LIGHT_SPACING * 2.
+        + MACOS_TRAFFIC_LIGHT_TRAILING_GAP
+}
 
 fn highlight_code_block(block: &CodeBlock) -> Vec<(Range<usize>, HighlightStyle)> {
     let syntax_set = SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines);
@@ -226,6 +244,7 @@ struct Cowork {
     timeline_scroll_handle: ScrollHandle,
     thread_store: Entity<ThreadStore>,
     active_thread_id: Option<Uuid>,
+    titlebar_click_armed: bool,
     tokio_handle: tokio::runtime::Handle,
     _window_activation_subscription: Subscription,
 }
@@ -268,16 +287,26 @@ impl Cowork {
     fn render_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("toggle-sidebar")
-            .h_full()
-            .w(px(40.))
+            .size(px(28.))
+            .when(cfg!(target_os = "macos"), |this| {
+                this.ml(macos_sidebar_toggle_margin())
+            })
             .flex()
             .items_center()
             .justify_center()
+            .rounded_md()
             .occlude()
             .cursor_pointer()
             .text_sm()
             .text_color(rgb(0xa1a1aa))
             .hover(|this| this.bg(rgb(0x2d2d30)))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.titlebar_click_armed = false;
+                    cx.stop_propagation();
+                }),
+            )
             .on_click(cx.listener(|this, _, _, cx| {
                 this.sidebar_open = !this.sidebar_open;
                 cx.notify();
@@ -392,6 +421,23 @@ impl Cowork {
             .justify_between()
             .bg(rgb(0x1c1c1f))
             .window_control_area(WindowControlArea::Drag)
+            .when(cfg!(target_os = "macos"), |this| {
+                this.on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                        let is_titlebar_double_click =
+                            event.click_count == 2 && this.titlebar_click_armed;
+                        this.titlebar_click_armed = event.click_count == 1;
+                        cx.stop_propagation();
+
+                        if is_titlebar_double_click {
+                            window.titlebar_double_click();
+                        } else {
+                            window.start_window_move();
+                        }
+                    }),
+                )
+            })
             .child(self.render_sidebar_toggle(cx))
             .child(
                 div()
@@ -419,39 +465,48 @@ impl Cowork {
                             .when(sharing_status == SharingStatus::Failed, |this| {
                                 this.text_color(rgb(0xf87171))
                             })
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.titlebar_click_armed = false;
+                                    cx.stop_propagation();
+                                }),
+                            )
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.toggle_sharing(cx);
                             }))
                             .child(share_label),
                     )
-                    .child(
-                        div()
-                            .h_full()
-                            .flex()
-                            .font_family("Segoe Fluent Icons")
-                            .child(Self::render_caption_button(
-                                "minimize-window",
-                                "\u{e921}",
-                                WindowControlArea::Min,
-                                false,
-                            ))
-                            .child(Self::render_caption_button(
-                                "maximize-window",
-                                if window.is_maximized() {
-                                    "\u{e923}"
-                                } else {
-                                    "\u{e922}"
-                                },
-                                WindowControlArea::Max,
-                                false,
-                            ))
-                            .child(Self::render_caption_button(
-                                "close-window",
-                                "\u{e8bb}",
-                                WindowControlArea::Close,
-                                true,
-                            )),
-                    ),
+                    .when(!cfg!(target_os = "macos"), |this| {
+                        this.child(
+                            div()
+                                .h_full()
+                                .flex()
+                                .font_family("Segoe Fluent Icons")
+                                .child(Self::render_caption_button(
+                                    "minimize-window",
+                                    "\u{e921}",
+                                    WindowControlArea::Min,
+                                    false,
+                                ))
+                                .child(Self::render_caption_button(
+                                    "maximize-window",
+                                    if window.is_maximized() {
+                                        "\u{e923}"
+                                    } else {
+                                        "\u{e922}"
+                                    },
+                                    WindowControlArea::Max,
+                                    false,
+                                ))
+                                .child(Self::render_caption_button(
+                                    "close-window",
+                                    "\u{e8bb}",
+                                    WindowControlArea::Close,
+                                    true,
+                                )),
+                        )
+                    }),
             )
     }
 
@@ -1081,8 +1136,9 @@ fn main() {
                 titlebar: Some(TitlebarOptions {
                     title: Some("Cowork".into()),
                     appears_transparent: true,
-                    ..Default::default()
+                    traffic_light_position: Some(macos_traffic_light_position()),
                 }),
+                app_owns_titlebar_drag: cfg!(target_os = "macos"),
                 ..Default::default()
             };
 
@@ -1114,6 +1170,7 @@ fn main() {
                         timeline_scroll_handle: ScrollHandle::new(),
                         thread_store,
                         active_thread_id: None,
+                        titlebar_click_armed: false,
                         tokio_handle,
                         _window_activation_subscription: window_activation_subscription,
                     }
@@ -1124,6 +1181,7 @@ fn main() {
                 return;
             }
 
+            cx.set_quit_mode(QuitMode::LastWindowClosed);
             cx.activate(true);
         });
 }
