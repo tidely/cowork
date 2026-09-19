@@ -4,9 +4,10 @@ use futures::StreamExt;
 use gpui::{
     Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClipboardItem, Context, Entity,
     Focusable, FontStyle, FontWeight, HighlightStyle, IntoElement, KeyBinding, MouseButton,
-    MouseDownEvent, MouseUpEvent, PlatformInput, QuitMode, Render, ScrollHandle, SharedString,
-    SpringAnimation, SpringConfig, Subscription, TitlebarOptions, Window, WindowBounds,
-    WindowControlArea, WindowOptions, actions, div, img, point, prelude::*, px, rgb, rgba, size,
+    MouseDownEvent, MouseUpEvent, PlatformInput, QuitMode, Render, ScrollHandle, ScrollWheelEvent,
+    SharedString, SpringAnimation, SpringConfig, Subscription, TitlebarOptions, Window,
+    WindowBounds, WindowControlArea, WindowOptions, actions, div, img, point, prelude::*, px, rgb,
+    rgba, size,
 };
 use gpui_base::{
     SelectableText, TextSelectionLayer, TextView, TextViewDefaults, TextViewStyle, Textarea,
@@ -242,6 +243,7 @@ struct Cowork {
     recents_open: bool,
     composer: Entity<TextareaState>,
     timeline_scroll_handle: ScrollHandle,
+    follow_generation: bool,
     thread_store: Entity<ThreadStore>,
     active_thread_id: Option<Uuid>,
     titlebar_click_armed: bool,
@@ -519,6 +521,7 @@ impl Cowork {
             composer.set_value("", window, cx);
         });
         self.active_thread_id = Some(thread_id);
+        self.follow_generation = true;
         self.timeline_scroll_handle.scroll_to_bottom();
         self.composer.focus_handle(cx).focus(window, cx);
         cx.notify();
@@ -883,7 +886,9 @@ impl Cowork {
 
                 let result = this.update(cx, |this, cx| {
                     if this.active_thread_id == Some(thread_id) {
-                        this.timeline_scroll_handle.scroll_to_bottom();
+                        if this.follow_generation {
+                            this.timeline_scroll_handle.scroll_to_bottom();
+                        }
                         cx.notify();
                     }
                 });
@@ -961,8 +966,28 @@ impl Cowork {
                 failed: false,
             });
         });
+        self.follow_generation = true;
         self.start_generation(thread_id, prompt, history, cx);
         self.timeline_scroll_handle.scroll_to_bottom();
+    }
+
+    fn timeline_scrolled(
+        &mut self,
+        event: &ScrollWheelEvent,
+        window: &mut Window,
+        _: &mut Context<Self>,
+    ) {
+        let delta_y = event.delta.pixel_delta(window.line_height()).y;
+        let max_offset = self.timeline_scroll_handle.max_offset().y;
+
+        if delta_y > px(0.) && max_offset > px(0.) {
+            self.follow_generation = false;
+        } else if delta_y < px(0.) {
+            let projected_offset = self.timeline_scroll_handle.offset().y + delta_y;
+            if projected_offset <= -max_offset + px(1.) {
+                self.follow_generation = true;
+            }
+        }
     }
 
     fn submit_composer_action(
@@ -1018,6 +1043,7 @@ impl Cowork {
                     .size_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.timeline_scroll_handle)
+                    .on_scroll_wheel(cx.listener(Self::timeline_scrolled))
                     .child(
                         div()
                             .w_full()
@@ -1173,6 +1199,7 @@ fn main() {
                         recents_open: true,
                         composer,
                         timeline_scroll_handle: ScrollHandle::new(),
+                        follow_generation: true,
                         thread_store,
                         active_thread_id: None,
                         titlebar_click_armed: false,
