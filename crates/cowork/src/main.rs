@@ -37,8 +37,8 @@ const MACOS_TRAFFIC_LIGHT_X_INSET: gpui::Pixels = px(12.);
 const MACOS_TRAFFIC_LIGHT_SIZE: gpui::Pixels = px(14.);
 const MACOS_TRAFFIC_LIGHT_SPACING: gpui::Pixels = px(6.);
 const MACOS_TRAFFIC_LIGHT_TRAILING_GAP: gpui::Pixels = px(12.);
-const OLLAMA_MODEL: &str = "qwen3.8:27b";
-const OLLAMA_CONTEXT_TOKENS: u64 = 131_072;
+const OLLAMA_MODEL: &str = "gemma4:12b-it-qat";
+const OLLAMA_CONTEXT_TOKENS: u64 = 8_192;
 const OLLAMA_AVATAR_PATH: &str = "providers/ollama.png";
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -159,7 +159,7 @@ impl AssetSource for Assets {
     }
 }
 
-actions!(cowork, [SubmitComposer]);
+actions!(cowork, [Quit, SubmitComposer]);
 
 #[derive(Clone, Copy)]
 enum MessageAuthor {
@@ -1127,6 +1127,11 @@ fn main() {
                 KeyBinding::new("ctrl-enter", SubmitComposer, Some("Input")),
                 KeyBinding::new("cmd-enter", SubmitComposer, Some("Input")),
             ]);
+            #[cfg(target_os = "macos")]
+            {
+                cx.on_action(|_: &Quit, cx| cx.quit());
+                cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+            }
             let window_options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
