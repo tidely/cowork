@@ -1,14 +1,14 @@
-use std::{sync::OnceLock, time::Duration};
+use std::{borrow::Cow, sync::OnceLock, time::Duration};
 
 use futures::StreamExt;
 use gpui::{
-    Animation, AnimationExt, App, AppContext, Bounds, ClipboardItem, Context, Entity, Focusable,
-    IntoElement, KeyBinding, Render, ScrollHandle, SpringAnimation, SpringConfig, TitlebarOptions,
-    Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, prelude::*, px, rgb,
-    size,
+    Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClipboardItem, Context, Entity,
+    Focusable, IntoElement, KeyBinding, Render, ScrollHandle, SharedString, SpringAnimation,
+    SpringConfig, TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowOptions, actions,
+    div, img, prelude::*, px, rgb, size,
 };
 use gpui_base::{
-    SelectableText, TextSelectionLayer, Textarea,
+    SelectableText, TextSelectionLayer, TextView, TextViewStyle, Textarea,
     input::{InputEditorStyle, TextareaState},
 };
 use iroh::{Endpoint, endpoint::presets};
@@ -27,8 +27,30 @@ const SIDEBAR_WIDTH: gpui::Pixels = px(275.);
 const TOP_BAR_HEIGHT: gpui::Pixels = px(40.);
 const OLLAMA_MODEL: &str = "qwen3.8:27b";
 const OLLAMA_CONTEXT_TOKENS: u64 = 131_072;
+const OLLAMA_AVATAR_PATH: &str = "providers/ollama.png";
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+
+struct Assets;
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
+        match path {
+            OLLAMA_AVATAR_PATH => Ok(Some(Cow::Borrowed(include_bytes!(
+                "../../../assets/providers/ollama.png"
+            )))),
+            _ => Ok(None),
+        }
+    }
+
+    fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
+        Ok(OLLAMA_AVATAR_PATH
+            .starts_with(path)
+            .then(|| OLLAMA_AVATAR_PATH.into())
+            .into_iter()
+            .collect())
+    }
+}
 
 actions!(cowork, [SubmitComposer]);
 
@@ -497,17 +519,23 @@ impl Cowork {
             )
     }
 
-    fn render_avatar(label: &'static str) -> gpui::Div {
+    fn render_avatar(author: MessageAuthor) -> gpui::Div {
         div()
             .size(px(22.))
             .flex()
             .items_center()
             .justify_center()
+            .overflow_hidden()
             .rounded_full()
-            .bg(rgb(0x3f3f46))
-            .text_xs()
-            .text_color(rgb(0xf4f4f5))
-            .child(label)
+            .when(matches!(author, MessageAuthor::User), |this| {
+                this.bg(rgb(0x3f3f46))
+                    .text_xs()
+                    .text_color(rgb(0xf4f4f5))
+                    .child("U")
+            })
+            .when(matches!(author, MessageAuthor::Agent), |this| {
+                this.child(img(OLLAMA_AVATAR_PATH).size_full())
+            })
     }
 
     fn render_timeline_message(
@@ -515,11 +543,31 @@ impl Cowork {
         index: usize,
         message: &TimelineMessage,
     ) -> impl IntoElement {
-        let avatar = match message.author {
-            MessageAuthor::User => "U",
-            MessageAuthor::Agent => "A",
-        };
         let waiting = !message.complete && message.text.is_empty();
+        let message_content = match message.author {
+            MessageAuthor::User => SelectableText::new(
+                format!("timeline-text-{thread_id}-{index}"),
+                message.text.clone(),
+            )
+            .document_order(index as u64)
+            .into_any_element(),
+            MessageAuthor::Agent => TextView::markdown(
+                format!("timeline-markdown-{thread_id}-{index}"),
+                message.text.clone(),
+            )
+            .style(
+                TextViewStyle::default()
+                    .with_foreground(rgb(0xd4d4d8).into())
+                    .with_muted_foreground(rgb(0x8b8b95).into())
+                    .with_link(rgb(0x60a5fa).into())
+                    .with_code_background(rgb(0x27272a).into())
+                    .with_border(rgb(0x3f3f46).into())
+                    .with_heading_base_font_size(px(14.))
+                    .with_dark(true),
+            )
+            .w_full()
+            .into_any_element(),
+        };
 
         div()
             .id(("timeline-message", index))
@@ -532,7 +580,7 @@ impl Cowork {
                     .flex_none()
                     .flex()
                     .justify_center()
-                    .child(Self::render_avatar(avatar)),
+                    .child(Self::render_avatar(message.author)),
             )
             .child(
                 div()
@@ -555,15 +603,7 @@ impl Cowork {
                                 ),
                         )
                     })
-                    .when(!message.text.is_empty(), |this| {
-                        this.child(
-                            SelectableText::new(
-                                format!("timeline-text-{thread_id}-{index}"),
-                                message.text.clone(),
-                            )
-                            .document_order(index as u64),
-                        )
-                    }),
+                    .when(!message.text.is_empty(), |this| this.child(message_content)),
             )
             .child(div().w(px(40.)).flex_none())
     }
@@ -830,7 +870,7 @@ impl Cowork {
                                             .flex_none()
                                             .flex()
                                             .justify_center()
-                                            .child(Self::render_avatar("U")),
+                                            .child(Self::render_avatar(MessageAuthor::User)),
                                     )
                                     .child(
                                         div()
@@ -911,55 +951,57 @@ fn main() {
         return;
     }
 
-    gpui_platform::application().run(move |cx: &mut App| {
-        gpui_base::init(cx);
-        cx.bind_keys([
-            KeyBinding::new("ctrl-enter", SubmitComposer, Some("Input")),
-            KeyBinding::new("cmd-enter", SubmitComposer, Some("Input")),
-        ]);
-        let window_options = WindowOptions {
-            window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
-                None,
-                size(px(1200.), px(760.)),
-                cx,
-            ))),
-            titlebar: Some(TitlebarOptions {
-                title: Some("Cowork".into()),
-                appears_transparent: true,
-                ..Default::default()
-            }),
-            ..Default::default()
-        };
-
-        if let Err(error) = cx.open_window(window_options, move |window, cx| {
-            let tokio_handle = tokio_handle.clone();
-            let thread_store = cx.new(|_| ThreadStore {
-                threads: Vec::new(),
-            });
-            let composer = cx.new(|cx| {
-                let mut composer = TextareaState::new(window, cx).auto_grow(1, 8);
-                composer.set_editor_style(InputEditorStyle {
-                    caret: rgb(0xffffff).into(),
+    gpui_platform::application()
+        .with_assets(Assets)
+        .run(move |cx: &mut App| {
+            gpui_base::init(cx);
+            cx.bind_keys([
+                KeyBinding::new("ctrl-enter", SubmitComposer, Some("Input")),
+                KeyBinding::new("cmd-enter", SubmitComposer, Some("Input")),
+            ]);
+            let window_options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                    None,
+                    size(px(1200.), px(760.)),
+                    cx,
+                ))),
+                titlebar: Some(TitlebarOptions {
+                    title: Some("Cowork".into()),
+                    appears_transparent: true,
                     ..Default::default()
-                });
-                composer
-            });
-            composer.focus_handle(cx).focus(window, cx);
-            cx.new(|_| Cowork {
-                sidebar_open: true,
-                recents_open: true,
-                composer,
-                timeline_scroll_handle: ScrollHandle::new(),
-                thread_store,
-                active_thread_id: None,
-                tokio_handle,
-            })
-        }) {
-            eprintln!("failed to open Cowork window: {error}");
-            cx.quit();
-            return;
-        }
+                }),
+                ..Default::default()
+            };
 
-        cx.activate(true);
-    });
+            if let Err(error) = cx.open_window(window_options, move |window, cx| {
+                let tokio_handle = tokio_handle.clone();
+                let thread_store = cx.new(|_| ThreadStore {
+                    threads: Vec::new(),
+                });
+                let composer = cx.new(|cx| {
+                    let mut composer = TextareaState::new(window, cx).auto_grow(1, 8);
+                    composer.set_editor_style(InputEditorStyle {
+                        caret: rgb(0xffffff).into(),
+                        ..Default::default()
+                    });
+                    composer
+                });
+                composer.focus_handle(cx).focus(window, cx);
+                cx.new(|_| Cowork {
+                    sidebar_open: true,
+                    recents_open: true,
+                    composer,
+                    timeline_scroll_handle: ScrollHandle::new(),
+                    thread_store,
+                    active_thread_id: None,
+                    tokio_handle,
+                })
+            }) {
+                eprintln!("failed to open Cowork window: {error}");
+                cx.quit();
+                return;
+            }
+
+            cx.activate(true);
+        });
 }
