@@ -3,16 +3,17 @@ use std::{borrow::Cow, ops::Range, sync::OnceLock, time::Duration};
 use futures::StreamExt;
 use gpui::{
     Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClipboardItem, Context, Entity,
-    Focusable, FontStyle, FontWeight, HighlightStyle, IntoElement, KeyBinding, MouseButton,
-    MouseDownEvent, MouseUpEvent, PlatformInput, QuitMode, Render, ScrollHandle, ScrollWheelEvent,
-    SharedString, SpringAnimation, SpringConfig, Subscription, TitlebarOptions, Window,
-    WindowBounds, WindowControlArea, WindowOptions, actions, div, img, point, prelude::*, px, rgb,
-    rgba, size,
+    Focusable, FontStyle, FontWeight, HighlightStyle, IntoElement, KeyBinding, KeyDownEvent,
+    LineFragment, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput, QuitMode, Render,
+    ScrollHandle, ScrollWheelEvent, SharedString, SpringAnimation, SpringConfig, Subscription,
+    TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, img,
+    point, prelude::*, px, rgb, rgba, size,
 };
 use gpui_base::{
-    SelectableText, TextSelectionLayer, TextView, TextViewDefaults, TextViewStyle, Textarea,
-    input::{InputEditorStyle, TextareaState},
-    text::CodeBlock,
+    SelectableText, TextSelection, TextSelectionLayer, TextView, TextViewDefaults, TextViewState,
+    TextViewStyle, Textarea,
+    input::{InputEditorStyle, InputEvent, TextareaState},
+    text::{CodeBlock, SelectionFormat},
 };
 use iroh::{Endpoint, endpoint::presets};
 use rig::{
@@ -41,6 +42,7 @@ const MACOS_TRAFFIC_LIGHT_TRAILING_GAP: gpui::Pixels = px(12.);
 const OLLAMA_MODEL: &str = "gemma4:12b-it-qat";
 const OLLAMA_CONTEXT_TOKENS: u64 = 8_192;
 const OLLAMA_AVATAR_PATH: &str = "providers/ollama.png";
+const USER_ACCENT: u32 = 0xe26d5a;
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
@@ -172,8 +174,22 @@ enum MessageAuthor {
 struct TimelineMessage {
     author: MessageAuthor,
     text: String,
+    history_text: Option<String>,
+    text_view: Option<Entity<TextViewState>>,
+    visible: bool,
     complete: bool,
     failed: bool,
+}
+
+#[derive(Clone)]
+struct InlineComment {
+    id: Uuid,
+    message_index: usize,
+    submitted_message_index: Option<usize>,
+    quote: String,
+    source_range: Range<usize>,
+    body: Entity<TextareaState>,
+    submitted: bool,
 }
 
 #[derive(Clone)]
@@ -215,6 +231,7 @@ impl ThreadSharing {
 struct Thread {
     summary: ThreadSummary,
     messages: Vec<TimelineMessage>,
+    comments: Vec<InlineComment>,
     generating: bool,
     sharing: ThreadSharing,
 }
@@ -246,6 +263,7 @@ struct Cowork {
     follow_generation: bool,
     thread_store: Entity<ThreadStore>,
     active_thread_id: Option<Uuid>,
+    selection_message_index: Option<usize>,
     titlebar_click_armed: bool,
     tokio_handle: tokio::runtime::Handle,
     _window_activation_subscription: Subscription,
@@ -521,6 +539,7 @@ impl Cowork {
             composer.set_value("", window, cx);
         });
         self.active_thread_id = Some(thread_id);
+        self.selection_message_index = None;
         self.follow_generation = true;
         self.timeline_scroll_handle.scroll_to_bottom();
         self.composer.focus_handle(cx).focus(window, cx);
@@ -619,6 +638,7 @@ impl Cowork {
                                     composer.set_value("", window, cx);
                                 });
                                 this.active_thread_id = None;
+                                this.selection_message_index = None;
                                 this.composer.focus_handle(cx).focus(window, cx);
                                 cx.notify();
                             }))
@@ -679,6 +699,148 @@ impl Cowork {
             )
     }
 
+    fn begin_inline_comment(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.modifiers.control
+            || event.keystroke.modifiers.platform
+            || event.keystroke.modifiers.function
+        {
+            return;
+        }
+        let Some(initial_text) = event.keystroke.key_char.as_deref() else {
+            return;
+        };
+        if initial_text.chars().all(char::is_control) {
+            return;
+        }
+        let quote = TextSelection::selected_text(window, cx).trim().to_string();
+        let (Some(thread_id), Some(message_index)) =
+            (self.active_thread_id, self.selection_message_index)
+        else {
+            return;
+        };
+        if quote.is_empty() {
+            return;
+        }
+        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+            return;
+        };
+        let source_range = {
+            let thread = thread.read(cx);
+            let Some(message) = thread.messages.get(message_index) else {
+                return;
+            };
+            if !matches!(message.author, MessageAuthor::Agent) {
+                return;
+            }
+            let Some(start) = message.text.find(&quote) else {
+                return;
+            };
+            start..start + quote.len()
+        };
+
+        let body = cx.new(|cx| {
+            let mut body = TextareaState::new(window, cx).auto_grow(1, usize::MAX);
+            body.set_editor_style(InputEditorStyle {
+                caret: rgb(0xffffff).into(),
+                ..Default::default()
+            });
+            body
+        });
+        body.update(cx, |body, cx| {
+            body.insert(initial_text, window, cx);
+        });
+        let comment_id = Uuid::new_v4();
+        thread.update(cx, |thread, _| {
+            thread.comments.push(InlineComment {
+                id: comment_id,
+                message_index,
+                submitted_message_index: None,
+                quote,
+                source_range,
+                body: body.clone(),
+                submitted: false,
+            });
+        });
+        let observed_body = body.clone();
+        let observed_thread = thread.clone();
+        cx.subscribe(&body, move |_, _, event: &InputEvent, cx| {
+            if matches!(event, InputEvent::Change) && observed_body.read(cx).value().is_empty() {
+                observed_thread.update(cx, |thread, _| {
+                    thread
+                        .comments
+                        .retain(|comment| comment.id != comment_id || comment.submitted);
+                });
+                cx.notify();
+            }
+        })
+        .detach();
+        TextSelection::clear(window, cx);
+        body.focus_handle(cx).focus(window, cx);
+        window.prevent_default();
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn render_comment_card(
+        comment: &InlineComment,
+        location: &'static str,
+        show_quote: bool,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        let accent = rgb(USER_ACCENT);
+        let body = if comment.submitted {
+            div()
+                .w_full()
+                .text_color(rgb(0xe4e4e7))
+                .child(comment.body.read(cx).value())
+                .into_any_element()
+        } else {
+            div()
+                .id(format!("comment-editor-{location}-{}", comment.id))
+                .flex_1()
+                .min_w_0()
+                .child(Textarea::new(&comment.body))
+                .into_any_element()
+        };
+
+        div()
+            .id(format!("inline-comment-{location}-{}", comment.id))
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .when(show_quote, |this| {
+                this.child(
+                    div()
+                        .w_full()
+                        .text_color(rgb(0xa1a1aa))
+                        .line_clamp(2)
+                        .child(comment.quote.clone()),
+                )
+            })
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_l_2()
+                    .border_color(accent)
+                    .rounded_md()
+                    .bg(rgb(0x202023))
+                    .child(Self::render_avatar(MessageAuthor::User))
+                    .child(body),
+            )
+            .into_any_element()
+    }
+
     fn render_avatar(author: MessageAuthor) -> gpui::Div {
         div()
             .size(px(22.))
@@ -688,7 +850,7 @@ impl Cowork {
             .overflow_hidden()
             .rounded_full()
             .when(matches!(author, MessageAuthor::User), |this| {
-                this.bg(rgb(0x3f3f46))
+                this.bg(rgb(USER_ACCENT))
                     .text_xs()
                     .text_color(rgb(0xf4f4f5))
                     .child("U")
@@ -698,40 +860,196 @@ impl Cowork {
             })
     }
 
+    fn markdown_style() -> TextViewStyle {
+        TextViewStyle::default()
+            .with_foreground(rgb(0xd4d4d8).into())
+            .with_muted_foreground(rgb(0x8b8b95).into())
+            .with_link(rgb(0x60a5fa).into())
+            .with_code_background(rgb(0x27272a).into())
+            .with_border(rgb(0x3f3f46).into())
+            .with_table(gpui::StyleRefinement::default().bg(rgb(0x18181b)))
+            .with_heading_base_font_size(px(14.))
+            .with_dark(true)
+    }
+
+    fn annotated_markdown_style() -> TextViewStyle {
+        Self::markdown_style().with_link(rgb(USER_ACCENT).into())
+    }
+
+    fn annotated_markdown_html(markdown: &str) -> String {
+        let mut options = markdown::Options::gfm();
+        options.compile.allow_dangerous_html = true;
+        markdown::to_html_with_options(markdown, &options).unwrap_or_else(|_| markdown.to_string())
+    }
+
+    fn render_message_segment(
+        thread_id: Uuid,
+        message_index: usize,
+        segment_index: usize,
+        author: MessageAuthor,
+        text: &str,
+        annotated: bool,
+    ) -> gpui::AnyElement {
+        match author {
+            _ if annotated => TextView::html(
+                format!("timeline-annotated-{thread_id}-{message_index}-{segment_index}"),
+                Self::annotated_markdown_html(text),
+            )
+            .style(Self::annotated_markdown_style())
+            .w_full()
+            .into_any_element(),
+            MessageAuthor::User => SelectableText::new(
+                format!("timeline-text-{thread_id}-{message_index}-{segment_index}"),
+                text.to_string(),
+            )
+            .document_order((message_index * 1_000 + segment_index) as u64)
+            .into_any_element(),
+            MessageAuthor::Agent => TextView::markdown(
+                format!("timeline-markdown-{thread_id}-{message_index}-{segment_index}"),
+                text.to_string(),
+            )
+            .selection_format(SelectionFormat::Source)
+            .style(Self::markdown_style())
+            .w_full()
+            .into_any_element(),
+        }
+    }
+
+    fn wrapped_line_end(
+        text: &str,
+        selection_end: usize,
+        wrap_width: gpui::Pixels,
+        window: &mut Window,
+    ) -> usize {
+        let hard_line_start = text[..selection_end]
+            .rfind('\n')
+            .map_or(0, |offset| offset + 1);
+        let hard_line_end = text[selection_end..]
+            .find('\n')
+            .map_or(text.len(), |offset| selection_end + offset);
+        let hard_line = &text[hard_line_start..hard_line_end];
+        let selected_end_in_line = selection_end - hard_line_start;
+        let font_size = px(14.);
+        let mut wrapper = window
+            .text_system()
+            .line_wrapper(window.text_style().font(), font_size);
+        let fragments = [LineFragment::text(hard_line)];
+        let end = wrapper
+            .wrap_line(&fragments, wrap_width)
+            .map(|boundary| boundary.ix)
+            .find(|boundary| *boundary >= selected_end_in_line)
+            .unwrap_or(hard_line.len());
+        let source_end = hard_line_start + end;
+        if source_end == hard_line_end && hard_line_end < text.len() {
+            hard_line_end + 1
+        } else {
+            source_end
+        }
+    }
+
     fn render_timeline_message(
+        &self,
         thread_id: Uuid,
         index: usize,
         message: &TimelineMessage,
-    ) -> impl IntoElement {
+        comments: &[InlineComment],
+        wrap_width: gpui::Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let waiting = !message.complete && message.text.is_empty();
-        let message_content = match message.author {
-            MessageAuthor::User => SelectableText::new(
-                format!("timeline-text-{thread_id}-{index}"),
-                message.text.clone(),
-            )
-            .document_order(index as u64)
-            .into_any_element(),
-            MessageAuthor::Agent => TextView::markdown(
-                format!("timeline-markdown-{thread_id}-{index}"),
-                message.text.clone(),
-            )
-            .style(
-                TextViewStyle::default()
-                    .with_foreground(rgb(0xd4d4d8).into())
-                    .with_muted_foreground(rgb(0x8b8b95).into())
-                    .with_link(rgb(0x60a5fa).into())
-                    .with_code_background(rgb(0x27272a).into())
-                    .with_border(rgb(0x3f3f46).into())
-                    .with_table(gpui::StyleRefinement::default().bg(rgb(0x18181b)))
-                    .with_heading_base_font_size(px(14.))
-                    .with_dark(true),
-            )
-            .w_full()
-            .into_any_element(),
-        };
+        let mut message_content = comments
+            .iter()
+            .filter(|comment| comment.submitted_message_index == Some(index))
+            .map(|comment| Self::render_comment_card(comment, "submission", true, cx))
+            .collect::<Vec<_>>();
+        let mut cursor = 0;
+        let mut anchored_comments = comments
+            .iter()
+            .filter(|comment| comment.message_index == index)
+            .filter(|comment| {
+                comment.source_range.start < comment.source_range.end
+                    && comment.source_range.end <= message.text.len()
+                    && message.text.is_char_boundary(comment.source_range.start)
+                    && message.text.is_char_boundary(comment.source_range.end)
+            })
+            .collect::<Vec<_>>();
+        anchored_comments.sort_by_key(|comment| comment.source_range.start);
+
+        if anchored_comments.is_empty()
+            && let Some(text_view) = &message.text_view
+            && !message.text.is_empty()
+        {
+            message_content.push(
+                TextView::new(text_view)
+                    .selection_format(SelectionFormat::Source)
+                    .style(Self::markdown_style())
+                    .w_full()
+                    .into_any_element(),
+            );
+            cursor = message.text.len();
+        }
+
+        let mut comment_index = 0;
+        while comment_index < anchored_comments.len() {
+            let first = anchored_comments[comment_index];
+            if first.source_range.start < cursor {
+                comment_index += 1;
+                continue;
+            }
+            let line_end =
+                Self::wrapped_line_end(&message.text, first.source_range.end, wrap_width, window);
+            let group_start = comment_index;
+            while comment_index < anchored_comments.len()
+                && anchored_comments[comment_index].source_range.start < line_end
+            {
+                comment_index += 1;
+            }
+            let group = &anchored_comments[group_start..comment_index];
+            let mut annotated = message.text[cursor..line_end].to_string();
+            for comment in group.iter().rev() {
+                let start = comment.source_range.start - cursor;
+                let end = comment.source_range.end - cursor;
+                if end <= annotated.len()
+                    && annotated.is_char_boundary(start)
+                    && annotated.is_char_boundary(end)
+                {
+                    annotated.insert_str(end, "</a>");
+                    annotated.insert_str(start, "<a href=\"#inline-comment\">");
+                }
+            }
+            message_content.push(Self::render_message_segment(
+                thread_id,
+                index,
+                message_content.len(),
+                message.author,
+                &annotated,
+                true,
+            ));
+            for comment in group {
+                message_content.push(Self::render_comment_card(comment, "timeline", false, cx));
+            }
+            cursor = line_end;
+        }
+        if cursor < message.text.len() {
+            message_content.push(Self::render_message_segment(
+                thread_id,
+                index,
+                message_content.len(),
+                message.author,
+                &message.text[cursor..],
+                false,
+            ));
+        }
 
         div()
             .id(("timeline-message", index))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, _| {
+                    this.selection_message_index = Some(index);
+                }),
+            )
             .w_full()
             .flex()
             .items_start()
@@ -749,6 +1067,7 @@ impl Cowork {
                     .min_w_0()
                     .flex()
                     .flex_col()
+                    .gap_3()
                     .when(message.failed, |this| this.text_color(rgb(0xf87171)))
                     .when(waiting, |this| {
                         this.child(
@@ -764,18 +1083,24 @@ impl Cowork {
                                 ),
                         )
                     })
-                    .when(!message.text.is_empty(), |this| this.child(message_content)),
+                    .when(!message_content.is_empty(), |this| {
+                        this.children(message_content)
+                    }),
             )
             .child(div().w(px(40.)).flex_none())
+            .into_any_element()
     }
 
     fn rig_history(messages: &[TimelineMessage]) -> Vec<RigMessage> {
         messages
             .iter()
             .filter(|message| message.complete && !message.failed)
-            .map(|message| match message.author {
-                MessageAuthor::User => RigMessage::user(&message.text),
-                MessageAuthor::Agent => RigMessage::assistant(&message.text),
+            .map(|message| {
+                let text = message.history_text.as_deref().unwrap_or(&message.text);
+                match message.author {
+                    MessageAuthor::User => RigMessage::user(text),
+                    MessageAuthor::Agent => RigMessage::assistant(text),
+                }
             })
             .collect()
     }
@@ -790,11 +1115,15 @@ impl Cowork {
         let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
             return;
         };
+        let text_view = cx.new(|cx| TextViewState::markdown("", cx));
         let message_index = thread.update(cx, |thread, _| {
             let message_index = thread.messages.len();
             thread.messages.push(TimelineMessage {
                 author: MessageAuthor::Agent,
                 text: String::new(),
+                history_text: None,
+                text_view: Some(text_view),
+                visible: true,
                 complete: false,
                 failed: false,
             });
@@ -858,31 +1187,52 @@ impl Cowork {
 
         cx.spawn(async move |this, cx| {
             while let Some(event) = receiver.recv().await {
-                let finished = thread.update(cx, |thread, _| {
+                let (finished, text_view_update) = thread.update(cx, |thread, _| {
                     let Some(message) = thread.messages.get_mut(message_index) else {
-                        return true;
+                        return (true, None);
                     };
                     match event {
                         AgentEvent::Text(text) => {
                             message.text.push_str(&text);
-                            false
+                            (
+                                false,
+                                message
+                                    .text_view
+                                    .clone()
+                                    .map(|text_view| (text_view, text, true)),
+                            )
                         }
                         AgentEvent::Finished => {
                             message.complete = true;
                             thread.generating = false;
-                            true
+                            (true, None)
                         }
                         AgentEvent::Failed(error) => {
                             message.complete = true;
                             message.failed = true;
-                            if message.text.is_empty() {
+                            let update = if message.text.is_empty() {
                                 message.text = format!("Unable to generate a response: {error}");
-                            }
+                                message
+                                    .text_view
+                                    .clone()
+                                    .map(|text_view| (text_view, message.text.clone(), false))
+                            } else {
+                                None
+                            };
                             thread.generating = false;
-                            true
+                            (true, update)
                         }
                     }
                 });
+                if let Some((text_view, text, append)) = text_view_update {
+                    text_view.update(cx, |text_view, cx| {
+                        if append {
+                            text_view.push_str(&text, cx);
+                        } else {
+                            text_view.set_text(&text, cx);
+                        }
+                    });
+                }
 
                 let result = this.update(cx, |this, cx| {
                     if this.active_thread_id == Some(thread_id) {
@@ -910,6 +1260,49 @@ impl Cowork {
         title
     }
 
+    fn prompt_with_comments(
+        prompt: &str,
+        comments: &[InlineComment],
+        messages: &[TimelineMessage],
+        cx: &App,
+    ) -> String {
+        let pending = comments
+            .iter()
+            .filter(|comment| {
+                !comment.submitted && !comment.body.read(cx).value().trim().is_empty()
+            })
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return prompt.to_string();
+        }
+
+        let mut result = String::from(
+            "The user attached the following inline comments to immutable excerpts from the conversation:\n",
+        );
+        for (index, comment) in pending.iter().enumerate() {
+            let author = messages
+                .get(comment.message_index)
+                .map(|message| match message.author {
+                    MessageAuthor::User => "user",
+                    MessageAuthor::Agent => "assistant",
+                })
+                .unwrap_or("conversation");
+            result.push_str(&format!(
+                "\n{}. Excerpt from {} message {}:\n> {}\nComment: {}\n",
+                index + 1,
+                author,
+                comment.message_index + 1,
+                comment.quote.replace('\n', "\n> "),
+                comment.body.read(cx).value().trim(),
+            ));
+        }
+        if !prompt.trim().is_empty() {
+            result.push_str("\nAdditional user message:\n");
+            result.push_str(prompt);
+        }
+        result
+    }
+
     fn submit_composer(
         &mut self,
         composer: &Entity<TextareaState>,
@@ -917,10 +1310,6 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) {
         let prompt = composer.read(cx).value().to_string();
-        if prompt.trim().is_empty() {
-            return;
-        }
-
         let active_thread = self
             .active_thread_id
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx));
@@ -928,6 +1317,14 @@ impl Cowork {
             .as_ref()
             .is_some_and(|thread| thread.read(cx).generating)
         {
+            return;
+        }
+        let has_pending_comments = active_thread.as_ref().is_some_and(|thread| {
+            thread.read(cx).comments.iter().any(|comment| {
+                !comment.submitted && !comment.body.read(cx).value().trim().is_empty()
+            })
+        });
+        if prompt.trim().is_empty() && !has_pending_comments {
             return;
         }
         let history = active_thread
@@ -948,6 +1345,7 @@ impl Cowork {
                     title: Self::thread_title(&prompt),
                 },
                 messages: Vec::new(),
+                comments: Vec::new(),
                 generating: false,
                 sharing: ThreadSharing::NotShared,
             });
@@ -958,16 +1356,40 @@ impl Cowork {
             (thread_id, thread)
         };
 
+        let agent_prompt = {
+            let thread = thread.read(cx);
+            Self::prompt_with_comments(&prompt, &thread.comments, &thread.messages, cx)
+        };
+        let submitted_comment_ids = thread
+            .read(cx)
+            .comments
+            .iter()
+            .filter(|comment| {
+                !comment.submitted && !comment.body.read(cx).value().trim().is_empty()
+            })
+            .map(|comment| comment.id)
+            .collect::<Vec<_>>();
         thread.update(cx, |thread, _| {
+            let submitted_message_index = thread.messages.len();
+            for comment in &mut thread.comments {
+                if submitted_comment_ids.contains(&comment.id) {
+                    comment.submitted = true;
+                    comment.submitted_message_index = Some(submitted_message_index);
+                }
+            }
             thread.messages.push(TimelineMessage {
                 author: MessageAuthor::User,
                 text: prompt.clone(),
+                history_text: (!submitted_comment_ids.is_empty()).then(|| agent_prompt.clone()),
+                text_view: None,
+                visible: !prompt.trim().is_empty() || !submitted_comment_ids.is_empty(),
                 complete: true,
                 failed: false,
             });
         });
+        self.selection_message_index = None;
         self.follow_generation = true;
-        self.start_generation(thread_id, prompt, history, cx);
+        self.start_generation(thread_id, agent_prompt, history, cx);
         self.timeline_scroll_handle.scroll_to_bottom();
     }
 
@@ -1011,19 +1433,41 @@ impl Cowork {
             .child(Textarea::new(composer))
     }
 
-    fn render_main_editor(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_main_editor(&self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_thread_id = self.active_thread_id;
-        let messages = active_thread_id
+        let (messages, comments) = active_thread_id
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
-            .map(|thread| thread.read(cx).messages.clone())
-            .unwrap_or_default();
-        let timeline_messages = active_thread_id
-            .into_iter()
-            .flat_map(|thread_id| {
-                messages.iter().enumerate().map(move |(index, message)| {
-                    Self::render_timeline_message(thread_id, index, message)
-                })
+            .map(|thread| {
+                let thread = thread.read(cx);
+                (thread.messages.clone(), thread.comments.clone())
             })
+            .unwrap_or_default();
+        let sidebar_width = if self.sidebar_open {
+            SIDEBAR_WIDTH
+        } else {
+            px(0.)
+        };
+        let available_width = window.viewport_size().width - sidebar_width - px(82.);
+        let wrap_width = if available_width > px(120.) {
+            available_width
+        } else {
+            px(120.)
+        };
+        let mut timeline_messages = Vec::new();
+        if let Some(thread_id) = active_thread_id {
+            for (index, message) in messages.iter().enumerate() {
+                if message.visible {
+                    timeline_messages.push(self.render_timeline_message(
+                        thread_id, index, message, &comments, wrap_width, window, cx,
+                    ));
+                }
+            }
+        }
+
+        let composer_comments = comments
+            .iter()
+            .filter(|comment| !comment.submitted)
+            .map(|comment| Self::render_comment_card(comment, "composer", true, cx))
             .collect::<Vec<_>>();
 
         div()
@@ -1069,11 +1513,25 @@ impl Cowork {
                                             .child(Self::render_avatar(MessageAuthor::User)),
                                     )
                                     .child(
-                                        Self::render_composer_input(&self.composer)
-                                            .on_click(cx.listener(|this, _, window, cx| {
-                                                this.composer.focus_handle(cx).focus(window, cx);
-                                            }))
-                                            .on_action(cx.listener(Self::submit_composer_action)),
+                                        div()
+                                            .id("composer-column")
+                                            .flex_1()
+                                            .min_w_0()
+                                            .flex()
+                                            .flex_col()
+                                            .gap_3()
+                                            .children(composer_comments)
+                                            .child(
+                                                Self::render_composer_input(&self.composer)
+                                                    .on_click(cx.listener(|this, _, window, cx| {
+                                                        this.composer
+                                                            .focus_handle(cx)
+                                                            .focus(window, cx);
+                                                    }))
+                                                    .on_action(
+                                                        cx.listener(Self::submit_composer_action),
+                                                    ),
+                                            ),
                                     )
                                     .child(div().w(px(40.)).flex_none()),
                             ),
@@ -1096,6 +1554,7 @@ impl Render for Cowork {
             .flex_col()
             .overflow_hidden()
             .bg(rgb(0x1c1c1f))
+            .on_key_down(cx.listener(Self::begin_inline_comment))
             .child(TextSelectionLayer)
             .child(self.render_top_bar(window, cx))
             .child(
@@ -1114,7 +1573,7 @@ impl Render for Cowork {
                             |sidebar, width| sidebar.w(width),
                         ),
                     )
-                    .child(self.render_main_editor(cx)),
+                    .child(self.render_main_editor(window, cx)),
             )
     }
 }
@@ -1202,6 +1661,7 @@ fn main() {
                         follow_generation: true,
                         thread_store,
                         active_thread_id: None,
+                        selection_message_index: None,
                         titlebar_click_armed: false,
                         tokio_handle,
                         _window_activation_subscription: window_activation_subscription,
@@ -1221,6 +1681,17 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn annotated_markdown_preserves_inline_underline() {
+        let html = Cowork::annotated_markdown_html(
+            "Before <a href=\"#inline-comment\">selected text</a> after",
+        );
+
+        assert!(html.contains("<a href=\"#inline-comment\">selected text</a>"));
+        assert!(html.contains("Before "));
+        assert!(html.contains(" after"));
+    }
 
     #[test]
     fn highlights_fenced_rust_code() {

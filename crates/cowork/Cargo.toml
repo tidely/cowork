@@ -12,6 +12,7 @@ gpui.workspace = true
 gpui-base.workspace = true
 gpui_platform.workspace = true
 iroh.workspace = true
+markdown.workspace = true
 rig.workspace = true
 serde_json.workspace = true
 syntect.workspace = true
