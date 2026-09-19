@@ -1,16 +1,17 @@
-use std::{borrow::Cow, sync::OnceLock, time::Duration};
+use std::{borrow::Cow, ops::Range, sync::OnceLock, time::Duration};
 
 use futures::StreamExt;
 use gpui::{
     Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClipboardItem, Context, Entity,
-    Focusable, IntoElement, KeyBinding, MouseButton, MouseUpEvent, PlatformInput, Render,
-    ScrollHandle, SharedString, SpringAnimation, SpringConfig, Subscription, TitlebarOptions,
-    Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, img, prelude::*, px, rgb,
-    size,
+    Focusable, FontStyle, FontWeight, HighlightStyle, IntoElement, KeyBinding, MouseButton,
+    MouseUpEvent, PlatformInput, Render, ScrollHandle, SharedString, SpringAnimation, SpringConfig,
+    Subscription, TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowOptions, actions,
+    div, img, prelude::*, px, rgb, rgba, size,
 };
 use gpui_base::{
-    SelectableText, TextSelectionLayer, TextView, TextViewStyle, Textarea,
+    SelectableText, TextSelectionLayer, TextView, TextViewDefaults, TextViewStyle, Textarea,
     input::{InputEditorStyle, TextareaState},
+    text::CodeBlock,
 };
 use iroh::{Endpoint, endpoint::presets};
 use rig::{
@@ -21,6 +22,12 @@ use rig::{
     streaming::{Delta, StreamEvent},
 };
 use serde_json::json;
+use syntect::{
+    easy::HighlightLines,
+    highlighting::{FontStyle as SyntectFontStyle, Theme, ThemeSet},
+    parsing::SyntaxSet,
+    util::LinesWithEndings,
+};
 use tokio::{runtime::Runtime, sync::mpsc};
 use uuid::Uuid;
 
@@ -31,6 +38,87 @@ const OLLAMA_CONTEXT_TOKENS: u64 = 131_072;
 const OLLAMA_AVATAR_PATH: &str = "providers/ollama.png";
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
+static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+static SYNTAX_THEME: OnceLock<Option<Theme>> = OnceLock::new();
+
+fn highlight_code_block(block: &CodeBlock) -> Vec<(Range<usize>, HighlightStyle)> {
+    let syntax_set = SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines);
+    let theme = SYNTAX_THEME.get_or_init(|| {
+        let themes = ThemeSet::load_defaults();
+        themes
+            .themes
+            .get("base16-ocean.dark")
+            .cloned()
+            .or_else(|| themes.themes.values().next().cloned())
+    });
+    let Some(theme) = theme else {
+        return Vec::new();
+    };
+
+    let syntax = block
+        .lang()
+        .and_then(|language| {
+            let language = language.split_whitespace().next()?;
+            syntax_set
+                .find_syntax_by_token(language)
+                .or_else(|| syntax_set.find_syntax_by_extension(language))
+                .or_else(|| {
+                    syntax_set
+                        .syntaxes()
+                        .iter()
+                        .find(|syntax| syntax.name.eq_ignore_ascii_case(language))
+                })
+        })
+        .unwrap_or_else(|| syntax_set.find_syntax_plain_text());
+    let code = block.code();
+    let mut highlighter = HighlightLines::new(syntax, theme);
+    let mut offset = 0;
+    let mut highlights = Vec::new();
+
+    for line in LinesWithEndings::from(code.as_ref()) {
+        let line_highlights = match highlighter.highlight_line(line, syntax_set) {
+            Ok(line_highlights) => line_highlights,
+            Err(error) => {
+                eprintln!(
+                    "failed to highlight {syntax_name} code block: {error}",
+                    syntax_name = syntax.name
+                );
+                return Vec::new();
+            }
+        };
+
+        for (style, text) in line_highlights {
+            let end = offset + text.len();
+            if offset < end {
+                let foreground = style.foreground;
+                let color = rgba(
+                    (u32::from(foreground.r) << 24)
+                        | (u32::from(foreground.g) << 16)
+                        | (u32::from(foreground.b) << 8)
+                        | u32::from(foreground.a),
+                );
+                highlights.push((
+                    offset..end,
+                    HighlightStyle {
+                        color: Some(color.into()),
+                        font_weight: style
+                            .font_style
+                            .contains(SyntectFontStyle::BOLD)
+                            .then_some(FontWeight::BOLD),
+                        font_style: style
+                            .font_style
+                            .contains(SyntectFontStyle::ITALIC)
+                            .then_some(FontStyle::Italic),
+                        ..Default::default()
+                    },
+                ));
+            }
+            offset = end;
+        }
+    }
+
+    highlights
+}
 
 struct Assets;
 
@@ -576,6 +664,7 @@ impl Cowork {
                     .with_link(rgb(0x60a5fa).into())
                     .with_code_background(rgb(0x27272a).into())
                     .with_border(rgb(0x3f3f46).into())
+                    .with_table(gpui::StyleRefinement::default().bg(rgb(0x18181b)))
                     .with_heading_base_font_size(px(14.))
                     .with_dark(true),
             )
@@ -976,6 +1065,9 @@ fn main() {
         .with_assets(Assets)
         .run(move |cx: &mut App| {
             gpui_base::init(cx);
+            TextViewDefaults::new()
+                .with_code_block_highlighter(highlight_code_block)
+                .install(cx);
             cx.bind_keys([
                 KeyBinding::new("ctrl-enter", SubmitComposer, Some("Input")),
                 KeyBinding::new("cmd-enter", SubmitComposer, Some("Input")),
@@ -1039,6 +1131,20 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn highlights_fenced_rust_code() {
+        let code = "fn main() { println!(\"hello\"); }\n";
+        let block = CodeBlock::from_code(code, Some("rust"));
+        let highlights = highlight_code_block(&block);
+
+        assert!(!highlights.is_empty());
+        assert!(
+            highlights
+                .iter()
+                .all(|(range, _)| range.start < range.end && range.end <= code.len())
+        );
+    }
 
     struct ComposerTestView {
         composer: Entity<TextareaState>,
