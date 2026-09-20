@@ -39,7 +39,7 @@ const MACOS_TRAFFIC_LIGHT_X_INSET: gpui::Pixels = px(12.);
 const MACOS_TRAFFIC_LIGHT_SIZE: gpui::Pixels = px(14.);
 const MACOS_TRAFFIC_LIGHT_SPACING: gpui::Pixels = px(6.);
 const MACOS_TRAFFIC_LIGHT_TRAILING_GAP: gpui::Pixels = px(12.);
-const OLLAMA_MODEL: &str = "gemma4:12b-it-qat";
+const OLLAMA_MODEL: &str = "lfm2.5";
 const OLLAMA_CONTEXT_TOKENS: u64 = 8_192;
 const OLLAMA_AVATAR_PATH: &str = "providers/ollama.png";
 const USER_ACCENT: u32 = 0xe26d5a;
@@ -171,25 +171,50 @@ enum MessageAuthor {
 }
 
 #[derive(Clone)]
-struct TimelineMessage {
-    author: MessageAuthor,
+enum TimelineMessage {
+    User(UserMessageGroup),
+    Agent(AgentMessage),
+}
+
+#[derive(Clone)]
+struct AgentMessage {
+    id: Uuid,
     text: String,
-    history_text: Option<String>,
-    text_view: Option<Entity<TextViewState>>,
-    visible: bool,
+    text_view: Entity<TextViewState>,
     complete: bool,
     failed: bool,
 }
 
 #[derive(Clone)]
-struct InlineComment {
+struct UserMessageGroup {
     id: Uuid,
-    message_index: usize,
-    submitted_message_index: Option<usize>,
+    comments: Vec<UserComment>,
+    content: UserMessageContent,
+    comments_folded: bool,
+}
+
+#[derive(Clone)]
+enum UserMessageContent {
+    Editing(Entity<TextareaState>),
+    Submitted {
+        text: String,
+        history_text: Option<String>,
+    },
+}
+
+#[derive(Clone)]
+struct UserComment {
+    id: Uuid,
+    source_message_id: Uuid,
     quote: String,
     source_range: Range<usize>,
-    body: Entity<TextareaState>,
-    submitted: bool,
+    body: UserCommentBody,
+}
+
+#[derive(Clone)]
+enum UserCommentBody {
+    Editing(Entity<TextareaState>),
+    Submitted(String),
 }
 
 struct MarkdownTextLeaf {
@@ -241,8 +266,8 @@ impl ThreadSharing {
 
 struct Thread {
     summary: ThreadSummary,
-    messages: Vec<TimelineMessage>,
-    comments: Vec<InlineComment>,
+    timeline: Vec<TimelineMessage>,
+    draft: UserMessageGroup,
     generating: bool,
     sharing: ThreadSharing,
 }
@@ -269,13 +294,13 @@ enum AgentEvent {
 struct Cowork {
     sidebar_open: bool,
     recents_open: bool,
-    composer: Entity<TextareaState>,
+    new_thread_draft: UserMessageGroup,
     timeline_scroll_handle: ScrollHandle,
     follow_generation: bool,
     thread_store: Entity<ThreadStore>,
     active_thread_id: Option<Uuid>,
-    selection_message_index: Option<usize>,
-    segment_text_views: HashMap<(Uuid, usize, usize, usize), SegmentTextView>,
+    selection_message_id: Option<Uuid>,
+    segment_text_views: HashMap<(Uuid, Uuid, usize, usize), SegmentTextView>,
     render_generation: u64,
     titlebar_click_armed: bool,
     tokio_handle: tokio::runtime::Handle,
@@ -283,6 +308,30 @@ struct Cowork {
 }
 
 impl Cowork {
+    fn new_user_message_draft(window: &mut Window, cx: &mut App) -> UserMessageGroup {
+        let composer = cx.new(|cx| {
+            let mut composer = TextareaState::new(window, cx).auto_grow(1, usize::MAX);
+            composer.set_editor_style(InputEditorStyle {
+                caret: rgb(0xffffff).into(),
+                ..Default::default()
+            });
+            composer
+        });
+        UserMessageGroup {
+            id: Uuid::new_v4(),
+            comments: Vec::new(),
+            content: UserMessageContent::Editing(composer),
+            comments_folded: false,
+        }
+    }
+
+    fn draft_composer(draft: &UserMessageGroup) -> Entity<TextareaState> {
+        let UserMessageContent::Editing(composer) = &draft.content else {
+            unreachable!("thread drafts are always editable");
+        };
+        composer.clone()
+    }
+
     fn end_stale_mouse_drag(window: &mut Window, cx: &mut App) {
         window.dispatch_event(
             PlatformInput::MouseUp(MouseUpEvent {
@@ -548,14 +597,15 @@ impl Cowork {
             return;
         }
 
-        self.composer.update(cx, |composer, cx| {
-            composer.set_value("", window, cx);
-        });
+        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+            return;
+        };
+        let composer = Self::draft_composer(&thread.read(cx).draft);
         self.active_thread_id = Some(thread_id);
-        self.selection_message_index = None;
+        self.selection_message_id = None;
         self.follow_generation = true;
         self.timeline_scroll_handle.scroll_to_bottom();
-        self.composer.focus_handle(cx).focus(window, cx);
+        composer.focus_handle(cx).focus(window, cx);
         cx.notify();
     }
 
@@ -647,12 +697,12 @@ impl Cowork {
                             })
                             .hover(|this| this.bg(rgb(0x3a3a3e)))
                             .on_click(cx.listener(|this, _, window, cx| {
-                                this.composer.update(cx, |composer, cx| {
-                                    composer.set_value("", window, cx);
-                                });
+                                this.new_thread_draft = Self::new_user_message_draft(window, cx);
                                 this.active_thread_id = None;
-                                this.selection_message_index = None;
-                                this.composer.focus_handle(cx).focus(window, cx);
+                                this.selection_message_id = None;
+                                Self::draft_composer(&this.new_thread_draft)
+                                    .focus_handle(cx)
+                                    .focus(window, cx);
                                 cx.notify();
                             }))
                             .text_sm()
@@ -756,15 +806,15 @@ impl Cowork {
     fn selected_message_source_range(
         &self,
         thread_id: Uuid,
-        message_index: usize,
-        message: &TimelineMessage,
+        message_id: Uuid,
+        message: &AgentMessage,
         cx: &App,
     ) -> Option<Range<usize>> {
         let mut selected_ranges = self
             .segment_text_views
             .iter()
-            .filter(|((segment_thread_id, segment_message_index, _, _), _)| {
-                *segment_thread_id == thread_id && *segment_message_index == message_index
+            .filter(|((segment_thread_id, segment_message_id, _, _), _)| {
+                *segment_thread_id == thread_id && *segment_message_id == message_id
             })
             .filter_map(|((_, _, segment_start, _), text_view)| {
                 text_view
@@ -781,12 +831,7 @@ impl Cowork {
             })
         });
 
-        segmented.or_else(|| {
-            message
-                .text_view
-                .as_ref()
-                .and_then(|text_view| text_view.read(cx).selected_source_range())
-        })
+        segmented.or_else(|| message.text_view.read(cx).selected_source_range())
     }
 
     fn unique_source_range_for_quote(markdown: &str, quote: &str) -> Option<Range<usize>> {
@@ -881,8 +926,8 @@ impl Cowork {
             return;
         }
         let quote = TextSelection::selected_text(window, cx).trim().to_string();
-        let (Some(thread_id), Some(message_index)) =
-            (self.active_thread_id, self.selection_message_index)
+        let (Some(thread_id), Some(message_id)) =
+            (self.active_thread_id, self.selection_message_id)
         else {
             return;
         };
@@ -894,14 +939,14 @@ impl Cowork {
         };
         let source_range = {
             let thread = thread.read(cx);
-            let Some(message) = thread.messages.get(message_index) else {
+            let Some(message) = thread.timeline.iter().find_map(|entry| match entry {
+                TimelineMessage::Agent(message) if message.id == message_id => Some(message),
+                _ => None,
+            }) else {
                 return;
             };
-            if !matches!(message.author, MessageAuthor::Agent) {
-                return;
-            }
             let Some(source_range) = self
-                .selected_message_source_range(thread_id, message_index, message, cx)
+                .selected_message_source_range(thread_id, message_id, message, cx)
                 .or_else(|| Self::unique_source_range_for_quote(&message.text, &quote))
             else {
                 return;
@@ -922,15 +967,14 @@ impl Cowork {
         });
         let comment_id = Uuid::new_v4();
         thread.update(cx, |thread, _| {
-            thread.comments.push(InlineComment {
+            thread.draft.comments.push(UserComment {
                 id: comment_id,
-                message_index,
-                submitted_message_index: None,
+                source_message_id: message_id,
                 quote,
                 source_range,
-                body: body.clone(),
-                submitted: false,
+                body: UserCommentBody::Editing(body.clone()),
             });
+            thread.draft.comments_folded = false;
         });
         let observed_body = body.clone();
         let observed_thread = thread.clone();
@@ -938,8 +982,9 @@ impl Cowork {
             if matches!(event, InputEvent::Change) && observed_body.read(cx).value().is_empty() {
                 observed_thread.update(cx, |thread, _| {
                     thread
+                        .draft
                         .comments
-                        .retain(|comment| comment.id != comment_id || comment.submitted);
+                        .retain(|comment| comment.id != comment_id);
                 });
                 cx.notify();
             }
@@ -952,26 +997,74 @@ impl Cowork {
         cx.notify();
     }
 
-    fn render_comment_card(
-        comment: &InlineComment,
-        location: &'static str,
-        show_quote: bool,
-        cx: &App,
-    ) -> gpui::AnyElement {
+    fn toggle_comment_group(&mut self, group_id: Uuid, cx: &mut Context<Self>) {
+        if self.new_thread_draft.id == group_id {
+            self.new_thread_draft.comments_folded = !self.new_thread_draft.comments_folded;
+            cx.notify();
+            return;
+        }
+
+        let threads = self.thread_store.read(cx).threads.clone();
+        for thread in threads {
+            let toggled = thread.update(cx, |thread, _| {
+                if thread.draft.id == group_id {
+                    thread.draft.comments_folded = !thread.draft.comments_folded;
+                    return true;
+                }
+                for entry in &mut thread.timeline {
+                    if let TimelineMessage::User(group) = entry
+                        && group.id == group_id
+                    {
+                        group.comments_folded = !group.comments_folded;
+                        return true;
+                    }
+                }
+                false
+            });
+            if toggled {
+                break;
+            }
+        }
+        cx.notify();
+    }
+
+    fn render_comment_group_toggle(
+        group_id: Uuid,
+        count: usize,
+        collapsed: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let label = format!("{} comment{}", count, if count == 1 { "" } else { "s" });
+        div()
+            .id(format!("toggle-comments-{group_id}"))
+            .h(px(24.))
+            .flex()
+            .items_center()
+            .gap_2()
+            .cursor_pointer()
+            .text_color(rgb(0xa1a1aa))
+            .hover(|this| this.text_color(rgb(0xe4e4e7)))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.toggle_comment_group(group_id, cx);
+            }))
+            .child(label)
+            .child(if collapsed { "›" } else { "⌄" })
+    }
+
+    fn render_comment_card(comment: &UserComment, location: &'static str) -> gpui::AnyElement {
         let accent = rgb(USER_ACCENT);
-        let body = if comment.submitted {
-            div()
+        let body = match &comment.body {
+            UserCommentBody::Submitted(body) => div()
                 .w_full()
                 .text_color(rgb(0xe4e4e7))
-                .child(comment.body.read(cx).value())
-                .into_any_element()
-        } else {
-            div()
+                .child(body.clone())
+                .into_any_element(),
+            UserCommentBody::Editing(body) => div()
                 .id(format!("comment-editor-{location}-{}", comment.id))
                 .flex_1()
                 .min_w_0()
-                .child(Textarea::new(&comment.body))
-                .into_any_element()
+                .child(Textarea::new(body))
+                .into_any_element(),
         };
 
         div()
@@ -979,30 +1072,44 @@ impl Cowork {
             .w_full()
             .flex()
             .flex_col()
-            .gap_2()
-            .when(show_quote, |this| {
-                this.child(
-                    div()
-                        .w_full()
-                        .text_color(rgb(0xa1a1aa))
-                        .line_clamp(2)
-                        .child(comment.quote.clone()),
-                )
-            })
+            .overflow_hidden()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(0x303036))
+            .bg(rgb(0x202023))
             .child(
                 div()
                     .w_full()
-                    .flex()
-                    .items_center()
-                    .gap_2()
                     .px_3()
-                    .py_2()
-                    .border_l_2()
-                    .border_color(accent)
-                    .rounded_md()
-                    .bg(rgb(0x202023))
-                    .child(Self::render_avatar(MessageAuthor::User))
-                    .child(body),
+                    .pt_3()
+                    .pb_2()
+                    .text_color(rgb(0xd4d4d8))
+                    .line_clamp(2)
+                    .child(comment.quote.clone()),
+            )
+            .child(
+                div().w_full().px_3().pb_3().child(
+                    div()
+                        .w_full()
+                        .overflow_hidden()
+                        .border_1()
+                        .border_color(rgb(0x303036))
+                        .rounded_md()
+                        .bg(rgb(0x1d1d20))
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .px_3()
+                                .py_2()
+                                .border_l_2()
+                                .border_color(accent)
+                                .child(Self::render_avatar(MessageAuthor::User))
+                                .child(body),
+                        ),
+                ),
             )
             .into_any_element()
     }
@@ -1075,49 +1182,36 @@ impl Cowork {
     fn render_message_segment(
         &mut self,
         thread_id: Uuid,
-        message_index: usize,
+        message_id: Uuid,
         segment_index: usize,
-        author: MessageAuthor,
         source_range: Range<usize>,
         text: &str,
         annotated: bool,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        match author {
-            _ if annotated => TextView::html(
-                format!("timeline-annotated-{thread_id}-{message_index}-{segment_index}"),
+        if annotated {
+            return TextView::html(
+                format!("timeline-annotated-{message_id}-{segment_index}"),
                 Self::annotated_markdown_html(text),
             )
             .style(Self::annotated_markdown_style())
             .w_full()
-            .into_any_element(),
-            MessageAuthor::User => SelectableText::new(
-                format!("timeline-text-{thread_id}-{message_index}-{segment_index}"),
-                text.to_string(),
-            )
-            .document_order((message_index * 1_000 + segment_index) as u64)
-            .into_any_element(),
-            MessageAuthor::Agent => {
-                let text_view = self
-                    .segment_text_views
-                    .entry((
-                        thread_id,
-                        message_index,
-                        source_range.start,
-                        source_range.end,
-                    ))
-                    .or_insert_with(|| SegmentTextView {
-                        state: cx.new(|cx| TextViewState::markdown(text, cx)),
-                        rendered_at: self.render_generation,
-                    });
-                text_view.rendered_at = self.render_generation;
-                TextView::new(&text_view.state)
-                    .selection_format(SelectionFormat::Plain)
-                    .style(Self::markdown_style())
-                    .w_full()
-                    .into_any_element()
-            }
+            .into_any_element();
         }
+
+        let text_view = self
+            .segment_text_views
+            .entry((thread_id, message_id, source_range.start, source_range.end))
+            .or_insert_with(|| SegmentTextView {
+                state: cx.new(|cx| TextViewState::markdown(text, cx)),
+                rendered_at: self.render_generation,
+            });
+        text_view.rendered_at = self.render_generation;
+        TextView::new(&text_view.state)
+            .selection_format(SelectionFormat::Plain)
+            .style(Self::markdown_style())
+            .w_full()
+            .into_any_element()
     }
 
     fn hard_line_start(text: &str, offset: usize) -> usize {
@@ -1154,26 +1248,90 @@ impl Cowork {
         }
     }
 
-    fn render_timeline_message(
+    fn render_user_message_group(
+        &self,
+        index: usize,
+        group: &UserMessageGroup,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let mut content = Vec::new();
+        if !group.comments.is_empty() {
+            content.push(
+                Self::render_comment_group_toggle(
+                    group.id,
+                    group.comments.len(),
+                    group.comments_folded,
+                    cx,
+                )
+                .into_any_element(),
+            );
+            if !group.comments_folded {
+                content.extend(
+                    group
+                        .comments
+                        .iter()
+                        .map(|comment| Self::render_comment_card(comment, "submission")),
+                );
+            }
+        }
+        if let UserMessageContent::Submitted { text, .. } = &group.content
+            && !text.trim().is_empty()
+        {
+            content.push(
+                SelectableText::new(format!("timeline-user-text-{}", group.id), text.clone())
+                    .document_order((index * 1_000 + content.len()) as u64)
+                    .into_any_element(),
+            );
+        }
+
+        div()
+            .id(("timeline-message", index))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, _| {
+                    this.selection_message_id = None;
+                }),
+            )
+            .w_full()
+            .flex()
+            .items_start()
+            .child(
+                div()
+                    .w(px(40.))
+                    .flex_none()
+                    .flex()
+                    .justify_center()
+                    .child(Self::render_avatar(MessageAuthor::User)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .children(content),
+            )
+            .child(div().w(px(40.)).flex_none())
+            .into_any_element()
+    }
+
+    fn render_agent_message(
         &mut self,
         thread_id: Uuid,
         index: usize,
-        message: &TimelineMessage,
-        comments: &[InlineComment],
+        message: &AgentMessage,
+        comments: &[UserComment],
         wrap_width: gpui::Pixels,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let waiting = !message.complete && message.text.is_empty();
-        let mut message_content = comments
-            .iter()
-            .filter(|comment| comment.submitted_message_index == Some(index))
-            .map(|comment| Self::render_comment_card(comment, "submission", true, cx))
-            .collect::<Vec<_>>();
+        let mut message_content = Vec::new();
         let mut cursor = 0;
         let mut anchored_comments = comments
             .iter()
-            .filter(|comment| comment.message_index == index)
+            .filter(|comment| comment.source_message_id == message.id)
             .filter(|comment| {
                 comment.source_range.start < comment.source_range.end
                     && comment.source_range.end <= message.text.len()
@@ -1183,12 +1341,9 @@ impl Cowork {
             .collect::<Vec<_>>();
         anchored_comments.sort_by_key(|comment| comment.source_range.start);
 
-        if anchored_comments.is_empty()
-            && let Some(text_view) = &message.text_view
-            && !message.text.is_empty()
-        {
+        if anchored_comments.is_empty() && !message.text.is_empty() {
             message_content.push(
-                TextView::new(text_view)
+                TextView::new(&message.text_view)
                     .selection_format(SelectionFormat::Plain)
                     .style(Self::markdown_style())
                     .w_full()
@@ -1209,9 +1364,8 @@ impl Cowork {
             if cursor < annotated_start {
                 message_content.push(self.render_message_segment(
                     thread_id,
-                    index,
+                    message.id,
                     message_content.len(),
-                    message.author,
                     cursor..annotated_start,
                     &message.text[cursor..annotated_start],
                     false,
@@ -1241,25 +1395,25 @@ impl Cowork {
                 Self::annotate_markdown(&message.text[cursor..line_end], annotation_ranges);
             message_content.push(self.render_message_segment(
                 thread_id,
-                index,
+                message.id,
                 message_content.len(),
-                message.author,
                 cursor..line_end,
                 &annotated,
                 true,
                 cx,
             ));
-            for comment in group {
-                message_content.push(Self::render_comment_card(comment, "timeline", false, cx));
-            }
+            message_content.extend(
+                group
+                    .iter()
+                    .map(|comment| Self::render_comment_card(comment, "inline")),
+            );
             cursor = line_end;
         }
         if cursor < message.text.len() {
             message_content.push(self.render_message_segment(
                 thread_id,
-                index,
+                message.id,
                 message_content.len(),
-                message.author,
                 cursor..message.text.len(),
                 &message.text[cursor..],
                 false,
@@ -1267,12 +1421,13 @@ impl Cowork {
             ));
         }
 
+        let message_id = message.id;
         div()
             .id(("timeline-message", index))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, _| {
-                    this.selection_message_index = Some(index);
+                    this.selection_message_id = Some(message_id);
                 }),
             )
             .w_full()
@@ -1284,7 +1439,7 @@ impl Cowork {
                     .flex_none()
                     .flex()
                     .justify_center()
-                    .child(Self::render_avatar(message.author)),
+                    .child(Self::render_avatar(MessageAuthor::Agent)),
             )
             .child(
                 div()
@@ -1308,24 +1463,44 @@ impl Cowork {
                                 ),
                         )
                     })
-                    .when(!message_content.is_empty(), |this| {
-                        this.children(message_content)
-                    }),
+                    .children(message_content),
             )
             .child(div().w(px(40.)).flex_none())
             .into_any_element()
     }
 
+    fn render_timeline_message(
+        &mut self,
+        thread_id: Uuid,
+        index: usize,
+        message: &TimelineMessage,
+        comments: &[UserComment],
+        wrap_width: gpui::Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        match message {
+            TimelineMessage::User(group) => self.render_user_message_group(index, group, cx),
+            TimelineMessage::Agent(message) => self
+                .render_agent_message(thread_id, index, message, comments, wrap_width, window, cx),
+        }
+    }
+
     fn rig_history(messages: &[TimelineMessage]) -> Vec<RigMessage> {
         messages
             .iter()
-            .filter(|message| message.complete && !message.failed)
-            .map(|message| {
-                let text = message.history_text.as_deref().unwrap_or(&message.text);
-                match message.author {
-                    MessageAuthor::User => RigMessage::user(text),
-                    MessageAuthor::Agent => RigMessage::assistant(text),
+            .filter_map(|message| match message {
+                TimelineMessage::User(group) => {
+                    let UserMessageContent::Submitted { text, history_text } = &group.content
+                    else {
+                        return None;
+                    };
+                    Some(RigMessage::user(history_text.as_deref().unwrap_or(text)))
                 }
+                TimelineMessage::Agent(message) if message.complete && !message.failed => {
+                    Some(RigMessage::assistant(&message.text))
+                }
+                TimelineMessage::Agent(_) => None,
             })
             .collect()
     }
@@ -1341,19 +1516,16 @@ impl Cowork {
             return;
         };
         let text_view = cx.new(|cx| TextViewState::markdown("", cx));
-        let message_index = thread.update(cx, |thread, _| {
-            let message_index = thread.messages.len();
-            thread.messages.push(TimelineMessage {
-                author: MessageAuthor::Agent,
+        let message_id = Uuid::new_v4();
+        thread.update(cx, |thread, _| {
+            thread.timeline.push(TimelineMessage::Agent(AgentMessage {
+                id: message_id,
                 text: String::new(),
-                history_text: None,
-                text_view: Some(text_view),
-                visible: true,
+                text_view,
                 complete: false,
                 failed: false,
-            });
+            }));
             thread.generating = true;
-            message_index
         });
 
         let thread = thread.clone();
@@ -1413,19 +1585,18 @@ impl Cowork {
         cx.spawn(async move |this, cx| {
             while let Some(event) = receiver.recv().await {
                 let (finished, text_view_update) = thread.update(cx, |thread, _| {
-                    let Some(message) = thread.messages.get_mut(message_index) else {
+                    let Some(message) = thread.timeline.iter_mut().find_map(|entry| match entry {
+                        TimelineMessage::Agent(message) if message.id == message_id => {
+                            Some(message)
+                        }
+                        _ => None,
+                    }) else {
                         return (true, None);
                     };
                     match event {
                         AgentEvent::Text(text) => {
                             message.text.push_str(&text);
-                            (
-                                false,
-                                message
-                                    .text_view
-                                    .clone()
-                                    .map(|text_view| (text_view, text, true)),
-                            )
+                            (false, Some((message.text_view.clone(), text, true)))
                         }
                         AgentEvent::Finished => {
                             message.complete = true;
@@ -1437,10 +1608,7 @@ impl Cowork {
                             message.failed = true;
                             let update = if message.text.is_empty() {
                                 message.text = format!("Unable to generate a response: {error}");
-                                message
-                                    .text_view
-                                    .clone()
-                                    .map(|text_view| (text_view, message.text.clone(), false))
+                                Some((message.text_view.clone(), message.text.clone(), false))
                             } else {
                                 None
                             };
@@ -1485,16 +1653,25 @@ impl Cowork {
         title
     }
 
+    fn editable_comment_body(comment: &UserComment, cx: &App) -> Option<String> {
+        let UserCommentBody::Editing(body) = &comment.body else {
+            return None;
+        };
+        let value = body.read(cx).value().to_string();
+        (!value.trim().is_empty()).then_some(value)
+    }
+
     fn prompt_with_comments(
         prompt: &str,
-        comments: &[InlineComment],
-        messages: &[TimelineMessage],
+        draft: &UserMessageGroup,
+        timeline: &[TimelineMessage],
         cx: &App,
     ) -> String {
-        let pending = comments
+        let pending = draft
+            .comments
             .iter()
-            .filter(|comment| {
-                !comment.submitted && !comment.body.read(cx).value().trim().is_empty()
+            .filter_map(|comment| {
+                Self::editable_comment_body(comment, cx).map(|body| (comment, body))
             })
             .collect::<Vec<_>>();
         if pending.is_empty() {
@@ -1504,21 +1681,24 @@ impl Cowork {
         let mut result = String::from(
             "The user attached the following inline comments to immutable excerpts from the conversation:\n",
         );
-        for (index, comment) in pending.iter().enumerate() {
-            let author = messages
-                .get(comment.message_index)
-                .map(|message| match message.author {
-                    MessageAuthor::User => "user",
-                    MessageAuthor::Agent => "assistant",
+        for (index, (comment, body)) in pending.iter().enumerate() {
+            let message_number = timeline
+                .iter()
+                .position(|entry| {
+                    matches!(
+                        entry,
+                        TimelineMessage::Agent(message)
+                            if message.id == comment.source_message_id
+                    )
                 })
-                .unwrap_or("conversation");
+                .map(|index| index + 1)
+                .unwrap_or_default();
             result.push_str(&format!(
-                "\n{}. Excerpt from {} message {}:\n> {}\nComment: {}\n",
+                "\n{}. Excerpt from assistant message {}:\n> {}\nComment: {}\n",
                 index + 1,
-                author,
-                comment.message_index + 1,
+                message_number,
                 comment.quote.replace('\n', "\n> "),
-                comment.body.read(cx).value().trim(),
+                body.trim(),
             ));
         }
         if !prompt.trim().is_empty() {
@@ -1528,13 +1708,7 @@ impl Cowork {
         result
     }
 
-    fn submit_composer(
-        &mut self,
-        composer: &Entity<TextareaState>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let prompt = composer.read(cx).value().to_string();
+    fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active_thread = self
             .active_thread_id
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx));
@@ -1544,24 +1718,67 @@ impl Cowork {
         {
             return;
         }
-        let has_pending_comments = active_thread.as_ref().is_some_and(|thread| {
-            thread.read(cx).comments.iter().any(|comment| {
-                !comment.submitted && !comment.body.read(cx).value().trim().is_empty()
-            })
-        });
-        if prompt.trim().is_empty() && !has_pending_comments {
+
+        let draft = active_thread
+            .as_ref()
+            .map(|thread| thread.read(cx).draft.clone())
+            .unwrap_or_else(|| self.new_thread_draft.clone());
+        let composer = Self::draft_composer(&draft);
+        let prompt = composer.read(cx).value().to_string();
+        let has_comments = draft
+            .comments
+            .iter()
+            .any(|comment| Self::editable_comment_body(comment, cx).is_some());
+        if prompt.trim().is_empty() && !has_comments {
             return;
         }
-        let history = active_thread
-            .as_ref()
-            .map(|thread| Self::rig_history(&thread.read(cx).messages))
-            .unwrap_or_default();
-        composer.update(cx, |composer, cx| {
-            composer.set_value("", window, cx);
-        });
 
-        let (thread_id, thread) = if let Some(thread) = active_thread {
-            (thread.read(cx).summary.id, thread)
+        let timeline = active_thread
+            .as_ref()
+            .map(|thread| thread.read(cx).timeline.clone())
+            .unwrap_or_default();
+        let history = Self::rig_history(&timeline);
+        let agent_prompt = Self::prompt_with_comments(&prompt, &draft, &timeline, cx);
+        let submitted_comments = draft
+            .comments
+            .iter()
+            .filter_map(|comment| {
+                Self::editable_comment_body(comment, cx).map(|body| UserComment {
+                    id: comment.id,
+                    source_message_id: comment.source_message_id,
+                    quote: comment.quote.clone(),
+                    source_range: comment.source_range.clone(),
+                    body: UserCommentBody::Submitted(body),
+                })
+            })
+            .collect::<Vec<_>>();
+        let remaining_comments = draft
+            .comments
+            .iter()
+            .filter(|comment| Self::editable_comment_body(comment, cx).is_none())
+            .cloned()
+            .collect::<Vec<_>>();
+        let submitted_group = UserMessageGroup {
+            id: draft.id,
+            comments: submitted_comments,
+            content: UserMessageContent::Submitted {
+                text: prompt.clone(),
+                history_text: has_comments.then(|| agent_prompt.clone()),
+            },
+            comments_folded: draft.comments_folded,
+        };
+        let mut next_draft = Self::new_user_message_draft(window, cx);
+        next_draft.comments = remaining_comments;
+        next_draft.comments_folded = !next_draft.comments.is_empty() && draft.comments_folded;
+        let next_composer = Self::draft_composer(&next_draft);
+
+        let thread_id = if let Some(thread) = active_thread {
+            let thread_id = thread.read(cx).summary.id;
+            thread.update(cx, |thread, _| {
+                thread.timeline.push(TimelineMessage::User(submitted_group));
+                thread.draft = next_draft;
+            });
+            thread_id
         } else {
             let thread_id = Uuid::new_v4();
             let thread = cx.new(|_| Thread {
@@ -1569,51 +1786,22 @@ impl Cowork {
                     id: thread_id,
                     title: Self::thread_title(&prompt),
                 },
-                messages: Vec::new(),
-                comments: Vec::new(),
+                timeline: vec![TimelineMessage::User(submitted_group)],
+                draft: next_draft,
                 generating: false,
                 sharing: ThreadSharing::NotShared,
             });
+            self.new_thread_draft = Self::new_user_message_draft(window, cx);
             self.thread_store.update(cx, |store, _| {
                 store.threads.insert(0, thread.clone());
             });
             self.active_thread_id = Some(thread_id);
-            (thread_id, thread)
+            thread_id
         };
 
-        let agent_prompt = {
-            let thread = thread.read(cx);
-            Self::prompt_with_comments(&prompt, &thread.comments, &thread.messages, cx)
-        };
-        let submitted_comment_ids = thread
-            .read(cx)
-            .comments
-            .iter()
-            .filter(|comment| {
-                !comment.submitted && !comment.body.read(cx).value().trim().is_empty()
-            })
-            .map(|comment| comment.id)
-            .collect::<Vec<_>>();
-        thread.update(cx, |thread, _| {
-            let submitted_message_index = thread.messages.len();
-            for comment in &mut thread.comments {
-                if submitted_comment_ids.contains(&comment.id) {
-                    comment.submitted = true;
-                    comment.submitted_message_index = Some(submitted_message_index);
-                }
-            }
-            thread.messages.push(TimelineMessage {
-                author: MessageAuthor::User,
-                text: prompt.clone(),
-                history_text: (!submitted_comment_ids.is_empty()).then(|| agent_prompt.clone()),
-                text_view: None,
-                visible: !prompt.trim().is_empty() || !submitted_comment_ids.is_empty(),
-                complete: true,
-                failed: false,
-            });
-        });
-        self.selection_message_index = None;
+        self.selection_message_id = None;
         self.follow_generation = true;
+        next_composer.focus_handle(cx).focus(window, cx);
         self.start_generation(thread_id, agent_prompt, history, cx);
         self.timeline_scroll_handle.scroll_to_bottom();
     }
@@ -1643,7 +1831,7 @@ impl Cowork {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.submit_composer(&self.composer.clone(), window, cx);
+        self.submit_composer(window, cx);
     }
 
     fn render_composer_input(composer: &Entity<TextareaState>) -> gpui::Stateful<gpui::Div> {
@@ -1665,13 +1853,23 @@ impl Cowork {
     ) -> impl IntoElement {
         self.render_generation = self.render_generation.wrapping_add(1);
         let active_thread_id = self.active_thread_id;
-        let (messages, comments) = active_thread_id
+        let (messages, draft) = active_thread_id
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
             .map(|thread| {
                 let thread = thread.read(cx);
-                (thread.messages.clone(), thread.comments.clone())
+                (thread.timeline.clone(), thread.draft.clone())
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| (Vec::new(), self.new_thread_draft.clone()));
+        let comments = messages
+            .iter()
+            .filter_map(|message| match message {
+                TimelineMessage::User(group) => Some(group.comments.as_slice()),
+                TimelineMessage::Agent(_) => None,
+            })
+            .flatten()
+            .chain(draft.comments.iter())
+            .cloned()
+            .collect::<Vec<_>>();
         let sidebar_width = if self.sidebar_open {
             SIDEBAR_WIDTH
         } else {
@@ -1686,22 +1884,24 @@ impl Cowork {
         let mut timeline_messages = Vec::new();
         if let Some(thread_id) = active_thread_id {
             for (index, message) in messages.iter().enumerate() {
-                if message.visible {
-                    timeline_messages.push(self.render_timeline_message(
-                        thread_id, index, message, &comments, wrap_width, window, cx,
-                    ));
-                }
+                timeline_messages.push(self.render_timeline_message(
+                    thread_id, index, message, &comments, wrap_width, window, cx,
+                ));
             }
         }
 
         self.segment_text_views
             .retain(|_, text_view| text_view.rendered_at == self.render_generation);
 
-        let composer_comments = comments
+        let composer_comments = draft
+            .comments
             .iter()
-            .filter(|comment| !comment.submitted)
-            .map(|comment| Self::render_comment_card(comment, "composer", true, cx))
+            .map(|comment| Self::render_comment_card(comment, "composer"))
             .collect::<Vec<_>>();
+        let composer_comment_count = composer_comments.len();
+        let composer_comment_group = (composer_comment_count > 0).then_some(draft.id);
+        let composer_comments_collapsed = draft.comments_folded;
+        let composer = Self::draft_composer(&draft);
 
         div()
             .id("main-editor")
@@ -1753,16 +1953,24 @@ impl Cowork {
                                             .flex()
                                             .flex_col()
                                             .gap_3()
-                                            .children(composer_comments)
+                                            .when_some(composer_comment_group, |this, group_id| {
+                                                this.child(Self::render_comment_group_toggle(
+                                                    group_id,
+                                                    composer_comment_count,
+                                                    composer_comments_collapsed,
+                                                    cx,
+                                                ))
+                                            })
+                                            .when(!composer_comments_collapsed, |this| {
+                                                this.children(composer_comments)
+                                            })
                                             .child(
-                                                Self::render_composer_input(&self.composer)
-                                                    .on_click(cx.listener(
-                                                        |this, _, window, cx| {
-                                                            this.composer
-                                                                .focus_handle(cx)
-                                                                .focus(window, cx);
-                                                        },
-                                                    )),
+                                                Self::render_composer_input(&composer).on_click({
+                                                    let composer = composer.clone();
+                                                    cx.listener(move |_, _, window, cx| {
+                                                        composer.focus_handle(cx).focus(window, cx);
+                                                    })
+                                                }),
                                             ),
                                     )
                                     .child(div().w(px(40.)).flex_none()),
@@ -1870,15 +2078,10 @@ fn main() {
                 let thread_store = cx.new(|_| ThreadStore {
                     threads: Vec::new(),
                 });
-                let composer = cx.new(|cx| {
-                    let mut composer = TextareaState::new(window, cx).auto_grow(1, usize::MAX);
-                    composer.set_editor_style(InputEditorStyle {
-                        caret: rgb(0xffffff).into(),
-                        ..Default::default()
-                    });
-                    composer
-                });
-                composer.focus_handle(cx).focus(window, cx);
+                let new_thread_draft = Cowork::new_user_message_draft(window, cx);
+                Cowork::draft_composer(&new_thread_draft)
+                    .focus_handle(cx)
+                    .focus(window, cx);
                 cx.new(|cx| {
                     let window_activation_subscription =
                         cx.observe_window_activation(window, |_, window, _cx| {
@@ -1889,12 +2092,12 @@ fn main() {
                     Cowork {
                         sidebar_open: true,
                         recents_open: true,
-                        composer,
+                        new_thread_draft,
                         timeline_scroll_handle: ScrollHandle::new(),
                         follow_generation: true,
                         thread_store,
                         active_thread_id: None,
-                        selection_message_index: None,
+                        selection_message_id: None,
                         segment_text_views: HashMap::new(),
                         render_generation: 0,
                         titlebar_click_armed: false,

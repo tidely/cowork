@@ -12,6 +12,7 @@ edition = "2024"
 
 [workspace.dependencies]
 gpui = { package = "gpui-pre", version = "0.3.5" }
+# https://github.com/longbridge/gpui-kit/pull/3136
 gpui-base = { git = "https://github.com/tidely/gpui-kit", branch = "selected-source-range" }
 gpui_platform = { package = "gpui-pre-platform", version = "0.3.5", features = ["font-kit", "wayland", "x11", "runtime_shaders"] }
 futures = "0.3"
@@ -21,5 +22,4 @@ rig = { git = "https://github.com/0xPlaygrounds/rig", rev = "2d16c1b25f6749b3a2c
 serde_json = "1"
 syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
-
 uuid = { version = "1", features = ["v4"] }
