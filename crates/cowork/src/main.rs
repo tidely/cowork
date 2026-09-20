@@ -21,7 +21,7 @@ use rig::{
     completion::Message as RigMessage,
     prelude::*,
     providers::ollama::wire::Ollama,
-    streaming::{Delta, StreamEvent},
+    streaming::{BlockClose, Delta, StreamEvent},
 };
 use serde_json::json;
 use syntect::{
@@ -179,6 +179,10 @@ enum TimelineMessage {
 #[derive(Clone)]
 struct AgentMessage {
     id: Uuid,
+    thinking: String,
+    thinking_view: Entity<TextViewState>,
+    thinking_complete: bool,
+    thinking_expanded: bool,
     text: String,
     text_view: Entity<TextViewState>,
     complete: bool,
@@ -286,6 +290,8 @@ impl ThreadStore {
 }
 
 enum AgentEvent {
+    Thinking(String),
+    ThinkingFinished,
     Text(String),
     Finished,
     Failed(String),
@@ -1316,6 +1322,25 @@ impl Cowork {
             .into_any_element()
     }
 
+    fn toggle_thinking(&mut self, thread_id: Uuid, message_id: Uuid, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+            return;
+        };
+        thread.update(cx, |thread, _| {
+            for entry in &mut thread.timeline {
+                if let TimelineMessage::Agent(message) = entry
+                    && message.id == message_id
+                    && message.thinking_complete
+                    && !message.thinking.is_empty()
+                {
+                    message.thinking_expanded = !message.thinking_expanded;
+                    break;
+                }
+            }
+        });
+        cx.notify();
+    }
+
     fn render_agent_message(
         &mut self,
         thread_id: Uuid,
@@ -1326,7 +1351,7 @@ impl Cowork {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let waiting = !message.complete && message.text.is_empty();
+        let waiting = !message.complete && message.thinking.is_empty() && message.text.is_empty();
         let mut message_content = Vec::new();
         let mut cursor = 0;
         let mut anchored_comments = comments
@@ -1422,6 +1447,50 @@ impl Cowork {
         }
 
         let message_id = message.id;
+        let thinking_expanded = !message.thinking_complete || message.thinking_expanded;
+        let thinking_content = (!message.thinking.is_empty() && thinking_expanded).then(|| {
+            TextView::new(&message.thinking_view)
+                .selection_format(SelectionFormat::Plain)
+                .style(Self::markdown_style())
+                .w_full()
+                .into_any_element()
+        });
+        let thinking = (!message.thinking.is_empty()).then(|| {
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .id(format!("toggle-thinking-{message_id}"))
+                        .h(px(24.))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .text_sm()
+                        .text_color(rgb(0x71717a))
+                        .when(message.thinking_complete, |this| {
+                            this.hover(|this| this.text_color(rgb(0xa1a1aa)))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.toggle_thinking(thread_id, message_id, cx);
+                                }))
+                        })
+                        .child(if message.thinking_complete {
+                            "Thinking"
+                        } else {
+                            "Thinking…"
+                        }),
+                )
+                .children(thinking_content.map(|content| {
+                    div()
+                        .pl_3()
+                        .border_l_1()
+                        .border_color(rgb(0x3f3f46))
+                        .opacity(0.7)
+                        .child(content)
+                }))
+        });
         div()
             .id(("timeline-message", index))
             .on_mouse_down(
@@ -1463,6 +1532,7 @@ impl Cowork {
                                 ),
                         )
                     })
+                    .children(thinking)
                     .children(message_content),
             )
             .child(div().w(px(40.)).flex_none())
@@ -1515,11 +1585,16 @@ impl Cowork {
         let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
             return;
         };
+        let thinking_view = cx.new(|cx| TextViewState::markdown("", cx));
         let text_view = cx.new(|cx| TextViewState::markdown("", cx));
         let message_id = Uuid::new_v4();
         thread.update(cx, |thread, _| {
             thread.timeline.push(TimelineMessage::Agent(AgentMessage {
                 id: message_id,
+                thinking: String::new(),
+                thinking_view,
+                thinking_complete: false,
+                thinking_expanded: true,
                 text: String::new(),
                 text_view,
                 complete: false,
@@ -1555,6 +1630,22 @@ impl Cowork {
 
             while let Some(item) = stream.next().await {
                 match item {
+                    Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockDelta {
+                        delta: Delta::Reasoning { text },
+                        ..
+                    })) => {
+                        if sender.send(AgentEvent::Thinking(text)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockEnd {
+                        end: BlockClose::Reasoning { .. },
+                        ..
+                    })) => {
+                        if sender.send(AgentEvent::ThinkingFinished).await.is_err() {
+                            return;
+                        }
+                    }
                     Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockDelta {
                         delta: Delta::Text { text },
                         ..
@@ -1594,17 +1685,34 @@ impl Cowork {
                         return (true, None);
                     };
                     match event {
+                        AgentEvent::Thinking(text) => {
+                            message.thinking.push_str(&text);
+                            (false, Some((message.thinking_view.clone(), text, true)))
+                        }
+                        AgentEvent::ThinkingFinished => {
+                            message.thinking_complete = true;
+                            message.thinking_expanded = false;
+                            (false, None)
+                        }
                         AgentEvent::Text(text) => {
+                            if !message.thinking.is_empty() && !message.thinking_complete {
+                                message.thinking_complete = true;
+                                message.thinking_expanded = false;
+                            }
                             message.text.push_str(&text);
                             (false, Some((message.text_view.clone(), text, true)))
                         }
                         AgentEvent::Finished => {
                             message.complete = true;
+                            message.thinking_complete = true;
+                            message.thinking_expanded = false;
                             thread.generating = false;
                             (true, None)
                         }
                         AgentEvent::Failed(error) => {
                             message.complete = true;
+                            message.thinking_complete = true;
+                            message.thinking_expanded = false;
                             message.failed = true;
                             let update = if message.text.is_empty() {
                                 message.text = format!("Unable to generate a response: {error}");
