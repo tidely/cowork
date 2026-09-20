@@ -9,12 +9,12 @@ use std::{
 use anyhow::Context as _;
 use futures::StreamExt;
 use gpui::{
-    Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClipboardItem, Context, Entity,
-    Focusable, FontStyle, FontWeight, HighlightStyle, IntoElement, KeyBinding, KeyDownEvent,
-    LineFragment, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput, QuitMode, Render,
-    ScrollHandle, ScrollWheelEvent, SharedString, SpringAnimation, SpringConfig, Subscription,
-    TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowOptions, actions, div, img,
-    point, prelude::*, px, rems, rgb, rgba, size,
+    Animation, AnimationExt, AnyWindowHandle, App, AppContext, AssetSource, Bounds, ClipboardItem,
+    Context, Entity, Focusable, FontStyle, FontWeight, HighlightStyle, IntoElement, KeyBinding,
+    KeyDownEvent, LineFragment, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput, QuitMode,
+    Render, ScrollHandle, ScrollWheelEvent, SharedString, SpringAnimation, SpringConfig,
+    Subscription, TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowOptions, actions,
+    div, img, point, prelude::*, px, rems, rgb, rgba, size,
 };
 use gpui_base::{
     SelectableText, TextSelection, TextSelectionLayer, TextView, TextViewDefaults, TextViewState,
@@ -230,7 +230,10 @@ struct UserComment {
 
 #[derive(Clone)]
 enum UserCommentBody {
-    Editing(Entity<TextareaState>),
+    Editing {
+        inline: Entity<TextareaState>,
+        composer: Entity<TextareaState>,
+    },
     Submitted(SharedString),
 }
 
@@ -376,6 +379,22 @@ impl Cowork {
             unreachable!("thread drafts are always editable");
         };
         composer.clone()
+    }
+
+    fn new_comment_editor(
+        initial_text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Entity<TextareaState> {
+        cx.new(|cx| {
+            let mut body = TextareaState::new(window, cx).auto_grow(1, usize::MAX);
+            body.set_editor_style(InputEditorStyle {
+                caret: rgb(0xffffff).into(),
+                ..Default::default()
+            });
+            body.insert(initial_text, window, cx);
+            body
+        })
     }
 
     fn new_empty_local_thread(draft: UserMessageGroup, cx: &mut App) -> Entity<Thread> {
@@ -1444,17 +1463,8 @@ impl Cowork {
             source_range
         };
 
-        let body = cx.new(|cx| {
-            let mut body = TextareaState::new(window, cx).auto_grow(1, usize::MAX);
-            body.set_editor_style(InputEditorStyle {
-                caret: rgb(0xffffff).into(),
-                ..Default::default()
-            });
-            body
-        });
-        body.update(cx, |body, cx| {
-            body.insert(initial_text, window, cx);
-        });
+        let inline_body = Self::new_comment_editor(initial_text, window, cx);
+        let composer_body = Self::new_comment_editor(initial_text, window, cx);
         let comment_id = Uuid::new_v4();
         thread.update(cx, |thread, _| {
             thread.draft.comments.push(UserComment {
@@ -1462,29 +1472,78 @@ impl Cowork {
                 source_message_id: message_id,
                 quote,
                 source_range,
-                body: UserCommentBody::Editing(body.clone()),
+                body: UserCommentBody::Editing {
+                    inline: inline_body.clone(),
+                    composer: composer_body.clone(),
+                },
             });
             thread.draft.comments_folded = false;
         });
-        let observed_body = body.clone();
-        let observed_thread = thread.clone();
-        cx.subscribe(&body, move |_, _, event: &InputEvent, cx| {
-            if matches!(event, InputEvent::Change) && observed_body.read(cx).value().is_empty() {
-                observed_thread.update(cx, |thread, _| {
-                    thread
-                        .draft
-                        .comments
-                        .retain(|comment| comment.id != comment_id);
-                });
-                cx.notify();
-            }
-        })
-        .detach();
+        Self::synchronize_comment_editor(
+            &inline_body,
+            composer_body.clone(),
+            thread.clone(),
+            comment_id,
+            window.window_handle(),
+            cx,
+        );
+        Self::synchronize_comment_editor(
+            &composer_body,
+            inline_body.clone(),
+            thread,
+            comment_id,
+            window.window_handle(),
+            cx,
+        );
         TextSelection::clear(window, cx);
-        body.focus_handle(cx).focus(window, cx);
+        inline_body.focus_handle(cx).focus(window, cx);
         window.prevent_default();
         cx.stop_propagation();
         cx.notify();
+    }
+
+    fn synchronize_comment_editor(
+        source: &Entity<TextareaState>,
+        target: Entity<TextareaState>,
+        thread: Entity<Thread>,
+        comment_id: Uuid,
+        window_handle: AnyWindowHandle,
+        cx: &mut Context<Self>,
+    ) {
+        let source = source.clone();
+        cx.subscribe(
+            &source.clone(),
+            move |_, _, event: &InputEvent, cx| match event {
+                InputEvent::Change => {
+                    let value = source.read(cx).value();
+                    cx.defer({
+                        let value = value.clone();
+                        let target = target.clone();
+                        move |cx| {
+                            let _ = cx.update_window(window_handle, |_, window, cx| {
+                                if target.read(cx).value() != value {
+                                    target.update(cx, |target, cx| {
+                                        target.set_value(value, window, cx);
+                                    });
+                                }
+                            });
+                        }
+                    });
+                    cx.notify();
+                }
+                InputEvent::Blur if source.read(cx).value().trim().is_empty() => {
+                    thread.update(cx, |thread, _| {
+                        thread
+                            .draft
+                            .comments
+                            .retain(|comment| comment.id != comment_id);
+                    });
+                    cx.notify();
+                }
+                _ => {}
+            },
+        )
+        .detach();
     }
 
     fn toggle_comment_group(&mut self, group_id: Uuid, cx: &mut Context<Self>) {
@@ -1541,24 +1600,62 @@ impl Cowork {
             .child(if collapsed { "›" } else { "⌄" })
     }
 
-    fn render_comment_card(comment: &UserComment, location: &'static str) -> gpui::AnyElement {
-        let accent = rgb(USER_ACCENT);
+    fn render_inline_comment(comment: &UserComment) -> gpui::AnyElement {
         let body = match &comment.body {
             UserCommentBody::Submitted(body) => div()
                 .w_full()
                 .text_color(rgb(0xe4e4e7))
                 .child(body.clone())
                 .into_any_element(),
-            UserCommentBody::Editing(body) => div()
-                .id(format!("comment-editor-{location}-{}", comment.id))
+            UserCommentBody::Editing { inline, .. } => div()
+                .id(format!("comment-editor-inline-{}", comment.id))
                 .flex_1()
                 .min_w_0()
-                .child(Textarea::new(body))
+                .child(Textarea::new(inline))
                 .into_any_element(),
         };
 
         div()
-            .id(format!("inline-comment-{location}-{}", comment.id))
+            .id(format!("inline-comment-{}", comment.id))
+            .w_full()
+            .overflow_hidden()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(0x303036))
+            .bg(rgb(0x1d1d20))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_3()
+                    .py_2()
+                    .border_l_2()
+                    .border_color(rgb(USER_ACCENT))
+                    .child(Self::render_avatar(MessageAuthor::User))
+                    .child(body),
+            )
+            .into_any_element()
+    }
+
+    fn render_composer_comment(comment: &UserComment) -> gpui::AnyElement {
+        let body = match &comment.body {
+            UserCommentBody::Submitted(body) => div()
+                .w_full()
+                .text_color(rgb(0xe4e4e7))
+                .child(body.clone())
+                .into_any_element(),
+            UserCommentBody::Editing { composer, .. } => div()
+                .id(format!("comment-editor-composer-{}", comment.id))
+                .flex_1()
+                .min_w_0()
+                .child(Textarea::new(composer))
+                .into_any_element(),
+        };
+
+        div()
+            .id(format!("composer-comment-{}", comment.id))
             .w_full()
             .flex()
             .flex_col()
@@ -1595,7 +1692,7 @@ impl Cowork {
                                 .px_3()
                                 .py_2()
                                 .border_l_2()
-                                .border_color(accent)
+                                .border_color(rgb(USER_ACCENT))
                                 .child(Self::render_avatar(MessageAuthor::User))
                                 .child(body),
                         ),
@@ -1750,12 +1847,7 @@ impl Cowork {
                 .into_any_element(),
             );
             if !group.comments_folded {
-                content.extend(
-                    group
-                        .comments
-                        .iter()
-                        .map(|comment| Self::render_comment_card(comment, "submission")),
-                );
+                content.extend(group.comments.iter().map(Self::render_composer_comment));
             }
         }
         if let UserMessageContent::Submitted { text, .. } = &group.content
@@ -1908,7 +2000,7 @@ impl Cowork {
             message_content.extend(
                 group
                     .iter()
-                    .map(|comment| Self::render_comment_card(comment, "inline")),
+                    .map(|comment| Self::render_inline_comment(comment)),
             );
             cursor = line_end;
         }
@@ -2243,10 +2335,10 @@ impl Cowork {
     }
 
     fn editable_comment_body(comment: &UserComment, cx: &App) -> Option<SharedString> {
-        let UserCommentBody::Editing(body) = &comment.body else {
+        let UserCommentBody::Editing { inline, .. } = &comment.body else {
             return None;
         };
-        let value = body.read(cx).value();
+        let value = inline.read(cx).value();
         (!value.trim().is_empty()).then_some(value)
     }
 
@@ -2475,9 +2567,14 @@ impl Cowork {
         self.segment_text_views
             .retain(|_, text_view| text_view.rendered_at == self.render_generation);
 
-        // Draft comments are already rendered beside their quoted agent text. A TextareaState
-        // keeps one set of layout bounds for mouse hit-testing, so rendering the same comment
-        // editor here as well would make clicks in the inline copy resolve against this copy.
+        let composer_comments = draft
+            .comments
+            .iter()
+            .map(Self::render_composer_comment)
+            .collect::<Vec<_>>();
+        let composer_comment_count = composer_comments.len();
+        let composer_comment_group = (composer_comment_count > 0).then_some(draft.id);
+        let composer_comments_collapsed = draft.comments_folded;
         let composer = Self::draft_composer(&draft);
 
         div()
@@ -2530,6 +2627,17 @@ impl Cowork {
                                             .flex()
                                             .flex_col()
                                             .gap_3()
+                                            .when_some(composer_comment_group, |this, group_id| {
+                                                this.child(Self::render_comment_group_toggle(
+                                                    group_id,
+                                                    composer_comment_count,
+                                                    composer_comments_collapsed,
+                                                    cx,
+                                                ))
+                                            })
+                                            .when(!composer_comments_collapsed, |this| {
+                                                this.children(composer_comments)
+                                            })
                                             .child(
                                                 Self::render_composer_input(&composer).on_click({
                                                     let composer = composer.clone();
