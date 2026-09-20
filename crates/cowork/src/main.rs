@@ -491,7 +491,7 @@ impl Cowork {
                 .alpns(vec![COWORK_ALPN.to_vec()])
                 .bind()
                 .await
-                .map_err(|error| error.to_string());
+                .map_err(anyhow::Error::from);
             if let Ok(endpoint) = &result {
                 let endpoint = endpoint.clone();
                 tokio::spawn(async move {
@@ -2082,7 +2082,7 @@ impl Cowork {
         let thread = thread.clone();
         let (sender, mut receiver) = mpsc::channel(128);
         let generation_task = self.tokio_handle.spawn(async move {
-            let client = Ollama::new().bound().map_err(|error| error.to_string())?;
+            let client = Ollama::new().bound()?;
             let agent = client
                 .agent(OLLAMA_MODEL)
                 .additional_params(json!({
@@ -2093,10 +2093,10 @@ impl Cowork {
             let stream = agent.prompt(prompt).history(&history).stream();
 
             _ = stream
-                .map(|item| Ok(item.map_err(|error| error.to_string())))
+                .map(|item| Ok(item.map_err(anyhow::Error::from)))
                 .forward(PollSender::new(sender))
                 .await;
-            Ok(())
+            Ok::<_, anyhow::Error>(())
         });
 
         cx.spawn(async move |this, cx| {
@@ -2183,7 +2183,7 @@ impl Cowork {
                 let error = match generation_task.await {
                     Ok(Ok(())) => None,
                     Ok(Err(error)) => Some(error),
-                    Err(error) => Some(error.to_string()),
+                    Err(error) => Some(error.into()),
                 };
                 let text_view_update = thread.update(cx, |thread, _| {
                     let Some(message) = thread.timeline.iter_mut().find_map(|entry| match entry {
