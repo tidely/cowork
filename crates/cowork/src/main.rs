@@ -293,12 +293,25 @@ struct JoinDialog {
     _input_subscription: Subscription,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ThreadOwnership {
+    Local,
+    Remote,
+}
+
+impl ThreadOwnership {
+    fn remove_on_disconnect(self) -> bool {
+        matches!(self, Self::Remote)
+    }
+}
+
 struct Thread {
     summary: ThreadSummary,
     timeline: Vec<TimelineMessage>,
     draft: UserMessageGroup,
     generating: bool,
     sharing: ThreadSharing,
+    ownership: ThreadOwnership,
 }
 
 struct ThreadStore {
@@ -362,6 +375,43 @@ impl Cowork {
             unreachable!("thread drafts are always editable");
         };
         composer.clone()
+    }
+
+    fn new_empty_local_thread(draft: UserMessageGroup, cx: &mut App) -> Entity<Thread> {
+        let thread_id = Uuid::new_v4();
+        cx.new(|_| Thread {
+            summary: ThreadSummary {
+                id: thread_id,
+                title: "New thread".into(),
+            },
+            timeline: Vec::new(),
+            draft,
+            generating: false,
+            sharing: ThreadSharing::NotShared,
+            ownership: ThreadOwnership::Local,
+        })
+    }
+
+    fn prepare_thread_for_sharing(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Thread> {
+        if let Some(thread) = self
+            .active_thread_id
+            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
+        {
+            return thread;
+        }
+
+        let next_draft = Self::new_user_message_draft(window, cx);
+        let draft = std::mem::replace(&mut self.new_thread_draft, next_draft);
+        let thread = Self::new_empty_local_thread(draft, cx);
+        self.active_thread_id = Some(thread.read(cx).summary.id);
+        self.thread_store.update(cx, |store, _| {
+            store.threads.insert(0, thread.clone());
+        });
+        thread
     }
 
     fn end_stale_mouse_drag(window: &mut Window, cx: &mut App) {
@@ -620,6 +670,7 @@ impl Cowork {
                                     endpoint,
                                     connection,
                                 },
+                                ownership: ThreadOwnership::Remote,
                             });
                             this.thread_store.update(cx, |store, _| {
                                 store.threads.insert(0, thread);
@@ -653,13 +704,9 @@ impl Cowork {
         .detach();
     }
 
-    fn toggle_sharing(&mut self, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.active_thread_id else {
-            return;
-        };
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
-            return;
-        };
+    fn toggle_sharing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let thread = self.prepare_thread_for_sharing(window, cx);
+        let thread_id = thread.read(cx).summary.id;
 
         match thread.read(cx).sharing.status() {
             SharingStatus::NotShared | SharingStatus::Failed => self.start_sharing(thread, cx),
@@ -692,6 +739,19 @@ impl Cowork {
                     drop(connection);
                     Some(endpoint)
                 });
+                if thread.read(cx).ownership.remove_on_disconnect() {
+                    self.thread_store.update(cx, |store, cx| {
+                        store
+                            .threads
+                            .retain(|thread| thread.read(cx).summary.id != thread_id);
+                    });
+                    self.active_thread_id = None;
+                    self.selection_message_id = None;
+                    self.new_thread_draft = Self::new_user_message_draft(window, cx);
+                    Self::draft_composer(&self.new_thread_draft)
+                        .focus_handle(cx)
+                        .focus(window, cx);
+                }
                 if let Some(endpoint) = endpoint {
                     self.tokio_handle.spawn(async move {
                         endpoint.close().await;
@@ -717,7 +777,7 @@ impl Cowork {
             SharingStatus::Connected => "Disconnect",
             SharingStatus::Failed => "Retry share",
         };
-        let sharing_enabled = active_thread.is_some() && sharing_status != SharingStatus::Sharing;
+        let sharing_enabled = sharing_status != SharingStatus::Sharing;
 
         div()
             .h(TOP_BAR_HEIGHT)
@@ -807,8 +867,8 @@ impl Cowork {
                                     cx.stop_propagation();
                                 }),
                             )
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.toggle_sharing(cx);
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.toggle_sharing(window, cx);
                             }))
                             .child(share_label),
                     )
@@ -2066,13 +2126,7 @@ impl Cowork {
                         }
                     }
                     Err(error) => {
-                        if sender
-                            .send(AgentEvent::Failed(error.to_string()))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
+                        _ = sender.send(AgentEvent::Failed(error.to_string())).await;
                         return;
                     }
                     _ => {}
@@ -2170,6 +2224,10 @@ impl Cowork {
             title.push('…');
         }
         title
+    }
+
+    fn title_for_first_message(timeline: &[TimelineMessage], prompt: &str) -> Option<String> {
+        timeline.is_empty().then(|| Self::thread_title(prompt))
     }
 
     fn editable_comment_body(comment: &UserComment, cx: &App) -> Option<String> {
@@ -2294,6 +2352,9 @@ impl Cowork {
         let thread_id = if let Some(thread) = active_thread {
             let thread_id = thread.read(cx).summary.id;
             thread.update(cx, |thread, _| {
+                if let Some(title) = Self::title_for_first_message(&thread.timeline, &prompt) {
+                    thread.summary.title = title;
+                }
                 thread.timeline.push(TimelineMessage::User(submitted_group));
                 thread.draft = next_draft;
             });
@@ -2309,6 +2370,7 @@ impl Cowork {
                 draft: next_draft,
                 generating: false,
                 sharing: ThreadSharing::NotShared,
+                ownership: ThreadOwnership::Local,
             });
             self.new_thread_draft = Self::new_user_message_draft(window, cx);
             self.thread_store.update(cx, |store, _| {
@@ -2782,6 +2844,67 @@ mod tests {
                 .iter()
                 .all(|(range, _)| range.start < range.end && range.end <= code.len())
         );
+    }
+
+    #[test]
+    fn collaborator_threads_are_removed_on_disconnect_but_owned_threads_are_retained() {
+        assert!(ThreadOwnership::Remote.remove_on_disconnect());
+        assert!(!ThreadOwnership::Local.remove_on_disconnect());
+    }
+
+    #[test]
+    fn first_message_titles_an_empty_pre_shared_thread() {
+        assert_eq!(
+            Cowork::title_for_first_message(&[], "  Collaborate on this prompt  "),
+            Some("Collaborate on this prompt".into())
+        );
+
+        let existing_timeline = vec![TimelineMessage::User(UserMessageGroup {
+            id: Uuid::new_v4(),
+            comments: Vec::new(),
+            content: UserMessageContent::Submitted {
+                text: "Existing message".into(),
+                history_text: None,
+            },
+            comments_folded: false,
+        })];
+        assert_eq!(
+            Cowork::title_for_first_message(&existing_timeline, "Later message"),
+            None
+        );
+    }
+
+    struct EmptyThreadTestView {
+        thread: Entity<Thread>,
+        draft_id: Uuid,
+    }
+
+    impl Render for EmptyThreadTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    #[gpui::test]
+    fn sharing_before_first_message_materializes_an_empty_owned_thread(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_base::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let draft = Cowork::new_user_message_draft(window, cx);
+            let draft_id = draft.id;
+            let thread = Cowork::new_empty_local_thread(draft, cx);
+            EmptyThreadTestView { thread, draft_id }
+        });
+
+        view.read_with(cx, |view, cx| {
+            let thread = view.thread.read(cx);
+            assert!(thread.timeline.is_empty());
+            assert_eq!(thread.draft.id, view.draft_id);
+            assert_eq!(thread.summary.title, "New thread");
+            assert_eq!(thread.ownership, ThreadOwnership::Local);
+            assert!(matches!(thread.sharing, ThreadSharing::NotShared));
+        });
     }
 
     struct ComposerTestView {
