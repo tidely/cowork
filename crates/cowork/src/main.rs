@@ -19,6 +19,7 @@ use iroh::{
     Endpoint, EndpointId,
     endpoint::{Connection, presets},
 };
+use itertools::Itertools;
 use rig::{
     agent::MultiTurnStreamItem,
     completion::Message as RigMessage,
@@ -2222,12 +2223,15 @@ impl Cowork {
         .detach();
     }
 
-    // TODO: Reduce allocations
     fn thread_title(prompt: &str) -> String {
-        let normalized_prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
-        let mut characters = normalized_prompt.chars();
-        let mut title = characters.by_ref().take(32).collect::<String>();
-        if characters.next().is_some() {
+        const MAX_CHARACTERS: usize = 32;
+
+        let mut title = Itertools::intersperse(prompt.split_whitespace(), " ")
+            .flat_map(str::chars)
+            .take(MAX_CHARACTERS + 1)
+            .collect::<String>();
+        if title.chars().count() > MAX_CHARACTERS {
+            title.pop();
             title.push('…');
         }
         title
@@ -2863,6 +2867,26 @@ mod tests {
     fn collaborator_threads_are_removed_on_disconnect_but_owned_threads_are_retained() {
         assert!(ThreadOwnership::Remote.remove_on_disconnect());
         assert!(!ThreadOwnership::Local.remove_on_disconnect());
+    }
+
+    #[test]
+    fn thread_titles_normalize_whitespace_and_truncate_by_character() {
+        assert_eq!(
+            Cowork::thread_title("  Collaborate\non\tthis prompt  "),
+            "Collaborate on this prompt"
+        );
+        assert_eq!(
+            Cowork::thread_title("12345678901234567890123456789012"),
+            "12345678901234567890123456789012"
+        );
+        assert_eq!(
+            Cowork::thread_title("12345678901234567890123456789012 more"),
+            "12345678901234567890123456789012…"
+        );
+        assert_eq!(
+            Cowork::thread_title("🦀".repeat(33).as_str()),
+            format!("{}…", "🦀".repeat(32))
+        );
     }
 
     #[test]

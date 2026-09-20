@@ -1850,6 +1850,7 @@ dependencies = [
  "gpui-pre",
  "gpui-pre-platform",
  "iroh",
+ "itertools 0.14.0",
  "markdown",
  "rig",
  "serde_json",
