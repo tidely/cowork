@@ -224,8 +224,7 @@ struct UserComment {
 #[derive(Clone)]
 enum UserCommentBody {
     Editing(Entity<TextareaState>),
-    // TODO: Make this SharedString, as its immutable
-    Submitted(String),
+    Submitted(SharedString),
 }
 
 struct MarkdownTextLeaf {
@@ -2241,36 +2240,30 @@ impl Cowork {
         timeline.is_empty().then(|| Self::thread_title(prompt))
     }
 
-    // TODO: This should just return the `SharedString`, saves clones down the line
-    fn editable_comment_body(comment: &UserComment, cx: &App) -> Option<String> {
+    fn editable_comment_body(comment: &UserComment, cx: &App) -> Option<SharedString> {
         let UserCommentBody::Editing(body) = &comment.body else {
             return None;
         };
-        let value = body.read(cx).value().to_string();
+        let value = body.read(cx).value();
         (!value.trim().is_empty()).then_some(value)
     }
 
     fn prompt_with_comments(
         prompt: &str,
-        draft: &UserMessageGroup,
+        comments: &[UserComment],
         timeline: &[TimelineMessage],
-        cx: &App,
     ) -> String {
-        let pending = draft
-            .comments
-            .iter()
-            .filter_map(|comment| {
-                Self::editable_comment_body(comment, cx).map(|body| (comment, body))
-            })
-            .collect::<Vec<_>>();
-        if pending.is_empty() {
+        if comments.is_empty() {
             return prompt.to_string();
         }
 
         let mut result = String::from(
             "The user attached the following inline comments to immutable excerpts from the conversation:\n",
         );
-        for (index, (comment, body)) in pending.iter().enumerate() {
+        for (index, comment) in comments.iter().enumerate() {
+            let UserCommentBody::Submitted(body) = &comment.body else {
+                continue;
+            };
             let message_number = timeline
                 .iter()
                 .position(|entry| {
@@ -2314,39 +2307,33 @@ impl Cowork {
             .unwrap_or_else(|| self.new_thread_draft.clone());
         let composer = Self::draft_composer(&draft);
         let prompt = composer.read(cx).value().to_string();
-        let has_comments = draft
-            .comments
-            .iter()
-            .any(|comment| Self::editable_comment_body(comment, cx).is_some());
+        let mut submitted_comments = Vec::new();
+        let mut remaining_comments = Vec::new();
+        for comment in &draft.comments {
+            if let Some(body) = Self::editable_comment_body(comment, cx) {
+                submitted_comments.push(UserComment {
+                    id: comment.id,
+                    source_message_id: comment.source_message_id,
+                    quote: comment.quote.clone(),
+                    source_range: comment.source_range.clone(),
+                    body: UserCommentBody::Submitted(body),
+                });
+            } else {
+                remaining_comments.push(comment);
+            }
+        }
+        let has_comments = !submitted_comments.is_empty();
         if prompt.trim().is_empty() && !has_comments {
             return;
         }
+        let remaining_comments = remaining_comments.into_iter().cloned().collect::<Vec<_>>();
 
         let timeline = active_thread
             .as_ref()
             .map(|thread| thread.read(cx).timeline.clone())
             .unwrap_or_default();
         let history = Self::rig_history(&timeline);
-        let agent_prompt = Self::prompt_with_comments(&prompt, &draft, &timeline, cx);
-        let submitted_comments = draft
-            .comments
-            .iter()
-            .filter_map(|comment| {
-                Self::editable_comment_body(comment, cx).map(|body| UserComment {
-                    id: comment.id,
-                    source_message_id: comment.source_message_id,
-                    quote: comment.quote.clone(),
-                    source_range: comment.source_range.clone(),
-                    body: UserCommentBody::Submitted(body),
-                })
-            })
-            .collect::<Vec<_>>();
-        let remaining_comments = draft
-            .comments
-            .iter()
-            .filter(|comment| Self::editable_comment_body(comment, cx).is_none())
-            .cloned()
-            .collect::<Vec<_>>();
+        let agent_prompt = Self::prompt_with_comments(&prompt, &submitted_comments, &timeline);
         let submitted_group = UserMessageGroup {
             id: draft.id,
             comments: submitted_comments,
