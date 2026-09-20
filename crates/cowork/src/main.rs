@@ -12,10 +12,13 @@ use gpui::{
 use gpui_base::{
     SelectableText, TextSelection, TextSelectionLayer, TextView, TextViewDefaults, TextViewState,
     TextViewStyle, Textarea,
-    input::{InputEditorStyle, InputEvent, TextareaState},
+    input::{Input, InputEditorStyle, InputEvent, InputState, TextareaState},
     text::{CodeBlock, SelectionFormat},
 };
-use iroh::{Endpoint, endpoint::presets};
+use iroh::{
+    Endpoint, EndpointId,
+    endpoint::{Connection, presets},
+};
 use rig::{
     agent::MultiTurnStreamItem,
     completion::Message as RigMessage,
@@ -43,6 +46,7 @@ const OLLAMA_MODEL: &str = "lfm2.5";
 const OLLAMA_CONTEXT_TOKENS: u64 = 8_192;
 const OLLAMA_AVATAR_PATH: &str = "providers/ollama.png";
 const USER_ACCENT: u32 = 0xe26d5a;
+const COWORK_ALPN: &[u8] = b"cowork/0";
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
@@ -243,6 +247,7 @@ enum SharingStatus {
     NotShared,
     Sharing,
     Shared,
+    Connected,
     Failed,
 }
 
@@ -250,6 +255,10 @@ enum ThreadSharing {
     NotShared,
     Sharing,
     Shared(Endpoint),
+    Connected {
+        endpoint: Endpoint,
+        connection: Connection,
+    },
     Failed,
 }
 
@@ -259,13 +268,29 @@ impl ThreadSharing {
             Self::NotShared => SharingStatus::NotShared,
             Self::Sharing => SharingStatus::Sharing,
             Self::Shared(_) => SharingStatus::Shared,
+            Self::Connected { .. } => SharingStatus::Connected,
             Self::Failed => SharingStatus::Failed,
         }
     }
 
     fn is_collaborating(&self) -> bool {
-        matches!(self, Self::Sharing | Self::Shared(_))
+        matches!(
+            self,
+            Self::Sharing | Self::Shared(_) | Self::Connected { .. }
+        )
     }
+}
+
+enum JoinStatus {
+    Idle,
+    Joining,
+    Failed(String),
+}
+
+struct JoinDialog {
+    endpoint_token: Entity<InputState>,
+    status: JoinStatus,
+    _input_subscription: Subscription,
 }
 
 struct Thread {
@@ -309,6 +334,7 @@ struct Cowork {
     segment_text_views: HashMap<(Uuid, Uuid, usize, usize), SegmentTextView>,
     render_generation: u64,
     titlebar_click_armed: bool,
+    join_dialog: Option<JoinDialog>,
     tokio_handle: tokio::runtime::Handle,
     _window_activation_subscription: Subscription,
 }
@@ -411,9 +437,34 @@ impl Cowork {
         let (sender, mut receiver) = mpsc::channel(1);
         self.tokio_handle.spawn(async move {
             let result = Endpoint::builder(presets::N0)
+                .alpns(vec![COWORK_ALPN.to_vec()])
                 .bind()
                 .await
                 .map_err(|error| error.to_string());
+            if let Ok(endpoint) = &result {
+                let endpoint = endpoint.clone();
+                tokio::spawn(async move {
+                    while let Some(incoming) = endpoint.accept().await {
+                        let accepting = match incoming.accept() {
+                            Ok(accepting) => accepting,
+                            Err(error) => {
+                                eprintln!("failed to accept connection: {error}");
+                                continue;
+                            }
+                        };
+                        tokio::spawn(async move {
+                            match accepting.await {
+                                Ok(connection) => {
+                                    connection.closed().await;
+                                }
+                                Err(error) => {
+                                    eprintln!("failed to establish incoming connection: {error}");
+                                }
+                            }
+                        });
+                    }
+                });
+            }
             if sender.send(result).await.is_err() {
                 return;
             }
@@ -426,17 +477,10 @@ impl Cowork {
 
             match result {
                 Ok(endpoint) => {
-                    let endpoint_id = endpoint.id().to_string();
                     thread.update(cx, |thread, _| {
                         thread.sharing = ThreadSharing::Shared(endpoint);
                     });
-                    if this
-                        .update(cx, |_, cx| {
-                            cx.write_to_clipboard(ClipboardItem::new_string(endpoint_id));
-                            cx.notify();
-                        })
-                        .is_err()
-                    {
+                    if this.update(cx, |_, cx| cx.notify()).is_err() {
                         return;
                     }
                 }
@@ -446,6 +490,161 @@ impl Cowork {
                         thread.sharing = ThreadSharing::Failed;
                     });
                     if this.update(cx, |_, cx| cx.notify()).is_err() {
+                        return;
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn copy_endpoint_id(&self, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.active_thread_id else {
+            return;
+        };
+        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+            return;
+        };
+        let endpoint_id = {
+            let thread = thread.read(cx);
+            let ThreadSharing::Shared(endpoint) = &thread.sharing else {
+                return;
+            };
+            endpoint.id().to_string()
+        };
+
+        cx.write_to_clipboard(ClipboardItem::new_string(endpoint_id));
+    }
+
+    fn open_join_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let endpoint_token = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("Paste endpoint token");
+            input.set_editor_style(InputEditorStyle {
+                caret: rgb(0xffffff).into(),
+                ..Default::default()
+            });
+            input
+        });
+        let input_subscription =
+            cx.subscribe(&endpoint_token, |this, _, event: &InputEvent, cx| {
+                if matches!(event, InputEvent::Change) {
+                    if let Some(dialog) = &mut this.join_dialog
+                        && matches!(dialog.status, JoinStatus::Failed(_))
+                    {
+                        dialog.status = JoinStatus::Idle;
+                    }
+                    cx.notify();
+                }
+            });
+        endpoint_token.focus_handle(cx).focus(window, cx);
+        self.join_dialog = Some(JoinDialog {
+            endpoint_token,
+            status: JoinStatus::Idle,
+            _input_subscription: input_subscription,
+        });
+        cx.notify();
+    }
+
+    fn close_join_dialog(&mut self, cx: &mut Context<Self>) {
+        if self
+            .join_dialog
+            .as_ref()
+            .is_some_and(|dialog| matches!(dialog.status, JoinStatus::Joining))
+        {
+            return;
+        }
+        self.join_dialog = None;
+        cx.notify();
+    }
+
+    fn join_shared_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(dialog) = &mut self.join_dialog else {
+            return;
+        };
+        if matches!(dialog.status, JoinStatus::Joining) {
+            return;
+        }
+
+        let token = dialog.endpoint_token.read(cx).value().trim().to_string();
+        let endpoint_id = match token.parse::<EndpointId>() {
+            Ok(endpoint_id) => endpoint_id,
+            Err(_) => {
+                dialog.status = JoinStatus::Failed("Enter a valid endpoint token.".into());
+                cx.notify();
+                return;
+            }
+        };
+        dialog.status = JoinStatus::Joining;
+        let draft = Self::new_user_message_draft(window, cx);
+        cx.notify();
+
+        let (sender, mut receiver) = mpsc::channel(1);
+        self.tokio_handle.spawn(async move {
+            let result = match Endpoint::builder(presets::N0).bind().await {
+                Ok(endpoint) => {
+                    match tokio::time::timeout(
+                        Duration::from_secs(20),
+                        endpoint.connect(endpoint_id, COWORK_ALPN),
+                    )
+                    .await
+                    {
+                        Ok(Ok(connection)) => Ok((endpoint, connection)),
+                        Ok(Err(error)) => Err(error.to_string()),
+                        Err(_) => Err("Connection timed out.".to_string()),
+                    }
+                }
+                Err(error) => Err(error.to_string()),
+            };
+            let _ = sender.send(result).await;
+        });
+
+        cx.spawn(async move |this, cx| {
+            let Some(result) = receiver.recv().await else {
+                return;
+            };
+            match result {
+                Ok((endpoint, connection)) => {
+                    let endpoint_label = token.chars().take(8).collect::<String>();
+                    let thread_id = Uuid::new_v4();
+                    if this
+                        .update(cx, move |this, cx| {
+                            let thread = cx.new(|_| Thread {
+                                summary: ThreadSummary {
+                                    id: thread_id,
+                                    title: format!("Shared thread {endpoint_label}"),
+                                },
+                                timeline: Vec::new(),
+                                draft,
+                                generating: false,
+                                sharing: ThreadSharing::Connected {
+                                    endpoint,
+                                    connection,
+                                },
+                            });
+                            this.thread_store.update(cx, |store, _| {
+                                store.threads.insert(0, thread);
+                            });
+                            this.active_thread_id = Some(thread_id);
+                            this.selection_message_id = None;
+                            this.join_dialog = None;
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    eprintln!("failed to join shared thread: {error}");
+                    if this
+                        .update(cx, |this, cx| {
+                            if let Some(dialog) = &mut this.join_dialog {
+                                dialog.status = JoinStatus::Failed(error);
+                            }
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -481,6 +680,25 @@ impl Cowork {
                 }
                 cx.notify();
             }
+            SharingStatus::Connected => {
+                let endpoint = thread.update(cx, |thread, _| {
+                    let ThreadSharing::Connected {
+                        endpoint,
+                        connection,
+                    } = std::mem::replace(&mut thread.sharing, ThreadSharing::NotShared)
+                    else {
+                        return None;
+                    };
+                    drop(connection);
+                    Some(endpoint)
+                });
+                if let Some(endpoint) = endpoint {
+                    self.tokio_handle.spawn(async move {
+                        endpoint.close().await;
+                    });
+                }
+                cx.notify();
+            }
         }
     }
 
@@ -496,6 +714,7 @@ impl Cowork {
             SharingStatus::NotShared => "Share",
             SharingStatus::Sharing => "Sharing…",
             SharingStatus::Shared => "Unshare",
+            SharingStatus::Connected => "Disconnect",
             SharingStatus::Failed => "Retry share",
         };
         let sharing_enabled = active_thread.is_some() && sharing_status != SharingStatus::Sharing;
@@ -532,6 +751,34 @@ impl Cowork {
                     .h_full()
                     .flex()
                     .items_center()
+                    .when(sharing_status == SharingStatus::Shared, |this| {
+                        this.child(
+                            div()
+                                .id("copy-endpoint-id")
+                                .size(px(28.))
+                                .mr_1()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_md()
+                                .occlude()
+                                .cursor_pointer()
+                                .text_sm()
+                                .text_color(rgb(0xa1a1aa))
+                                .hover(|this| this.bg(rgb(0x2d2d30)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.titlebar_click_armed = false;
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.copy_endpoint_id(cx);
+                                }))
+                                .child("🔗"),
+                        )
+                    })
                     .child(
                         div()
                             .id("toggle-sharing")
@@ -718,6 +965,27 @@ impl Cowork {
                     )
                     .child(
                         div()
+                            .id("join-shared-thread")
+                            .h(px(34.))
+                            .mx_2()
+                            .px_2()
+                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded_md()
+                            .cursor_pointer()
+                            .hover(|this| this.bg(rgb(0x3a3a3e)))
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_join_dialog(window, cx);
+                            }))
+                            .text_sm()
+                            .text_color(rgb(0xf4f4f5))
+                            .child("🔗")
+                            .child("Join shared thread"),
+                    )
+                    .child(
+                        div()
                             .h(px(44.))
                             .flex_none()
                             .flex()
@@ -766,6 +1034,149 @@ impl Cowork {
                         )
                     }),
             )
+    }
+
+    fn render_join_dialog(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let dialog = self.join_dialog.as_ref()?;
+        let joining = matches!(dialog.status, JoinStatus::Joining);
+        let has_token = !dialog.endpoint_token.read(cx).value().trim().is_empty();
+        let can_join = has_token && !joining;
+        let error = match &dialog.status {
+            JoinStatus::Failed(error) => Some(error.clone()),
+            _ => None,
+        };
+        let endpoint_token = dialog.endpoint_token.clone();
+
+        Some(
+            div()
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .id("join-dialog-backdrop")
+                        .absolute()
+                        .inset_0()
+                        .bg(rgba(0x00000099))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.close_join_dialog(cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .id("join-dialog")
+                        .relative()
+                        .w(px(440.))
+                        .p_5()
+                        .flex()
+                        .flex_col()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(rgb(0x3f3f46))
+                        .bg(rgb(0x242427))
+                        .shadow_lg()
+                        .text_sm()
+                        .text_color(rgb(0xd4d4d8))
+                        .child(
+                            div()
+                                .text_size(px(17.))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(rgb(0xf4f4f5))
+                                .child("Join shared thread"),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_color(rgb(0xa1a1aa))
+                                .child("Paste the endpoint token shared with you."),
+                        )
+                        .child(
+                            div()
+                                .id("endpoint-token-input")
+                                .h(px(38.))
+                                .mt_4()
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x52525b))
+                                .bg(rgb(0x18181b))
+                                .on_click({
+                                    let endpoint_token = endpoint_token.clone();
+                                    cx.listener(move |_, _, window, cx| {
+                                        endpoint_token.focus_handle(cx).focus(window, cx);
+                                    })
+                                })
+                                .child(Input::new(&endpoint_token)),
+                        )
+                        .children(
+                            error.map(|error| div().mt_2().text_color(rgb(0xf87171)).child(error)),
+                        )
+                        .child(
+                            div()
+                                .mt_5()
+                                .flex()
+                                .justify_end()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .id("cancel-join")
+                                        .h(px(32.))
+                                        .px_3()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(0x52525b))
+                                        .text_color(if joining {
+                                            rgb(0x71717a)
+                                        } else {
+                                            rgb(0xd4d4d8)
+                                        })
+                                        .when(!joining, |this| {
+                                            this.cursor_pointer()
+                                                .hover(|this| this.bg(rgb(0x3a3a3e)))
+                                        })
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.close_join_dialog(cx);
+                                        }))
+                                        .child("Cancel"),
+                                )
+                                .child(
+                                    div()
+                                        .id("confirm-join")
+                                        .h(px(32.))
+                                        .px_3()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .bg(if can_join {
+                                            rgb(USER_ACCENT)
+                                        } else {
+                                            rgb(0x3f3f46)
+                                        })
+                                        .text_color(if can_join {
+                                            rgb(0xffffff)
+                                        } else {
+                                            rgb(0x71717a)
+                                        })
+                                        .when(can_join, |this| {
+                                            this.cursor_pointer().hover(|this| this.opacity(0.9))
+                                        })
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.join_shared_thread(window, cx);
+                                        }))
+                                        .child(if joining { "Joining…" } else { "Join thread" }),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
     }
 
     fn markdown_text_leaves(markdown: &str) -> Vec<MarkdownTextLeaf> {
@@ -2082,6 +2493,7 @@ impl Render for Cowork {
 
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .overflow_hidden()
@@ -2108,6 +2520,7 @@ impl Render for Cowork {
                     )
                     .child(self.render_main_editor(window, cx)),
             )
+            .children(self.render_join_dialog(cx))
     }
 }
 
@@ -2193,6 +2606,7 @@ fn main() {
                         segment_text_views: HashMap::new(),
                         render_generation: 0,
                         titlebar_click_armed: false,
+                        join_dialog: None,
                         tokio_handle,
                         _window_activation_subscription: window_activation_subscription,
                     }
