@@ -2001,14 +2001,9 @@ impl Cowork {
         self.segment_text_views
             .retain(|_, text_view| text_view.rendered_at == self.render_generation);
 
-        let composer_comments = draft
-            .comments
-            .iter()
-            .map(|comment| Self::render_comment_card(comment, "composer"))
-            .collect::<Vec<_>>();
-        let composer_comment_count = composer_comments.len();
-        let composer_comment_group = (composer_comment_count > 0).then_some(draft.id);
-        let composer_comments_collapsed = draft.comments_folded;
+        // Draft comments are already rendered beside their quoted agent text. A TextareaState
+        // keeps one set of layout bounds for mouse hit-testing, so rendering the same comment
+        // editor here as well would make clicks in the inline copy resolve against this copy.
         let composer = Self::draft_composer(&draft);
 
         div()
@@ -2061,17 +2056,6 @@ impl Cowork {
                                             .flex()
                                             .flex_col()
                                             .gap_3()
-                                            .when_some(composer_comment_group, |this, group_id| {
-                                                this.child(Self::render_comment_group_toggle(
-                                                    group_id,
-                                                    composer_comment_count,
-                                                    composer_comments_collapsed,
-                                                    cx,
-                                                ))
-                                            })
-                                            .when(!composer_comments_collapsed, |this| {
-                                                this.children(composer_comments)
-                                            })
                                             .child(
                                                 Self::render_composer_input(&composer).on_click({
                                                     let composer = composer.clone();
