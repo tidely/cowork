@@ -22,4 +22,5 @@ rig = { git = "https://github.com/0xPlaygrounds/rig", rev = "2d16c1b25f6749b3a2c
 serde_json = "1"
 syntect = { version = "5.2", default-features = false, features = ["default-fancy"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
+tokio-util = "0.7"
 uuid = { version = "1", features = ["v4"] }

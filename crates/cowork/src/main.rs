@@ -34,6 +34,7 @@ use syntect::{
     util::LinesWithEndings,
 };
 use tokio::{runtime::Runtime, sync::mpsc};
+use tokio_util::sync::PollSender;
 use uuid::Uuid;
 
 const SIDEBAR_WIDTH: gpui::Pixels = px(275.);
@@ -325,14 +326,6 @@ impl ThreadStore {
             .find(|thread| thread.read(cx).summary.id == thread_id)
             .cloned()
     }
-}
-
-enum AgentEvent {
-    Thinking(String),
-    ThinkingFinished,
-    Text(String),
-    Finished,
-    Failed(String),
 }
 
 struct Cowork {
@@ -2076,20 +2069,8 @@ impl Cowork {
 
         let thread = thread.clone();
         let (sender, mut receiver) = mpsc::channel(128);
-        self.tokio_handle.spawn(async move {
-            let client = match Ollama::new().bound() {
-                Ok(client) => client,
-                Err(error) => {
-                    if sender
-                        .send(AgentEvent::Failed(error.to_string()))
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    return;
-                }
-            };
+        let generation_task = self.tokio_handle.spawn(async move {
+            let client = Ollama::new().bound().map_err(|error| error.to_string())?;
             let agent = client
                 .agent(OLLAMA_MODEL)
                 .additional_params(json!({
@@ -2097,49 +2078,18 @@ impl Cowork {
                     "think": "medium"
                 }))
                 .build();
-            let mut stream = agent.prompt(prompt).history(&history).stream();
+            let stream = agent.prompt(prompt).history(&history).stream();
 
-            while let Some(item) = stream.next().await {
-                match item {
-                    Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockDelta {
-                        delta: Delta::Reasoning { text },
-                        ..
-                    })) => {
-                        if sender.send(AgentEvent::Thinking(text)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockEnd {
-                        end: BlockClose::Reasoning { .. },
-                        ..
-                    })) => {
-                        if sender.send(AgentEvent::ThinkingFinished).await.is_err() {
-                            return;
-                        }
-                    }
-                    Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockDelta {
-                        delta: Delta::Text { text },
-                        ..
-                    })) => {
-                        if sender.send(AgentEvent::Text(text)).await.is_err() {
-                            return;
-                        }
-                    }
-                    Err(error) => {
-                        _ = sender.send(AgentEvent::Failed(error.to_string())).await;
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-
-            if sender.send(AgentEvent::Finished).await.is_err() {
-                return;
-            }
+            _ = stream
+                .map(|item| Ok(item.map_err(|error| error.to_string())))
+                .forward(PollSender::new(sender))
+                .await;
+            Ok(())
         });
 
         cx.spawn(async move |this, cx| {
-            while let Some(event) = receiver.recv().await {
+            let mut stream_completed = true;
+            while let Some(item) = receiver.recv().await {
                 let (finished, text_view_update) = thread.update(cx, |thread, _| {
                     let Some(message) = thread.timeline.iter_mut().find_map(|entry| match entry {
                         TimelineMessage::Agent(message) if message.id == message_id => {
@@ -2149,17 +2099,26 @@ impl Cowork {
                     }) else {
                         return (true, None);
                     };
-                    match event {
-                        AgentEvent::Thinking(text) => {
+                    match item {
+                        Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockDelta {
+                            delta: Delta::Reasoning { text },
+                            ..
+                        })) => {
                             message.thinking.push_str(&text);
                             (false, Some((message.thinking_view.clone(), text, true)))
                         }
-                        AgentEvent::ThinkingFinished => {
+                        Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockEnd {
+                            end: BlockClose::Reasoning { .. },
+                            ..
+                        })) => {
                             message.thinking_complete = true;
                             message.thinking_expanded = false;
                             (false, None)
                         }
-                        AgentEvent::Text(text) => {
+                        Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockDelta {
+                            delta: Delta::Text { text },
+                            ..
+                        })) => {
                             if !message.thinking.is_empty() && !message.thinking_complete {
                                 message.thinking_complete = true;
                                 message.thinking_expanded = false;
@@ -2167,14 +2126,7 @@ impl Cowork {
                             message.text.push_str(&text);
                             (false, Some((message.text_view.clone(), text, true)))
                         }
-                        AgentEvent::Finished => {
-                            message.complete = true;
-                            message.thinking_complete = true;
-                            message.thinking_expanded = false;
-                            thread.generating = false;
-                            (true, None)
-                        }
-                        AgentEvent::Failed(error) => {
+                        Err(error) => {
                             message.complete = true;
                             message.thinking_complete = true;
                             message.thinking_expanded = false;
@@ -2188,6 +2140,7 @@ impl Cowork {
                             thread.generating = false;
                             (true, update)
                         }
+                        _ => (false, None),
                     }
                 });
                 if let Some((text_view, text, append)) = text_view_update {
@@ -2209,8 +2162,49 @@ impl Cowork {
                     }
                 });
                 if result.is_err() || finished {
+                    stream_completed = false;
                     break;
                 }
+            }
+
+            if stream_completed {
+                let error = match generation_task.await {
+                    Ok(Ok(())) => None,
+                    Ok(Err(error)) => Some(error),
+                    Err(error) => Some(error.to_string()),
+                };
+                let text_view_update = thread.update(cx, |thread, _| {
+                    let Some(message) = thread.timeline.iter_mut().find_map(|entry| match entry {
+                        TimelineMessage::Agent(message) if message.id == message_id => {
+                            Some(message)
+                        }
+                        _ => None,
+                    }) else {
+                        return None;
+                    };
+                    message.complete = true;
+                    message.thinking_complete = true;
+                    message.thinking_expanded = false;
+                    thread.generating = false;
+                    let Some(error) = error else {
+                        return None;
+                    };
+                    message.failed = true;
+                    if message.text.is_empty() {
+                        message.text = format!("Unable to generate a response: {error}");
+                        Some((message.text_view.clone(), message.text.clone()))
+                    } else {
+                        None
+                    }
+                });
+                if let Some((text_view, text)) = text_view_update {
+                    text_view.update(cx, |text_view, cx| text_view.set_text(&text, cx));
+                }
+                _ = this.update(cx, |this, cx| {
+                    if this.active_thread_id == Some(thread_id) {
+                        cx.notify();
+                    }
+                });
             }
         })
         .detach();

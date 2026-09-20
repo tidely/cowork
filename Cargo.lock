@@ -1855,6 +1855,7 @@ dependencies = [
  "serde_json",
  "syntect",
  "tokio",
+ "tokio-util",
  "uuid",
 ]
 
