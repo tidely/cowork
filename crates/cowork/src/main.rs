@@ -223,6 +223,7 @@ struct UserComment {
 #[derive(Clone)]
 enum UserCommentBody {
     Editing(Entity<TextareaState>),
+    // TODO: Make this SharedString, as its immutable
     Submitted(String),
 }
 
@@ -316,6 +317,7 @@ struct Thread {
 }
 
 struct ThreadStore {
+    // TODO: We insert a lot at index 0, we should use a VecDeque
     threads: Vec<Entity<Thread>>,
 }
 
@@ -632,6 +634,8 @@ impl Cowork {
                     .await
                     {
                         Ok(Ok(connection)) => Ok((endpoint, connection)),
+                        // TODO: make errors just use anyhow, that way we can just ? them,
+                        // instead of having .to_string everywhere
                         Ok(Err(error)) => Err(error.to_string()),
                         Err(_) => Err("Connection timed out.".to_string()),
                     }
@@ -1361,18 +1365,32 @@ impl Cowork {
     }
 
     fn annotate_markdown(markdown: &str, ranges: impl IntoIterator<Item = Range<usize>>) -> String {
-        let mut ranges = ranges.into_iter().collect::<Vec<_>>();
+        let mut ranges = ranges
+            .into_iter()
+            .filter(|range| {
+                range.start < range.end
+                    && range.end <= markdown.len()
+                    && markdown.is_char_boundary(range.start)
+                    && markdown.is_char_boundary(range.end)
+            })
+            .collect::<Vec<_>>();
         ranges.sort_by_key(|range| range.start);
-        let mut annotated = markdown.to_string();
-        for range in ranges.into_iter().rev() {
-            if range.start < range.end
-                && range.end <= annotated.len()
-                && annotated.is_char_boundary(range.start)
-                && annotated.is_char_boundary(range.end)
+
+        let mut merged_ranges = Vec::<Range<usize>>::new();
+        for range in ranges {
+            if let Some(previous) = merged_ranges.last_mut()
+                && range.start <= previous.end
             {
-                annotated.insert_str(range.end, "</a>");
-                annotated.insert_str(range.start, "<a href=\"#inline-comment\">");
+                previous.end = previous.end.max(range.end);
+            } else {
+                merged_ranges.push(range);
             }
+        }
+
+        let mut annotated = markdown.to_string();
+        for range in merged_ranges.into_iter().rev() {
+            annotated.insert_str(range.end, "](#inline-comment)");
+            annotated.insert_str(range.start, "[");
         }
         annotated
     }
@@ -1643,12 +1661,6 @@ impl Cowork {
         Self::markdown_style().with_link(rgb(USER_ACCENT).into())
     }
 
-    fn annotated_markdown_html(markdown: &str) -> String {
-        let mut options = markdown::Options::gfm();
-        options.compile.allow_dangerous_html = true;
-        markdown::to_html_with_options(markdown, &options).unwrap_or_else(|_| markdown.to_string())
-    }
-
     fn render_message_segment(
         &mut self,
         thread_id: Uuid,
@@ -1660,9 +1672,9 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         if annotated {
-            return TextView::html(
+            return TextView::markdown(
                 format!("timeline-annotated-{message_id}-{segment_index}"),
-                Self::annotated_markdown_html(text),
+                text,
             )
             .style(Self::annotated_markdown_style())
             .w_full()
@@ -2210,6 +2222,7 @@ impl Cowork {
         .detach();
     }
 
+    // TODO: Reduce allocations
     fn thread_title(prompt: &str) -> String {
         let normalized_prompt = prompt.split_whitespace().collect::<Vec<_>>().join(" ");
         let mut characters = normalized_prompt.chars();
@@ -2224,6 +2237,7 @@ impl Cowork {
         timeline.is_empty().then(|| Self::thread_title(prompt))
     }
 
+    // TODO: This should just return the `SharedString`, saves clones down the line
     fn editable_comment_body(comment: &UserComment, cx: &App) -> Option<String> {
         let UserCommentBody::Editing(body) = &comment.body else {
             return None;
@@ -2683,28 +2697,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn annotated_markdown_preserves_inline_underline() {
-        let html = Cowork::annotated_markdown_html(
-            "Before <a href=\"#inline-comment\">selected text</a> after",
-        );
+    fn annotated_markdown_uses_native_markdown_link() {
+        let annotated = Cowork::annotate_markdown("Before selected text after", [7..20]);
 
-        assert!(html.contains("<a href=\"#inline-comment\">selected text</a>"));
-        assert!(html.contains("Before "));
-        assert!(html.contains(" after"));
+        assert_eq!(annotated, "Before [selected text](#inline-comment) after");
+    }
+
+    #[test]
+    fn annotated_markdown_merges_intersecting_comments() {
+        let annotated = Cowork::annotate_markdown("overlapping", [0..7, 4..11]);
+
+        assert_eq!(annotated, "[overlapping](#inline-comment)");
     }
 
     #[test]
     fn annotated_markdown_preserves_heading_around_partial_selection() {
-        let html = Cowork::annotated_markdown_html("### A <a href=\"#inline-comment\">Heading</a>");
+        let annotated = Cowork::annotate_markdown("### A Heading", [6..13]);
 
-        assert!(html.contains("<h3>A <a href=\"#inline-comment\">Heading</a></h3>"));
+        assert_eq!(annotated, "### A [Heading](#inline-comment)");
     }
 
     #[test]
     fn annotated_markdown_preserves_bold_around_partial_selection() {
-        let html = Cowork::annotated_markdown_html("**H<a href=\"#inline-comment\">i</a>**");
+        let annotated = Cowork::annotate_markdown("**Hi**", [3..4]);
 
-        assert!(html.contains("<strong>H<a href=\"#inline-comment\">i</a></strong>"));
+        assert_eq!(annotated, "**H[i](#inline-comment)**");
     }
 
     #[test]
@@ -2714,55 +2731,55 @@ mod tests {
                 "inside bold",
                 "Before **bold text** after",
                 "old",
-                "Before **b<a href=\"#inline-comment\">old</a> text** after",
+                "Before **b[old](#inline-comment) text** after",
             ),
             (
                 "across opening bold edge",
                 "Before **bold text** after",
                 "re bold",
-                "Befo<a href=\"#inline-comment\">re </a>**<a href=\"#inline-comment\">bold</a> text** after",
+                "Befo[re ](#inline-comment)**[bold](#inline-comment) text** after",
             ),
             (
                 "across closing bold edge",
                 "Before **bold text** after",
                 "text af",
-                "Before **bold <a href=\"#inline-comment\">text</a>**<a href=\"#inline-comment\"> af</a>ter",
+                "Before **bold [text](#inline-comment)**[ af](#inline-comment)ter",
             ),
             (
                 "whole bold section",
                 "Before **bold text** after",
                 "bold text",
-                "Before **<a href=\"#inline-comment\">bold text</a>** after",
+                "Before **[bold text](#inline-comment)** after",
             ),
             (
                 "across several styled sections",
                 "A **bold** and *italic* tail",
                 "bold and italic ta",
-                "A **<a href=\"#inline-comment\">bold</a>**<a href=\"#inline-comment\"> and </a>*<a href=\"#inline-comment\">italic</a>*<a href=\"#inline-comment\"> ta</a>il",
+                "A **[bold](#inline-comment)**[ and ](#inline-comment)*[italic](#inline-comment)*[ ta](#inline-comment)il",
             ),
             (
                 "nested styles",
                 "Start **bold and *italic*** end",
                 "and italic",
-                "Start **bold <a href=\"#inline-comment\">and </a>*<a href=\"#inline-comment\">italic</a>*** end",
+                "Start **bold [and ](#inline-comment)*[italic](#inline-comment)*** end",
             ),
             (
                 "whole inline code",
                 "Use `value` now",
                 "value",
-                "Use <a href=\"#inline-comment\">`value`</a> now",
+                "Use [`value`](#inline-comment) now",
             ),
             (
                 "partial inline code is atomic",
                 "Use `value` now",
                 "alu",
-                "Use <a href=\"#inline-comment\">`value`</a> now",
+                "Use [`value`](#inline-comment) now",
             ),
             (
                 "heading and emphasis",
                 "### A **styled heading** here",
                 "A styled heading h",
-                "### <a href=\"#inline-comment\">A </a>**<a href=\"#inline-comment\">styled heading</a>**<a href=\"#inline-comment\"> h</a>ere",
+                "### [A ](#inline-comment)**[styled heading](#inline-comment)**[ h](#inline-comment)ere",
             ),
         ];
 
@@ -2773,9 +2790,10 @@ mod tests {
             let annotated = Cowork::annotate_markdown(markdown, ranges);
 
             assert_eq!(annotated, expected, "{name}");
-            let html = Cowork::annotated_markdown_html(&annotated);
+            let html = markdown::to_html_with_options(&annotated, &markdown::Options::gfm())
+                .expect("annotated Markdown should compile");
             assert!(
-                html.contains("<a href=\"#inline-comment\">"),
+                html.contains("href=\"#inline-comment\""),
                 "{name}: annotation should survive Markdown rendering: {html}"
             );
         }
@@ -2789,11 +2807,12 @@ mod tests {
             .expect("selection should map to the Markdown source");
         let ranges = Cowork::annotation_ranges(markdown, source_range);
         let annotated = Cowork::annotate_markdown(markdown, ranges);
-        let html = Cowork::annotated_markdown_html(&annotated);
+        let html = markdown::to_html_with_options(&annotated, &markdown::Options::gfm())
+            .expect("annotated Markdown should compile");
 
         assert_eq!(
             annotated,
-            "<a href=\"#inline-comment\">In Rust, we use `u128` to handle larger numbers</a>"
+            "[In Rust, we use `u128` to handle larger numbers](#inline-comment)"
         );
         assert!(html.contains(
             "<a href=\"#inline-comment\">In Rust, we use <code>u128</code> to handle larger numbers</a>"
