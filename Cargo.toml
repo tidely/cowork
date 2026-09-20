@@ -11,6 +11,7 @@ edition = "2024"
 [workspace.lints.clippy]
 
 [workspace.dependencies]
+anyhow = "1"
 gpui = { package = "gpui-pre", version = "0.3.5" }
 # https://github.com/longbridge/gpui-kit/pull/3136
 gpui-base = { git = "https://github.com/tidely/gpui-kit", branch = "selected-source-range" }

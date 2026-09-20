@@ -6,6 +6,7 @@ use std::{
     time::Duration,
 };
 
+use anyhow::Context as _;
 use futures::StreamExt;
 use gpui::{
     Animation, AnimationExt, App, AppContext, AssetSource, Bounds, ClipboardItem, Context, Entity,
@@ -630,23 +631,17 @@ impl Cowork {
 
         let (sender, mut receiver) = mpsc::channel(1);
         self.tokio_handle.spawn(async move {
-            let result = match Endpoint::builder(presets::N0).bind().await {
-                Ok(endpoint) => {
-                    match tokio::time::timeout(
-                        Duration::from_secs(20),
-                        endpoint.connect(endpoint_id, COWORK_ALPN),
-                    )
-                    .await
-                    {
-                        Ok(Ok(connection)) => Ok((endpoint, connection)),
-                        // TODO: make errors just use anyhow, that way we can just ? them,
-                        // instead of having .to_string everywhere
-                        Ok(Err(error)) => Err(error.to_string()),
-                        Err(_) => Err("Connection timed out.".to_string()),
-                    }
-                }
-                Err(error) => Err(error.to_string()),
-            };
+            let result: anyhow::Result<_> = async {
+                let endpoint = Endpoint::builder(presets::N0).bind().await?;
+                let connection = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    endpoint.connect(endpoint_id, COWORK_ALPN),
+                )
+                .await
+                .context("Connection timed out.")??;
+                Ok((endpoint, connection))
+            }
+            .await;
             let _ = sender.send(result).await;
         });
 
@@ -692,7 +687,7 @@ impl Cowork {
                     if this
                         .update(cx, |this, cx| {
                             if let Some(dialog) = &mut this.join_dialog {
-                                dialog.status = JoinStatus::Failed(error);
+                                dialog.status = JoinStatus::Failed(error.to_string());
                             }
                             cx.notify();
                         })
