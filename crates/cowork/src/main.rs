@@ -1041,25 +1041,27 @@ impl Cowork {
                             .child("🔗")
                             .child("Join shared thread"),
                     )
-                    .child(
-                        div()
-                            .h(px(44.))
-                            .flex_none()
-                            .flex()
-                            .items_end()
-                            .px_3()
-                            .pb_2()
-                            .text_sm()
-                            .text_color(rgb(0x71717a))
-                            .child("Collaborating"),
-                    )
-                    .child(
-                        div().flex_none().px_2().children(
-                            collaborating_threads
-                                .iter()
-                                .map(|(thread, _)| self.render_sidebar_thread(thread, cx)),
-                        ),
-                    )
+                    .when(!collaborating_threads.is_empty(), |this| {
+                        this.child(
+                            div()
+                                .h(px(44.))
+                                .flex_none()
+                                .flex()
+                                .items_end()
+                                .px_3()
+                                .pb_2()
+                                .text_sm()
+                                .text_color(rgb(0x71717a))
+                                .child("Collaborating"),
+                        )
+                        .child(
+                            div().flex_none().px_2().children(
+                                collaborating_threads
+                                    .iter()
+                                    .map(|(thread, _)| self.render_sidebar_thread(thread, cx)),
+                            ),
+                        )
+                    })
                     .child(
                         div()
                             .id("toggle-recents")
