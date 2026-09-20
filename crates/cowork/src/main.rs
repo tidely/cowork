@@ -1,4 +1,10 @@
-use std::{borrow::Cow, collections::HashMap, ops::Range, sync::OnceLock, time::Duration};
+use std::{
+    borrow::Cow,
+    collections::{HashMap, VecDeque},
+    ops::Range,
+    sync::OnceLock,
+    time::Duration,
+};
 
 use futures::StreamExt;
 use gpui::{
@@ -317,8 +323,7 @@ struct Thread {
 }
 
 struct ThreadStore {
-    // TODO: We insert a lot at index 0, we should use a VecDeque
-    threads: Vec<Entity<Thread>>,
+    threads: VecDeque<Entity<Thread>>,
 }
 
 impl ThreadStore {
@@ -404,7 +409,7 @@ impl Cowork {
         let thread = Self::new_empty_local_thread(draft, cx);
         self.active_thread_id = Some(thread.read(cx).summary.id);
         self.thread_store.update(cx, |store, _| {
-            store.threads.insert(0, thread.clone());
+            store.threads.push_front(thread.clone());
         });
         thread
     }
@@ -670,7 +675,7 @@ impl Cowork {
                                 ownership: ThreadOwnership::Remote,
                             });
                             this.thread_store.update(cx, |store, _| {
-                                store.threads.insert(0, thread);
+                                store.threads.push_front(thread);
                             });
                             this.active_thread_id = Some(thread_id);
                             this.selection_message_id = None;
@@ -2373,7 +2378,7 @@ impl Cowork {
             });
             self.new_thread_draft = Self::new_user_message_draft(window, cx);
             self.thread_store.update(cx, |store, _| {
-                store.threads.insert(0, thread.clone());
+                store.threads.push_front(thread.clone());
             });
             self.active_thread_id = Some(thread_id);
             thread_id
@@ -2642,7 +2647,7 @@ fn main() {
             if let Err(error) = cx.open_window(window_options, move |window, cx| {
                 let tokio_handle = tokio_handle.clone();
                 let thread_store = cx.new(|_| ThreadStore {
-                    threads: Vec::new(),
+                    threads: VecDeque::new(),
                 });
                 let new_thread_draft = Cowork::new_user_message_draft(window, cx);
                 Cowork::draft_composer(&new_thread_draft)
