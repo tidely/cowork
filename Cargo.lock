@@ -3957,7 +3957,7 @@ dependencies = [
 [[package]]
 name = "gpui-base"
 version = "0.6.4"
-source = "git+https://github.com/tidely/gpui-kit?branch=selected-source-range#a9a53e410c0d50a538142c688c769190529cd46c"
+source = "git+https://github.com/tidely/gpui-kit?branch=selected-source-range#e00be9c3b704337a494ec57ea98c238acfa04c50"
 dependencies = [
  "aho-corasick",
  "anyhow",

@@ -238,9 +238,9 @@ enum UserCommentBody {
 }
 
 struct MarkdownTextLeaf {
-    rendered: String,
     source_range: Range<usize>,
     annotation_range: Range<usize>,
+    atomic: bool,
 }
 
 struct SegmentTextView {
@@ -1259,27 +1259,26 @@ impl Cowork {
 
     fn markdown_text_leaves(markdown: &str) -> Vec<MarkdownTextLeaf> {
         fn collect(node: &markdown::mdast::Node, source: &str, leaves: &mut Vec<MarkdownTextLeaf>) {
-            let value_and_atomic = match node {
-                markdown::mdast::Node::Text(text) => Some((&text.value, false)),
-                markdown::mdast::Node::InlineCode(code) => Some((&code.value, true)),
-                _ => None,
-            };
-            if let Some((value, atomic)) = value_and_atomic
-                && !value.is_empty()
+            let atomic = matches!(node, markdown::mdast::Node::InlineCode(_));
+            if (matches!(node, markdown::mdast::Node::Text(_)) || atomic)
                 && let Some(position) = node.position()
-                && let Some(node_source) = source.get(position.start.offset..position.end.offset)
-                && let Some(relative_start) = node_source.find(value)
+                && position.start.offset < position.end.offset
+                && source
+                    .get(position.start.offset..position.end.offset)
+                    .is_some()
             {
-                let start = position.start.offset + relative_start;
-                let source_range = start..start + value.len();
+                let mut source_start = position.start.offset;
+                if !atomic
+                    && let Some(previous) = source_start.checked_sub(1)
+                    && source.as_bytes().get(previous) == Some(&b'\\')
+                {
+                    source_start = previous;
+                }
+                let source_range = source_start..position.end.offset;
                 leaves.push(MarkdownTextLeaf {
-                    rendered: value.clone(),
-                    source_range,
-                    annotation_range: if atomic {
-                        position.start.offset..position.end.offset
-                    } else {
-                        start..start + value.len()
-                    },
+                    source_range: source_range.clone(),
+                    annotation_range: position.start.offset..position.end.offset,
+                    atomic,
                 });
                 return;
             }
@@ -1329,38 +1328,6 @@ impl Cowork {
         segmented.or_else(|| message.text_view.read(cx).selected_source_range())
     }
 
-    fn unique_source_range_for_quote(markdown: &str, quote: &str) -> Option<Range<usize>> {
-        let leaves = Self::markdown_text_leaves(markdown);
-        let rendered = leaves
-            .iter()
-            .map(|leaf| leaf.rendered.as_str())
-            .collect::<String>();
-        let mut matches = rendered.match_indices(quote);
-        let (rendered_start, _) = matches.next()?;
-        if matches.next().is_some() {
-            return None;
-        }
-        let rendered_end = rendered_start + quote.len();
-        let mut rendered_cursor = 0;
-        let mut source_start = None;
-        let mut source_end = None;
-
-        for leaf in leaves {
-            let leaf_start = rendered_cursor;
-            let leaf_end = leaf_start + leaf.rendered.len();
-            if source_start.is_none() && rendered_start >= leaf_start && rendered_start < leaf_end {
-                source_start = Some(leaf.source_range.start + rendered_start - leaf_start);
-            }
-            if rendered_end > leaf_start && rendered_end <= leaf_end {
-                source_end = Some(leaf.source_range.start + rendered_end - leaf_start);
-                break;
-            }
-            rendered_cursor = leaf_end;
-        }
-
-        Some(source_start?..source_end?)
-    }
-
     fn annotation_ranges(markdown: &str, selection: Range<usize>) -> Vec<Range<usize>> {
         let mut ranges = Vec::<Range<usize>>::new();
         for leaf in Self::markdown_text_leaves(markdown) {
@@ -1369,7 +1336,7 @@ impl Cowork {
             if start >= end {
                 continue;
             }
-            let range = if leaf.annotation_range != leaf.source_range {
+            let range = if leaf.atomic {
                 leaf.annotation_range
             } else {
                 start..end
@@ -1422,6 +1389,47 @@ impl Cowork {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.keystroke.key == "escape" {
+            let Some(thread) = self
+                .active_thread_id
+                .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
+            else {
+                return;
+            };
+            let empty_comment_id = thread.read(cx).draft.comments.iter().find_map(|comment| {
+                let UserCommentBody::Editing { inline, composer } = &comment.body else {
+                    return None;
+                };
+                let focused_editor = if inline.focus_handle(cx).is_focused(window) {
+                    inline
+                } else if composer.focus_handle(cx).is_focused(window) {
+                    composer
+                } else {
+                    return None;
+                };
+                focused_editor
+                    .read(cx)
+                    .value()
+                    .trim()
+                    .is_empty()
+                    .then_some(comment.id)
+            });
+            let Some(comment_id) = empty_comment_id else {
+                return;
+            };
+
+            thread.update(cx, |thread, _| {
+                thread
+                    .draft
+                    .comments
+                    .retain(|comment| comment.id != comment_id);
+            });
+            window.prevent_default();
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        }
+
         if event.keystroke.modifiers.control
             || event.keystroke.modifiers.platform
             || event.keystroke.modifiers.function
@@ -1454,9 +1462,8 @@ impl Cowork {
             }) else {
                 return;
             };
-            let Some(source_range) = self
-                .selected_message_source_range(thread_id, message_id, message, cx)
-                .or_else(|| Self::unique_source_range_for_quote(&message.text, &quote))
+            let Some(source_range) =
+                self.selected_message_source_range(thread_id, message_id, message, cx)
             else {
                 return;
             };
@@ -2826,67 +2833,74 @@ mod tests {
     }
 
     #[test]
-    fn comments_follow_plain_text_selections_across_markdown_boundaries() {
+    fn comments_follow_gpui_source_ranges_across_markdown_boundaries() {
+        fn through(markdown: &str, start: &str, end: &str) -> Range<usize> {
+            let start_offset = markdown.find(start).expect("selection start");
+            let end_offset = markdown[start_offset..]
+                .find(end)
+                .map(|offset| start_offset + offset + end.len())
+                .expect("selection end");
+            start_offset..end_offset
+        }
+
         let cases = [
             (
                 "inside bold",
                 "Before **bold text** after",
-                "old",
+                through("Before **bold text** after", "old", "old"),
                 "Before **b[old](#inline-comment) text** after",
             ),
             (
                 "across opening bold edge",
                 "Before **bold text** after",
-                "re bold",
+                through("Before **bold text** after", "re ", "bold"),
                 "Befo[re ](#inline-comment)**[bold](#inline-comment) text** after",
             ),
             (
                 "across closing bold edge",
                 "Before **bold text** after",
-                "text af",
+                through("Before **bold text** after", "text", " af"),
                 "Before **bold [text](#inline-comment)**[ af](#inline-comment)ter",
             ),
             (
                 "whole bold section",
                 "Before **bold text** after",
-                "bold text",
+                through("Before **bold text** after", "bold", "text"),
                 "Before **[bold text](#inline-comment)** after",
             ),
             (
                 "across several styled sections",
                 "A **bold** and *italic* tail",
-                "bold and italic ta",
+                through("A **bold** and *italic* tail", "bold", " ta"),
                 "A **[bold](#inline-comment)**[ and ](#inline-comment)*[italic](#inline-comment)*[ ta](#inline-comment)il",
             ),
             (
                 "nested styles",
                 "Start **bold and *italic*** end",
-                "and italic",
+                through("Start **bold and *italic*** end", "and ", "italic"),
                 "Start **bold [and ](#inline-comment)*[italic](#inline-comment)*** end",
             ),
             (
                 "whole inline code",
                 "Use `value` now",
-                "value",
+                5..10,
                 "Use [`value`](#inline-comment) now",
             ),
             (
                 "partial inline code is atomic",
                 "Use `value` now",
-                "alu",
+                6..9,
                 "Use [`value`](#inline-comment) now",
             ),
             (
                 "heading and emphasis",
                 "### A **styled heading** here",
-                "A styled heading h",
+                through("### A **styled heading** here", "A ", "** h"),
                 "### [A ](#inline-comment)**[styled heading](#inline-comment)**[ h](#inline-comment)ere",
             ),
         ];
 
-        for (name, markdown, quote, expected) in cases {
-            let source_range = Cowork::unique_source_range_for_quote(markdown, quote)
-                .unwrap_or_else(|| panic!("{name}: selection should map to source"));
+        for (name, markdown, source_range, expected) in cases {
             let ranges = Cowork::annotation_ranges(markdown, source_range);
             let annotated = Cowork::annotate_markdown(markdown, ranges);
 
@@ -2903,10 +2917,7 @@ mod tests {
     #[test]
     fn can_comment_on_selection_across_inline_code() {
         let markdown = "In Rust, we use `u128` to handle larger numbers";
-        let quote = "In Rust, we use u128 to handle larger numbers";
-        let source_range = Cowork::unique_source_range_for_quote(markdown, quote)
-            .expect("selection should map to the Markdown source");
-        let ranges = Cowork::annotation_ranges(markdown, source_range);
+        let ranges = Cowork::annotation_ranges(markdown, 0..markdown.len());
         let annotated = Cowork::annotate_markdown(markdown, ranges);
         let html = markdown::to_html_with_options(&annotated, &markdown::Options::gfm())
             .expect("annotated Markdown should compile");
@@ -2921,13 +2932,171 @@ mod tests {
     }
 
     #[test]
-    fn quote_fallback_does_not_guess_between_repeated_text() {
-        let markdown = "Repeat **this phrase** once, then repeat **this phrase** again.";
+    fn comments_use_gpui_range_to_target_identical_styled_text() {
+        let markdown = "**same** then **same**";
+        let ranges = Cowork::annotation_ranges(markdown, 16..20);
+        let annotated = Cowork::annotate_markdown(markdown, ranges);
 
-        assert_eq!(
-            Cowork::unique_source_range_for_quote(markdown, "this phrase"),
-            None
+        assert_eq!(annotated, "**same** then **[same](#inline-comment)**");
+    }
+
+    fn assert_backslash_selection_creates_comment(
+        cx: &mut gpui::TestAppContext,
+        markdown: &'static str,
+        expected_quote: &str,
+    ) {
+        struct SelectionRoot {
+            cowork: Entity<Cowork>,
+            text_view: Entity<TextViewState>,
+            composer: Entity<TextareaState>,
+            message_id: Uuid,
+        }
+
+        impl Render for SelectionRoot {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .w(px(160.))
+                    .flex()
+                    .flex_col()
+                    .on_key_down(cx.listener(|this, event, window, cx| {
+                        this.cowork.update(cx, |cowork, cx| {
+                            cowork.begin_inline_comment(event, window, cx);
+                        });
+                    }))
+                    .child(TextSelectionLayer)
+                    .child(
+                        div()
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.cowork.update(cx, |cowork, _| {
+                                        cowork.selection_message_id = Some(this.message_id);
+                                    });
+                                }),
+                            )
+                            .child(
+                                TextView::new(&self.text_view)
+                                    .selection_format(SelectionFormat::Plain),
+                            ),
+                    )
+                    .child(Textarea::new(&self.composer))
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let tokio_handle = runtime.handle().clone();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let message_id = Uuid::new_v4();
+            let text_view = cx.new(|cx| TextViewState::markdown(markdown, cx));
+            let thinking_view = cx.new(|cx| TextViewState::markdown("", cx));
+            let thread_id = Uuid::new_v4();
+            let draft = Cowork::new_user_message_draft(window, cx);
+            let composer = Cowork::draft_composer(&draft);
+            let thread = cx.new(|_| Thread {
+                summary: ThreadSummary {
+                    id: thread_id,
+                    title: "Test".into(),
+                },
+                timeline: vec![TimelineMessage::Agent(AgentMessage {
+                    id: message_id,
+                    thinking: String::new(),
+                    thinking_view,
+                    thinking_complete: true,
+                    thinking_expanded: false,
+                    text: markdown.into(),
+                    text_view: text_view.clone(),
+                    complete: true,
+                    failed: false,
+                })],
+                draft,
+                generating: false,
+                sharing: ThreadSharing::NotShared,
+                ownership: ThreadOwnership::Local,
+            });
+            let thread_store = cx.new(|_| ThreadStore {
+                threads: VecDeque::from([thread]),
+            });
+            let cowork = cx.new(|cx| Cowork {
+                sidebar_open: true,
+                recents_open: true,
+                new_thread_draft: Cowork::new_user_message_draft(window, cx),
+                timeline_scroll_handle: ScrollHandle::new(),
+                follow_generation: true,
+                thread_store,
+                active_thread_id: Some(thread_id),
+                selection_message_id: None,
+                segment_text_views: HashMap::new(),
+                render_generation: 0,
+                titlebar_click_armed: false,
+                join_dialog: None,
+                tokio_handle,
+                _window_activation_subscription: cx.observe_window_activation(window, |_, _, _| {}),
+            });
+            composer.focus_handle(cx).focus(window, cx);
+            SelectionRoot {
+                cowork,
+                text_view,
+                composer,
+                message_id,
+            }
+        });
+        let cx: &mut gpui::VisualTestContext = cx;
+        cx.run_until_parked();
+        cx.simulate_mouse_down(
+            point(px(1.), px(8.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
         );
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_mouse_move(
+            point(px(155.), px(8.)),
+            Some(MouseButton::Left),
+            gpui::Modifiers::default(),
+        );
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        cx.simulate_mouse_up(
+            point(px(155.), px(8.)),
+            MouseButton::Left,
+            gpui::Modifiers::default(),
+        );
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        cx.simulate_keystrokes("x");
+
+        view.read_with(cx, |view, cx| {
+            let cowork = view.cowork.read(cx);
+            let thread = cowork
+                .thread_store
+                .read(cx)
+                .thread(cowork.active_thread_id.expect("active thread"), cx)
+                .expect("thread");
+            let thread = thread.read(cx);
+            let [comment] = thread.draft.comments.as_slice() else {
+                panic!("typing with the selection should create one comment");
+            };
+            assert_eq!(comment.quote, expected_quote);
+            assert_eq!(comment.source_range, 0..markdown.len());
+            let UserCommentBody::Editing { inline, .. } = &comment.body else {
+                panic!("new comment should be editable");
+            };
+            assert_eq!(inline.read(cx).value(), "x");
+        });
+    }
+
+    #[gpui::test]
+    fn backslash_selections_create_comments_with_gpui_ranges(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_base::init);
+        assert_backslash_selection_creates_comment(cx, r"a\b", r"a\b");
+        assert_backslash_selection_creates_comment(cx, r"a\\b", r"a\b");
     }
 
     #[test]
