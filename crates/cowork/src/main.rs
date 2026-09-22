@@ -2402,8 +2402,7 @@ impl Cowork {
 
     fn render_message_segment(
         &mut self,
-        thread_id: Uuid,
-        message_id: Uuid,
+        thread_message_id: ThreadMessageId,
         _segment_index: usize,
         source_range: Range<usize>,
         text: &str,
@@ -2413,13 +2412,7 @@ impl Cowork {
     ) -> gpui::AnyElement {
         let text_view = self
             .segment_text_views
-            .entry((
-                ThreadMessageId {
-                    thread_id,
-                    message_id,
-                },
-                source_range,
-            ))
+            .entry((thread_message_id, source_range))
             .or_insert_with(|| SegmentTextView {
                 state: cx.new(|cx| TextViewState::markdown(text, cx)),
                 text: text.to_owned(),
@@ -2571,8 +2564,7 @@ impl Cowork {
 
     fn render_agent_text(
         &mut self,
-        thread_id: Uuid,
-        message_id: Uuid,
+        thread_message_id: ThreadMessageId,
         text: &str,
         text_view: &Entity<TextViewState>,
         comments: &[UserComment],
@@ -2584,7 +2576,7 @@ impl Cowork {
         let mut cursor = 0;
         let mut anchored_comments = comments
             .iter()
-            .filter(|comment| comment.reference.message_id == message_id)
+            .filter(|comment| comment.reference.message_id == thread_message_id.message_id)
             .filter(|comment| {
                 comment.reference.range.start < comment.reference.range.end
                     && comment.reference.range.end <= text.len()
@@ -2616,8 +2608,7 @@ impl Cowork {
                 Self::hard_line_start(text, first.reference.range.start).max(cursor);
             if cursor < annotated_start {
                 content.push(self.render_message_segment(
-                    thread_id,
-                    message_id,
+                    thread_message_id,
                     content.len(),
                     cursor..annotated_start,
                     &text[cursor..annotated_start],
@@ -2648,8 +2639,7 @@ impl Cowork {
                 annotation_ranges,
             );
             content.push(self.render_message_segment(
-                thread_id,
-                message_id,
+                thread_message_id,
                 content.len(),
                 cursor..line_end,
                 &annotated,
@@ -2666,8 +2656,7 @@ impl Cowork {
         }
         if cursor < text.len() {
             content.push(self.render_message_segment(
-                thread_id,
-                message_id,
+                thread_message_id,
                 content.len(),
                 cursor..text.len(),
                 &text[cursor..],
@@ -2701,8 +2690,10 @@ impl Cowork {
             {
                 let response_id = response.id;
                 let response_content = self.render_agent_text(
-                    thread_id,
-                    response_id,
+                    ThreadMessageId {
+                        thread_id,
+                        message_id: response.id,
+                    },
                     &response.response,
                     &response.response_view,
                     comments,
@@ -2734,8 +2725,10 @@ impl Cowork {
         }
 
         let message_content = self.render_agent_text(
-            thread_id,
-            message.id,
+            ThreadMessageId {
+                thread_id,
+                message_id: message.id,
+            },
             &message.text,
             &message.text_view,
             comments,
@@ -3936,8 +3929,10 @@ mod tests {
             fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
                 let content = self.cowork.update(cx, |cowork, cx| {
                     cowork.render_agent_text(
-                        self.thread_id,
-                        self.message_id,
+                        ThreadMessageId {
+                            thread_id: self.thread_id,
+                            message_id: self.message_id,
+                        },
                         self.markdown,
                         &self.text_view,
                         &self.comments,
