@@ -388,6 +388,9 @@ impl ThreadOwnership {
 }
 
 struct Thread {
+    /// Identifies this local view. Multiple views may mirror the same shared
+    /// thread, so this must remain distinct from `summary.id`.
+    instance_id: Uuid,
     summary: ThreadSummary,
     timeline: Vec<TimelineMessage>,
     draft: UserMessageGroup,
@@ -559,6 +562,7 @@ impl Thread {
     ) -> Self {
         let (summary, timeline) = snapshot.into_native(cx);
         let mut thread = Self {
+            instance_id: Uuid::new_v4(),
             summary,
             timeline: Vec::new(),
             draft,
@@ -750,7 +754,7 @@ impl ThreadStore {
     fn thread(&self, thread_id: Uuid, cx: &App) -> Option<Entity<Thread>> {
         self.threads
             .iter()
-            .find(|thread| thread.read(cx).summary.id == thread_id)
+            .find(|thread| thread.read(cx).instance_id == thread_id)
             .cloned()
     }
 }
@@ -836,6 +840,7 @@ impl Cowork {
     fn new_empty_local_thread(draft: UserMessageGroup, cx: &mut App) -> Entity<Thread> {
         let thread_id = Uuid::new_v4();
         cx.new(|_| Thread {
+            instance_id: thread_id,
             summary: ThreadSummary {
                 id: thread_id,
                 title: "New thread".into(),
@@ -863,7 +868,7 @@ impl Cowork {
         let next_draft = Self::new_user_message_draft(window, cx);
         let draft = std::mem::replace(&mut self.new_thread_draft, next_draft);
         let thread = Self::new_empty_local_thread(draft, cx);
-        self.active_thread_id = Some(thread.read(cx).summary.id);
+        self.active_thread_id = Some(thread.read(cx).instance_id);
         self.thread_store.update(cx, |store, _| {
             store.threads.push_front(thread.clone());
         });
@@ -1197,17 +1202,6 @@ impl Cowork {
                 return;
             }
         };
-        let joining_own_thread = self.thread_store.read(cx).threads.iter().any(|thread| {
-            matches!(
-                &thread.read(cx).sharing,
-                ThreadSharing::Shared { endpoint, .. } if endpoint.id() == endpoint_id
-            )
-        });
-        if joining_own_thread {
-            dialog.status = JoinStatus::Failed("You can't join your own shared thread.".into());
-            cx.notify();
-            return;
-        }
         dialog.status = JoinStatus::Joining;
         let draft = Self::new_user_message_draft(window, cx);
         cx.notify();
@@ -1268,7 +1262,7 @@ impl Cowork {
                         cx,
                     )
                 });
-                let thread_id = thread.read(cx).summary.id;
+                let thread_id = thread.read(cx).instance_id;
                 this.thread_store.update(cx, |store, _| {
                     store.threads.push_front(thread.clone());
                 });
@@ -1297,7 +1291,7 @@ impl Cowork {
 
     fn toggle_sharing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let thread = self.prepare_thread_for_sharing(window, cx);
-        let thread_id = thread.read(cx).summary.id;
+        let thread_id = thread.read(cx).instance_id;
 
         match thread.read(cx).sharing.status() {
             SharingStatus::NotShared | SharingStatus::Failed => self.start_sharing(thread, cx),
@@ -1335,7 +1329,7 @@ impl Cowork {
                     self.thread_store.update(cx, |store, cx| {
                         store
                             .threads
-                            .retain(|thread| thread.read(cx).summary.id != thread_id);
+                            .retain(|thread| thread.read(cx).instance_id != thread_id);
                     });
                     self.active_thread_id = None;
                     self.selection_message_id = None;
@@ -1520,10 +1514,10 @@ impl Cowork {
 
     fn render_sidebar_thread(
         &self,
+        thread_id: Uuid,
         thread: &ThreadSummary,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let thread_id = thread.id;
         div()
             .id(thread_id.to_string())
             .h(px(30.))
@@ -1533,7 +1527,7 @@ impl Cowork {
             .items_center()
             .rounded_md()
             .cursor_pointer()
-            .when(self.active_thread_id == Some(thread.id), |this| {
+            .when(self.active_thread_id == Some(thread_id), |this| {
                 this.bg(rgb(0x2d2d30))
             })
             .hover(|this| this.bg(rgb(0x3a3a3e)))
@@ -1555,9 +1549,13 @@ impl Cowork {
             .iter()
             .map(|thread| {
                 let thread = thread.read(cx);
-                (thread.summary.clone(), thread.sharing.is_collaborating())
+                (
+                    thread.instance_id,
+                    thread.summary.clone(),
+                    thread.sharing.is_collaborating(),
+                )
             })
-            .partition(|(_, collaborating)| *collaborating);
+            .partition(|(_, _, collaborating)| *collaborating);
         let recents_arrow = div()
             .size(px(16.))
             .flex()
@@ -1654,11 +1652,14 @@ impl Cowork {
                                 .child("Collaborating"),
                         )
                         .child(
-                            div().flex_none().px_2().children(
-                                collaborating_threads
-                                    .iter()
-                                    .map(|(thread, _)| self.render_sidebar_thread(thread, cx)),
-                            ),
+                            div()
+                                .flex_none()
+                                .px_2()
+                                .children(collaborating_threads.iter().map(
+                                    |(thread_id, thread, _)| {
+                                        self.render_sidebar_thread(*thread_id, thread, cx)
+                                    },
+                                )),
                         )
                     })
                     .child(
@@ -1683,13 +1684,11 @@ impl Cowork {
                             .child(recents_arrow),
                     )
                     .when(self.recents_open, |this| {
-                        this.child(
-                            div().flex_1().min_h_0().overflow_hidden().px_2().children(
-                                recent_threads
-                                    .iter()
-                                    .map(|(thread, _)| self.render_sidebar_thread(thread, cx)),
-                            ),
-                        )
+                        this.child(div().flex_1().min_h_0().overflow_hidden().px_2().children(
+                            recent_threads.iter().map(|(thread_id, thread, _)| {
+                                self.render_sidebar_thread(*thread_id, thread, cx)
+                            }),
+                        ))
                     }),
             )
     }
@@ -3259,7 +3258,7 @@ impl Cowork {
         let next_composer = Self::draft_composer(&next_draft);
 
         let thread_id = if let Some(thread) = active_thread {
-            let thread_id = thread.read(cx).summary.id;
+            let thread_id = thread.read(cx).instance_id;
             thread.update(cx, |thread, cx| {
                 if let Some(title) = Self::title_for_first_message(&thread.timeline, &prompt) {
                     thread.emit(protocol::HostMessage::ThreadTitled(title), cx);
@@ -3274,6 +3273,7 @@ impl Cowork {
         } else {
             let thread_id = Uuid::new_v4();
             let thread = cx.new(|_| Thread {
+                instance_id: thread_id,
                 summary: ThreadSummary {
                     id: thread_id,
                     title: Self::thread_title(&prompt),
@@ -4011,6 +4011,7 @@ mod tests {
             let comments = draft.comments.clone();
             let composer = Cowork::draft_composer(&draft);
             let thread = cx.new(|_| Thread {
+                instance_id: thread_id,
                 summary: ThreadSummary {
                     id: thread_id,
                     title: "Test".into(),
@@ -4509,6 +4510,8 @@ mod tests {
                 .read(cx);
 
             assert_eq!(collaborator.to_protocol(), host.to_protocol());
+            assert_eq!(collaborator.summary.id, host.summary.id);
+            assert_ne!(collaborator.instance_id, host.instance_id);
             assert!(!host.generating);
             assert!(!collaborator.generating);
 
