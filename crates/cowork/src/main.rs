@@ -278,6 +278,8 @@ struct ThreadMessageId {
 
 struct SegmentTextView {
     state: Entity<TextViewState>,
+    text: String,
+    source_offsets: Option<Vec<usize>>,
     rendered_at: u64,
 }
 
@@ -1836,6 +1838,13 @@ impl Cowork {
                     .read(cx)
                     .selected_source_range()
                     .map(|range| {
+                        let range = text_view
+                            .source_offsets
+                            .as_ref()
+                            .and_then(|offsets| {
+                                Some(*offsets.get(range.start)?..*offsets.get(range.end)?)
+                            })
+                            .unwrap_or(range);
                         (range.start + source_range.start)..(range.end + source_range.start)
                     })
             });
@@ -1874,7 +1883,10 @@ impl Cowork {
         ranges
     }
 
-    fn annotate_markdown(markdown: &str, ranges: impl IntoIterator<Item = Range<usize>>) -> String {
+    fn annotate_markdown_with_source_offsets(
+        markdown: &str,
+        ranges: impl IntoIterator<Item = Range<usize>>,
+    ) -> (String, Vec<usize>) {
         let mut ranges = ranges
             .into_iter()
             .filter(|range| {
@@ -1897,12 +1909,29 @@ impl Cowork {
             }
         }
 
-        let mut annotated = markdown.to_string();
-        for range in merged_ranges.into_iter().rev() {
-            annotated.insert_str(range.end, "](#inline-comment)");
-            annotated.insert_str(range.start, "[");
+        let mut annotated = String::new();
+        let mut source_offsets = vec![0];
+        let mut cursor = 0;
+        for range in merged_ranges {
+            annotated.push_str(&markdown[cursor..range.start]);
+            source_offsets.extend((cursor + 1)..=range.start);
+
+            annotated.push('[');
+            source_offsets.push(range.start);
+
+            annotated.push_str(&markdown[range.clone()]);
+            source_offsets.extend((range.start + 1)..=range.end);
+
+            const LINK_SUFFIX: &str = "](#inline-comment)";
+            annotated.push_str(LINK_SUFFIX);
+            source_offsets.extend(std::iter::repeat_n(range.end, LINK_SUFFIX.len()));
+            cursor = range.end;
         }
-        annotated
+        annotated.push_str(&markdown[cursor..]);
+        source_offsets.extend((cursor + 1)..=markdown.len());
+
+        debug_assert_eq!(source_offsets.len(), annotated.len() + 1);
+        (annotated, source_offsets)
     }
 
     fn begin_inline_comment(
@@ -1973,14 +2002,10 @@ impl Cowork {
             return;
         }
         let quote = TextSelection::selected_text(window, cx).trim().to_string();
-        let (Some(thread_id), Some(message_id)) =
+        let (Some(thread_id), Some(preferred_message_id)) =
             (self.active_thread_id, self.selection_message_id)
         else {
             return;
-        };
-        let thread_message_id = ThreadMessageId {
-            thread_id,
-            message_id,
         };
         if quote.is_empty() {
             return;
@@ -1988,27 +2013,36 @@ impl Cowork {
         let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
             return;
         };
-        let source_range = {
+        let (message_id, source_range) = {
             let thread = thread.read(cx);
-            let Some(text_view) = thread.timeline.iter().find_map(|entry| match entry {
-                TimelineMessage::Agent(message) if message.id == message_id => {
-                    Some(message.text_view.clone())
-                }
-                TimelineMessage::Agent(message) => message
-                    .comment_responses
-                    .iter()
-                    .find(|response| response.id == message_id)
-                    .map(|response| response.response_view.clone()),
-                _ => None,
+            let mut targets = thread
+                .timeline
+                .iter()
+                .filter_map(|entry| match entry {
+                    TimelineMessage::Agent(message) => Some(
+                        std::iter::once((message.id, message.text_view.clone())).chain(
+                            message
+                                .comment_responses
+                                .iter()
+                                .map(|response| (response.id, response.response_view.clone())),
+                        ),
+                    ),
+                    TimelineMessage::User(_) => None,
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+            targets.sort_by_key(|(message_id, _)| *message_id != preferred_message_id);
+            let Some(target) = targets.into_iter().find_map(|(message_id, text_view)| {
+                let thread_message_id = ThreadMessageId {
+                    thread_id,
+                    message_id,
+                };
+                self.selected_message_source_range(thread_message_id, &text_view, cx)
+                    .map(|source_range| (message_id, source_range))
             }) else {
                 return;
             };
-            let Some(source_range) =
-                self.selected_message_source_range(thread_message_id, &text_view, cx)
-            else {
-                return;
-            };
-            source_range
+            target
         };
 
         let inline_body = Self::new_comment_editor(initial_text, window, cx);
@@ -2314,22 +2348,13 @@ impl Cowork {
         &mut self,
         thread_id: Uuid,
         message_id: Uuid,
-        segment_index: usize,
+        _segment_index: usize,
         source_range: Range<usize>,
         text: &str,
         annotated: bool,
+        source_offsets: Option<Vec<usize>>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        if annotated {
-            return TextView::markdown(
-                format!("timeline-annotated-{message_id}-{segment_index}"),
-                text,
-            )
-            .style(Self::annotated_markdown_style())
-            .w_full()
-            .into_any_element();
-        }
-
         let text_view = self
             .segment_text_views
             .entry((
@@ -2341,12 +2366,33 @@ impl Cowork {
             ))
             .or_insert_with(|| SegmentTextView {
                 state: cx.new(|cx| TextViewState::markdown(text, cx)),
+                text: text.to_owned(),
+                source_offsets: source_offsets.clone(),
                 rendered_at: self.render_generation,
             });
         text_view.rendered_at = self.render_generation;
+        text_view.source_offsets = source_offsets;
+        if text_view.text != text {
+            text_view.text.clear();
+            text_view.text.push_str(text);
+            if annotated {
+                // Reparse the whole annotated segment. Incrementally replacing
+                // Markdown can retain stale link-render caches and drop an
+                // existing highlight when a neighboring annotation is added.
+                text_view.state = cx.new(|cx| TextViewState::markdown(text, cx));
+            } else {
+                text_view
+                    .state
+                    .update(cx, |view, cx| view.set_text(text, cx));
+            }
+        }
         TextView::new(&text_view.state)
             .selection_format(SelectionFormat::Plain)
-            .style(Self::markdown_style())
+            .style(if annotated {
+                Self::annotated_markdown_style()
+            } else {
+                Self::markdown_style()
+            })
             .w_full()
             .into_any_element()
     }
@@ -2520,6 +2566,7 @@ impl Cowork {
                     cursor..annotated_start,
                     &text[cursor..annotated_start],
                     false,
+                    None,
                     cx,
                 ));
                 cursor = annotated_start;
@@ -2540,7 +2587,10 @@ impl Cowork {
                     (range.start >= cursor && range.end <= line_end)
                         .then_some((range.start - cursor)..(range.end - cursor))
                 });
-            let annotated = Self::annotate_markdown(&text[cursor..line_end], annotation_ranges);
+            let (annotated, source_offsets) = Self::annotate_markdown_with_source_offsets(
+                &text[cursor..line_end],
+                annotation_ranges,
+            );
             content.push(self.render_message_segment(
                 thread_id,
                 message_id,
@@ -2548,6 +2598,7 @@ impl Cowork {
                 cursor..line_end,
                 &annotated,
                 true,
+                Some(source_offsets),
                 cx,
             ));
             content.extend(
@@ -2565,6 +2616,7 @@ impl Cowork {
                 cursor..text.len(),
                 &text[cursor..],
                 false,
+                None,
                 cx,
             ));
         }
@@ -2615,9 +2667,8 @@ impl Cowork {
                         .gap_3()
                         .on_mouse_down(
                             MouseButton::Left,
-                            cx.listener(move |this, _, _, cx| {
+                            cx.listener(move |this, _, _, _| {
                                 this.selection_message_id = Some(response_id);
-                                cx.stop_propagation();
                             }),
                         )
                         .children(response_content)
@@ -3452,8 +3503,8 @@ fn main() {
                 .with_code_block_highlighter(highlight_code_block)
                 .install(cx);
             cx.bind_keys([
-                KeyBinding::new("ctrl-enter", SubmitComposer, Some("Input")),
-                KeyBinding::new("cmd-enter", SubmitComposer, Some("Input")),
+                KeyBinding::new("ctrl-enter", SubmitComposer, None),
+                KeyBinding::new("cmd-enter", SubmitComposer, None),
             ]);
             #[cfg(target_os = "macos")]
             {
@@ -3523,30 +3574,34 @@ fn main() {
 mod tests {
     use super::*;
 
+    fn annotate_markdown(markdown: &str, ranges: impl IntoIterator<Item = Range<usize>>) -> String {
+        Cowork::annotate_markdown_with_source_offsets(markdown, ranges).0
+    }
+
     #[test]
     fn annotated_markdown_uses_native_markdown_link() {
-        let annotated = Cowork::annotate_markdown("Before selected text after", [7..20]);
+        let annotated = annotate_markdown("Before selected text after", [7..20]);
 
         assert_eq!(annotated, "Before [selected text](#inline-comment) after");
     }
 
     #[test]
     fn annotated_markdown_merges_intersecting_comments() {
-        let annotated = Cowork::annotate_markdown("overlapping", [0..7, 4..11]);
+        let annotated = annotate_markdown("overlapping", [0..7, 4..11]);
 
         assert_eq!(annotated, "[overlapping](#inline-comment)");
     }
 
     #[test]
     fn annotated_markdown_preserves_heading_around_partial_selection() {
-        let annotated = Cowork::annotate_markdown("### A Heading", [6..13]);
+        let annotated = annotate_markdown("### A Heading", [6..13]);
 
         assert_eq!(annotated, "### A [Heading](#inline-comment)");
     }
 
     #[test]
     fn annotated_markdown_preserves_bold_around_partial_selection() {
-        let annotated = Cowork::annotate_markdown("**Hi**", [3..4]);
+        let annotated = annotate_markdown("**Hi**", [3..4]);
 
         assert_eq!(annotated, "**H[i](#inline-comment)**");
     }
@@ -3621,7 +3676,7 @@ mod tests {
 
         for (name, markdown, source_range, expected) in cases {
             let ranges = Cowork::annotation_ranges(markdown, source_range);
-            let annotated = Cowork::annotate_markdown(markdown, ranges);
+            let annotated = annotate_markdown(markdown, ranges);
 
             assert_eq!(annotated, expected, "{name}");
             let html = markdown::to_html_with_options(&annotated, &markdown::Options::gfm())
@@ -3637,7 +3692,7 @@ mod tests {
     fn can_comment_on_selection_across_inline_code() {
         let markdown = "In Rust, we use `u128` to handle larger numbers";
         let ranges = Cowork::annotation_ranges(markdown, 0..markdown.len());
-        let annotated = Cowork::annotate_markdown(markdown, ranges);
+        let annotated = annotate_markdown(markdown, ranges);
         let html = markdown::to_html_with_options(&annotated, &markdown::Options::gfm())
             .expect("annotated Markdown should compile");
 
@@ -3654,7 +3709,7 @@ mod tests {
     fn comments_use_gpui_range_to_target_identical_styled_text() {
         let markdown = "**same** then **same**";
         let ranges = Cowork::annotation_ranges(markdown, 16..20);
-        let annotated = Cowork::annotate_markdown(markdown, ranges);
+        let annotated = annotate_markdown(markdown, ranges);
 
         assert_eq!(annotated, "**same** then **[same](#inline-comment)**");
     }
@@ -3663,17 +3718,37 @@ mod tests {
         cx: &mut gpui::TestAppContext,
         markdown: &'static str,
         expected_quote: &str,
+        expected_range: Range<usize>,
         target_comment_reply: bool,
+        existing_comment_range: Option<Range<usize>>,
+        selection_start_x: f32,
+        selection_end_x: f32,
+        expected_highlights_after_comment: Option<usize>,
     ) {
         struct SelectionRoot {
             cowork: Entity<Cowork>,
             text_view: Entity<TextViewState>,
             composer: Entity<TextareaState>,
+            thread_id: Uuid,
             message_id: Uuid,
+            markdown: &'static str,
+            comments: Vec<UserComment>,
         }
 
         impl Render for SelectionRoot {
-            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let content = self.cowork.update(cx, |cowork, cx| {
+                    cowork.render_agent_text(
+                        self.thread_id,
+                        self.message_id,
+                        self.markdown,
+                        &self.text_view,
+                        &self.comments,
+                        px(160.),
+                        window,
+                        cx,
+                    )
+                });
                 div()
                     .w(px(160.))
                     .flex()
@@ -3694,10 +3769,7 @@ mod tests {
                                     });
                                 }),
                             )
-                            .child(
-                                TextView::new(&self.text_view)
-                                    .selection_format(SelectionFormat::Plain),
-                            ),
+                            .children(content),
                     )
                     .child(Textarea::new(&self.composer))
             }
@@ -3719,7 +3791,19 @@ mod tests {
             };
             let thinking_view = cx.new(|cx| TextViewState::markdown("", cx));
             let thread_id = Uuid::new_v4();
-            let draft = Cowork::new_user_message_draft(window, cx);
+            let mut draft = Cowork::new_user_message_draft(window, cx);
+            if let Some(range) = existing_comment_range.clone() {
+                draft.comments.push(UserComment {
+                    id: Uuid::new_v4(),
+                    reference: CommentReference {
+                        message_id,
+                        quote: markdown[range.clone()].into(),
+                        range,
+                    },
+                    body: UserCommentBody::Submitted("Existing comment".into()),
+                });
+            }
+            let comments = draft.comments.clone();
             let composer = Cowork::draft_composer(&draft);
             let thread = cx.new(|_| Thread {
                 summary: ThreadSummary {
@@ -3780,13 +3864,16 @@ mod tests {
                 cowork,
                 text_view,
                 composer,
+                thread_id,
                 message_id,
+                markdown,
+                comments,
             }
         });
         let cx: &mut gpui::VisualTestContext = cx;
         cx.run_until_parked();
         cx.simulate_mouse_down(
-            point(px(1.), px(8.)),
+            point(px(selection_start_x), px(8.)),
             MouseButton::Left,
             gpui::Modifiers::default(),
         );
@@ -3794,7 +3881,7 @@ mod tests {
             let _ = window.draw(cx);
         });
         cx.simulate_mouse_move(
-            point(px(155.), px(8.)),
+            point(px(selection_end_x), px(8.)),
             Some(MouseButton::Left),
             gpui::Modifiers::default(),
         );
@@ -3802,7 +3889,7 @@ mod tests {
             let _ = window.draw(cx);
         });
         cx.simulate_mouse_up(
-            point(px(155.), px(8.)),
+            point(px(selection_end_x), px(8.)),
             MouseButton::Left,
             gpui::Modifiers::default(),
         );
@@ -3810,6 +3897,19 @@ mod tests {
             let _ = window.draw(cx);
         });
 
+        let annotated_state_before = expected_highlights_after_comment.map(|_| {
+            view.read_with(cx, |view, cx| {
+                view.cowork
+                    .read(cx)
+                    .segment_text_views
+                    .iter()
+                    .find(|((segment, _), _)| segment.message_id == view.message_id)
+                    .expect("annotated segment")
+                    .1
+                    .state
+                    .entity_id()
+            })
+        });
         cx.simulate_keystrokes("x");
 
         view.read_with(cx, |view, cx| {
@@ -3820,29 +3920,160 @@ mod tests {
                 .thread(cowork.active_thread_id.expect("active thread"), cx)
                 .expect("thread");
             let thread = thread.read(cx);
-            let [comment] = thread.draft.comments.as_slice() else {
-                panic!("typing with the selection should create one comment");
+            let Some(comment) = thread
+                .draft
+                .comments
+                .iter()
+                .find(|comment| matches!(comment.body, UserCommentBody::Editing { .. }))
+            else {
+                panic!("typing with the selection should create an editable comment");
             };
             assert_eq!(comment.reference.quote, expected_quote);
-            assert_eq!(comment.reference.range, 0..markdown.len());
+            assert_eq!(comment.reference.range, expected_range);
             let UserCommentBody::Editing { inline, .. } = &comment.body else {
-                panic!("new comment should be editable");
+                unreachable!();
             };
             assert_eq!(inline.read(cx).value(), "x");
         });
+
+        if let Some(expected_highlights) = expected_highlights_after_comment {
+            let comments = view.read_with(cx, |view, cx| {
+                let cowork = view.cowork.read(cx);
+                cowork
+                    .thread_store
+                    .read(cx)
+                    .thread(cowork.active_thread_id.expect("active thread"), cx)
+                    .expect("thread")
+                    .read(cx)
+                    .draft
+                    .comments
+                    .clone()
+            });
+            view.update(cx, |view, cx| {
+                view.comments = comments;
+                cx.notify();
+            });
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            view.read_with(cx, |view, cx| {
+                let highlight_count = view
+                    .cowork
+                    .read(cx)
+                    .segment_text_views
+                    .iter()
+                    .filter(|((segment, _), _)| segment.message_id == view.message_id)
+                    .map(|(_, segment)| segment.text.matches("#inline-comment").count())
+                    .sum::<usize>();
+                assert_eq!(highlight_count, expected_highlights);
+                let annotated_state_after = view
+                    .cowork
+                    .read(cx)
+                    .segment_text_views
+                    .iter()
+                    .find(|((segment, _), _)| segment.message_id == view.message_id)
+                    .expect("annotated segment")
+                    .1
+                    .state
+                    .entity_id();
+                assert_ne!(Some(annotated_state_after), annotated_state_before);
+            });
+        }
     }
 
     #[gpui::test]
     fn backslash_selections_create_comments_with_gpui_ranges(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_base::init);
-        assert_backslash_selection_creates_comment(cx, r"a\b", r"a\b", false);
-        assert_backslash_selection_creates_comment(cx, r"a\\b", r"a\b", false);
+        assert_backslash_selection_creates_comment(
+            cx,
+            r"a\b",
+            r"a\b",
+            0..3,
+            false,
+            None,
+            1.,
+            155.,
+            None,
+        );
+        assert_backslash_selection_creates_comment(
+            cx,
+            r"a\\b",
+            r"a\b",
+            0..4,
+            false,
+            None,
+            1.,
+            155.,
+            None,
+        );
     }
 
     #[gpui::test]
     fn comments_can_target_agent_comment_replies(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_base::init);
-        assert_backslash_selection_creates_comment(cx, "Agent reply", "Agent reply", true);
+        assert_backslash_selection_creates_comment(
+            cx,
+            "Agent reply",
+            "Agent reply",
+            0..11,
+            true,
+            None,
+            1.,
+            155.,
+            None,
+        );
+    }
+
+    #[gpui::test]
+    fn comments_can_target_text_before_an_existing_comment(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_base::init);
+        assert_backslash_selection_creates_comment(
+            cx,
+            "alpha beta gamma",
+            "alpha",
+            0..5,
+            false,
+            Some(11..16),
+            1.,
+            48.,
+            None,
+        );
+    }
+
+    #[gpui::test]
+    fn creating_comment_immediately_before_existing_preserves_both_highlights(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_base::init);
+        assert_backslash_selection_creates_comment(
+            cx,
+            "alpha beta gamma",
+            "beta",
+            6..10,
+            false,
+            Some(11..16),
+            54.,
+            96.,
+            Some(2),
+        );
+    }
+
+    #[gpui::test]
+    fn comments_after_an_existing_comment_keep_original_source_offsets(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_base::init);
+        assert_backslash_selection_creates_comment(
+            cx,
+            "alpha beta gamma",
+            "gamma",
+            11..16,
+            false,
+            Some(0..5),
+            104.,
+            155.,
+            Some(2),
+        );
     }
 
     #[test]
