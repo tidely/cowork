@@ -1185,6 +1185,17 @@ impl Cowork {
                 return;
             }
         };
+        let joining_own_thread = self.thread_store.read(cx).threads.iter().any(|thread| {
+            matches!(
+                &thread.read(cx).sharing,
+                ThreadSharing::Shared { endpoint, .. } if endpoint.id() == endpoint_id
+            )
+        });
+        if joining_own_thread {
+            dialog.status = JoinStatus::Failed("You can't join your own shared thread.".into());
+            cx.notify();
+            return;
+        }
         dialog.status = JoinStatus::Joining;
         let draft = Self::new_user_message_draft(window, cx);
         cx.notify();
