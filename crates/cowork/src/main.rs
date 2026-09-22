@@ -9,12 +9,13 @@ use std::{
 use anyhow::Context as _;
 use futures::StreamExt;
 use gpui::{
-    Animation, AnimationExt, AnyWindowHandle, App, AppContext, AssetSource, Bounds, ClipboardItem,
-    Context, Entity, Focusable, FontStyle, FontWeight, HighlightStyle, IntoElement, KeyBinding,
-    KeyDownEvent, LineFragment, MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput, QuitMode,
-    Render, ScrollHandle, ScrollWheelEvent, SharedString, SpringAnimation, SpringConfig,
-    Subscription, TitlebarOptions, Window, WindowBounds, WindowControlArea, WindowOptions, actions,
-    div, img, point, prelude::*, px, rems, rgb, rgba, size,
+    Animation, AnimationExt, AnyWindowHandle, App, AppContext, AssetSource, AsyncApp, Bounds,
+    ClipboardItem, Context, Entity, Focusable, FontStyle, FontWeight, FutureExt, HighlightStyle,
+    IntoElement, KeyBinding, KeyDownEvent, LineFragment, MouseButton, MouseDownEvent, MouseUpEvent,
+    PlatformInput, QuitMode, Render, ScrollHandle, ScrollWheelEvent, SharedString, SpringAnimation,
+    SpringConfig, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds,
+    WindowControlArea, WindowOptions, actions, div, img, point, prelude::*, px, rems, rgb, rgba,
+    size,
 };
 use gpui_base::{
     SelectableText, TextSelection, TextSelectionLayer, TextView, TextViewDefaults, TextViewState,
@@ -24,7 +25,7 @@ use gpui_base::{
 };
 use iroh::{
     Endpoint, EndpointId,
-    endpoint::{Connection, presets},
+    endpoint::{Accepting, Connection, presets},
 };
 use itertools::Itertools;
 use rig::{
@@ -41,9 +42,14 @@ use syntect::{
     parsing::SyntaxSet,
     util::LinesWithEndings,
 };
-use tokio::{runtime::Runtime, sync::mpsc};
+use tokio::{
+    runtime::Runtime,
+    sync::{broadcast, mpsc},
+};
 use tokio_util::sync::PollSender;
 use uuid::Uuid;
+
+mod protocol;
 
 const SIDEBAR_WIDTH: gpui::Pixels = px(275.);
 const TOP_BAR_HEIGHT: gpui::Pixels = px(40.);
@@ -51,11 +57,16 @@ const MACOS_TRAFFIC_LIGHT_X_INSET: gpui::Pixels = px(12.);
 const MACOS_TRAFFIC_LIGHT_SIZE: gpui::Pixels = px(14.);
 const MACOS_TRAFFIC_LIGHT_SPACING: gpui::Pixels = px(6.);
 const MACOS_TRAFFIC_LIGHT_TRAILING_GAP: gpui::Pixels = px(12.);
-const OLLAMA_MODEL: &str = "lfm2.5";
-const OLLAMA_CONTEXT_TOKENS: u64 = 8_192;
+const OLLAMA_MODEL: &str = "qwen3.8:27b";
+const OLLAMA_CONTEXT_TOKENS: u64 = 16 * 8_192;
 const OLLAMA_AVATAR_PATH: &str = "providers/ollama.png";
 const USER_ACCENT: u32 = 0xe26d5a;
 const COWORK_ALPN: &[u8] = b"cowork/0";
+/// How long any single step of the collaboration handshake may take.
+const PEER_TIMEOUT: Duration = Duration::from_secs(20);
+/// How many thread events a collaborator may fall behind before the host
+/// re-bases it on a fresh snapshot instead of a delta.
+const THREAD_EVENT_CAPACITY: usize = 1024;
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
@@ -263,13 +274,32 @@ enum SharingStatus {
     Failed,
 }
 
+/// The host's end of a collaborator connection.
+type HostPeer = protocol::Peer<protocol::HostMessage, protocol::CollaboratorMessage>;
+
+/// A collaborator's end of its connection to a thread's host.
+type ThreadHost = protocol::Peer<protocol::CollaboratorMessage, protocol::HostMessage>;
+
 enum ThreadSharing {
     NotShared,
     Sharing,
-    Shared(Endpoint),
+    /// Hosting the thread. `events` fans every local change out to all
+    /// collaborators; dropping it tears their connections down.
+    Shared {
+        endpoint: Endpoint,
+        events: broadcast::Sender<protocol::HostMessage>,
+    },
+    /// Mirroring someone else's thread.
+    ///
+    /// `connection` and `host` are held rather than read: they keep the QUIC
+    /// connection and its protocol stream open, so replacing this state is what
+    /// disconnects. `host` is also where peer specific requests, such as
+    /// permission changes, will be sent from.
+    #[allow(dead_code, reason = "fields are held open for their lifetime")]
     Connected {
         endpoint: Endpoint,
         connection: Connection,
+        host: async_channel::Sender<protocol::CollaboratorMessage>,
     },
     Failed,
 }
@@ -279,7 +309,7 @@ impl ThreadSharing {
         match self {
             Self::NotShared => SharingStatus::NotShared,
             Self::Sharing => SharingStatus::Sharing,
-            Self::Shared(_) => SharingStatus::Shared,
+            Self::Shared { .. } => SharingStatus::Shared,
             Self::Connected { .. } => SharingStatus::Connected,
             Self::Failed => SharingStatus::Failed,
         }
@@ -288,7 +318,7 @@ impl ThreadSharing {
     fn is_collaborating(&self) -> bool {
         matches!(
             self,
-            Self::Sharing | Self::Shared(_) | Self::Connected { .. }
+            Self::Sharing | Self::Shared { .. } | Self::Connected { .. }
         )
     }
 }
@@ -312,6 +342,10 @@ enum ThreadOwnership {
 }
 
 impl ThreadOwnership {
+    fn can_write(self) -> bool {
+        matches!(self, Self::Local)
+    }
+
     fn remove_on_disconnect(self) -> bool {
         matches!(self, Self::Remote)
     }
@@ -324,6 +358,309 @@ struct Thread {
     generating: bool,
     sharing: ThreadSharing,
     ownership: ThreadOwnership,
+}
+
+impl UserComment {
+    fn to_protocol(&self) -> Option<protocol::UserComment> {
+        let UserCommentBody::Submitted(body) = &self.body else {
+            return None;
+        };
+        Some(protocol::UserComment {
+            id: self.id.into_bytes(),
+            source_message_id: self.source_message_id.into_bytes(),
+            quote: self.quote.clone(),
+            source_range: (self.source_range.start, self.source_range.end),
+            body: body.to_string(),
+        })
+    }
+}
+
+impl protocol::UserComment {
+    fn into_native(self) -> UserComment {
+        UserComment {
+            id: Uuid::from_bytes(self.id),
+            source_message_id: Uuid::from_bytes(self.source_message_id),
+            quote: self.quote,
+            source_range: self.source_range.0..self.source_range.1,
+            body: UserCommentBody::Submitted(self.body.into()),
+        }
+    }
+}
+
+impl UserMessageGroup {
+    fn to_protocol(&self) -> Option<protocol::UserMessage> {
+        let UserMessageContent::Submitted { text, .. } = &self.content else {
+            return None;
+        };
+        Some(protocol::UserMessage {
+            id: self.id.into_bytes(),
+            text: text.clone(),
+            comments: self
+                .comments
+                .iter()
+                .filter_map(UserComment::to_protocol)
+                .collect(),
+        })
+    }
+}
+
+impl protocol::UserMessage {
+    fn into_native(self) -> UserMessageGroup {
+        UserMessageGroup {
+            id: Uuid::from_bytes(self.id),
+            comments: self
+                .comments
+                .into_iter()
+                .map(protocol::UserComment::into_native)
+                .collect(),
+            content: UserMessageContent::Submitted {
+                text: self.text,
+                history_text: None,
+            },
+            comments_folded: false,
+        }
+    }
+}
+
+impl AgentMessage {
+    /// An empty message for an agent that has just started responding.
+    fn new(id: Uuid, cx: &mut impl AppContext) -> Self {
+        Self {
+            id,
+            thinking: String::new(),
+            thinking_view: cx.new(|cx| TextViewState::markdown("", cx)),
+            thinking_complete: false,
+            thinking_expanded: true,
+            text: String::new(),
+            text_view: cx.new(|cx| TextViewState::markdown("", cx)),
+            complete: false,
+            failed: false,
+        }
+    }
+
+    fn to_protocol(&self) -> protocol::AgentMessage {
+        protocol::AgentMessage {
+            id: self.id.into_bytes(),
+            thinking: self.thinking.clone(),
+            thinking_complete: self.thinking_complete,
+            text: self.text.clone(),
+            complete: self.complete,
+            failed: self.failed,
+        }
+    }
+}
+
+impl protocol::AgentMessage {
+    fn into_native(self, cx: &mut impl AppContext) -> AgentMessage {
+        let thinking_view = cx.new(|cx| TextViewState::markdown(&self.thinking, cx));
+        let text_view = cx.new(|cx| TextViewState::markdown(&self.text, cx));
+        AgentMessage {
+            id: Uuid::from_bytes(self.id),
+            thinking: self.thinking,
+            thinking_view,
+            thinking_complete: self.thinking_complete,
+            thinking_expanded: !self.thinking_complete,
+            text: self.text,
+            text_view,
+            complete: self.complete,
+            failed: self.failed,
+        }
+    }
+}
+
+impl TimelineMessage {
+    fn to_protocol(&self) -> Option<protocol::TimelineMessage> {
+        match self {
+            Self::User(message) => message.to_protocol().map(protocol::TimelineMessage::User),
+            Self::Agent(message) => Some(protocol::TimelineMessage::Agent(message.to_protocol())),
+        }
+    }
+}
+
+impl protocol::TimelineMessage {
+    fn into_native(self, cx: &mut impl AppContext) -> TimelineMessage {
+        match self {
+            Self::User(message) => TimelineMessage::User(message.into_native()),
+            Self::Agent(message) => TimelineMessage::Agent(message.into_native(cx)),
+        }
+    }
+}
+
+impl Thread {
+    /// Builds the local mirror of a thread hosted by someone else.
+    fn from_snapshot(
+        snapshot: protocol::ThreadSnapshot,
+        draft: UserMessageGroup,
+        sharing: ThreadSharing,
+        cx: &mut impl AppContext,
+    ) -> Self {
+        let (summary, timeline) = snapshot.into_native(cx);
+        let mut thread = Self {
+            summary,
+            timeline: Vec::new(),
+            draft,
+            generating: false,
+            sharing,
+            ownership: ThreadOwnership::Remote,
+        };
+        thread.set_timeline(timeline);
+        thread
+    }
+
+    fn to_protocol(&self) -> protocol::ThreadSnapshot {
+        protocol::ThreadSnapshot {
+            id: self.summary.id.into_bytes(),
+            title: self.summary.title.clone(),
+            messages: self
+                .timeline
+                .iter()
+                .filter_map(TimelineMessage::to_protocol)
+                .collect(),
+        }
+    }
+
+    /// Subscribes to this thread's events, returning `None` when it is not
+    /// being hosted.
+    ///
+    /// Callers that also need a snapshot must take both in the same
+    /// `Entity::update`: thread state only changes on the foreground thread, so
+    /// pairing them there guarantees the subscription starts exactly where the
+    /// snapshot ends, with no event missed or replayed.
+    fn subscribe(&self) -> Option<broadcast::Receiver<protocol::HostMessage>> {
+        match &self.sharing {
+            ThreadSharing::Shared { events, .. } => Some(events.subscribe()),
+            _ => None,
+        }
+    }
+
+    /// Broadcasts an event to every collaborator without applying it locally.
+    ///
+    /// Needed for the changes whose local representation carries more than the
+    /// wire form does, such as a user message that also remembers the prompt
+    /// the agent was given and whether its comments are folded.
+    fn publish(&self, event: protocol::HostMessage) {
+        if let ThreadSharing::Shared { events, .. } = &self.sharing {
+            // An error here only means nobody has joined yet.
+            _ = events.send(event);
+        }
+    }
+
+    /// Applies a thread event locally and broadcasts it verbatim.
+    ///
+    /// Host and collaborators then run the same [`Thread::apply`] over the same
+    /// events, so their timelines stay identical by construction. Only use this
+    /// for events that fully describe the change they make.
+    fn emit(&mut self, event: protocol::HostMessage, cx: &mut impl AppContext) {
+        // Checked up front so that an unshared thread, which is the common
+        // case, never pays to clone a streamed chunk.
+        if matches!(self.sharing, ThreadSharing::Shared { .. }) {
+            self.publish(event.clone());
+        }
+        self.apply(event, cx);
+    }
+
+    /// Folds a thread event into the timeline.
+    fn apply(&mut self, event: protocol::HostMessage, cx: &mut impl AppContext) {
+        match event {
+            protocol::HostMessage::Welcome(snapshot) => {
+                let (summary, timeline) = snapshot.into_native(cx);
+                self.summary = summary;
+                self.set_timeline(timeline);
+            }
+            protocol::HostMessage::ThreadTitled(title) => self.summary.title = title,
+            protocol::HostMessage::UserMessage(message) => self
+                .timeline
+                .push(TimelineMessage::User(message.into_native())),
+            protocol::HostMessage::AgentStarted { id } => {
+                self.timeline.push(TimelineMessage::Agent(AgentMessage::new(
+                    Uuid::from_bytes(id),
+                    cx,
+                )));
+                self.generating = true;
+            }
+            protocol::HostMessage::AgentTextAppended { id, target, text } => {
+                let Some(message) = self.agent_message_mut(id) else {
+                    return;
+                };
+                let view = match target {
+                    protocol::AgentText::Thinking => {
+                        message.thinking.push_str(&text);
+                        message.thinking_view.clone()
+                    }
+                    protocol::AgentText::Response => {
+                        // Some models never close the reasoning block, so the
+                        // first answer token ends it instead.
+                        if !message.thinking.is_empty() && !message.thinking_complete {
+                            message.thinking_complete = true;
+                            message.thinking_expanded = false;
+                        }
+                        message.text.push_str(&text);
+                        message.text_view.clone()
+                    }
+                };
+                view.update(cx, |view, cx| view.push_str(&text, cx));
+            }
+            protocol::HostMessage::AgentThinkingEnded { id } => {
+                let Some(message) = self.agent_message_mut(id) else {
+                    return;
+                };
+                message.thinking_complete = true;
+                message.thinking_expanded = false;
+            }
+            protocol::HostMessage::AgentEnded {
+                id,
+                failed,
+                failure,
+            } => {
+                self.generating = false;
+                let Some(message) = self.agent_message_mut(id) else {
+                    return;
+                };
+                message.complete = true;
+                message.thinking_complete = true;
+                message.thinking_expanded = false;
+                message.failed = failed;
+                // Only surface the failure when the agent said nothing itself.
+                if let Some(failure) = failure
+                    && message.text.is_empty()
+                {
+                    let view = message.text_view.clone();
+                    view.update(cx, |view, cx| view.set_text(&failure, cx));
+                    message.text = failure;
+                }
+            }
+        }
+    }
+
+    fn set_timeline(&mut self, timeline: Vec<TimelineMessage>) {
+        self.generating = timeline
+            .iter()
+            .any(|message| matches!(message, TimelineMessage::Agent(message) if !message.complete));
+        self.timeline = timeline;
+    }
+
+    fn agent_message_mut(&mut self, id: uuid::Bytes) -> Option<&mut AgentMessage> {
+        let id = Uuid::from_bytes(id);
+        self.timeline.iter_mut().find_map(|entry| match entry {
+            TimelineMessage::Agent(message) if message.id == id => Some(message),
+            _ => None,
+        })
+    }
+}
+
+impl protocol::ThreadSnapshot {
+    fn into_native(self, cx: &mut impl AppContext) -> (ThreadSummary, Vec<TimelineMessage>) {
+        let summary = ThreadSummary {
+            id: Uuid::from_bytes(self.id),
+            title: self.title,
+        };
+        let timeline = self
+            .messages
+            .into_iter()
+            .map(|message| message.into_native(cx))
+            .collect();
+        (summary, timeline)
+    }
 }
 
 struct ThreadStore {
@@ -504,16 +841,65 @@ impl Cowork {
         });
         cx.notify();
 
-        let (sender, mut receiver) = mpsc::channel(1);
-        self.tokio_handle.spawn(async move {
-            let result = Endpoint::builder(presets::N0)
+        let (peers, accepted_peers) = async_channel::bounded(protocol::PEER_CHANNEL_CAPACITY);
+        let endpoint_task = Self::bind_shared_endpoint(&self.tokio_handle, peers);
+
+        cx.spawn(async move |this, cx| {
+            let endpoint = endpoint_task
+                .await
+                .context("Endpoint setup task failed.")
+                .and_then(|result| result);
+            let endpoint = match endpoint {
+                Ok(endpoint) => endpoint,
+                Err(error) => {
+                    eprintln!("failed to share thread: {error:#}");
+                    thread.update(cx, |thread, _| thread.sharing = ThreadSharing::Failed);
+                    _ = this.update(cx, |_, cx| cx.notify());
+                    return;
+                }
+            };
+            thread.update(cx, |thread, _| {
+                thread.sharing = ThreadSharing::Shared {
+                    endpoint,
+                    events: broadcast::channel(THREAD_EVENT_CAPACITY).0,
+                };
+            });
+            if this.update(cx, |_, cx| cx.notify()).is_err() {
+                return;
+            }
+
+            // Peers are only served once the thread is hosting, so that every
+            // one of them can subscribe to its events. Connections accepted
+            // before that wait in the channel.
+            let thread = thread.downgrade();
+            while let Ok(peer) = accepted_peers.recv().await {
+                let thread = thread.clone();
+                cx.spawn(async move |cx| {
+                    if let Err(error) = Self::serve_peer(thread, peer, cx).await {
+                        eprintln!("stopped serving collaborator: {error:#}");
+                    }
+                })
+                .detach();
+            }
+        })
+        .detach();
+    }
+
+    /// Binds the endpoint collaborators dial into, forwarding every accepted
+    /// connection to `peers` as a ready to use protocol channel.
+    fn bind_shared_endpoint(
+        tokio_handle: &tokio::runtime::Handle,
+        peers: async_channel::Sender<HostPeer>,
+    ) -> tokio::task::JoinHandle<anyhow::Result<Endpoint>> {
+        tokio_handle.spawn(async move {
+            let endpoint = Endpoint::builder(presets::N0)
                 .alpns(vec![COWORK_ALPN.to_vec()])
                 .bind()
-                .await
-                .map_err(anyhow::Error::from);
-            if let Ok(endpoint) = &result {
+                .await?;
+
+            tokio::spawn({
                 let endpoint = endpoint.clone();
-                tokio::spawn(async move {
+                async move {
                     while let Some(incoming) = endpoint.accept().await {
                         let accepting = match incoming.accept() {
                             Ok(accepting) => accepting,
@@ -522,50 +908,106 @@ impl Cowork {
                                 continue;
                             }
                         };
+                        let peers = peers.clone();
                         tokio::spawn(async move {
-                            match accepting.await {
-                                Ok(connection) => {
-                                    connection.closed().await;
-                                }
-                                Err(error) => {
-                                    eprintln!("failed to establish incoming connection: {error}");
-                                }
+                            if let Err(error) = Self::accept_peer(accepting, peers).await {
+                                eprintln!("failed to accept collaborator: {error:#}");
                             }
                         });
                     }
-                });
-            }
-            if sender.send(result).await.is_err() {
-                return;
-            }
-        });
-
-        cx.spawn(async move |this, cx| {
-            let Some(result) = receiver.recv().await else {
-                return;
-            };
-
-            match result {
-                Ok(endpoint) => {
-                    thread.update(cx, |thread, _| {
-                        thread.sharing = ThreadSharing::Shared(endpoint);
-                    });
-                    if this.update(cx, |_, cx| cx.notify()).is_err() {
-                        return;
-                    }
                 }
-                Err(error) => {
-                    eprintln!("failed to share thread: {error}");
-                    thread.update(cx, |thread, _| {
-                        thread.sharing = ThreadSharing::Failed;
-                    });
-                    if this.update(cx, |_, cx| cx.notify()).is_err() {
-                        return;
+            });
+
+            Ok(endpoint)
+        })
+    }
+
+    /// Finishes one incoming connection's handshake and hands its protocol
+    /// channel over to the foreground.
+    async fn accept_peer(
+        accepting: Accepting,
+        peers: async_channel::Sender<HostPeer>,
+    ) -> anyhow::Result<()> {
+        let connection = accepting.await?;
+        let (send, recv) = tokio::time::timeout(PEER_TIMEOUT, connection.accept_bi())
+            .await
+            .context("Timed out waiting for a peer protocol stream.")??;
+        // The streams keep the connection alive, so `connection` itself can go.
+        peers
+            .send(protocol::spawn_peer(tokio::io::join(recv, send)))
+            .await
+            .context("Shared thread is no longer available.")
+    }
+
+    /// Streams the shared thread to one collaborator for as long as it stays
+    /// connected.
+    ///
+    /// The collaborator is first re-based onto a snapshot, then fed the thread's
+    /// events verbatim. Peer specific requests flow the other way on the peer's
+    /// own channel.
+    async fn serve_peer(
+        thread: WeakEntity<Thread>,
+        peer: HostPeer,
+        cx: &mut AsyncApp,
+    ) -> anyhow::Result<()> {
+        let join = peer
+            .receive()
+            .with_timeout(PEER_TIMEOUT, cx.background_executor())
+            .await?
+            .context("Peer closed before joining.")?;
+        anyhow::ensure!(
+            join == protocol::CollaboratorMessage::Join,
+            "Expected a join message, got {join:?}."
+        );
+
+        // Drain peer specific requests so that a peer which stops reading its
+        // own replies can never stall the event stream it is subscribed to.
+        cx.spawn({
+            let requests = peer.incoming.clone();
+            async move |_| {
+                while let Ok(request) = requests.recv().await {
+                    match request {
+                        protocol::CollaboratorMessage::Join => {}
                     }
                 }
             }
         })
         .detach();
+
+        let mut events = Self::send_snapshot(&thread, &peer, cx).await?;
+        loop {
+            match events.recv().await {
+                Ok(event) => peer
+                    .send(event)
+                    .await
+                    .context("Peer stopped receiving thread events.")?,
+                // A peer that fell further behind than the event buffer has
+                // missed changes, so re-base it rather than applying deltas to
+                // a timeline that no longer matches the host's.
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    events = Self::send_snapshot(&thread, &peer, cx).await?;
+                }
+                Err(broadcast::error::RecvError::Closed) => return Ok(()),
+            }
+        }
+    }
+
+    /// Sends a peer a full snapshot and returns a subscription that resumes
+    /// exactly where the snapshot left off.
+    async fn send_snapshot(
+        thread: &WeakEntity<Thread>,
+        peer: &HostPeer,
+        cx: &mut AsyncApp,
+    ) -> anyhow::Result<broadcast::Receiver<protocol::HostMessage>> {
+        let (snapshot, events) = thread
+            .update(cx, |thread, _| {
+                Some((thread.to_protocol(), thread.subscribe()?))
+            })?
+            .context("Thread is no longer shared.")?;
+        peer.send(protocol::HostMessage::Welcome(snapshot))
+            .await
+            .context("Peer disconnected before receiving the thread snapshot.")?;
+        Ok(events)
     }
 
     fn copy_endpoint_id(&self, cx: &mut Context<Self>) {
@@ -577,7 +1019,7 @@ impl Cowork {
         };
         let endpoint_id = {
             let thread = thread.read(cx);
-            let ThreadSharing::Shared(endpoint) = &thread.sharing else {
+            let ThreadSharing::Shared { endpoint, .. } = &thread.sharing else {
                 return;
             };
             endpoint.id().to_string()
@@ -648,72 +1090,83 @@ impl Cowork {
         let draft = Self::new_user_message_draft(window, cx);
         cx.notify();
 
-        let (sender, mut receiver) = mpsc::channel(1);
-        self.tokio_handle.spawn(async move {
-            let result: anyhow::Result<_> = async {
-                let endpoint = Endpoint::builder(presets::N0).bind().await?;
-                let connection = tokio::time::timeout(
-                    Duration::from_secs(20),
-                    endpoint.connect(endpoint_id, COWORK_ALPN),
-                )
+        let join_task = self.tokio_handle.spawn(async move {
+            let endpoint = Endpoint::builder(presets::N0).bind().await?;
+            let connection =
+                tokio::time::timeout(PEER_TIMEOUT, endpoint.connect(endpoint_id, COWORK_ALPN))
+                    .await
+                    .context("Connection timed out.")??;
+            let (send, recv) = tokio::time::timeout(PEER_TIMEOUT, connection.open_bi())
                 .await
-                .context("Connection timed out.")??;
-                Ok((endpoint, connection))
-            }
-            .await;
-            let _ = sender.send(result).await;
+                .context("Timed out opening the peer protocol stream.")??;
+            let host: ThreadHost = protocol::spawn_peer(tokio::io::join(recv, send));
+            host.send(protocol::CollaboratorMessage::Join)
+                .await
+                .context("Peer connection is no longer available.")?;
+            let welcome = tokio::time::timeout(PEER_TIMEOUT, host.receive())
+                .await
+                .context("Timed out waiting for the thread snapshot.")?
+                .context("Host closed the protocol stream before sending the thread snapshot.")?;
+            let protocol::HostMessage::Welcome(snapshot) = welcome else {
+                anyhow::bail!("Host sent a thread event before the thread snapshot.");
+            };
+            Ok::<_, anyhow::Error>((endpoint, connection, host, snapshot))
         });
 
         cx.spawn(async move |this, cx| {
-            let Some(result) = receiver.recv().await else {
+            let result = join_task
+                .await
+                .context("Join task failed.")
+                .and_then(|result| result);
+            let (endpoint, connection, host, snapshot) = match result {
+                Ok(joined) => joined,
+                Err(error) => {
+                    eprintln!("failed to join shared thread: {error:#}");
+                    _ = this.update(cx, |this, cx| {
+                        if let Some(dialog) = &mut this.join_dialog {
+                            dialog.status = JoinStatus::Failed(error.to_string());
+                        }
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+
+            let (requests, events) = host.split();
+            let Ok((thread, thread_id)) = this.update(cx, move |this, cx| {
+                let thread = cx.new(|cx| {
+                    Thread::from_snapshot(
+                        snapshot,
+                        draft,
+                        ThreadSharing::Connected {
+                            endpoint,
+                            connection,
+                            host: requests,
+                        },
+                        cx,
+                    )
+                });
+                let thread_id = thread.read(cx).summary.id;
+                this.thread_store.update(cx, |store, _| {
+                    store.threads.push_front(thread.clone());
+                });
+                this.active_thread_id = Some(thread_id);
+                this.selection_message_id = None;
+                this.join_dialog = None;
+                cx.notify();
+                (thread, thread_id)
+            }) else {
                 return;
             };
-            match result {
-                Ok((endpoint, connection)) => {
-                    let endpoint_label = token.chars().take(8).collect::<String>();
-                    let thread_id = Uuid::new_v4();
-                    if this
-                        .update(cx, move |this, cx| {
-                            let thread = cx.new(|_| Thread {
-                                summary: ThreadSummary {
-                                    id: thread_id,
-                                    title: format!("Shared thread {endpoint_label}"),
-                                },
-                                timeline: Vec::new(),
-                                draft,
-                                generating: false,
-                                sharing: ThreadSharing::Connected {
-                                    endpoint,
-                                    connection,
-                                },
-                                ownership: ThreadOwnership::Remote,
-                            });
-                            this.thread_store.update(cx, |store, _| {
-                                store.threads.push_front(thread);
-                            });
-                            this.active_thread_id = Some(thread_id);
-                            this.selection_message_id = None;
-                            this.join_dialog = None;
-                            cx.notify();
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                Err(error) => {
-                    eprintln!("failed to join shared thread: {error}");
-                    if this
-                        .update(cx, |this, cx| {
-                            if let Some(dialog) = &mut this.join_dialog {
-                                dialog.status = JoinStatus::Failed(error.to_string());
-                            }
-                            cx.notify();
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
+
+            // Replay the host's changes onto the local mirror of the thread.
+            while let Ok(event) = events.recv().await {
+                thread.update(cx, |thread, cx| thread.apply(event, cx));
+                if this
+                    .update(cx, |this, cx| this.thread_updated(thread_id, cx))
+                    .is_err()
+                {
+                    return;
                 }
             }
         })
@@ -728,8 +1181,10 @@ impl Cowork {
             SharingStatus::NotShared | SharingStatus::Failed => self.start_sharing(thread, cx),
             SharingStatus::Sharing => {}
             SharingStatus::Shared => {
+                // Replacing the state drops the event channel, which ends every
+                // peer's subscription and unwinds the tasks serving them.
                 let endpoint = thread.update(cx, |thread, _| {
-                    let ThreadSharing::Shared(endpoint) =
+                    let ThreadSharing::Shared { endpoint, .. } =
                         std::mem::replace(&mut thread.sharing, ThreadSharing::NotShared)
                     else {
                         return None;
@@ -744,15 +1199,14 @@ impl Cowork {
                 cx.notify();
             }
             SharingStatus::Connected => {
+                // Replacing the state drops the channel to the host, closing
+                // the protocol stream that kept the connection alive.
                 let endpoint = thread.update(cx, |thread, _| {
-                    let ThreadSharing::Connected {
-                        endpoint,
-                        connection,
-                    } = std::mem::replace(&mut thread.sharing, ThreadSharing::NotShared)
+                    let ThreadSharing::Connected { endpoint, .. } =
+                        std::mem::replace(&mut thread.sharing, ThreadSharing::NotShared)
                     else {
                         return None;
                     };
-                    drop(connection);
                     Some(endpoint)
                 });
                 if thread.read(cx).ownership.remove_on_disconnect() {
@@ -929,12 +1383,16 @@ impl Cowork {
         let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
             return;
         };
-        let composer = Self::draft_composer(&thread.read(cx).draft);
+        let thread = thread.read(cx);
+        let composer = Self::draft_composer(&thread.draft);
+        let can_write = thread.ownership.can_write();
         self.active_thread_id = Some(thread_id);
         self.selection_message_id = None;
         self.follow_generation = true;
         self.timeline_scroll_handle.scroll_to_bottom();
-        composer.focus_handle(cx).focus(window, cx);
+        if can_write {
+            composer.focus_handle(cx).focus(window, cx);
+        }
         cx.notify();
     }
 
@@ -1389,6 +1847,14 @@ impl Cowork {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self
+            .active_thread_id
+            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
+            .is_some_and(|thread| !thread.read(cx).ownership.can_write())
+        {
+            return;
+        }
+
         if event.keystroke.key == "escape" {
             let Some(thread) = self
                 .active_thread_id
@@ -2162,25 +2628,16 @@ impl Cowork {
         let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
             return;
         };
-        let thinking_view = cx.new(|cx| TextViewState::markdown("", cx));
-        let text_view = cx.new(|cx| TextViewState::markdown("", cx));
         let message_id = Uuid::new_v4();
-        thread.update(cx, |thread, _| {
-            thread.timeline.push(TimelineMessage::Agent(AgentMessage {
-                id: message_id,
-                thinking: String::new(),
-                thinking_view,
-                thinking_complete: false,
-                thinking_expanded: true,
-                text: String::new(),
-                text_view,
-                complete: false,
-                failed: false,
-            }));
-            thread.generating = true;
+        thread.update(cx, |thread, cx| {
+            thread.emit(
+                protocol::HostMessage::AgentStarted {
+                    id: message_id.into_bytes(),
+                },
+                cx,
+            );
         });
 
-        let thread = thread.clone();
         let (sender, mut receiver) = mpsc::channel(128);
         let generation_task = self.tokio_handle.spawn(async move {
             let client = Ollama::new().bound()?;
@@ -2203,78 +2660,14 @@ impl Cowork {
         cx.spawn(async move |this, cx| {
             let mut stream_completed = true;
             while let Some(item) = receiver.recv().await {
-                let (finished, text_view_update) = thread.update(cx, |thread, _| {
-                    let Some(message) = thread.timeline.iter_mut().find_map(|entry| match entry {
-                        TimelineMessage::Agent(message) if message.id == message_id => {
-                            Some(message)
-                        }
-                        _ => None,
-                    }) else {
-                        return (true, None);
-                    };
-                    match item {
-                        Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockDelta {
-                            delta: Delta::Reasoning { text },
-                            ..
-                        })) => {
-                            message.thinking.push_str(&text);
-                            (false, Some((message.thinking_view.clone(), text, true)))
-                        }
-                        Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockEnd {
-                            end: BlockClose::Reasoning { .. },
-                            ..
-                        })) => {
-                            message.thinking_complete = true;
-                            message.thinking_expanded = false;
-                            (false, None)
-                        }
-                        Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockDelta {
-                            delta: Delta::Text { text },
-                            ..
-                        })) => {
-                            if !message.thinking.is_empty() && !message.thinking_complete {
-                                message.thinking_complete = true;
-                                message.thinking_expanded = false;
-                            }
-                            message.text.push_str(&text);
-                            (false, Some((message.text_view.clone(), text, true)))
-                        }
-                        Err(error) => {
-                            message.complete = true;
-                            message.thinking_complete = true;
-                            message.thinking_expanded = false;
-                            message.failed = true;
-                            let update = if message.text.is_empty() {
-                                message.text = format!("Unable to generate a response: {error}");
-                                Some((message.text_view.clone(), message.text.clone(), false))
-                            } else {
-                                None
-                            };
-                            thread.generating = false;
-                            (true, update)
-                        }
-                        _ => (false, None),
-                    }
-                });
-                if let Some((text_view, text, append)) = text_view_update {
-                    text_view.update(cx, |text_view, cx| {
-                        if append {
-                            text_view.push_str(&text, cx);
-                        } else {
-                            text_view.set_text(&text, cx);
-                        }
-                    });
-                }
+                let Some(event) = Self::agent_stream_event(message_id, item) else {
+                    continue;
+                };
+                let ended = matches!(event, protocol::HostMessage::AgentEnded { .. });
+                thread.update(cx, |thread, cx| thread.emit(event, cx));
 
-                let result = this.update(cx, |this, cx| {
-                    if this.active_thread_id == Some(thread_id) {
-                        if this.follow_generation {
-                            this.timeline_scroll_handle.scroll_to_bottom();
-                        }
-                        cx.notify();
-                    }
-                });
-                if result.is_err() || finished {
+                let result = this.update(cx, |this, cx| this.thread_updated(thread_id, cx));
+                if result.is_err() || ended {
                     stream_completed = false;
                     break;
                 }
@@ -2286,41 +2679,70 @@ impl Cowork {
                     Ok(Err(error)) => Some(error),
                     Err(error) => Some(error.into()),
                 };
-                let text_view_update = thread.update(cx, |thread, _| {
-                    let Some(message) = thread.timeline.iter_mut().find_map(|entry| match entry {
-                        TimelineMessage::Agent(message) if message.id == message_id => {
-                            Some(message)
-                        }
-                        _ => None,
-                    }) else {
-                        return None;
-                    };
-                    message.complete = true;
-                    message.thinking_complete = true;
-                    message.thinking_expanded = false;
-                    thread.generating = false;
-                    let Some(error) = error else {
-                        return None;
-                    };
-                    message.failed = true;
-                    if message.text.is_empty() {
-                        message.text = format!("Unable to generate a response: {error}");
-                        Some((message.text_view.clone(), message.text.clone()))
-                    } else {
-                        None
-                    }
+                thread.update(cx, |thread, cx| {
+                    thread.emit(
+                        protocol::HostMessage::AgentEnded {
+                            id: message_id.into_bytes(),
+                            failed: error.is_some(),
+                            failure: error
+                                .map(|error| format!("Unable to generate a response: {error}")),
+                        },
+                        cx,
+                    );
                 });
-                if let Some((text_view, text)) = text_view_update {
-                    text_view.update(cx, |text_view, cx| text_view.set_text(&text, cx));
-                }
-                _ = this.update(cx, |this, cx| {
-                    if this.active_thread_id == Some(thread_id) {
-                        cx.notify();
-                    }
-                });
+                _ = this.update(cx, |this, cx| this.thread_updated(thread_id, cx));
             }
         })
         .detach();
+    }
+
+    /// Translates one item of the agent's stream into the thread event it
+    /// represents, or `None` for items that do not change the timeline.
+    fn agent_stream_event(
+        message_id: Uuid,
+        item: anyhow::Result<MultiTurnStreamItem>,
+    ) -> Option<protocol::HostMessage> {
+        let id = message_id.into_bytes();
+        match item {
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockDelta {
+                delta: Delta::Reasoning { text },
+                ..
+            })) => Some(protocol::HostMessage::AgentTextAppended {
+                id,
+                target: protocol::AgentText::Thinking,
+                text,
+            }),
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockEnd {
+                end: BlockClose::Reasoning { .. },
+                ..
+            })) => Some(protocol::HostMessage::AgentThinkingEnded { id }),
+            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockDelta {
+                delta: Delta::Text { text },
+                ..
+            })) => Some(protocol::HostMessage::AgentTextAppended {
+                id,
+                target: protocol::AgentText::Response,
+                text,
+            }),
+            Err(error) => Some(protocol::HostMessage::AgentEnded {
+                id,
+                failed: true,
+                failure: Some(format!("Unable to generate a response: {error}")),
+            }),
+            _ => None,
+        }
+    }
+
+    /// Redraws the timeline after `thread_id` changed, staying pinned to the
+    /// newest output unless the user has scrolled away.
+    fn thread_updated(&mut self, thread_id: Uuid, cx: &mut Context<Self>) {
+        if self.active_thread_id != Some(thread_id) {
+            return;
+        }
+        if self.follow_generation {
+            self.timeline_scroll_handle.scroll_to_bottom();
+        }
+        cx.notify();
     }
 
     fn thread_title(prompt: &str) -> String {
@@ -2395,10 +2817,10 @@ impl Cowork {
         let active_thread = self
             .active_thread_id
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx));
-        if active_thread
-            .as_ref()
-            .is_some_and(|thread| thread.read(cx).generating)
-        {
+        if active_thread.as_ref().is_some_and(|thread| {
+            let thread = thread.read(cx);
+            !thread.ownership.can_write() || thread.generating
+        }) {
             return;
         }
 
@@ -2451,9 +2873,12 @@ impl Cowork {
 
         let thread_id = if let Some(thread) = active_thread {
             let thread_id = thread.read(cx).summary.id;
-            thread.update(cx, |thread, _| {
+            thread.update(cx, |thread, cx| {
                 if let Some(title) = Self::title_for_first_message(&thread.timeline, &prompt) {
-                    thread.summary.title = title;
+                    thread.emit(protocol::HostMessage::ThreadTitled(title), cx);
+                }
+                if let Some(message) = submitted_group.to_protocol() {
+                    thread.publish(protocol::HostMessage::UserMessage(message));
                 }
                 thread.timeline.push(TimelineMessage::User(submitted_group));
                 thread.draft = next_draft;
@@ -2534,13 +2959,17 @@ impl Cowork {
     ) -> impl IntoElement {
         self.render_generation = self.render_generation.wrapping_add(1);
         let active_thread_id = self.active_thread_id;
-        let (messages, draft) = active_thread_id
+        let (messages, draft, can_write) = active_thread_id
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
             .map(|thread| {
                 let thread = thread.read(cx);
-                (thread.timeline.clone(), thread.draft.clone())
+                (
+                    thread.timeline.clone(),
+                    thread.draft.clone(),
+                    thread.ownership.can_write(),
+                )
             })
-            .unwrap_or_else(|| (Vec::new(), self.new_thread_draft.clone()));
+            .unwrap_or_else(|| (Vec::new(), self.new_thread_draft.clone(), true));
         let comments = messages
             .iter()
             .filter_map(|message| match message {
@@ -2612,50 +3041,72 @@ impl Cowork {
                             .text_sm()
                             .text_color(rgb(0xd4d4d8))
                             .children(timeline_messages)
-                            .child(
-                                div()
-                                    .id("composer-row")
-                                    .w_full()
-                                    .flex()
-                                    .items_start()
-                                    .child(
-                                        div()
-                                            .w(px(40.))
-                                            .flex_none()
-                                            .flex()
-                                            .justify_center()
-                                            .child(Self::render_avatar(MessageAuthor::User)),
-                                    )
-                                    .child(
-                                        div()
-                                            .id("composer-column")
-                                            .flex_1()
-                                            .min_w_0()
-                                            .flex()
-                                            .flex_col()
-                                            .gap_3()
-                                            .when_some(composer_comment_group, |this, group_id| {
-                                                this.child(Self::render_comment_group_toggle(
-                                                    group_id,
-                                                    composer_comment_count,
-                                                    composer_comments_collapsed,
-                                                    cx,
-                                                ))
-                                            })
-                                            .when(!composer_comments_collapsed, |this| {
-                                                this.children(composer_comments)
-                                            })
-                                            .child(
-                                                Self::render_composer_input(&composer).on_click({
-                                                    let composer = composer.clone();
-                                                    cx.listener(move |_, _, window, cx| {
-                                                        composer.focus_handle(cx).focus(window, cx);
-                                                    })
-                                                }),
-                                            ),
-                                    )
-                                    .child(div().w(px(40.)).flex_none()),
-                            ),
+                            .when(can_write, |this| {
+                                this.child(
+                                    div()
+                                        .id("composer-row")
+                                        .w_full()
+                                        .flex()
+                                        .items_start()
+                                        .child(
+                                            div()
+                                                .w(px(40.))
+                                                .flex_none()
+                                                .flex()
+                                                .justify_center()
+                                                .child(Self::render_avatar(MessageAuthor::User)),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("composer-column")
+                                                .flex_1()
+                                                .min_w_0()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_3()
+                                                .when_some(
+                                                    composer_comment_group,
+                                                    |this, group_id| {
+                                                        this.child(
+                                                            Self::render_comment_group_toggle(
+                                                                group_id,
+                                                                composer_comment_count,
+                                                                composer_comments_collapsed,
+                                                                cx,
+                                                            ),
+                                                        )
+                                                    },
+                                                )
+                                                .when(!composer_comments_collapsed, |this| {
+                                                    this.children(composer_comments)
+                                                })
+                                                .child(
+                                                    Self::render_composer_input(&composer)
+                                                        .on_click({
+                                                            let composer = composer.clone();
+                                                            cx.listener(move |_, _, window, cx| {
+                                                                composer
+                                                                    .focus_handle(cx)
+                                                                    .focus(window, cx);
+                                                            })
+                                                        }),
+                                                ),
+                                        )
+                                        .child(div().w(px(40.)).flex_none()),
+                                )
+                            })
+                            .when(!can_write, |this| {
+                                this.child(
+                                    div()
+                                        .id("read-only-thread")
+                                        .w_full()
+                                        .flex()
+                                        .justify_center()
+                                        .text_xs()
+                                        .text_color(rgb(0x71717a))
+                                        .child("Read-only thread"),
+                                )
+                            }),
                     ),
             )
     }
@@ -3130,8 +3581,10 @@ mod tests {
     }
 
     #[test]
-    fn collaborator_threads_are_removed_on_disconnect_but_owned_threads_are_retained() {
+    fn collaborator_threads_are_read_only_and_removed_on_disconnect() {
+        assert!(!ThreadOwnership::Remote.can_write());
         assert!(ThreadOwnership::Remote.remove_on_disconnect());
+        assert!(ThreadOwnership::Local.can_write());
         assert!(!ThreadOwnership::Local.remove_on_disconnect());
     }
 
@@ -3207,6 +3660,125 @@ mod tests {
             assert_eq!(thread.summary.title, "New thread");
             assert_eq!(thread.ownership, ThreadOwnership::Local);
             assert!(matches!(thread.sharing, ThreadSharing::NotShared));
+        });
+    }
+
+    struct ThreadMirrorTestView {
+        host: Entity<Thread>,
+        collaborator: Option<Entity<Thread>>,
+    }
+
+    impl Render for ThreadMirrorTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    /// The events a host broadcasts while answering one prompt.
+    fn agent_stream_events(message_id: Uuid) -> Vec<protocol::HostMessage> {
+        let id = message_id.into_bytes();
+        vec![
+            protocol::HostMessage::ThreadTitled("Explain this".into()),
+            protocol::HostMessage::UserMessage(protocol::UserMessage {
+                id: Uuid::new_v4().into_bytes(),
+                text: "Explain this".into(),
+                comments: vec![protocol::UserComment {
+                    id: Uuid::new_v4().into_bytes(),
+                    source_message_id: Uuid::new_v4().into_bytes(),
+                    quote: "an excerpt".into(),
+                    source_range: (0, 10),
+                    body: "why?".into(),
+                }],
+            }),
+            protocol::HostMessage::AgentStarted { id },
+            protocol::HostMessage::AgentTextAppended {
+                id,
+                target: protocol::AgentText::Thinking,
+                text: "Weighing ".into(),
+            },
+            protocol::HostMessage::AgentTextAppended {
+                id,
+                target: protocol::AgentText::Thinking,
+                text: "options.".into(),
+            },
+            // No explicit thinking end, so the first response token closes it.
+            protocol::HostMessage::AgentTextAppended {
+                id,
+                target: protocol::AgentText::Response,
+                text: "Here is ".into(),
+            },
+            protocol::HostMessage::AgentTextAppended {
+                id,
+                target: protocol::AgentText::Response,
+                text: "the answer.".into(),
+            },
+            protocol::HostMessage::AgentEnded {
+                id,
+                failed: false,
+                failure: None,
+            },
+        ]
+    }
+
+    /// A collaborator that joins midway through a generation has to end up with
+    /// the host's timeline: its snapshot covers what it missed, and the events
+    /// it replays afterwards cover the rest.
+    #[gpui::test]
+    fn collaborators_joining_mid_stream_converge_on_the_host_timeline(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_base::init);
+        let message_id = Uuid::new_v4();
+        let events = agent_stream_events(message_id);
+        // The collaborator joins once the agent has started reasoning.
+        let joined_after = 4;
+
+        let (view, cx) = cx.add_window_view(|window, cx| ThreadMirrorTestView {
+            host: Cowork::new_empty_local_thread(Cowork::new_user_message_draft(window, cx), cx),
+            collaborator: None,
+        });
+
+        cx.update(|_, cx| {
+            view.update(cx, |view, cx| {
+                for event in events.iter().take(joined_after) {
+                    view.host
+                        .update(cx, |thread, cx| thread.apply(event.clone(), cx));
+                }
+
+                let snapshot = view.host.read(cx).to_protocol();
+                let draft = view.host.read(cx).draft.clone();
+                let collaborator = cx
+                    .new(|cx| Thread::from_snapshot(snapshot, draft, ThreadSharing::NotShared, cx));
+
+                for event in events.iter().skip(joined_after) {
+                    view.host
+                        .update(cx, |thread, cx| thread.apply(event.clone(), cx));
+                    collaborator.update(cx, |thread, cx| thread.apply(event.clone(), cx));
+                }
+                view.collaborator = Some(collaborator);
+            });
+        });
+
+        view.read_with(cx, |view, cx| {
+            let host = view.host.read(cx);
+            let collaborator = view
+                .collaborator
+                .as_ref()
+                .expect("collaborator should have joined")
+                .read(cx);
+
+            assert_eq!(collaborator.to_protocol(), host.to_protocol());
+            assert!(!host.generating);
+            assert!(!collaborator.generating);
+
+            let TimelineMessage::Agent(message) = &collaborator.timeline[1] else {
+                panic!("expected the agent's reply");
+            };
+            assert_eq!(message.thinking, "Weighing options.");
+            assert_eq!(message.text, "Here is the answer.");
+            assert!(message.thinking_complete);
+            assert!(message.complete);
+            assert!(!message.failed);
         });
     }
 
