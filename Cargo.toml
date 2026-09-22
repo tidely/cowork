@@ -11,6 +11,7 @@ edition = "2024"
 [workspace.lints.clippy]
 
 [workspace.dependencies]
+agent = { path = "crates/agent" }
 tools = { path = "crates/tools" }
 
 anyhow = "1"

@@ -6,8 +6,8 @@ use std::{
     time::Duration,
 };
 
+use agent::{Agent as StreamingAgent, AgentEvent};
 use anyhow::Context as _;
-use futures::StreamExt;
 use gpui::{
     Animation, AnimationExt, AnyWindowHandle, App, AppContext, AssetSource, AsyncApp, Bounds,
     ClipboardItem, Context, Entity, Focusable, FontStyle, FontWeight, FutureExt, HighlightStyle,
@@ -29,11 +29,11 @@ use iroh::{
 };
 use itertools::Itertools;
 use rig::{
-    agent::MultiTurnStreamItem,
     completion::Message as RigMessage,
     prelude::*,
     providers::ollama::wire::Ollama,
     streaming::{BlockClose, Delta, StreamEvent},
+    tool::ToolSet,
 };
 use serde_json::json;
 use syntect::{
@@ -46,8 +46,7 @@ use tokio::{
     runtime::Runtime,
     sync::{broadcast, mpsc},
 };
-use tokio_util::sync::PollSender;
-use tools::{RespondToComment, TurnComments};
+use tools::{RespondToComment, RespondToCommentArgs, TurnComments};
 use uuid::Uuid;
 
 mod protocol;
@@ -2862,7 +2861,7 @@ impl Cowork {
         &mut self,
         thread_id: Uuid,
         prompt: String,
-        history: Vec<RigMessage>,
+        mut history: Vec<RigMessage>,
         comment_group_id: Option<Uuid>,
         comment_ids: Vec<Uuid>,
         turn_comments: Arc<TurnComments>,
@@ -2882,24 +2881,22 @@ impl Cowork {
             );
         });
 
-        let (sender, mut receiver) = mpsc::channel(128);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
         let tool_comments = turn_comments.clone();
         let generation_task = self.tokio_handle.spawn(async move {
             let client = Ollama::new().bound()?;
-            let agent = client
-                .agent(OLLAMA_MODEL)
+            let model = client.completion(OLLAMA_MODEL);
+            let mut tools = ToolSet::default();
+            tools.add_tool(RespondToComment::new(tool_comments));
+            StreamingAgent::new(model, tools)
                 .additional_params(json!({
                     "num_ctx": OLLAMA_CONTEXT_TOKENS,
                     "think": "medium"
                 }))
-                .default_max_turns(usize::MAX)
-                .tool(RespondToComment::new(tool_comments))
-                .build();
-            let stream = agent.prompt(prompt).history(&history).stream();
-            _ = stream
-                .map(|item| Ok(item.map_err(anyhow::Error::from)))
-                .forward(PollSender::new(sender))
-                .await;
+                .run(RigMessage::user(prompt), &mut history, move |event| {
+                    _ = sender.send(event);
+                })
+                .await?;
             Ok::<_, anyhow::Error>(())
         });
 
@@ -2907,46 +2904,48 @@ impl Cowork {
             let mut stream_completed = true;
             let mut published_comment_responses = HashSet::new();
             while let Some(item) = receiver.recv().await {
-                if matches!(
-                    &item,
-                    Ok(MultiTurnStreamItem::ToolExecutionCommitted { .. })
-                ) {
-                    let responses = turn_comments.responses().unwrap_or_default();
-                    for response in responses {
-                        if !published_comment_responses.insert(response.comment_id.to_string()) {
-                            continue;
-                        }
-                        let Some(comment_id) = turn_comments
-                            .comment_ids()
-                            .iter()
-                            .position(|comment_id| comment_id == &response.comment_id)
-                            .and_then(|index| comment_ids.get(index))
-                        else {
-                            continue;
-                        };
-                        thread.update(cx, |thread, cx| {
-                            thread.emit(
-                                protocol::HostMessage::AgentCommentResponded {
-                                    id: message_id.into_bytes(),
-                                    response_id: Uuid::new_v4().into_bytes(),
-                                    comment_id: comment_id.into_bytes(),
-                                    response: response.response,
-                                },
-                                cx,
-                            );
-                        });
-                        _ = this.update(cx, |this, cx| this.thread_updated(thread_id, cx));
+                if let AgentEvent::ToolCall(call) = &item
+                    && call.function.name == "respond_to_comment"
+                    && let Ok(response) = serde_json::from_value::<RespondToCommentArgs>(
+                        call.function.arguments.clone(),
+                    )
+                    && !response.response.trim().is_empty()
+                    && published_comment_responses.insert(response.comment_id.clone())
+                    && let Some(comment_id) = turn_comments
+                        .comment_ids()
+                        .iter()
+                        .position(|comment_id| comment_id.as_str() == response.comment_id)
+                        .and_then(|index| comment_ids.get(index))
+                {
+                    thread.update(cx, |thread, cx| {
+                        thread.emit(
+                            protocol::HostMessage::AgentCommentResponded {
+                                id: message_id.into_bytes(),
+                                response_id: Uuid::new_v4().into_bytes(),
+                                comment_id: comment_id.into_bytes(),
+                                response: response.response,
+                            },
+                            cx,
+                        );
+                    });
+                    if this
+                        .update(cx, |this, cx| this.thread_updated(thread_id, cx))
+                        .is_err()
+                    {
+                        stream_completed = false;
+                        break;
                     }
                 }
 
                 let Some(event) = Self::agent_stream_event(message_id, item) else {
                     continue;
                 };
-                let ended = matches!(event, protocol::HostMessage::AgentEnded { .. });
                 thread.update(cx, |thread, cx| thread.emit(event, cx));
 
-                let result = this.update(cx, |this, cx| this.thread_updated(thread_id, cx));
-                if result.is_err() || ended {
+                if this
+                    .update(cx, |this, cx| this.thread_updated(thread_id, cx))
+                    .is_err()
+                {
                     stream_completed = false;
                     break;
                 }
@@ -2976,37 +2975,30 @@ impl Cowork {
 
     /// Translates one item of the agent's stream into the thread event it
     /// represents, or `None` for items that do not change the timeline.
-    fn agent_stream_event(
-        message_id: Uuid,
-        item: anyhow::Result<MultiTurnStreamItem>,
-    ) -> Option<protocol::HostMessage> {
+    fn agent_stream_event(message_id: Uuid, item: AgentEvent) -> Option<protocol::HostMessage> {
         let id = message_id.into_bytes();
         match item {
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockDelta {
+            AgentEvent::Model(StreamEvent::BlockDelta {
                 delta: Delta::Reasoning { text },
                 ..
-            })) => Some(protocol::HostMessage::AgentTextAppended {
+            }) => Some(protocol::HostMessage::AgentTextAppended {
                 id,
                 target: protocol::AgentText::Thinking,
                 text,
             }),
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockEnd {
+            AgentEvent::Model(StreamEvent::BlockEnd {
                 end: BlockClose::Reasoning { .. },
                 ..
-            })) => Some(protocol::HostMessage::AgentThinkingEnded { id }),
-            Ok(MultiTurnStreamItem::StreamAssistantItem(StreamEvent::BlockDelta {
+            }) => Some(protocol::HostMessage::AgentThinkingEnded { id }),
+            AgentEvent::Model(StreamEvent::BlockDelta {
                 delta: Delta::Text { text },
                 ..
-            })) => Some(protocol::HostMessage::AgentTextAppended {
+            }) => Some(protocol::HostMessage::AgentTextAppended {
                 id,
                 target: protocol::AgentText::Response,
                 text,
             }),
-            Err(error) => Some(protocol::HostMessage::AgentEnded {
-                id,
-                failure: Some(format!("Unable to generate a response: {error}")),
-            }),
-            _ => None,
+            AgentEvent::Model(_) | AgentEvent::ToolCall(_) | AgentEvent::ToolResult { .. } => None,
         }
     }
 
