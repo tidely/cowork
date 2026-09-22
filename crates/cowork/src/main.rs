@@ -29,8 +29,9 @@ use gpui_base::{
     text::{CodeBlock, SelectionFormat},
 };
 use gpui_component::{
-    Icon, Sizable as _,
+    Icon, Sizable as _, Theme as ComponentTheme, ThemeMode,
     button::{Button, ButtonVariants as _},
+    sidebar::SidebarToggleButton,
 };
 use gpui_kit_assets::IconName as AssetIconName;
 use iroh::{
@@ -176,7 +177,10 @@ fn highlight_code_block(block: &CodeBlock) -> Vec<(Range<usize>, HighlightStyle)
     highlights
 }
 
-gpui_kit_assets::icon_assets!(ComposerButtonAssets, [SendHorizontal, Square]);
+gpui_kit_assets::icon_assets!(
+    AppIconAssets,
+    [PanelLeftClose, PanelLeftOpen, SendHorizontal, Square]
+);
 
 struct Assets;
 
@@ -186,12 +190,12 @@ impl AssetSource for Assets {
             OLLAMA_AVATAR_PATH => Ok(Some(Cow::Borrowed(include_bytes!(
                 "../../../assets/providers/ollama.png"
             )))),
-            _ => ComposerButtonAssets.load(path),
+            _ => AppIconAssets.load(path),
         }
     }
 
     fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
-        let mut assets = ComposerButtonAssets.list(path)?;
+        let mut assets = AppIconAssets.list(path)?;
         if OLLAMA_AVATAR_PATH.starts_with(path) {
             assets.push(OLLAMA_AVATAR_PATH.into());
         }
@@ -912,20 +916,9 @@ impl Cowork {
 
     fn render_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .id("toggle-sidebar")
-            .size(px(28.))
             .when(cfg!(target_os = "macos"), |this| {
                 this.ml(macos_sidebar_toggle_margin())
             })
-            .flex()
-            .items_center()
-            .justify_center()
-            .rounded_md()
-            .occlude()
-            .cursor_pointer()
-            .text_sm()
-            .text_color(rgb(0xa1a1aa))
-            .hover(|this| this.bg(rgb(0x2d2d30)))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
@@ -933,11 +926,14 @@ impl Cowork {
                     cx.stop_propagation();
                 }),
             )
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.sidebar_open = !this.sidebar_open;
-                cx.notify();
-            }))
-            .child("▥")
+            .child(
+                SidebarToggleButton::new()
+                    .collapsed(!self.sidebar_open)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.sidebar_open = !this.sidebar_open;
+                        cx.notify();
+                    })),
+            )
     }
 
     fn start_sharing(&mut self, thread: Entity<Thread>, cx: &mut Context<Self>) {
@@ -3690,6 +3686,7 @@ fn main() -> anyhow::Result<()> {
         .with_assets(Assets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
+            ComponentTheme::change(ThemeMode::Dark, None, cx);
             TextViewDefaults::new()
                 .with_code_block_highlighter(highlight_code_block)
                 .install(cx);
