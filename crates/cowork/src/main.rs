@@ -746,6 +746,7 @@ impl protocol::ThreadSnapshot {
     }
 }
 
+#[derive(Default)]
 struct ThreadStore {
     threads: VecDeque<Entity<Thread>>,
 }
@@ -3674,28 +3675,21 @@ impl Render for Cowork {
     }
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let worker_threads = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(4)
         .clamp(2, 8);
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(worker_threads)
         .thread_name("cowork-agent")
         .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            eprintln!("failed to start the agent runtime: {error}");
-            return;
-        }
-    };
+        .build()?;
     let tokio_handle = runtime.handle().clone();
-    if TOKIO_RUNTIME.set(runtime).is_err() {
-        eprintln!("the agent runtime was already initialized");
-        return;
-    }
+    anyhow::ensure!(
+        TOKIO_RUNTIME.set(runtime).is_ok(),
+        "the agent runtime was already initialized",
+    );
 
     gpui_platform::application()
         .with_assets(Assets)
@@ -3730,9 +3724,7 @@ fn main() {
 
             if let Err(error) = cx.open_window(window_options, move |window, cx| {
                 let tokio_handle = tokio_handle.clone();
-                let thread_store = cx.new(|_| ThreadStore {
-                    threads: VecDeque::new(),
-                });
+                let thread_store = cx.new(|_| ThreadStore::default());
                 let new_thread_draft = Cowork::new_user_message_draft(window, cx);
                 Cowork::draft_composer(&new_thread_draft)
                     .focus_handle(cx)
@@ -3771,6 +3763,8 @@ fn main() {
             cx.set_quit_mode(QuitMode::LastWindowClosed);
             cx.activate(true);
         });
+
+    Ok(())
 }
 
 #[cfg(test)]
