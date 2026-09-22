@@ -609,7 +609,6 @@ impl Thread {
             }
             protocol::HostMessage::AgentEnded {
                 id,
-                failed,
                 failure,
             } => {
                 self.generating = false;
@@ -619,7 +618,7 @@ impl Thread {
                 message.complete = true;
                 message.thinking_complete = true;
                 message.thinking_expanded = false;
-                message.failed = failed;
+                message.failed = failure.is_some();
                 // Only surface the failure when the agent said nothing itself.
                 if let Some(failure) = failure
                     && message.text.is_empty()
@@ -2683,7 +2682,6 @@ impl Cowork {
                     thread.emit(
                         protocol::HostMessage::AgentEnded {
                             id: message_id.into_bytes(),
-                            failed: error.is_some(),
                             failure: error
                                 .map(|error| format!("Unable to generate a response: {error}")),
                         },
@@ -2726,7 +2724,6 @@ impl Cowork {
             }),
             Err(error) => Some(protocol::HostMessage::AgentEnded {
                 id,
-                failed: true,
                 failure: Some(format!("Unable to generate a response: {error}")),
             }),
             _ => None,
@@ -3714,7 +3711,6 @@ mod tests {
             },
             protocol::HostMessage::AgentEnded {
                 id,
-                failed: false,
                 failure: None,
             },
         ]

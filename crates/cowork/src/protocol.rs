@@ -48,7 +48,6 @@ pub(crate) enum HostMessage {
     /// agent produced no output of its own.
     AgentEnded {
         id: uuid::Bytes,
-        failed: bool,
         failure: Option<String>,
     },
 }
@@ -249,7 +248,6 @@ mod tests {
             },
             HostMessage::AgentEnded {
                 id: [7; 16],
-                failed: true,
                 failure: Some("Unable to generate a response".into()),
             },
         ] {
