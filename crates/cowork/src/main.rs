@@ -1759,15 +1759,10 @@ impl Cowork {
 
     fn selected_message_source_range(
         &self,
-        thread_id: Uuid,
-        message_id: Uuid,
+        thread_message_id: ThreadMessageId,
         message: &AgentMessage,
         cx: &App,
     ) -> Option<Range<usize>> {
-        let thread_message_id = ThreadMessageId {
-            thread_id,
-            message_id,
-        };
         let mut selected_ranges = self
             .segment_text_views
             .iter()
@@ -1920,6 +1915,10 @@ impl Cowork {
         else {
             return;
         };
+        let thread_message_id = ThreadMessageId {
+            thread_id,
+            message_id,
+        };
         if quote.is_empty() {
             return;
         }
@@ -1935,7 +1934,7 @@ impl Cowork {
                 return;
             };
             let Some(source_range) =
-                self.selected_message_source_range(thread_id, message_id, message, cx)
+                self.selected_message_source_range(thread_message_id, message, cx)
             else {
                 return;
             };
