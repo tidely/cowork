@@ -254,6 +254,12 @@ struct MarkdownTextLeaf {
     atomic: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct ThreadMessageId {
+    thread_id: Uuid,
+    message_id: Uuid,
+}
+
 struct SegmentTextView {
     state: Entity<TextViewState>,
     rendered_at: u64,
@@ -607,10 +613,7 @@ impl Thread {
                 message.thinking_complete = true;
                 message.thinking_expanded = false;
             }
-            protocol::HostMessage::AgentEnded {
-                id,
-                failure,
-            } => {
+            protocol::HostMessage::AgentEnded { id, failure } => {
                 self.generating = false;
                 let Some(message) = self.agent_message_mut(id) else {
                     return;
@@ -684,7 +687,7 @@ struct Cowork {
     thread_store: Entity<ThreadStore>,
     active_thread_id: Option<Uuid>,
     selection_message_id: Option<Uuid>,
-    segment_text_views: HashMap<(Uuid, Uuid, usize, usize), SegmentTextView>,
+    segment_text_views: HashMap<(ThreadMessageId, Range<usize>), SegmentTextView>,
     render_generation: u64,
     titlebar_click_armed: bool,
     join_dialog: Option<JoinDialog>,
@@ -1761,18 +1764,22 @@ impl Cowork {
         message: &AgentMessage,
         cx: &App,
     ) -> Option<Range<usize>> {
+        let thread_message_id = ThreadMessageId {
+            thread_id,
+            message_id,
+        };
         let mut selected_ranges = self
             .segment_text_views
             .iter()
-            .filter(|((segment_thread_id, segment_message_id, _, _), _)| {
-                *segment_thread_id == thread_id && *segment_message_id == message_id
-            })
-            .filter_map(|((_, _, segment_start, _), text_view)| {
+            .filter(|((segment_id, _), _)| *segment_id == thread_message_id)
+            .filter_map(|((_, source_range), text_view)| {
                 text_view
                     .state
                     .read(cx)
                     .selected_source_range()
-                    .map(|range| (range.start + segment_start)..(range.end + segment_start))
+                    .map(|range| {
+                        (range.start + source_range.start)..(range.end + source_range.start)
+                    })
             });
         let first = selected_ranges.next();
         let segmented = selected_ranges.fold(first, |combined, range| {
@@ -2254,7 +2261,13 @@ impl Cowork {
 
         let text_view = self
             .segment_text_views
-            .entry((thread_id, message_id, source_range.start, source_range.end))
+            .entry((
+                ThreadMessageId {
+                    thread_id,
+                    message_id,
+                },
+                source_range,
+            ))
             .or_insert_with(|| SegmentTextView {
                 state: cx.new(|cx| TextViewState::markdown(text, cx)),
                 rendered_at: self.render_generation,
@@ -3709,10 +3722,7 @@ mod tests {
                 target: protocol::AgentText::Response,
                 text: "the answer.".into(),
             },
-            protocol::HostMessage::AgentEnded {
-                id,
-                failure: None,
-            },
+            protocol::HostMessage::AgentEnded { id, failure: None },
         ]
     }
 
