@@ -82,10 +82,15 @@ pub(crate) struct UserMessage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct UserComment {
     pub(crate) id: uuid::Bytes,
-    pub(crate) source_message_id: uuid::Bytes,
-    pub(crate) quote: String,
-    pub(crate) source_range: (usize, usize),
+    pub(crate) reference: CommentReference,
     pub(crate) body: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CommentReference {
+    pub(crate) message_id: uuid::Bytes,
+    pub(crate) range: std::ops::Range<usize>,
+    pub(crate) quote: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -210,9 +215,11 @@ mod tests {
                     text: "Question".into(),
                     comments: vec![UserComment {
                         id: [3; 16],
-                        source_message_id: [4; 16],
-                        quote: "quote".into(),
-                        source_range: (5, 10),
+                        reference: CommentReference {
+                            message_id: [4; 16],
+                            range: 5..10,
+                            quote: "quote".into(),
+                        },
                         body: "comment".into(),
                     }],
                 }),

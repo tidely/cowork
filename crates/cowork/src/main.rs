@@ -233,10 +233,15 @@ enum UserMessageContent {
 #[derive(Clone)]
 struct UserComment {
     id: Uuid,
-    source_message_id: Uuid,
-    quote: String,
-    source_range: Range<usize>,
+    reference: CommentReference,
     body: UserCommentBody,
+}
+
+#[derive(Clone)]
+struct CommentReference {
+    message_id: Uuid,
+    range: Range<usize>,
+    quote: String,
 }
 
 #[derive(Clone)]
@@ -373,9 +378,11 @@ impl UserComment {
         };
         Some(protocol::UserComment {
             id: self.id.into_bytes(),
-            source_message_id: self.source_message_id.into_bytes(),
-            quote: self.quote.clone(),
-            source_range: (self.source_range.start, self.source_range.end),
+            reference: protocol::CommentReference {
+                message_id: self.reference.message_id.into_bytes(),
+                range: self.reference.range.clone(),
+                quote: self.reference.quote.clone(),
+            },
             body: body.to_string(),
         })
     }
@@ -385,9 +392,11 @@ impl protocol::UserComment {
     fn into_native(self) -> UserComment {
         UserComment {
             id: Uuid::from_bytes(self.id),
-            source_message_id: Uuid::from_bytes(self.source_message_id),
-            quote: self.quote,
-            source_range: self.source_range.0..self.source_range.1,
+            reference: CommentReference {
+                message_id: Uuid::from_bytes(self.reference.message_id),
+                range: self.reference.range,
+                quote: self.reference.quote,
+            },
             body: UserCommentBody::Submitted(self.body.into()),
         }
     }
@@ -1947,9 +1956,11 @@ impl Cowork {
         thread.update(cx, |thread, _| {
             thread.draft.comments.push(UserComment {
                 id: comment_id,
-                source_message_id: message_id,
-                quote,
-                source_range,
+                reference: CommentReference {
+                    message_id,
+                    range: source_range,
+                    quote,
+                },
                 body: UserCommentBody::Editing {
                     inline: inline_body.clone(),
                     composer: composer_body.clone(),
@@ -2150,7 +2161,7 @@ impl Cowork {
                     .pb_2()
                     .text_color(rgb(0xd4d4d8))
                     .line_clamp(2)
-                    .child(comment.quote.clone()),
+                    .child(comment.reference.quote.clone()),
             )
             .child(
                 div().w_full().px_3().pb_3().child(
@@ -2410,15 +2421,15 @@ impl Cowork {
         let mut cursor = 0;
         let mut anchored_comments = comments
             .iter()
-            .filter(|comment| comment.source_message_id == message.id)
+            .filter(|comment| comment.reference.message_id == message.id)
             .filter(|comment| {
-                comment.source_range.start < comment.source_range.end
-                    && comment.source_range.end <= message.text.len()
-                    && message.text.is_char_boundary(comment.source_range.start)
-                    && message.text.is_char_boundary(comment.source_range.end)
+                comment.reference.range.start < comment.reference.range.end
+                    && comment.reference.range.end <= message.text.len()
+                    && message.text.is_char_boundary(comment.reference.range.start)
+                    && message.text.is_char_boundary(comment.reference.range.end)
             })
             .collect::<Vec<_>>();
-        anchored_comments.sort_by_key(|comment| comment.source_range.start);
+        anchored_comments.sort_by_key(|comment| comment.reference.range.start);
 
         if anchored_comments.is_empty() && !message.text.is_empty() {
             message_content.push(
@@ -2434,12 +2445,12 @@ impl Cowork {
         let mut comment_index = 0;
         while comment_index < anchored_comments.len() {
             let first = anchored_comments[comment_index];
-            if first.source_range.start < cursor {
+            if first.reference.range.start < cursor {
                 comment_index += 1;
                 continue;
             }
             let annotated_start =
-                Self::hard_line_start(&message.text, first.source_range.start).max(cursor);
+                Self::hard_line_start(&message.text, first.reference.range.start).max(cursor);
             if cursor < annotated_start {
                 message_content.push(self.render_message_segment(
                     thread_id,
@@ -2452,11 +2463,15 @@ impl Cowork {
                 ));
                 cursor = annotated_start;
             }
-            let line_end =
-                Self::wrapped_line_end(&message.text, first.source_range.end, wrap_width, window);
+            let line_end = Self::wrapped_line_end(
+                &message.text,
+                first.reference.range.end,
+                wrap_width,
+                window,
+            );
             let group_start = comment_index;
             while comment_index < anchored_comments.len()
-                && anchored_comments[comment_index].source_range.start < line_end
+                && anchored_comments[comment_index].reference.range.start < line_end
             {
                 comment_index += 1;
             }
@@ -2464,7 +2479,7 @@ impl Cowork {
             let annotation_ranges = group
                 .iter()
                 .flat_map(|comment| {
-                    Self::annotation_ranges(&message.text, comment.source_range.clone())
+                    Self::annotation_ranges(&message.text, comment.reference.range.clone())
                 })
                 .filter_map(|range| {
                     (range.start >= cursor && range.end <= line_end)
@@ -2802,7 +2817,7 @@ impl Cowork {
                     matches!(
                         entry,
                         TimelineMessage::Agent(message)
-                            if message.id == comment.source_message_id
+                            if message.id == comment.reference.message_id
                     )
                 })
                 .map(|index| index + 1)
@@ -2811,7 +2826,7 @@ impl Cowork {
                 "\n{}. Excerpt from assistant message {}:\n> {}\nComment: {}\n",
                 index + 1,
                 message_number,
-                comment.quote.replace('\n', "\n> "),
+                comment.reference.quote.replace('\n', "\n> "),
                 body.trim(),
             ));
         }
@@ -2845,9 +2860,7 @@ impl Cowork {
             if let Some(body) = Self::editable_comment_body(comment, cx) {
                 submitted_comments.push(UserComment {
                     id: comment.id,
-                    source_message_id: comment.source_message_id,
-                    quote: comment.quote.clone(),
-                    source_range: comment.source_range.clone(),
+                    reference: comment.reference.clone(),
                     body: UserCommentBody::Submitted(body),
                 });
             } else {
@@ -3543,8 +3556,8 @@ mod tests {
             let [comment] = thread.draft.comments.as_slice() else {
                 panic!("typing with the selection should create one comment");
             };
-            assert_eq!(comment.quote, expected_quote);
-            assert_eq!(comment.source_range, 0..markdown.len());
+            assert_eq!(comment.reference.quote, expected_quote);
+            assert_eq!(comment.reference.range, 0..markdown.len());
             let UserCommentBody::Editing { inline, .. } = &comment.body else {
                 panic!("new comment should be editable");
             };
@@ -3693,9 +3706,11 @@ mod tests {
                 text: "Explain this".into(),
                 comments: vec![protocol::UserComment {
                     id: Uuid::new_v4().into_bytes(),
-                    source_message_id: Uuid::new_v4().into_bytes(),
-                    quote: "an excerpt".into(),
-                    source_range: (0, 10),
+                    reference: protocol::CommentReference {
+                        message_id: Uuid::new_v4().into_bytes(),
+                        range: 0..10,
+                        quote: "an excerpt".into(),
+                    },
                     body: "why?".into(),
                 }],
             }),
