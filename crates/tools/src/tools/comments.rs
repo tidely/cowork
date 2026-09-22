@@ -81,6 +81,25 @@ impl TurnComments {
             .clone())
     }
 
+    /// Returns aliases that have not received a response, in comment order.
+    pub fn unanswered_comment_ids(&self) -> Result<Vec<CommentId>, CommentToolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| CommentToolError::StoreUnavailable)?;
+        Ok(self
+            .comment_ids
+            .iter()
+            .filter(|comment_id| !state.responded_to.contains(*comment_id))
+            .cloned()
+            .collect())
+    }
+
+    /// Whether every comment in this turn has received a response.
+    pub fn is_complete(&self) -> Result<bool, CommentToolError> {
+        Ok(self.unanswered_comment_ids()?.is_empty())
+    }
+
     fn record_response(
         &self,
         comment_id: &str,
@@ -151,7 +170,7 @@ pub struct RespondToCommentArgs {
 
 #[derive(Debug, Serialize)]
 pub struct CommentResponseRecorded {
-    pub comment_id: CommentId,
+    pub comment_id: String,
     pub recorded: bool,
 }
 
@@ -213,11 +232,18 @@ impl Tool for RespondToComment {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
+        if self.comments.comment_ids().is_empty() {
+            return Ok(CommentResponseRecorded {
+                comment_id: args.comment_id,
+                recorded: false,
+            });
+        }
+
         let comment_id = self
             .comments
             .record_response(&args.comment_id, args.response)?;
         Ok(CommentResponseRecorded {
-            comment_id,
+            comment_id: comment_id.to_string(),
             recorded: true,
         })
     }
@@ -226,6 +252,24 @@ impl Tool for RespondToComment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stale_calls_are_ignored_when_the_turn_has_no_comments() {
+        let comments = Arc::new(TurnComments::new(0));
+        let tool = RespondToComment::new(comments.clone());
+        let result = futures::executor::block_on(tool.call(
+            &mut ToolContext::new(),
+            RespondToCommentArgs {
+                comment_id: "comment_1".into(),
+                response: "Stale response".into(),
+            },
+        ))
+        .unwrap();
+
+        assert!(!result.recorded);
+        assert_eq!(result.comment_id, "comment_1");
+        assert!(comments.responses().unwrap().is_empty());
+    }
 
     #[test]
     fn creates_predictable_turn_local_ids() {
@@ -265,6 +309,28 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn reports_unanswered_comments_in_comment_order() {
+        let comments = TurnComments::new(3);
+        comments
+            .record_response("comment_2", "Second response".into())
+            .unwrap();
+
+        assert!(!comments.is_complete().unwrap());
+        assert_eq!(
+            comments.unanswered_comment_ids().unwrap(),
+            vec![CommentId::for_index(0), CommentId::for_index(2)]
+        );
+
+        comments
+            .record_response("comment_1", "First response".into())
+            .unwrap();
+        comments
+            .record_response("comment_3", "Third response".into())
+            .unwrap();
+        assert!(comments.is_complete().unwrap());
     }
 
     #[test]

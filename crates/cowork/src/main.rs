@@ -1,8 +1,8 @@
 use std::{
     borrow::Cow,
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     ops::Range,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
@@ -47,6 +47,7 @@ use tokio::{
     sync::{broadcast, mpsc},
 };
 use tokio_util::sync::PollSender;
+use tools::{RespondToComment, TurnComments};
 use uuid::Uuid;
 
 mod protocol;
@@ -203,6 +204,8 @@ enum TimelineMessage {
 #[derive(Clone)]
 struct AgentMessage {
     id: Uuid,
+    comment_group_id: Option<Uuid>,
+    comment_responses: Vec<AgentCommentResponse>,
     thinking: String,
     thinking_view: Entity<TextViewState>,
     thinking_complete: bool,
@@ -211,6 +214,14 @@ struct AgentMessage {
     text_view: Entity<TextViewState>,
     complete: bool,
     failed: bool,
+}
+
+#[derive(Clone)]
+struct AgentCommentResponse {
+    id: Uuid,
+    comment_id: Uuid,
+    response: String,
+    response_view: Entity<TextViewState>,
 }
 
 #[derive(Clone)]
@@ -439,9 +450,11 @@ impl protocol::UserMessage {
 
 impl AgentMessage {
     /// An empty message for an agent that has just started responding.
-    fn new(id: Uuid, cx: &mut impl AppContext) -> Self {
+    fn new(id: Uuid, comment_group_id: Option<Uuid>, cx: &mut impl AppContext) -> Self {
         Self {
             id,
+            comment_group_id,
+            comment_responses: Vec::new(),
             thinking: String::new(),
             thinking_view: cx.new(|cx| TextViewState::markdown("", cx)),
             thinking_complete: false,
@@ -456,6 +469,16 @@ impl AgentMessage {
     fn to_protocol(&self) -> protocol::AgentMessage {
         protocol::AgentMessage {
             id: self.id.into_bytes(),
+            comment_group_id: self.comment_group_id.map(Uuid::into_bytes),
+            comment_responses: self
+                .comment_responses
+                .iter()
+                .map(|response| protocol::AgentCommentResponse {
+                    id: response.id.into_bytes(),
+                    comment_id: response.comment_id.into_bytes(),
+                    response: response.response.clone(),
+                })
+                .collect(),
             thinking: self.thinking.clone(),
             thinking_complete: self.thinking_complete,
             text: self.text.clone(),
@@ -471,6 +494,17 @@ impl protocol::AgentMessage {
         let text_view = cx.new(|cx| TextViewState::markdown(&self.text, cx));
         AgentMessage {
             id: Uuid::from_bytes(self.id),
+            comment_group_id: self.comment_group_id.map(Uuid::from_bytes),
+            comment_responses: self
+                .comment_responses
+                .into_iter()
+                .map(|response| AgentCommentResponse {
+                    id: Uuid::from_bytes(response.id),
+                    comment_id: Uuid::from_bytes(response.comment_id),
+                    response_view: cx.new(|cx| TextViewState::markdown(&response.response, cx)),
+                    response: response.response,
+                })
+                .collect(),
             thinking: self.thinking,
             thinking_view,
             thinking_complete: self.thinking_complete,
@@ -586,9 +620,13 @@ impl Thread {
             protocol::HostMessage::UserMessage(message) => self
                 .timeline
                 .push(TimelineMessage::User(message.into_native())),
-            protocol::HostMessage::AgentStarted { id } => {
+            protocol::HostMessage::AgentStarted {
+                id,
+                comment_group_id,
+            } => {
                 self.timeline.push(TimelineMessage::Agent(AgentMessage::new(
                     Uuid::from_bytes(id),
+                    comment_group_id.map(Uuid::from_bytes),
                     cx,
                 )));
                 self.generating = true;
@@ -621,6 +659,22 @@ impl Thread {
                 };
                 message.thinking_complete = true;
                 message.thinking_expanded = false;
+            }
+            protocol::HostMessage::AgentCommentResponded {
+                id,
+                response_id,
+                comment_id,
+                response,
+            } => {
+                let Some(message) = self.agent_message_mut(id) else {
+                    return;
+                };
+                message.comment_responses.push(AgentCommentResponse {
+                    id: Uuid::from_bytes(response_id),
+                    comment_id: Uuid::from_bytes(comment_id),
+                    response_view: cx.new(|cx| TextViewState::markdown(&response, cx)),
+                    response,
+                });
             }
             protocol::HostMessage::AgentEnded { id, failure } => {
                 self.generating = false;
@@ -1769,7 +1823,7 @@ impl Cowork {
     fn selected_message_source_range(
         &self,
         thread_message_id: ThreadMessageId,
-        message: &AgentMessage,
+        text_view: &Entity<TextViewState>,
         cx: &App,
     ) -> Option<Range<usize>> {
         let mut selected_ranges = self
@@ -1793,7 +1847,7 @@ impl Cowork {
             })
         });
 
-        segmented.or_else(|| message.text_view.read(cx).selected_source_range())
+        segmented.or_else(|| text_view.read(cx).selected_source_range())
     }
 
     fn annotation_ranges(markdown: &str, selection: Range<usize>) -> Vec<Range<usize>> {
@@ -1936,14 +1990,21 @@ impl Cowork {
         };
         let source_range = {
             let thread = thread.read(cx);
-            let Some(message) = thread.timeline.iter().find_map(|entry| match entry {
-                TimelineMessage::Agent(message) if message.id == message_id => Some(message),
+            let Some(text_view) = thread.timeline.iter().find_map(|entry| match entry {
+                TimelineMessage::Agent(message) if message.id == message_id => {
+                    Some(message.text_view.clone())
+                }
+                TimelineMessage::Agent(message) => message
+                    .comment_responses
+                    .iter()
+                    .find(|response| response.id == message_id)
+                    .map(|response| response.response_view.clone()),
                 _ => None,
             }) else {
                 return;
             };
             let Some(source_range) =
-                self.selected_message_source_range(thread_message_id, message, cx)
+                self.selected_message_source_range(thread_message_id, &text_view, cx)
             else {
                 return;
             };
@@ -2406,40 +2467,40 @@ impl Cowork {
         cx.notify();
     }
 
-    fn render_agent_message(
+    fn render_agent_text(
         &mut self,
         thread_id: Uuid,
-        index: usize,
-        message: &AgentMessage,
+        message_id: Uuid,
+        text: &str,
+        text_view: &Entity<TextViewState>,
         comments: &[UserComment],
         wrap_width: gpui::Pixels,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let waiting = !message.complete && message.thinking.is_empty() && message.text.is_empty();
-        let mut message_content = Vec::new();
+    ) -> Vec<gpui::AnyElement> {
+        let mut content = Vec::new();
         let mut cursor = 0;
         let mut anchored_comments = comments
             .iter()
-            .filter(|comment| comment.reference.message_id == message.id)
+            .filter(|comment| comment.reference.message_id == message_id)
             .filter(|comment| {
                 comment.reference.range.start < comment.reference.range.end
-                    && comment.reference.range.end <= message.text.len()
-                    && message.text.is_char_boundary(comment.reference.range.start)
-                    && message.text.is_char_boundary(comment.reference.range.end)
+                    && comment.reference.range.end <= text.len()
+                    && text.is_char_boundary(comment.reference.range.start)
+                    && text.is_char_boundary(comment.reference.range.end)
             })
             .collect::<Vec<_>>();
         anchored_comments.sort_by_key(|comment| comment.reference.range.start);
 
-        if anchored_comments.is_empty() && !message.text.is_empty() {
-            message_content.push(
-                TextView::new(&message.text_view)
+        if anchored_comments.is_empty() && !text.is_empty() {
+            content.push(
+                TextView::new(text_view)
                     .selection_format(SelectionFormat::Plain)
                     .style(Self::markdown_style())
                     .w_full()
                     .into_any_element(),
             );
-            cursor = message.text.len();
+            return content;
         }
 
         let mut comment_index = 0;
@@ -2450,25 +2511,21 @@ impl Cowork {
                 continue;
             }
             let annotated_start =
-                Self::hard_line_start(&message.text, first.reference.range.start).max(cursor);
+                Self::hard_line_start(text, first.reference.range.start).max(cursor);
             if cursor < annotated_start {
-                message_content.push(self.render_message_segment(
+                content.push(self.render_message_segment(
                     thread_id,
-                    message.id,
-                    message_content.len(),
+                    message_id,
+                    content.len(),
                     cursor..annotated_start,
-                    &message.text[cursor..annotated_start],
+                    &text[cursor..annotated_start],
                     false,
                     cx,
                 ));
                 cursor = annotated_start;
             }
-            let line_end = Self::wrapped_line_end(
-                &message.text,
-                first.reference.range.end,
-                wrap_width,
-                window,
-            );
+            let line_end =
+                Self::wrapped_line_end(text, first.reference.range.end, wrap_width, window);
             let group_start = comment_index;
             while comment_index < anchored_comments.len()
                 && anchored_comments[comment_index].reference.range.start < line_end
@@ -2478,42 +2535,107 @@ impl Cowork {
             let group = &anchored_comments[group_start..comment_index];
             let annotation_ranges = group
                 .iter()
-                .flat_map(|comment| {
-                    Self::annotation_ranges(&message.text, comment.reference.range.clone())
-                })
+                .flat_map(|comment| Self::annotation_ranges(text, comment.reference.range.clone()))
                 .filter_map(|range| {
                     (range.start >= cursor && range.end <= line_end)
                         .then_some((range.start - cursor)..(range.end - cursor))
                 });
-            let annotated =
-                Self::annotate_markdown(&message.text[cursor..line_end], annotation_ranges);
-            message_content.push(self.render_message_segment(
+            let annotated = Self::annotate_markdown(&text[cursor..line_end], annotation_ranges);
+            content.push(self.render_message_segment(
                 thread_id,
-                message.id,
-                message_content.len(),
+                message_id,
+                content.len(),
                 cursor..line_end,
                 &annotated,
                 true,
                 cx,
             ));
-            message_content.extend(
+            content.extend(
                 group
                     .iter()
                     .map(|comment| Self::render_inline_comment(comment)),
             );
             cursor = line_end;
         }
-        if cursor < message.text.len() {
-            message_content.push(self.render_message_segment(
+        if cursor < text.len() {
+            content.push(self.render_message_segment(
                 thread_id,
-                message.id,
-                message_content.len(),
-                cursor..message.text.len(),
-                &message.text[cursor..],
+                message_id,
+                content.len(),
+                cursor..text.len(),
+                &text[cursor..],
                 false,
                 cx,
             ));
         }
+        content
+    }
+
+    fn render_agent_message(
+        &mut self,
+        thread_id: Uuid,
+        index: usize,
+        message: &AgentMessage,
+        comments: &[UserComment],
+        submitted_comments: &[UserComment],
+        wrap_width: gpui::Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let waiting = !message.complete && message.thinking.is_empty() && message.text.is_empty();
+        let mut submitted_comment_content = Vec::new();
+        for comment in submitted_comments {
+            submitted_comment_content.push(Self::render_composer_comment(comment));
+            if let Some(response) = message
+                .comment_responses
+                .iter()
+                .find(|response| response.comment_id == comment.id)
+            {
+                let response_id = response.id;
+                let response_content = self.render_agent_text(
+                    thread_id,
+                    response_id,
+                    &response.response,
+                    &response.response_view,
+                    comments,
+                    wrap_width,
+                    window,
+                    cx,
+                );
+                submitted_comment_content.push(
+                    div()
+                        .id(format!("comment-response-{response_id}"))
+                        .w_full()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .bg(rgb(0x242428))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, _, cx| {
+                                this.selection_message_id = Some(response_id);
+                                cx.stop_propagation();
+                            }),
+                        )
+                        .children(response_content)
+                        .into_any_element(),
+                );
+            }
+        }
+
+        let message_content = self.render_agent_text(
+            thread_id,
+            message.id,
+            &message.text,
+            &message.text_view,
+            comments,
+            wrap_width,
+            window,
+            cx,
+        );
 
         let message_id = message.id;
         let thinking_expanded = !message.thinking_complete || message.thinking_expanded;
@@ -2587,6 +2709,7 @@ impl Cowork {
                     .flex_col()
                     .gap_3()
                     .when(message.failed, |this| this.text_color(rgb(0xf87171)))
+                    .children(submitted_comment_content)
                     .when(waiting, |this| {
                         this.child(
                             div()
@@ -2614,14 +2737,23 @@ impl Cowork {
         index: usize,
         message: &TimelineMessage,
         comments: &[UserComment],
+        submitted_comments: &[UserComment],
         wrap_width: gpui::Pixels,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         match message {
             TimelineMessage::User(group) => self.render_user_message_group(index, group, cx),
-            TimelineMessage::Agent(message) => self
-                .render_agent_message(thread_id, index, message, comments, wrap_width, window, cx),
+            TimelineMessage::Agent(message) => self.render_agent_message(
+                thread_id,
+                index,
+                message,
+                comments,
+                submitted_comments,
+                wrap_width,
+                window,
+                cx,
+            ),
         }
     }
 
@@ -2637,7 +2769,38 @@ impl Cowork {
                     Some(RigMessage::user(history_text.as_deref().unwrap_or(text)))
                 }
                 TimelineMessage::Agent(message) if message.complete && !message.failed => {
-                    Some(RigMessage::assistant(&message.text))
+                    let submitted_comments = message
+                        .comment_group_id
+                        .and_then(|group_id| {
+                            messages.iter().find_map(|entry| match entry {
+                                TimelineMessage::User(group) if group.id == group_id => {
+                                    Some(group.comments.as_slice())
+                                }
+                                _ => None,
+                            })
+                        })
+                        .unwrap_or_default();
+                    let mut history_text = submitted_comments
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(index, comment)| {
+                            message
+                                .comment_responses
+                                .iter()
+                                .find(|response| response.comment_id == comment.id)
+                                .map(|response| (index, response))
+                        })
+                        .map(|(index, response)| {
+                            format!("Reply to comment {}: {}", index + 1, response.response)
+                        })
+                        .join("\n\n");
+                    if !message.text.is_empty() {
+                        if !history_text.is_empty() {
+                            history_text.push_str("\n\n");
+                        }
+                        history_text.push_str(&message.text);
+                    }
+                    Some(RigMessage::assistant(history_text))
                 }
                 TimelineMessage::Agent(_) => None,
             })
@@ -2649,6 +2812,9 @@ impl Cowork {
         thread_id: Uuid,
         prompt: String,
         history: Vec<RigMessage>,
+        comment_group_id: Option<Uuid>,
+        comment_ids: Vec<Uuid>,
+        turn_comments: Arc<TurnComments>,
         cx: &mut Context<Self>,
     ) {
         let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
@@ -2659,12 +2825,14 @@ impl Cowork {
             thread.emit(
                 protocol::HostMessage::AgentStarted {
                     id: message_id.into_bytes(),
+                    comment_group_id: comment_group_id.map(Uuid::into_bytes),
                 },
                 cx,
             );
         });
 
         let (sender, mut receiver) = mpsc::channel(128);
+        let tool_comments = turn_comments.clone();
         let generation_task = self.tokio_handle.spawn(async move {
             let client = Ollama::new().bound()?;
             let agent = client
@@ -2673,9 +2841,10 @@ impl Cowork {
                     "num_ctx": OLLAMA_CONTEXT_TOKENS,
                     "think": "medium"
                 }))
+                .default_max_turns(usize::MAX)
+                .tool(RespondToComment::new(tool_comments))
                 .build();
             let stream = agent.prompt(prompt).history(&history).stream();
-
             _ = stream
                 .map(|item| Ok(item.map_err(anyhow::Error::from)))
                 .forward(PollSender::new(sender))
@@ -2685,7 +2854,40 @@ impl Cowork {
 
         cx.spawn(async move |this, cx| {
             let mut stream_completed = true;
+            let mut published_comment_responses = HashSet::new();
             while let Some(item) = receiver.recv().await {
+                if matches!(
+                    &item,
+                    Ok(MultiTurnStreamItem::ToolExecutionCommitted { .. })
+                ) {
+                    let responses = turn_comments.responses().unwrap_or_default();
+                    for response in responses {
+                        if !published_comment_responses.insert(response.comment_id.to_string()) {
+                            continue;
+                        }
+                        let Some(comment_id) = turn_comments
+                            .comment_ids()
+                            .iter()
+                            .position(|comment_id| comment_id == &response.comment_id)
+                            .and_then(|index| comment_ids.get(index))
+                        else {
+                            continue;
+                        };
+                        thread.update(cx, |thread, cx| {
+                            thread.emit(
+                                protocol::HostMessage::AgentCommentResponded {
+                                    id: message_id.into_bytes(),
+                                    response_id: Uuid::new_v4().into_bytes(),
+                                    comment_id: comment_id.into_bytes(),
+                                    response: response.response,
+                                },
+                                cx,
+                            );
+                        });
+                        _ = this.update(cx, |this, cx| this.thread_updated(thread_id, cx));
+                    }
+                }
+
                 let Some(event) = Self::agent_stream_event(message_id, item) else {
                     continue;
                 };
@@ -2798,6 +3000,7 @@ impl Cowork {
     fn prompt_with_comments(
         prompt: &str,
         comments: &[UserComment],
+        comment_ids: &[tools::CommentId],
         timeline: &[TimelineMessage],
     ) -> String {
         if comments.is_empty() {
@@ -2805,9 +3008,9 @@ impl Cowork {
         }
 
         let mut result = String::from(
-            "The user attached the following inline comments to immutable excerpts from the conversation:\n",
+            "The user attached the following inline comments to immutable excerpts from the conversation. You MUST call `respond_to_comment` exactly once for every comment_id before finishing your response. Put the direct reply to that comment in the tool's `response` argument; do not repeat these replies in your final prose.\n",
         );
-        for (index, comment) in comments.iter().enumerate() {
+        for (index, (comment, comment_id)) in comments.iter().zip(comment_ids.iter()).enumerate() {
             let UserCommentBody::Submitted(body) = &comment.body else {
                 continue;
             };
@@ -2818,13 +3021,17 @@ impl Cowork {
                         entry,
                         TimelineMessage::Agent(message)
                             if message.id == comment.reference.message_id
+                                || message.comment_responses.iter().any(|response| {
+                                    response.id == comment.reference.message_id
+                                })
                     )
                 })
                 .map(|index| index + 1)
                 .unwrap_or_default();
             result.push_str(&format!(
-                "\n{}. Excerpt from assistant message {}:\n> {}\nComment: {}\n",
+                "\n{}. {} — Excerpt from assistant message {}:\n> {}\nComment: {}\n",
                 index + 1,
+                comment_id,
                 message_number,
                 comment.reference.quote.replace('\n', "\n> "),
                 body.trim(),
@@ -2878,7 +3085,17 @@ impl Cowork {
             .map(|thread| thread.read(cx).timeline.clone())
             .unwrap_or_default();
         let history = Self::rig_history(&timeline);
-        let agent_prompt = Self::prompt_with_comments(&prompt, &submitted_comments, &timeline);
+        let turn_comments = Arc::new(TurnComments::new(submitted_comments.len()));
+        let agent_prompt = Self::prompt_with_comments(
+            &prompt,
+            &submitted_comments,
+            turn_comments.comment_ids(),
+            &timeline,
+        );
+        let submitted_comment_ids = submitted_comments
+            .iter()
+            .map(|comment| comment.id)
+            .collect::<Vec<_>>();
         let submitted_group = UserMessageGroup {
             id: draft.id,
             comments: submitted_comments,
@@ -2886,7 +3103,7 @@ impl Cowork {
                 text: prompt.clone(),
                 history_text: has_comments.then(|| agent_prompt.clone()),
             },
-            comments_folded: draft.comments_folded,
+            comments_folded: has_comments || draft.comments_folded,
         };
         let mut next_draft = Self::new_user_message_draft(window, cx);
         next_draft.comments = remaining_comments;
@@ -2930,7 +3147,15 @@ impl Cowork {
         self.selection_message_id = None;
         self.follow_generation = true;
         next_composer.focus_handle(cx).focus(window, cx);
-        self.start_generation(thread_id, agent_prompt, history, cx);
+        self.start_generation(
+            thread_id,
+            agent_prompt,
+            history,
+            has_comments.then_some(draft.id),
+            submitted_comment_ids,
+            turn_comments,
+            cx,
+        );
         self.timeline_scroll_handle.scroll_to_bottom();
     }
 
@@ -3016,8 +3241,29 @@ impl Cowork {
         let mut timeline_messages = Vec::new();
         if let Some(thread_id) = active_thread_id {
             for (index, message) in messages.iter().enumerate() {
+                let submitted_comments = match message {
+                    TimelineMessage::Agent(message) => message
+                        .comment_group_id
+                        .and_then(|group_id| {
+                            messages.iter().find_map(|entry| match entry {
+                                TimelineMessage::User(group) if group.id == group_id => {
+                                    Some(group.comments.as_slice())
+                                }
+                                _ => None,
+                            })
+                        })
+                        .unwrap_or_default(),
+                    TimelineMessage::User(_) => &[],
+                };
                 timeline_messages.push(self.render_timeline_message(
-                    thread_id, index, message, &comments, wrap_width, window, cx,
+                    thread_id,
+                    index,
+                    message,
+                    &comments,
+                    submitted_comments,
+                    wrap_width,
+                    window,
+                    cx,
                 ));
             }
         }
@@ -3417,6 +3663,7 @@ mod tests {
         cx: &mut gpui::TestAppContext,
         markdown: &'static str,
         expected_quote: &str,
+        target_comment_reply: bool,
     ) {
         struct SelectionRoot {
             cowork: Entity<Cowork>,
@@ -3464,6 +3711,12 @@ mod tests {
         let (view, cx) = cx.add_window_view(|window, cx| {
             let message_id = Uuid::new_v4();
             let text_view = cx.new(|cx| TextViewState::markdown(markdown, cx));
+            let main_text = if target_comment_reply { "" } else { markdown };
+            let main_text_view = if target_comment_reply {
+                cx.new(|cx| TextViewState::markdown("", cx))
+            } else {
+                text_view.clone()
+            };
             let thinking_view = cx.new(|cx| TextViewState::markdown("", cx));
             let thread_id = Uuid::new_v4();
             let draft = Cowork::new_user_message_draft(window, cx);
@@ -3474,13 +3727,27 @@ mod tests {
                     title: "Test".into(),
                 },
                 timeline: vec![TimelineMessage::Agent(AgentMessage {
-                    id: message_id,
+                    id: if target_comment_reply {
+                        Uuid::new_v4()
+                    } else {
+                        message_id
+                    },
+                    comment_group_id: None,
+                    comment_responses: target_comment_reply
+                        .then(|| AgentCommentResponse {
+                            id: message_id,
+                            comment_id: Uuid::new_v4(),
+                            response: markdown.into(),
+                            response_view: text_view.clone(),
+                        })
+                        .into_iter()
+                        .collect(),
                     thinking: String::new(),
                     thinking_view,
                     thinking_complete: true,
                     thinking_expanded: false,
-                    text: markdown.into(),
-                    text_view: text_view.clone(),
+                    text: main_text.into(),
+                    text_view: main_text_view,
                     complete: true,
                     failed: false,
                 })],
@@ -3568,8 +3835,14 @@ mod tests {
     #[gpui::test]
     fn backslash_selections_create_comments_with_gpui_ranges(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_base::init);
-        assert_backslash_selection_creates_comment(cx, r"a\b", r"a\b");
-        assert_backslash_selection_creates_comment(cx, r"a\\b", r"a\b");
+        assert_backslash_selection_creates_comment(cx, r"a\b", r"a\b", false);
+        assert_backslash_selection_creates_comment(cx, r"a\\b", r"a\b", false);
+    }
+
+    #[gpui::test]
+    fn comments_can_target_agent_comment_replies(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_base::init);
+        assert_backslash_selection_creates_comment(cx, "Agent reply", "Agent reply", true);
     }
 
     #[test]
@@ -3699,13 +3972,15 @@ mod tests {
     /// The events a host broadcasts while answering one prompt.
     fn agent_stream_events(message_id: Uuid) -> Vec<protocol::HostMessage> {
         let id = message_id.into_bytes();
+        let user_message_id = Uuid::new_v4().into_bytes();
+        let comment_id = Uuid::new_v4().into_bytes();
         vec![
             protocol::HostMessage::ThreadTitled("Explain this".into()),
             protocol::HostMessage::UserMessage(protocol::UserMessage {
-                id: Uuid::new_v4().into_bytes(),
+                id: user_message_id,
                 text: "Explain this".into(),
                 comments: vec![protocol::UserComment {
-                    id: Uuid::new_v4().into_bytes(),
+                    id: comment_id,
                     reference: protocol::CommentReference {
                         message_id: Uuid::new_v4().into_bytes(),
                         range: 0..10,
@@ -3714,7 +3989,16 @@ mod tests {
                     body: "why?".into(),
                 }],
             }),
-            protocol::HostMessage::AgentStarted { id },
+            protocol::HostMessage::AgentStarted {
+                id,
+                comment_group_id: Some(user_message_id),
+            },
+            protocol::HostMessage::AgentCommentResponded {
+                id,
+                response_id: Uuid::new_v4().into_bytes(),
+                comment_id,
+                response: "Because of this.".into(),
+            },
             protocol::HostMessage::AgentTextAppended {
                 id,
                 target: protocol::AgentText::Thinking,

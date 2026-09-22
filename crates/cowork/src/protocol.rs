@@ -34,8 +34,12 @@ pub(crate) enum HostMessage {
     /// A user message was appended to the timeline.
     UserMessage(UserMessage),
     /// The agent started responding; an empty message is appended and the
-    /// thread is marked as generating.
-    AgentStarted { id: uuid::Bytes },
+    /// thread is marked as generating. `comment_group_id` identifies the
+    /// submitted user comments rendered at the top of this response.
+    AgentStarted {
+        id: uuid::Bytes,
+        comment_group_id: Option<uuid::Bytes>,
+    },
     /// A chunk of streamed agent output to append to an in-flight message.
     AgentTextAppended {
         id: uuid::Bytes,
@@ -44,6 +48,13 @@ pub(crate) enum HostMessage {
     },
     /// The agent stopped reasoning and is about to answer.
     AgentThinkingEnded { id: uuid::Bytes },
+    /// The agent responded to one submitted comment.
+    AgentCommentResponded {
+        id: uuid::Bytes,
+        response_id: uuid::Bytes,
+        comment_id: uuid::Bytes,
+        response: String,
+    },
     /// The agent finished. `failure` carries a message to display when the
     /// agent produced no output of its own.
     AgentEnded {
@@ -96,11 +107,20 @@ pub(crate) struct CommentReference {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct AgentMessage {
     pub(crate) id: uuid::Bytes,
+    pub(crate) comment_group_id: Option<uuid::Bytes>,
+    pub(crate) comment_responses: Vec<AgentCommentResponse>,
     pub(crate) thinking: String,
     pub(crate) thinking_complete: bool,
     pub(crate) text: String,
     pub(crate) complete: bool,
     pub(crate) failed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AgentCommentResponse {
+    pub(crate) id: uuid::Bytes,
+    pub(crate) comment_id: uuid::Bytes,
+    pub(crate) response: String,
 }
 
 fn codec() -> LengthDelimitedCodec {
@@ -225,6 +245,12 @@ mod tests {
                 }),
                 TimelineMessage::Agent(AgentMessage {
                     id: [4; 16],
+                    comment_group_id: Some([2; 16]),
+                    comment_responses: vec![AgentCommentResponse {
+                        id: [5; 16],
+                        comment_id: [3; 16],
+                        response: "Reply".into(),
+                    }],
                     thinking: "Reasoning".into(),
                     thinking_complete: true,
                     text: "Answer".into(),
@@ -241,13 +267,22 @@ mod tests {
     #[test]
     fn agent_stream_events_round_trip_through_postcard() {
         for message in [
-            HostMessage::AgentStarted { id: [7; 16] },
+            HostMessage::AgentStarted {
+                id: [7; 16],
+                comment_group_id: Some([8; 16]),
+            },
             HostMessage::AgentTextAppended {
                 id: [7; 16],
                 target: AgentText::Thinking,
                 text: "Let me think".into(),
             },
             HostMessage::AgentThinkingEnded { id: [7; 16] },
+            HostMessage::AgentCommentResponded {
+                id: [7; 16],
+                response_id: [10; 16],
+                comment_id: [9; 16],
+                response: "Reply".into(),
+            },
             HostMessage::AgentTextAppended {
                 id: [7; 16],
                 target: AgentText::Response,
