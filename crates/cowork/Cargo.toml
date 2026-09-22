@@ -23,6 +23,7 @@ serde_json.workspace = true
 syntect.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
+tools.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
