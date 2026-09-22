@@ -1,7 +1,9 @@
 use std::{
     borrow::Cow,
+    cell::Cell,
     collections::{HashMap, HashSet, VecDeque},
     ops::Range,
+    rc::Rc,
     sync::{Arc, OnceLock},
     time::Duration,
 };
@@ -14,8 +16,8 @@ use gpui::{
     IntoElement, KeyBinding, KeyDownEvent, LineFragment, MouseButton, MouseDownEvent, MouseUpEvent,
     PlatformInput, QuitMode, Render, ScrollHandle, ScrollWheelEvent, SharedString, SpringAnimation,
     SpringConfig, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds,
-    WindowControlArea, WindowOptions, actions, div, img, point, prelude::*, px, rems, rgb, rgba,
-    size,
+    WindowControlArea, WindowOptions, actions, canvas, div, img, point, prelude::*, px, rems, rgb,
+    rgba, size,
 };
 use gpui_base::{
     SelectableText, TextSelection, TextSelectionLayer, TextView, TextViewDefaults, TextViewState,
@@ -53,6 +55,7 @@ mod protocol;
 
 const SIDEBAR_WIDTH: gpui::Pixels = px(275.);
 const TOP_BAR_HEIGHT: gpui::Pixels = px(40.);
+const BOTTOM_BAR_DIVIDER_THRESHOLD: gpui::Pixels = px(24.);
 const MACOS_TRAFFIC_LIGHT_X_INSET: gpui::Pixels = px(12.);
 const MACOS_TRAFFIC_LIGHT_SIZE: gpui::Pixels = px(14.);
 const MACOS_TRAFFIC_LIGHT_SPACING: gpui::Pixels = px(6.);
@@ -782,6 +785,19 @@ impl Cowork {
             unreachable!("thread drafts are always editable");
         };
         composer.clone()
+    }
+
+    fn editable_composer(&self, cx: &App) -> Option<Entity<TextareaState>> {
+        self.active_thread_id
+            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
+            .map(|thread| {
+                let thread = thread.read(cx);
+                thread
+                    .ownership
+                    .can_write()
+                    .then(|| Self::draft_composer(&thread.draft))
+            })
+            .unwrap_or_else(|| Some(Self::draft_composer(&self.new_thread_draft)))
     }
 
     fn new_comment_editor(
@@ -3221,6 +3237,59 @@ impl Cowork {
         }
     }
 
+    fn render_bottom_bar(
+        &self,
+        composer: Option<Entity<TextareaState>>,
+        read_only_line_bounds: Rc<Cell<Option<Bounds<gpui::Pixels>>>>,
+    ) -> impl IntoElement {
+        let timeline_scroll_handle = self.timeline_scroll_handle.clone();
+
+        div()
+            .id("bottom-bar")
+            .debug_selector(|| "bottom-bar".to_owned())
+            .relative()
+            .h(TOP_BAR_HEIGHT)
+            .w_full()
+            .flex_none()
+            .border_l_1()
+            .border_color(rgb(0x2d2d30))
+            .bg(rgb(0x18181b))
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, cx| {
+                        let content_bottom = if let Some(composer) = &composer {
+                            let composer = composer.read(cx);
+                            let text_end = composer.value().len();
+                            composer
+                                .range_to_bounds(&(text_end..text_end))
+                                .map(|bounds| bounds.bottom())
+                        } else {
+                            read_only_line_bounds.get().map(|bounds| bounds.bottom())
+                        };
+                        let Some(content_bottom) = content_bottom else {
+                            return;
+                        };
+                        let scroll_offset = timeline_scroll_handle.offset().y;
+                        let max_scroll_offset = timeline_scroll_handle.max_offset().y;
+                        let is_scrolled_to_bottom = max_scroll_offset > px(0.)
+                            && scroll_offset <= -max_scroll_offset + px(1.);
+                        let divider_visible = !is_scrolled_to_bottom
+                            && content_bottom >= bounds.top() - BOTTOM_BAR_DIVIDER_THRESHOLD;
+
+                        if divider_visible {
+                            window.paint_quad(gpui::fill(bounds, rgb(0x2d2d30)));
+                        }
+                    },
+                )
+                .absolute()
+                .top_0()
+                .left_0()
+                .right_0()
+                .h(px(1.)),
+            )
+    }
+
     fn submit_composer_action(
         &mut self,
         _: &SubmitComposer,
@@ -3244,6 +3313,7 @@ impl Cowork {
 
     fn render_main_editor(
         &mut self,
+        read_only_line_bounds: Rc<Cell<Option<Bounds<gpui::Pixels>>>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -3326,8 +3396,8 @@ impl Cowork {
 
         div()
             .id("main-editor")
-            .h_full()
             .flex_1()
+            .min_h_0()
             .min_w_0()
             .overflow_hidden()
             .rounded_tl(px(12.))
@@ -3410,12 +3480,23 @@ impl Cowork {
                                 this.child(
                                     div()
                                         .id("read-only-thread")
+                                        .relative()
                                         .w_full()
                                         .flex()
                                         .justify_center()
                                         .text_xs()
                                         .text_color(rgb(0x71717a))
-                                        .child("Read-only thread"),
+                                        .child("Read-only thread")
+                                        .child(
+                                            canvas(
+                                                move |bounds, _, _| {
+                                                    read_only_line_bounds.set(Some(bounds));
+                                                },
+                                                |_, _, _, _| {},
+                                            )
+                                            .absolute()
+                                            .size_full(),
+                                        ),
                                 )
                             }),
                     ),
@@ -3430,6 +3511,8 @@ impl Render for Cowork {
         } else {
             px(0.)
         };
+        let composer = self.editable_composer(cx);
+        let read_only_line_bounds = Rc::new(Cell::new(None));
 
         div()
             .size_full()
@@ -3458,7 +3541,21 @@ impl Render for Cowork {
                             |sidebar, width| sidebar.w(width),
                         ),
                     )
-                    .child(self.render_main_editor(window, cx)),
+                    .child(
+                        div()
+                            .h_full()
+                            .flex_1()
+                            .min_h_0()
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .child(self.render_main_editor(
+                                read_only_line_bounds.clone(),
+                                window,
+                                cx,
+                            ))
+                            .child(self.render_bottom_bar(composer, read_only_line_bounds)),
+                    ),
             )
             .children(self.render_join_dialog(cx))
     }
