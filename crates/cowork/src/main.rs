@@ -1,7 +1,7 @@
 use std::{
     borrow::Cow,
     cell::Cell,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
     ops::Range,
     rc::Rc,
     sync::{
@@ -3034,12 +3034,10 @@ impl Cowork {
                     );
                 });
                 _ = this.update(cx, |this, cx| {
-                    if this
-                        .active_generations
-                        .get(&thread_id)
-                        .is_some_and(|generation| generation.message_id == message_id)
-                    {
-                        this.active_generations.remove(&thread_id);
+                    if let Entry::Occupied(entry) = this.active_generations.entry(thread_id) {
+                        if entry.get().message_id == message_id {
+                            entry.remove();
+                        }
                     }
                     this.thread_updated(thread_id, cx);
                 });
