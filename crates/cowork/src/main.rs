@@ -1375,23 +1375,24 @@ impl Cowork {
             .justify_between()
             .bg(rgb(0x1c1c1f))
             .window_control_area(WindowControlArea::Drag)
-            .when(cfg!(target_os = "macos"), |this| {
-                this.on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, event: &MouseDownEvent, window, cx| {
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, event: &MouseDownEvent, window, cx| {
+                    cx.stop_propagation();
+
+                    if cfg!(target_os = "macos") {
                         let is_titlebar_double_click =
                             event.click_count == 2 && this.titlebar_click_armed;
                         this.titlebar_click_armed = event.click_count == 1;
-                        cx.stop_propagation();
 
                         if is_titlebar_double_click {
                             window.titlebar_double_click();
                         } else {
                             window.start_window_move();
                         }
-                    }),
-                )
-            })
+                    }
+                }),
+            )
             .child(self.render_sidebar_toggle(cx))
             .child(
                 div()
