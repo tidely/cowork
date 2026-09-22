@@ -1168,6 +1168,18 @@ impl Cowork {
         cx.notify();
     }
 
+    fn join_dialog_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if event.keystroke.key == "escape" {
+            self.close_join_dialog(cx);
+            cx.stop_propagation();
+        }
+    }
+
     fn join_shared_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(dialog) = &mut self.join_dialog else {
             return;
@@ -1698,6 +1710,7 @@ impl Cowork {
                 .absolute()
                 .inset_0()
                 .flex()
+                .on_key_down(cx.listener(Self::join_dialog_key_down))
                 .items_center()
                 .justify_center()
                 .child(
