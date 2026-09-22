@@ -23,8 +23,8 @@ use gpui::{
     rgba, size,
 };
 use gpui_base::{
-    SelectableText, TextSelection, TextSelectionLayer, TextView, TextViewDefaults, TextViewState,
-    TextViewStyle, Textarea,
+    GlobalState, SelectableText, TextSelection, TextSelectionLayer, TextView, TextViewDefaults,
+    TextViewState, TextViewStyle, Textarea,
     input::{Input, InputEditorStyle, InputEvent, InputState, TextareaState},
     text::{CodeBlock, SelectionFormat},
 };
@@ -1378,9 +1378,10 @@ impl Cowork {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    cx.stop_propagation();
+                    GlobalState::suppress_text_selection(cx);
 
                     if cfg!(target_os = "macos") {
+                        cx.stop_propagation();
                         let is_titlebar_double_click =
                             event.click_count == 2 && this.titlebar_click_armed;
                         this.titlebar_click_armed = event.click_count == 1;
