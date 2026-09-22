@@ -4,7 +4,10 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     ops::Range,
     rc::Rc,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -25,6 +28,11 @@ use gpui_base::{
     input::{Input, InputEditorStyle, InputEvent, InputState, TextareaState},
     text::{CodeBlock, SelectionFormat},
 };
+use gpui_component::{
+    Icon, Sizable as _,
+    button::{Button, ButtonVariants as _},
+};
+use gpui_kit_assets::IconName as AssetIconName;
 use iroh::{
     Endpoint, EndpointId,
     endpoint::{Accepting, Connection, presets},
@@ -168,6 +176,8 @@ fn highlight_code_block(block: &CodeBlock) -> Vec<(Range<usize>, HighlightStyle)
     highlights
 }
 
+gpui_kit_assets::icon_assets!(ComposerButtonAssets, [SendHorizontal, Square]);
+
 struct Assets;
 
 impl AssetSource for Assets {
@@ -176,16 +186,16 @@ impl AssetSource for Assets {
             OLLAMA_AVATAR_PATH => Ok(Some(Cow::Borrowed(include_bytes!(
                 "../../../assets/providers/ollama.png"
             )))),
-            _ => Ok(None),
+            _ => ComposerButtonAssets.load(path),
         }
     }
 
     fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
-        Ok(OLLAMA_AVATAR_PATH
-            .starts_with(path)
-            .then(|| OLLAMA_AVATAR_PATH.into())
-            .into_iter()
-            .collect())
+        let mut assets = ComposerButtonAssets.list(path)?;
+        if OLLAMA_AVATAR_PATH.starts_with(path) {
+            assets.push(OLLAMA_AVATAR_PATH.into());
+        }
+        Ok(assets)
     }
 }
 
@@ -745,6 +755,12 @@ impl ThreadStore {
     }
 }
 
+struct ActiveGeneration {
+    message_id: Uuid,
+    abort_handle: tokio::task::AbortHandle,
+    cancelled: Arc<AtomicBool>,
+}
+
 struct Cowork {
     sidebar_open: bool,
     recents_open: bool,
@@ -759,6 +775,7 @@ struct Cowork {
     titlebar_click_armed: bool,
     join_dialog: Option<JoinDialog>,
     tokio_handle: tokio::runtime::Handle,
+    active_generations: HashMap<Uuid, ActiveGeneration>,
     _window_activation_subscription: Subscription,
 }
 
@@ -2899,6 +2916,7 @@ impl Cowork {
 
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let tool_comments = turn_comments.clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
         let generation_task = self.tokio_handle.spawn(async move {
             let client = Ollama::new().bound()?;
             let model = client.completion(OLLAMA_MODEL);
@@ -2915,6 +2933,14 @@ impl Cowork {
                 .await?;
             Ok::<_, anyhow::Error>(())
         });
+        self.active_generations.insert(
+            thread_id,
+            ActiveGeneration {
+                message_id,
+                abort_handle: generation_task.abort_handle(),
+                cancelled: cancelled.clone(),
+            },
+        );
 
         cx.spawn(async move |this, cx| {
             let mut stream_completed = true;
@@ -2971,6 +2997,7 @@ impl Cowork {
                 let error = match generation_task.await {
                     Ok(Ok(())) => None,
                     Ok(Err(error)) => Some(error),
+                    Err(error) if error.is_cancelled() && cancelled.load(Ordering::Acquire) => None,
                     Err(error) => Some(error.into()),
                 };
                 thread.update(cx, |thread, cx| {
@@ -2983,7 +3010,16 @@ impl Cowork {
                         cx,
                     );
                 });
-                _ = this.update(cx, |this, cx| this.thread_updated(thread_id, cx));
+                _ = this.update(cx, |this, cx| {
+                    if this
+                        .active_generations
+                        .get(&thread_id)
+                        .is_some_and(|generation| generation.message_id == message_id)
+                    {
+                        this.active_generations.remove(&thread_id);
+                    }
+                    this.thread_updated(thread_id, cx);
+                });
             }
         })
         .detach();
@@ -3101,6 +3137,35 @@ impl Cowork {
             result.push_str(prompt);
         }
         result
+    }
+
+    fn stop_generation(&mut self, cx: &mut Context<Self>) {
+        let Some(thread_id) = self.active_thread_id else {
+            return;
+        };
+        let Some(generation) = self.active_generations.get(&thread_id) else {
+            return;
+        };
+        generation.cancelled.store(true, Ordering::Release);
+        generation.abort_handle.abort();
+        cx.notify();
+    }
+
+    fn composer_button_clicked(
+        &mut self,
+        _: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let generating = self
+            .active_thread_id
+            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
+            .is_some_and(|thread| thread.read(cx).generating);
+        if generating {
+            self.stop_generation(cx);
+        } else {
+            self.submit_composer(window, cx);
+        }
     }
 
     fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3241,8 +3306,29 @@ impl Cowork {
         &self,
         composer: Option<Entity<TextareaState>>,
         read_only_line_bounds: Rc<Cell<Option<Bounds<gpui::Pixels>>>>,
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let timeline_scroll_handle = self.timeline_scroll_handle.clone();
+        let show_button = composer.is_some();
+        let generating = self
+            .active_thread_id
+            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
+            .is_some_and(|thread| thread.read(cx).generating);
+        let button = if generating {
+            Button::new("stop-generation")
+                .icon(Icon::new(AssetIconName::Square))
+                .danger()
+                .small()
+                .accessibility_label("Stop generating")
+                .on_click(cx.listener(Self::composer_button_clicked))
+        } else {
+            Button::new("send-message")
+                .icon(Icon::new(AssetIconName::SendHorizontal))
+                .primary()
+                .small()
+                .accessibility_label("Send message")
+                .on_click(cx.listener(Self::composer_button_clicked))
+        };
 
         div()
             .id("bottom-bar")
@@ -3254,6 +3340,10 @@ impl Cowork {
             .border_l_1()
             .border_color(rgb(0x2d2d30))
             .bg(rgb(0x18181b))
+            .flex()
+            .items_center()
+            .justify_end()
+            .px_3()
             .child(
                 canvas(
                     |_, _, _| (),
@@ -3288,6 +3378,7 @@ impl Cowork {
                 .right_0()
                 .h(px(1.)),
             )
+            .when(show_button, |this| this.child(button))
     }
 
     fn submit_composer_action(
@@ -3554,7 +3645,7 @@ impl Render for Cowork {
                                 window,
                                 cx,
                             ))
-                            .child(self.render_bottom_bar(composer, read_only_line_bounds)),
+                            .child(self.render_bottom_bar(composer, read_only_line_bounds, cx)),
                     ),
             )
             .children(self.render_join_dialog(cx))
@@ -3587,7 +3678,7 @@ fn main() {
     gpui_platform::application()
         .with_assets(Assets)
         .run(move |cx: &mut App| {
-            gpui_base::init(cx);
+            gpui_component::init(cx);
             TextViewDefaults::new()
                 .with_code_block_highlighter(highlight_code_block)
                 .install(cx);
@@ -3645,6 +3736,7 @@ fn main() {
                         titlebar_click_armed: false,
                         join_dialog: None,
                         tokio_handle,
+                        active_generations: HashMap::new(),
                         _window_activation_subscription: window_activation_subscription,
                     }
                 })
@@ -3946,6 +4038,7 @@ mod tests {
                 titlebar_click_armed: false,
                 join_dialog: None,
                 tokio_handle,
+                active_generations: HashMap::new(),
                 _window_activation_subscription: cx.observe_window_activation(window, |_, _, _| {}),
             });
             composer.focus_handle(cx).focus(window, cx);
@@ -4072,7 +4165,7 @@ mod tests {
 
     #[gpui::test]
     fn backslash_selections_create_comments_with_gpui_ranges(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_base::init);
+        cx.update(gpui_component::init);
         assert_backslash_selection_creates_comment(
             cx,
             r"a\b",
@@ -4099,7 +4192,7 @@ mod tests {
 
     #[gpui::test]
     fn comments_can_target_agent_comment_replies(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_base::init);
+        cx.update(gpui_component::init);
         assert_backslash_selection_creates_comment(
             cx,
             "Agent reply",
@@ -4115,7 +4208,7 @@ mod tests {
 
     #[gpui::test]
     fn comments_can_target_text_before_an_existing_comment(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_base::init);
+        cx.update(gpui_component::init);
         assert_backslash_selection_creates_comment(
             cx,
             "alpha beta gamma",
@@ -4133,7 +4226,7 @@ mod tests {
     fn creating_comment_immediately_before_existing_preserves_both_highlights(
         cx: &mut gpui::TestAppContext,
     ) {
-        cx.update(gpui_base::init);
+        cx.update(gpui_component::init);
         assert_backslash_selection_creates_comment(
             cx,
             "alpha beta gamma",
@@ -4151,7 +4244,7 @@ mod tests {
     fn comments_after_an_existing_comment_keep_original_source_offsets(
         cx: &mut gpui::TestAppContext,
     ) {
-        cx.update(gpui_base::init);
+        cx.update(gpui_component::init);
         assert_backslash_selection_creates_comment(
             cx,
             "alpha beta gamma",
@@ -4260,7 +4353,7 @@ mod tests {
     fn sharing_before_first_message_materializes_an_empty_owned_thread(
         cx: &mut gpui::TestAppContext,
     ) {
-        cx.update(gpui_base::init);
+        cx.update(gpui_component::init);
         let (view, cx) = cx.add_window_view(|window, cx| {
             let draft = Cowork::new_user_message_draft(window, cx);
             let draft_id = draft.id;
@@ -4351,7 +4444,7 @@ mod tests {
     fn collaborators_joining_mid_stream_converge_on_the_host_timeline(
         cx: &mut gpui::TestAppContext,
     ) {
-        cx.update(gpui_base::init);
+        cx.update(gpui_component::init);
         let message_id = Uuid::new_v4();
         let events = agent_stream_events(message_id);
         // The collaborator joins once the agent has started reasoning.
@@ -4432,7 +4525,7 @@ mod tests {
 
     #[gpui::test]
     fn composer_grows_beyond_four_lines(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_base::init);
+        cx.update(gpui_component::init);
         let (view, cx) = cx.add_window_view(|window, cx| {
             let composer = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, usize::MAX));
             ComposerTestView { composer }
@@ -4457,7 +4550,7 @@ mod tests {
 
     #[gpui::test]
     fn synthetic_mouse_up_ends_a_stale_text_drag(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_base::init);
+        cx.update(gpui_component::init);
         let (view, cx) = cx.add_window_view(|window, cx| {
             let editor = cx.new(|cx| {
                 let mut editor = TextareaState::new(window, cx);
