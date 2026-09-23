@@ -18,8 +18,8 @@ use gpui::{
     ClipboardItem, Context, Entity, Focusable, FontStyle, FontWeight, FutureExt, HighlightStyle,
     IntoElement, KeyBinding, KeyDownEvent, LineFragment, MouseButton, MouseDownEvent, MouseUpEvent,
     PlatformInput, QuitMode, Render, ScrollHandle, ScrollWheelEvent, SharedString, Subscription,
-    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowControlArea, WindowOptions, actions,
-    canvas, div, img, point, prelude::*, px, rems, rgb, rgba, size,
+    TextRun, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowControlArea, WindowOptions,
+    actions, canvas, div, img, point, prelude::*, px, rems, rgb, rgba, size,
 };
 use gpui_base::{
     GlobalState, SelectableText, TextSelection, TextView, TextViewDefaults, TextViewState,
@@ -28,9 +28,11 @@ use gpui_base::{
     text::{CodeBlock, SelectionFormat},
 };
 use gpui_component::{
-    Collapsible, Disableable as _, Icon, Root, Sizable as _, ThemeMode, WindowExt as _,
+    Collapsible, Disableable as _, Icon, IndexPath, Root, Sizable as _, ThemeMode, WindowExt as _,
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
+    combobox::{Combobox, ComboboxState},
     dialog::{DialogDescription, DialogFooter, DialogHeader, DialogTitle},
+    searchable_list::{SearchableGroup, SearchableListItem, SearchableVec},
     sidebar::{
         Sidebar, SidebarCollapsible, SidebarItem, SidebarMenu, SidebarMenuItem, SidebarToggleButton,
     },
@@ -190,6 +192,7 @@ gpui_kit_assets::icon_assets!(
         Check,
         ChevronDown,
         ChevronRight,
+        ChevronUp,
         Link,
         PanelLeftClose,
         PanelLeftOpen,
@@ -227,6 +230,113 @@ actions!(cowork, [Quit, SubmitComposer]);
 enum MessageAuthor {
     User,
     Agent,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum ModelProvider {
+    Ollama,
+}
+
+impl ModelProvider {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ollama => "Ollama",
+        }
+    }
+
+    fn icon_path(self) -> &'static str {
+        match self {
+            Self::Ollama => OLLAMA_AVATAR_PATH,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct ModelSelection {
+    catalog_id: &'static str,
+    provider: ModelProvider,
+    model: &'static str,
+}
+
+#[derive(Clone)]
+struct LanguageModel {
+    name: SharedString,
+    selection: ModelSelection,
+}
+
+impl LanguageModel {
+    fn ollama(
+        catalog_id: &'static str,
+        name: impl Into<SharedString>,
+        model: &'static str,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            selection: ModelSelection {
+                catalog_id,
+                provider: ModelProvider::Ollama,
+                model,
+            },
+        }
+    }
+}
+
+impl SearchableListItem for LanguageModel {
+    type Value = ModelSelection;
+
+    fn title(&self) -> SharedString {
+        self.name.clone()
+    }
+
+    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                img(self.selection.provider.icon_path())
+                    .size(px(18.))
+                    .rounded(px(4.)),
+            )
+            .child(self.name.clone())
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.selection
+    }
+
+    fn matches(&self, query: &str) -> bool {
+        self.name.to_lowercase().contains(&query.to_lowercase())
+            || self
+                .selection
+                .provider
+                .label()
+                .to_lowercase()
+                .contains(&query.to_lowercase())
+            || self
+                .selection
+                .model
+                .to_lowercase()
+                .contains(&query.to_lowercase())
+    }
+}
+
+type ModelPickerItems = SearchableVec<SearchableGroup<LanguageModel>>;
+type ModelPickerState = ComboboxState<ModelPickerItems>;
+
+fn language_model_groups() -> ModelPickerItems {
+    SearchableVec::new(vec![
+        SearchableGroup::new("Recommended").item(LanguageModel::ollama(
+            "recommended-qwen-3.8-27b",
+            "Qwen 3.8 27B",
+            OLLAMA_MODEL,
+        )),
+        SearchableGroup::new(ModelProvider::Ollama.label()).item(LanguageModel::ollama(
+            "ollama-qwen-3.8-27b",
+            "Qwen 3.8 27B",
+            OLLAMA_MODEL,
+        )),
+    ])
 }
 
 #[derive(Clone)]
@@ -903,10 +1013,18 @@ struct Cowork {
     join_dialog: Option<Entity<JoinDialog>>,
     tokio_handle: tokio::runtime::Handle,
     active_generations: HashMap<Uuid, ActiveGeneration>,
+    model_picker: Entity<ModelPickerState>,
     _window_activation_subscription: Subscription,
 }
 
 impl Cowork {
+    fn new_model_picker(window: &mut Window, cx: &mut App) -> Entity<ModelPickerState> {
+        cx.new(|cx| {
+            ComboboxState::new(language_model_groups(), vec![IndexPath::new(0)], window, cx)
+                .searchable(true)
+        })
+    }
+
     fn new_user_message_draft(window: &mut Window, cx: &mut App) -> UserMessageGroup {
         let composer = cx.new(|cx| {
             let mut composer = TextareaState::new(window, cx).auto_grow(1, usize::MAX);
@@ -2979,12 +3097,17 @@ impl Cowork {
             );
         });
 
+        let Some(selected_model) = self.model_picker.read(cx).selected_value() else {
+            return;
+        };
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let tool_comments = turn_comments.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let generation_task = self.tokio_handle.spawn(async move {
             let client = Ollama::new().bound()?;
-            let model = client.completion(OLLAMA_MODEL);
+            let model = match selected_model.provider {
+                ModelProvider::Ollama => client.completion(selected_model.model),
+            };
             let mut tools = ToolSet::default();
             tools.add_tool(RespondToComment::new(tool_comments));
             StreamingAgent::new(model, tools)
@@ -3370,6 +3493,7 @@ impl Cowork {
         &self,
         composer: Option<Entity<TextareaState>>,
         read_only_line_bounds: Rc<Cell<Option<Bounds<gpui::Pixels>>>>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let timeline_scroll_handle = self.timeline_scroll_handle.clone();
@@ -3378,6 +3502,96 @@ impl Cowork {
             .active_thread_id
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
             .is_some_and(|thread| thread.read(cx).generating);
+        let selected_model_title = self
+            .model_picker
+            .read(cx)
+            .selection()
+            .first()
+            .map(|(_, model)| model.title())
+            .unwrap_or_else(|| "Select a model...".into());
+        let title_run = TextRun {
+            len: selected_model_title.len(),
+            font: window.text_style().font(),
+            color: rgb(0xd4d4d8).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        };
+        let title_width = window
+            .text_system()
+            .shape_line(selected_model_title, px(14.), &[title_run], None)
+            .width();
+        // Icon + chevron + two gaps + button padding + Combobox's custom-trigger slot gap.
+        let model_picker_width = title_width + px(62.);
+        let model_picker = div()
+            .w(model_picker_width)
+            .min_w_0()
+            .h(px(28.))
+            .mt(px(3.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                GlobalState::suppress_text_selection(cx);
+            })
+            .child(
+                Combobox::new(&self.model_picker)
+                    .search_placeholder("Search models...")
+                    .menu_width(px(360.))
+                    .menu_max_h(rems(24.))
+                    .appearance(false)
+                    .small()
+                    .p_0()
+                    .render_trigger(|trigger, _, _| {
+                        let selected_model = trigger.selection().first().map(|(_, model)| model);
+                        let title = selected_model
+                            .map(LanguageModel::title)
+                            .unwrap_or_else(|| "Select a model...".into());
+                        let provider = selected_model.map(|model| model.selection.provider);
+
+                        div()
+                            .h_full()
+                            .w_full()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .justify_end()
+                            .child(
+                                div()
+                                    .h_full()
+                                    .max_w_full()
+                                    .min_w_0()
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .gap_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .hover(|this| this.bg(rgb(0x2d2d30)))
+                                    .text_sm()
+                                    .text_color(rgb(0xd4d4d8))
+                                    .when_some(provider, |this, provider| {
+                                        this.child(
+                                            img(provider.icon_path())
+                                                .size(px(18.))
+                                                .flex_none()
+                                                .rounded(px(4.)),
+                                        )
+                                    })
+                                    .child(div().child(title))
+                                    .child(
+                                        Icon::new(if trigger.is_open() {
+                                            AssetIconName::ChevronUp
+                                        } else {
+                                            AssetIconName::ChevronDown
+                                        })
+                                        .size_4()
+                                        .flex_none()
+                                        .text_color(rgb(0xa1a1aa)),
+                                    ),
+                            )
+                    }),
+            );
         let button = if generating {
             Button::new("stop-generation")
                 .icon(Icon::new(AssetIconName::Square))
@@ -3406,6 +3620,7 @@ impl Cowork {
             .flex()
             .items_center()
             .justify_end()
+            .gap_1()
             .px_3()
             .child(
                 canvas(
@@ -3441,7 +3656,7 @@ impl Cowork {
                 .right_0()
                 .h(px(1.)),
             )
-            .when(show_button, |this| this.child(button))
+            .when(show_button, |this| this.child(model_picker).child(button))
     }
 
     fn submit_composer_action(
@@ -3694,7 +3909,12 @@ impl Render for Cowork {
                                 window,
                                 cx,
                             ))
-                            .child(self.render_bottom_bar(composer, read_only_line_bounds, cx)),
+                            .child(self.render_bottom_bar(
+                                composer,
+                                read_only_line_bounds,
+                                window,
+                                cx,
+                            )),
                     ),
             )
             .children(Root::render_dialog_layer(window, cx))
@@ -3722,6 +3942,9 @@ fn main() -> anyhow::Result<()> {
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
             gpui_component::Theme::change(ThemeMode::Dark, None, cx);
+            gpui_component::Theme::update(cx, |theme| {
+                theme.popover = rgb(0x1c1c1f).into();
+            });
             TextViewDefaults::new()
                 .with_code_block_highlighter(highlight_code_block)
                 .install(cx);
@@ -3779,6 +4002,7 @@ fn main() -> anyhow::Result<()> {
                         join_dialog: None,
                         tokio_handle,
                         active_generations: HashMap::new(),
+                        model_picker: Cowork::new_model_picker(window, cx),
                         _window_activation_subscription: window_activation_subscription,
                     }
                 });
@@ -4098,6 +4322,7 @@ mod tests {
                 join_dialog: None,
                 tokio_handle,
                 active_generations: HashMap::new(),
+                model_picker: Cowork::new_model_picker(window, cx),
                 _window_activation_subscription: cx.observe_window_activation(window, |_, _, _| {}),
             });
             composer.focus_handle(cx).focus(window, cx);
@@ -4204,7 +4429,7 @@ mod tests {
                     .segment_text_views
                     .iter()
                     .filter(|((segment, _), _)| segment.message_id == view.message_id)
-                    .map(|(_, segment)| segment.text.matches("#inline-comment").count())
+                    .map(|(_, segment)| segment.text.match_indices("#inline-comment").count())
                     .sum::<usize>();
                 assert_eq!(highlight_count, expected_highlights);
                 let annotated_state_after = view
