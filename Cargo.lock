@@ -1909,6 +1909,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "base64 0.22.1",
+ "draft",
  "futures",
  "gpui-base",
  "gpui-component",
@@ -3123,6 +3124,15 @@ name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "75b325c5dbd37f80359721ad39aca5a29fb04c89279657cffdda8736d0c0b9d2"
+
+[[package]]
+name = "draft"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "uuid",
+ "yrs",
+]
 
 [[package]]
 name = "dunce"
@@ -10774,6 +10784,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "smallstr"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "862077b1e764f04c251fe82a2ef562fd78d7cadaeb072ca7c2bcaf7217b1ff3b"
+dependencies = [
+ "smallvec",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -13809,6 +13828,24 @@ dependencies = [
  "quote",
  "syn 3.0.6",
  "synstructure",
+]
+
+[[package]]
+name = "yrs"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "52c70dc8beca8666c77612a96889106ca3cd65318609721f464624ff79685da9"
+dependencies = [
+ "arc-swap",
+ "async-lock",
+ "async-trait",
+ "dashmap",
+ "fastrand",
+ "serde",
+ "serde_json",
+ "smallstr",
+ "smallvec",
+ "thiserror 2.0.20",
 ]
 
 [[package]]

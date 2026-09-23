@@ -19,7 +19,7 @@ pub(crate) const PEER_CHANNEL_CAPACITY: usize = 128;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 1;
+pub(crate) const PROTOCOL_VERSION: u32 = 2;
 
 /// A request from a collaborator to the host.
 ///
@@ -129,10 +129,17 @@ pub(crate) enum TimelineMessage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct UserMessage {
     pub(crate) id: uuid::Bytes,
-    /// The participant who submitted the message.
+    pub(crate) comments: Vec<UserComment>,
+    /// The submitted prompt blocks in draft order.
+    pub(crate) blocks: Vec<PromptBlock>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PromptBlock {
+    pub(crate) id: uuid::Bytes,
+    /// The participant who created the block.
     pub(crate) author: uuid::Bytes,
     pub(crate) text: String,
-    pub(crate) comments: Vec<UserComment>,
     pub(crate) attachments: Vec<Attachment>,
 }
 
@@ -295,11 +302,14 @@ mod tests {
             messages: vec![
                 TimelineMessage::User(UserMessage {
                     id: [2; 16],
-                    author: [11; 16],
-                    text: "Question".into(),
-                    attachments: vec![Attachment {
-                        name: "notes.txt".into(),
-                        content: AttachmentContent::Text("Details".into()),
+                    blocks: vec![PromptBlock {
+                        id: [13; 16],
+                        author: [11; 16],
+                        text: "Question".into(),
+                        attachments: vec![Attachment {
+                            name: "notes.txt".into(),
+                            content: AttachmentContent::Text("Details".into()),
+                        }],
                     }],
                     comments: vec![UserComment {
                         id: [3; 16],

@@ -12,6 +12,7 @@ edition = "2024"
 
 [workspace.dependencies]
 agent = { path = "crates/agent" }
+draft = { path = "crates/draft" }
 tools = { path = "crates/tools" }
 
 anyhow = "1"
@@ -36,3 +37,4 @@ syntect = { version = "5.2", default-features = false, features = ["default-fanc
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 uuid = { version = "1", features = ["v4"] }
+yrs = "0.28"

@@ -48,6 +48,14 @@ impl ParticipantId {
         self.0.into_bytes()
     }
 
+    pub(crate) fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+
+    pub(crate) fn as_uuid(self) -> Uuid {
+        self.0
+    }
+
     pub(crate) fn display_name(self) -> String {
         let [adjective, animal] = self.words();
         format!("{adjective} {animal}")

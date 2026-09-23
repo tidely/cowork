@@ -16,19 +16,26 @@ use std::{
 use agent::{Agent as StreamingAgent, AgentEvent};
 use anyhow::Context as _;
 use base64::Engine as _;
+use draft::{
+    AttachmentId, AttachmentKind, AttachmentRecord, CommentTarget, Draft, DraftItemKind, ItemId,
+    TextEdit,
+};
 use gpui::{
-    Animation, AnimationExt, AnyWindowHandle, App, AppContext, AssetSource, AsyncApp, Bounds,
-    ClipboardEntry, ClipboardItem, Context, Entity, ExternalPaths, Focusable, FontStyle,
-    FontWeight, FutureExt, HighlightStyle, IntoElement, KeyBinding, KeyDownEvent, LineFragment,
-    MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions, PlatformInput, QuitMode, Render,
-    ScrollHandle, ScrollWheelEvent, SharedString, Subscription, TextRun, TitlebarOptions,
-    WeakEntity, Window, WindowBounds, WindowControlArea, WindowOptions, actions, canvas, div, img,
-    point, prelude::*, px, rems, rgb, rgba, size,
+    Animation, AnimationExt, App, AppContext, AssetSource, AsyncApp, Bounds, ClipboardEntry,
+    ClipboardItem, Context, Entity, EntityId, EntityInputHandler as _, ExternalPaths, Focusable,
+    FontStyle, FontWeight, FutureExt, HighlightStyle, IntoElement, KeyBinding, KeyDownEvent,
+    LineFragment, MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions, PlatformInput,
+    QuitMode, Render, ScrollHandle, ScrollWheelEvent, SharedString, Subscription, TextRun,
+    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowControlArea, WindowOptions, actions,
+    canvas, div, img, point, prelude::*, px, rems, rgb, rgba, size,
 };
 use gpui_base::{
     GlobalState, SelectableText, TextSelection, TextView, TextViewDefaults, TextViewState,
     TextViewStyle, Textarea,
-    input::{Input, InputEditorStyle, InputEvent, InputState, Paste, RopeExt as _, TextareaState},
+    input::{
+        Backspace, Escape, Input, InputEditorStyle, InputEvent, InputState, MoveDown, MoveUp,
+        Paste, TextareaState,
+    },
     text::{CodeBlock, SelectionFormat},
 };
 use gpui_component::{
@@ -417,27 +424,101 @@ fn escape_xml_attribute(value: &str) -> String {
         .replace('>', "&gt;")
 }
 
-fn message_with_attachments(text: &str, attachments: &[FileAttachment]) -> RigMessage {
-    let mut content = vec![UserContent::text(text)];
-    for attachment in attachments {
-        content.push(match &attachment.content {
-            FileAttachmentContent::Text(body) => UserContent::text(format!(
-                "<file name=\"{}\">\n{body}\n</file>",
-                escape_xml_attribute(&attachment.name)
-            )),
-            FileAttachmentContent::Png(image) => UserContent::image_base64(
-                base64::engine::general_purpose::STANDARD.encode(image.bytes()),
-                Some(ImageMediaType::PNG),
-                None,
-            ),
-            FileAttachmentContent::Jpeg(image) => UserContent::image_base64(
-                base64::engine::general_purpose::STANDARD.encode(image.bytes()),
-                Some(ImageMediaType::JPEG),
-                None,
-            ),
-        });
+/// The user message sent to the agent for one submission: the comment
+/// instructions, then every prompt block under its creator's name, each
+/// followed by its own attachments.
+fn agent_message(preface: Option<&str>, blocks: &[PromptBlock]) -> RigMessage {
+    let mut content = preface
+        .map(UserContent::text)
+        .into_iter()
+        .collect::<Vec<_>>();
+    for block in blocks {
+        content.push(UserContent::text(format!(
+            "{}:\n{}",
+            block.author.display_name(),
+            block.text
+        )));
+        content.extend(block.attachments.iter().map(attachment_content));
     }
     RigMessage::User { content }
+}
+
+fn attachment_content(attachment: &FileAttachment) -> UserContent {
+    match &attachment.content {
+        FileAttachmentContent::Text(body) => UserContent::text(format!(
+            "<file name=\"{}\">\n{body}\n</file>",
+            escape_xml_attribute(&attachment.name)
+        )),
+        FileAttachmentContent::Png(image) => UserContent::image_base64(
+            base64::engine::general_purpose::STANDARD.encode(image.bytes()),
+            Some(ImageMediaType::PNG),
+            None,
+        ),
+        FileAttachmentContent::Jpeg(image) => UserContent::image_base64(
+            base64::engine::general_purpose::STANDARD.encode(image.bytes()),
+            Some(ImageMediaType::JPEG),
+            None,
+        ),
+    }
+}
+
+/// When the caret is on the first visual line of `editor` (or the last, with
+/// `last`), returns its horizontal position, so moving to the neighboring
+/// editor can keep it.
+fn caret_x_on_edge_line(editor: &TextareaState, last: bool) -> Option<gpui::Pixels> {
+    let caret = editor.cursor();
+    let edge = if last { editor.value().len() } else { 0 };
+    // Without a layout there is nothing to compare, and the edge is as good a
+    // guess as any.
+    let Some(caret_bounds) = editor.range_to_bounds(&(caret..caret)) else {
+        return Some(px(0.));
+    };
+    let Some(edge_bounds) = editor.range_to_bounds(&(edge..edge)) else {
+        return Some(caret_bounds.left());
+    };
+    same_visual_line(caret_bounds.top(), edge_bounds.top()).then_some(caret_bounds.left())
+}
+
+/// The offset on the last visual line of `editor` (or the first, without
+/// `last`) horizontally closest to `x`.
+fn offset_near_x(editor: &TextareaState, x: gpui::Pixels, last: bool) -> usize {
+    let text = editor.value();
+    let edge = if last { text.len() } else { 0 };
+    let Some(edge_top) = editor
+        .range_to_bounds(&(edge..edge))
+        .map(|bounds| bounds.top())
+    else {
+        return edge;
+    };
+    let boundaries = text
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain([text.len()])
+        .collect::<Vec<_>>();
+    let on_line = |offset: &usize| {
+        editor
+            .range_to_bounds(&(*offset..*offset))
+            .map(|bounds| (bounds.left(), same_visual_line(bounds.top(), edge_top)))
+    };
+    let distance = |left: gpui::Pixels| if left > x { left - x } else { x - left };
+    // Walk inwards from the edge and stop at the first offset on another line.
+    let candidates: Box<dyn Iterator<Item = &usize>> = if last {
+        Box::new(boundaries.iter().rev())
+    } else {
+        Box::new(boundaries.iter())
+    };
+    candidates
+        .map_while(|offset| {
+            on_line(offset)
+                .filter(|(_, same_line)| *same_line)
+                .map(|(left, _)| (*offset, distance(left)))
+        })
+        .min_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map_or(edge, |(offset, _)| offset)
+}
+
+fn same_visual_line(a: gpui::Pixels, b: gpui::Pixels) -> bool {
+    a <= b + px(1.) && b <= a + px(1.)
 }
 
 fn endpoint_id_input_is_complete(input: &str) -> bool {
@@ -733,24 +814,277 @@ struct AgentCommentResponse {
     response_view: Entity<TextViewState>,
 }
 
+/// A submitted user message: the comments and prompt blocks of one
+/// submission.
 #[derive(Clone)]
 struct UserMessageGroup {
     id: Uuid,
-    /// Who submitted the message, or for a draft, who is writing it.
-    author: ParticipantId,
     comments: Vec<UserComment>,
-    attachments: Vec<FileAttachment>,
-    content: UserMessageContent,
+    blocks: Vec<PromptBlock>,
+    /// The comment instructions the agent was given with this message, so
+    /// history replays exactly what was sent. Only the host that ran the
+    /// agent has them.
+    history_preface: Option<String>,
     comments_folded: bool,
 }
 
 #[derive(Clone)]
-enum UserMessageContent {
-    Editing(Entity<TextareaState>),
-    Submitted {
-        text: String,
-        history_text: Option<String>,
+struct PromptBlock {
+    id: Uuid,
+    author: ParticipantId,
+    text: String,
+    attachments: Vec<FileAttachment>,
+}
+
+/// A thread's pending request: the shared draft document, the bytes of the
+/// files it references, and the local editors showing its items.
+///
+/// Editors are created lazily by [`Cowork::prepare_draft`] because they need
+/// a window, and they are kept in sync with the document there too.
+struct ThreadDraft {
+    /// Routes asynchronous work, such as reading attachments, to this draft
+    /// even after the user switched threads.
+    id: Uuid,
+    /// Who the local user is in this draft.
+    author: ParticipantId,
+    doc: Draft,
+    attachment_bytes: HashMap<AttachmentId, FileAttachment>,
+    editors: HashMap<ItemId, ItemEditors>,
+    /// The empty spot below the prompt blocks; typing there creates a block.
+    draft_position: Option<Entity<TextareaState>>,
+
+    /// Blocks created for attachments picked together, so they share one.
+    attachment_batches: HashMap<Uuid, ItemId>,
+    comments_folded: bool,
+}
+
+enum ItemEditors {
+    Prompt(Entity<TextareaState>),
+    /// A comment is edited both next to its excerpt and in the composer.
+    Comment {
+        inline: Entity<TextareaState>,
+        composer: Entity<TextareaState>,
     },
+}
+
+impl ItemEditors {
+    fn all(&self) -> Vec<&Entity<TextareaState>> {
+        match self {
+            Self::Prompt(editor) => vec![editor],
+            Self::Comment { inline, composer } => vec![inline, composer],
+        }
+    }
+}
+
+/// Which part of a draft an editor edits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditorSlot {
+    DraftPosition,
+    Prompt(ItemId),
+    CommentInline(ItemId),
+    CommentComposer(ItemId),
+}
+
+impl EditorSlot {
+    fn item(self) -> Option<ItemId> {
+        match self {
+            Self::DraftPosition => None,
+            Self::Prompt(id) | Self::CommentInline(id) | Self::CommentComposer(id) => Some(id),
+        }
+    }
+}
+
+impl ThreadDraft {
+    fn new(author: ParticipantId) -> Self {
+        Self {
+            id: Uuid::new_v4(),
+            author,
+            doc: Draft::new(),
+            attachment_bytes: HashMap::new(),
+            editors: HashMap::new(),
+            draft_position: None,
+            attachment_batches: HashMap::new(),
+            comments_folded: false,
+        }
+    }
+
+    fn slot_of(&self, editor: EntityId) -> Option<EditorSlot> {
+        if self
+            .draft_position
+            .as_ref()
+            .is_some_and(|draft_position| draft_position.entity_id() == editor)
+        {
+            return Some(EditorSlot::DraftPosition);
+        }
+        self.editors
+            .iter()
+            .find_map(|(&id, editors)| match editors {
+                ItemEditors::Prompt(prompt) => {
+                    (prompt.entity_id() == editor).then_some(EditorSlot::Prompt(id))
+                }
+                ItemEditors::Comment { inline, composer } => {
+                    if inline.entity_id() == editor {
+                        Some(EditorSlot::CommentInline(id))
+                    } else {
+                        (composer.entity_id() == editor).then_some(EditorSlot::CommentComposer(id))
+                    }
+                }
+            })
+    }
+
+    fn editor(&self, slot: EditorSlot) -> Option<Entity<TextareaState>> {
+        match (slot, slot.item().and_then(|id| self.editors.get(&id))) {
+            (EditorSlot::DraftPosition, _) => self.draft_position.clone(),
+            (EditorSlot::Prompt(_), Some(ItemEditors::Prompt(editor)))
+            | (EditorSlot::CommentInline(_), Some(ItemEditors::Comment { inline: editor, .. }))
+            | (
+                EditorSlot::CommentComposer(_),
+                Some(ItemEditors::Comment {
+                    composer: editor, ..
+                }),
+            ) => Some(editor.clone()),
+            _ => None,
+        }
+    }
+
+    /// The editors Up and Down move between, top to bottom: the composer's
+    /// comment editors unless folded, the prompt blocks, and the draft
+    /// position.
+    fn navigation_chain(&self) -> Vec<(EditorSlot, Entity<TextareaState>)> {
+        let mut chain = Vec::new();
+        let items = self.doc.items();
+        if !self.comments_folded {
+            chain.extend(
+                items
+                    .iter()
+                    .filter(|item| item.is_comment())
+                    .filter_map(|item| {
+                        let slot = EditorSlot::CommentComposer(item.id);
+                        Some((slot, self.editor(slot)?))
+                    }),
+            );
+        }
+        chain.extend(
+            items
+                .iter()
+                .filter(|item| item.is_prompt())
+                .filter_map(|item| {
+                    let slot = EditorSlot::Prompt(item.id);
+                    Some((slot, self.editor(slot)?))
+                }),
+        );
+        if let Some(draft_position) = &self.draft_position {
+            chain.push((EditorSlot::DraftPosition, draft_position.clone()));
+        }
+        chain
+    }
+
+    /// Removes items together with their editors and file bytes.
+    fn remove_items(&mut self, ids: &[ItemId]) {
+        let attachments = self
+            .doc
+            .items()
+            .into_iter()
+            .filter(|item| ids.contains(&item.id))
+            .flat_map(|item| match item.kind {
+                DraftItemKind::Prompt { attachments } => attachments,
+                DraftItemKind::Comment { .. } => Vec::new(),
+            })
+            .map(|record| record.id)
+            .collect::<Vec<_>>();
+        self.doc.remove_items(ids);
+        for id in ids {
+            self.editors.remove(id);
+        }
+        self.attachment_batches
+            .retain(|_, block| !ids.contains(block));
+        for attachment in attachments {
+            self.attachment_bytes.remove(&attachment);
+        }
+    }
+
+    /// Removes the item if it is empty. Returns whether it was removed.
+    fn remove_if_empty(&mut self, id: ItemId) -> bool {
+        if !self.doc.item(id).is_some_and(|item| item.is_empty()) {
+            return false;
+        }
+        self.remove_items(&[id]);
+        true
+    }
+
+    /// The block to attach a finished file to, creating it when needed.
+    fn attachment_block(&mut self, target: AttachmentTarget) -> ItemId {
+        let batch = match target {
+            AttachmentTarget::Block(id)
+                if self.doc.item(id).is_some_and(|item| item.is_prompt()) =>
+            {
+                return id;
+            }
+            AttachmentTarget::Block(_) => None,
+            AttachmentTarget::NewBlock(batch) => Some(batch),
+        };
+        if let Some(id) = batch.and_then(|batch| self.attachment_batches.get(&batch).copied())
+            && self.doc.contains(id)
+        {
+            return id;
+        }
+        let id = self.doc.create_prompt(self.author.as_uuid(), "");
+        if let Some(batch) = batch {
+            self.attachment_batches.insert(batch, id);
+        }
+        id
+    }
+
+    /// Where pending files for `target` are shown: the block they will land
+    /// in, or `None` for the draft position.
+    fn pending_block(&self, target: AttachmentTarget) -> Option<ItemId> {
+        let id = match target {
+            AttachmentTarget::Block(id) => id,
+            AttachmentTarget::NewBlock(batch) => *self.attachment_batches.get(&batch)?,
+        };
+        self.doc
+            .item(id)
+            .filter(|item| item.is_prompt())
+            .map(|item| item.id)
+    }
+
+    /// The draft's comments as the timeline and composer render them.
+    fn comment_views(&self) -> Vec<UserComment> {
+        self.doc
+            .items()
+            .into_iter()
+            .filter_map(|item| {
+                let DraftItemKind::Comment { target } = item.kind else {
+                    return None;
+                };
+                let body = match self.editors.get(&item.id) {
+                    Some(ItemEditors::Comment { inline, composer }) => UserCommentBody::Editing {
+                        inline: inline.clone(),
+                        composer: composer.clone(),
+                    },
+                    _ => UserCommentBody::Submitted(item.body.into()),
+                };
+                Some(UserComment {
+                    id: item.id.as_uuid(),
+                    author: ParticipantId::from_uuid(item.creator),
+                    reference: CommentReference {
+                        message_id: target.message_id,
+                        range: target.range,
+                        quote: target.quote,
+                    },
+                    body,
+                })
+            })
+            .collect()
+    }
+}
+
+/// Where a file being read will be attached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachmentTarget {
+    Block(ItemId),
+    /// A block created for the batch of files picked together.
+    NewBlock(Uuid),
 }
 
 #[derive(Clone)]
@@ -901,7 +1235,7 @@ struct Thread {
     participants: Vec<ParticipantId>,
     model: ModelSelection,
     timeline: Vec<TimelineMessage>,
-    draft: UserMessageGroup,
+    draft: ThreadDraft,
     generating: bool,
     sharing: ThreadSharing,
     ownership: ThreadOwnership,
@@ -941,25 +1275,48 @@ impl protocol::UserComment {
 }
 
 impl UserMessageGroup {
-    fn to_protocol(&self) -> Option<protocol::UserMessage> {
-        let UserMessageContent::Submitted { text, .. } = &self.content else {
-            return None;
-        };
-        Some(protocol::UserMessage {
+    fn to_protocol(&self) -> protocol::UserMessage {
+        protocol::UserMessage {
             id: self.id.into_bytes(),
-            author: self.author.into_bytes(),
-            text: text.clone(),
             comments: self
                 .comments
                 .iter()
                 .filter_map(UserComment::to_protocol)
                 .collect(),
+            blocks: self.blocks.iter().map(PromptBlock::to_protocol).collect(),
+        }
+    }
+
+    /// The text the thread is titled after.
+    fn title_text(&self) -> &str {
+        self.blocks
+            .iter()
+            .map(|block| block.text.as_str())
+            .chain(
+                self.comments
+                    .iter()
+                    .filter_map(|comment| match &comment.body {
+                        UserCommentBody::Submitted(body) => Some(body.as_ref()),
+                        UserCommentBody::Editing { .. } => None,
+                    }),
+            )
+            .find(|text| !text.trim().is_empty())
+            .unwrap_or_default()
+    }
+}
+
+impl PromptBlock {
+    fn to_protocol(&self) -> protocol::PromptBlock {
+        protocol::PromptBlock {
+            id: self.id.into_bytes(),
+            author: self.author.into_bytes(),
+            text: self.text.clone(),
             attachments: self
                 .attachments
                 .iter()
                 .map(FileAttachment::to_protocol)
                 .collect(),
-        })
+        }
     }
 }
 
@@ -967,21 +1324,26 @@ impl protocol::UserMessage {
     fn into_native(self) -> UserMessageGroup {
         UserMessageGroup {
             id: Uuid::from_bytes(self.id),
-            author: ParticipantId::from_bytes(self.author),
             comments: self
                 .comments
                 .into_iter()
                 .map(protocol::UserComment::into_native)
                 .collect(),
-            attachments: self
-                .attachments
+            blocks: self
+                .blocks
                 .into_iter()
-                .map(protocol::Attachment::into_native)
+                .map(|block| PromptBlock {
+                    id: Uuid::from_bytes(block.id),
+                    author: ParticipantId::from_bytes(block.author),
+                    text: block.text,
+                    attachments: block
+                        .attachments
+                        .into_iter()
+                        .map(protocol::Attachment::into_native)
+                        .collect(),
+                })
                 .collect(),
-            content: UserMessageContent::Submitted {
-                text: self.text,
-                history_text: None,
-            },
+            history_preface: None,
             comments_folded: false,
         }
     }
@@ -1057,10 +1419,10 @@ impl protocol::AgentMessage {
 }
 
 impl TimelineMessage {
-    fn to_protocol(&self) -> Option<protocol::TimelineMessage> {
+    fn to_protocol(&self) -> protocol::TimelineMessage {
         match self {
-            Self::User(message) => message.to_protocol().map(protocol::TimelineMessage::User),
-            Self::Agent(message) => Some(protocol::TimelineMessage::Agent(message.to_protocol())),
+            Self::User(message) => protocol::TimelineMessage::User(message.to_protocol()),
+            Self::Agent(message) => protocol::TimelineMessage::Agent(message.to_protocol()),
         }
     }
 }
@@ -1078,7 +1440,7 @@ impl Thread {
     /// Builds the local mirror of a thread hosted by someone else.
     fn from_welcome(
         welcome: protocol::Welcome,
-        draft: UserMessageGroup,
+        draft: ThreadDraft,
         sharing: ThreadSharing,
         cx: &mut impl AppContext,
     ) -> Self {
@@ -1138,7 +1500,7 @@ impl Thread {
             messages: self
                 .timeline
                 .iter()
-                .filter_map(TimelineMessage::to_protocol)
+                .map(TimelineMessage::to_protocol)
                 .collect(),
         }
     }
@@ -1488,9 +1850,31 @@ impl SidebarItem for CoworkSidebarSection {
     }
 }
 
+/// What the composer shows of a draft, read out of it for rendering.
+struct ComposerModel {
+    draft_id: Uuid,
+    author: ParticipantId,
+    comments: Vec<UserComment>,
+    comments_folded: bool,
+    blocks: Vec<ComposerBlock>,
+    draft_position: Option<Entity<TextareaState>>,
+    draft_row_visible: bool,
+    /// Files being read, by the block they will land in; `None` is the draft
+    /// position.
+    pending: Vec<(Option<ItemId>, Attachment)>,
+}
+
+struct ComposerBlock {
+    id: ItemId,
+    creator: ParticipantId,
+    editor: Entity<TextareaState>,
+    attachments: Vec<(AttachmentId, FileAttachment)>,
+}
+
 struct PendingAttachment {
     id: Uuid,
     draft_id: Uuid,
+    target: AttachmentTarget,
     name: String,
     is_image: bool,
     progress: Option<f32>,
@@ -1509,7 +1893,7 @@ struct AttachmentError {
 struct Cowork {
     sidebar_open: bool,
     recents_open: bool,
-    new_thread_draft: UserMessageGroup,
+    new_thread_draft: ThreadDraft,
     attachment_errors: Vec<AttachmentError>,
     pending_attachments: Vec<PendingAttachment>,
     timeline_scroll_handle: ScrollHandle,
@@ -1602,69 +1986,407 @@ impl Cowork {
         }
     }
 
-    fn new_user_message_draft(
-        author: ParticipantId,
-        window: &mut Window,
-        cx: &mut App,
-    ) -> UserMessageGroup {
-        let composer = cx.new(|cx| {
-            let mut composer = TextareaState::new(window, cx).auto_grow(1, usize::MAX);
-            composer.set_editor_style(InputEditorStyle {
+    /// An auto-growing editor holding `text`, with the caret at its end.
+    fn new_draft_editor(text: &str, window: &mut Window, cx: &mut App) -> Entity<TextareaState> {
+        cx.new(|cx| {
+            let mut editor = TextareaState::new(window, cx).auto_grow(1, usize::MAX);
+            editor.set_editor_style(InputEditorStyle {
                 caret: rgb(0xffffff).into(),
                 ..Default::default()
             });
-            composer
+            if !text.is_empty() {
+                editor.set_value(SharedString::from(text.to_owned()), window, cx);
+                editor.set_selected_range(text.len()..text.len(), cx);
+            }
+            editor
+        })
+    }
+
+    /// A draft editor whose input events are routed to the draft `draft_id`.
+    fn new_routed_draft_editor(
+        draft_id: Uuid,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<TextareaState> {
+        let editor = Self::new_draft_editor(text, window, cx);
+        // Ends by itself once the editor is dropped along with its item.
+        cx.subscribe_in(&editor, window, move |this, editor, event, window, cx| {
+            this.draft_editor_event(draft_id, editor, event, window, cx);
+        })
+        .detach();
+        editor
+    }
+
+    /// Brings a draft's editors in line with its document: creates editors
+    /// for new items and the draft position, drops those of removed items,
+    /// and shows text changed by anything other than the editor itself.
+    fn prepare_draft(&mut self, draft_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((missing, needs_draft_position, shown)) =
+            self.update_draft(draft_id, cx, |draft| {
+                let items = draft.doc.items();
+                draft
+                    .editors
+                    .retain(|id, _| items.iter().any(|item| item.id == *id));
+                let mut missing = Vec::new();
+                let mut shown = Vec::new();
+                for item in items {
+                    match draft.editors.get(&item.id) {
+                        Some(editors) => shown.extend(
+                            editors
+                                .all()
+                                .into_iter()
+                                .map(|editor| (editor.clone(), item.body.clone())),
+                        ),
+                        None => missing.push(item),
+                    }
+                }
+                (missing, draft.draft_position.is_none(), shown)
+            })
+        else {
+            return;
+        };
+
+        for (editor, body) in shown {
+            Self::show_text(&editor, &body, window, cx);
+        }
+        let created = missing
+            .into_iter()
+            .map(|item| {
+                let editors = if item.is_comment() {
+                    ItemEditors::Comment {
+                        inline: Self::new_routed_draft_editor(draft_id, &item.body, window, cx),
+                        composer: Self::new_routed_draft_editor(draft_id, &item.body, window, cx),
+                    }
+                } else {
+                    ItemEditors::Prompt(Self::new_routed_draft_editor(
+                        draft_id, &item.body, window, cx,
+                    ))
+                };
+                (item.id, editors)
+            })
+            .collect::<Vec<_>>();
+        let draft_position =
+            needs_draft_position.then(|| Self::new_routed_draft_editor(draft_id, "", window, cx));
+        if created.is_empty() && draft_position.is_none() {
+            return;
+        }
+        self.update_draft(draft_id, cx, |draft| {
+            for (id, editors) in created {
+                draft.editors.entry(id).or_insert(editors);
+            }
+            if let Some(draft_position) = draft_position {
+                draft.draft_position.get_or_insert(draft_position);
+            }
         });
-        UserMessageGroup {
-            id: Uuid::new_v4(),
-            author,
-            comments: Vec::new(),
-            attachments: Vec::new(),
-            content: UserMessageContent::Editing(composer),
-            comments_folded: false,
+    }
+
+    /// Replaces an editor's text, keeping its selection on the same text.
+    ///
+    /// Waits while an IME composition is in progress: its marked text is in
+    /// the editor but not yet in the document, and replacing it would cancel
+    /// the composition. The text catches up once the composition commits.
+    fn show_text(editor: &Entity<TextareaState>, text: &str, window: &mut Window, cx: &mut App) {
+        let (value, selection) = {
+            let editor = editor.read(cx);
+            (editor.value(), editor.selected_range())
+        };
+        let Some(edit) = TextEdit::diff(&value, text) else {
+            return;
+        };
+        if editor
+            .update(cx, |editor, cx| editor.marked_text_range(window, cx))
+            .is_some()
+        {
+            return;
+        }
+        let selection = edit.map_offset(selection.start)..edit.map_offset(selection.end);
+        editor.update(cx, |editor, cx| {
+            editor.set_value(SharedString::from(text.to_owned()), window, cx);
+            editor.set_selected_range(selection, cx);
+        });
+    }
+
+    fn draft_editor_event(
+        &mut self,
+        draft_id: Uuid,
+        editor: &Entity<TextareaState>,
+        event: &InputEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editor_id = editor.entity_id();
+        match event {
+            InputEvent::Change => {
+                let value = editor.read(cx).value().to_string();
+                let editor = editor.clone();
+                self.update_draft(draft_id, cx, move |draft| match draft.slot_of(editor_id) {
+                    // Typing at the draft position creates a block, and the
+                    // editor typed into becomes that block's, so focus, caret
+                    // and any IME composition carry on uninterrupted.
+                    Some(EditorSlot::DraftPosition) if !value.is_empty() => {
+                        let id = draft.doc.create_prompt(draft.author.as_uuid(), &value);
+                        draft.editors.insert(id, ItemEditors::Prompt(editor));
+                        draft.draft_position = None;
+                    }
+                    Some(slot) => {
+                        if let Some(id) = slot.item() {
+                            draft.doc.set_body(id, &value);
+                        }
+                    }
+                    None => {}
+                });
+                cx.notify();
+            }
+            // Empty items disappear once nobody is in them anymore. Switching
+            // to another window also blurs, but the user has not left.
+            InputEvent::Blur if window.is_window_active() => {
+                let Some(id) = self
+                    .read_draft(draft_id, cx, |draft| draft.slot_of(editor_id))
+                    .flatten()
+                    .and_then(EditorSlot::item)
+                else {
+                    return;
+                };
+                // Moving between the two editors of one comment, or leaving
+                // a block whose files are still being read, is not leaving.
+                let still_in_item = self
+                    .read_draft(draft_id, cx, |draft| {
+                        draft.editors.get(&id).is_some_and(|editors| {
+                            editors
+                                .all()
+                                .into_iter()
+                                .any(|editor| editor.focus_handle(cx).is_focused(window))
+                        })
+                    })
+                    .unwrap_or(false);
+                if still_in_item || self.has_pending_reads(draft_id, id, cx) {
+                    return;
+                }
+                self.update_draft(draft_id, cx, |draft| draft.remove_if_empty(id));
+                cx.notify();
+            }
+            InputEvent::Focus | InputEvent::Blur | InputEvent::PressEnter { .. } => {}
         }
     }
 
-    fn draft_composer(draft: &UserMessageGroup) -> Entity<TextareaState> {
-        let UserMessageContent::Editing(composer) = &draft.content else {
-            unreachable!("thread drafts are always editable");
-        };
-        composer.clone()
+    /// Reads the writable draft `draft_id` wherever it lives.
+    fn read_draft<R>(
+        &self,
+        draft_id: Uuid,
+        cx: &App,
+        read: impl FnOnce(&ThreadDraft) -> R,
+    ) -> Option<R> {
+        if self.new_thread_draft.id == draft_id {
+            return Some(read(&self.new_thread_draft));
+        }
+        self.thread_store
+            .read(cx)
+            .threads
+            .iter()
+            .map(|thread| thread.read(cx))
+            .find(|thread| thread.ownership.can_write() && thread.draft.id == draft_id)
+            .map(|thread| read(&thread.draft))
     }
 
-    fn editable_composer(&self, cx: &App) -> Option<Entity<TextareaState>> {
-        self.active_thread_id
-            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
-            .map(|thread| {
-                let thread = thread.read(cx);
-                thread
-                    .ownership
-                    .can_write()
-                    .then(|| Self::draft_composer(&thread.draft))
-            })
-            .unwrap_or_else(|| Some(Self::draft_composer(&self.new_thread_draft)))
+    /// The focused editor of the draft the composer shows.
+    fn focused_draft_editor(
+        &self,
+        window: &Window,
+        cx: &App,
+    ) -> Option<(Uuid, EditorSlot, Entity<TextareaState>)> {
+        let draft_id = self.writable_draft_id(cx)?;
+        self.read_draft(draft_id, cx, |draft| {
+            draft
+                .draft_position
+                .iter()
+                .map(|editor| (EditorSlot::DraftPosition, editor.clone()))
+                .chain(
+                    draft
+                        .editors
+                        .iter()
+                        .flat_map(|(&id, editors)| match editors {
+                            ItemEditors::Prompt(editor) => {
+                                vec![(EditorSlot::Prompt(id), editor.clone())]
+                            }
+                            ItemEditors::Comment { inline, composer } => vec![
+                                (EditorSlot::CommentInline(id), inline.clone()),
+                                (EditorSlot::CommentComposer(id), composer.clone()),
+                            ],
+                        }),
+                )
+                .find(|(_, editor)| editor.focus_handle(cx).is_focused(window))
+                .map(|(slot, editor)| (draft_id, slot, editor))
+        })?
     }
 
-    fn new_comment_editor(
-        initial_text: &str,
+    /// Focuses an editor of a draft, optionally moving its caret.
+    fn focus_draft_editor(
+        &mut self,
+        draft_id: Uuid,
+        slot: EditorSlot,
+        caret: Option<usize>,
         window: &mut Window,
-        cx: &mut App,
-    ) -> Entity<TextareaState> {
-        cx.new(|cx| {
-            let mut body = TextareaState::new(window, cx).auto_grow(1, usize::MAX);
-            body.set_editor_style(InputEditorStyle {
-                caret: rgb(0xffffff).into(),
-                ..Default::default()
-            });
-            body.insert(initial_text, window, cx);
-            body
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.prepare_draft(draft_id, window, cx);
+        let Some(editor) = self
+            .read_draft(draft_id, cx, |draft| draft.editor(slot))
+            .flatten()
+        else {
+            return false;
+        };
+        if let Some(caret) = caret {
+            let caret = caret.min(editor.read(cx).value().len());
+            editor.update(cx, |editor, cx| editor.set_selected_range(caret..caret, cx));
+        }
+        editor.focus_handle(cx).focus(window, cx);
+        cx.notify();
+        true
+    }
+
+    /// Focuses where the user most likely continues typing: the last prompt
+    /// block if there is one, otherwise the draft position.
+    fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft_id) = self.writable_draft_id(cx) else {
+            return;
+        };
+        self.prepare_draft(draft_id, window, cx);
+        let last_block = self
+            .read_draft(draft_id, cx, |draft| {
+                draft
+                    .doc
+                    .items()
+                    .into_iter()
+                    .rfind(|item| item.is_prompt())
+                    .map(|item| (item.id, item.body.len()))
+            })
+            .flatten();
+        match last_block {
+            Some((id, end)) => {
+                self.focus_draft_editor(draft_id, EditorSlot::Prompt(id), Some(end), window, cx)
+            }
+            None => self.focus_draft_editor(draft_id, EditorSlot::DraftPosition, None, window, cx),
+        };
+    }
+
+    /// Puts the caret into the composer unless it is already in the draft.
+    fn ensure_composer_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.focused_draft_editor(window, cx).is_none() {
+            self.focus_composer(window, cx);
+        }
+    }
+
+    /// Whether files are still being read into the block `id`.
+    fn has_pending_reads(&self, draft_id: Uuid, id: ItemId, cx: &App) -> bool {
+        self.read_draft(draft_id, cx, |draft| {
+            self.pending_attachments.iter().any(|pending| {
+                pending.draft_id == draft_id && draft.pending_block(pending.target) == Some(id)
+            })
         })
+        .unwrap_or(false)
+    }
+
+    /// Moves between the composer's editors when Up or Down leaves the first
+    /// or last visual line. Returns whether it moved.
+    fn move_between_draft_editors(
+        &mut self,
+        up: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((draft_id, slot, editor)) = self.focused_draft_editor(window, cx) else {
+            return false;
+        };
+        // A selection collapses first, as it does inside an editor.
+        if !editor.read(cx).selected_range().is_empty() {
+            return false;
+        }
+        let Some(caret_x) = caret_x_on_edge_line(editor.read(cx), !up) else {
+            return false;
+        };
+        let Some(chain) = self.read_draft(draft_id, cx, ThreadDraft::navigation_chain) else {
+            return false;
+        };
+        let Some(index) = chain.iter().position(|(chain_slot, _)| *chain_slot == slot) else {
+            return false;
+        };
+        let target = if up {
+            index.checked_sub(1)
+        } else {
+            Some(index + 1).filter(|next| *next < chain.len())
+        };
+        let Some((target_slot, target)) = target.map(|target| chain[target].clone()) else {
+            return false;
+        };
+        let caret = offset_near_x(target.read(cx), caret_x, up);
+        self.focus_draft_editor(draft_id, target_slot, Some(caret), window, cx)
+    }
+
+    /// Escape in an empty item removes it and returns to the draft position.
+    fn escape_empty_draft_item(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let Some((draft_id, slot, _)) = self.focused_draft_editor(window, cx) else {
+            return false;
+        };
+        let Some(id) = slot.item() else {
+            return false;
+        };
+        if !self
+            .update_draft(draft_id, cx, |draft| draft.remove_if_empty(id))
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        self.focus_draft_editor(draft_id, EditorSlot::DraftPosition, None, window, cx);
+        true
+    }
+
+    /// Backspace in an empty item removes it, and in the empty draft position
+    /// steps back; either way the caret moves to the end of the editor above.
+    fn backspace_out_of_empty_draft_item(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some((draft_id, slot, editor)) = self.focused_draft_editor(window, cx) else {
+            return false;
+        };
+        if !editor.read(cx).value().is_empty() {
+            return false;
+        }
+        let Some(chain) = self.read_draft(draft_id, cx, ThreadDraft::navigation_chain) else {
+            return false;
+        };
+        let previous = chain
+            .iter()
+            .position(|(chain_slot, _)| *chain_slot == slot)
+            .and_then(|index| index.checked_sub(1))
+            .map(|index| chain[index].clone());
+        match slot.item() {
+            Some(id) => {
+                if !self
+                    .update_draft(draft_id, cx, |draft| draft.remove_if_empty(id))
+                    .unwrap_or(false)
+                {
+                    return false;
+                }
+            }
+            None if previous.is_none() => return false,
+            None => {}
+        }
+        match previous {
+            Some((slot, editor)) => {
+                let end = editor.read(cx).value().len();
+                self.focus_draft_editor(draft_id, slot, Some(end), window, cx)
+            }
+            None => self.focus_draft_editor(draft_id, EditorSlot::DraftPosition, None, window, cx),
+        }
     }
 
     fn new_local_thread(
         title: String,
         timeline: Vec<TimelineMessage>,
-        draft: UserMessageGroup,
+        draft: ThreadDraft,
         participant_id: ParticipantId,
         model: ModelSelection,
         cx: &mut App,
@@ -1688,7 +2410,7 @@ impl Cowork {
     }
 
     fn new_empty_local_thread(
-        draft: UserMessageGroup,
+        draft: ThreadDraft,
         participant_id: ParticipantId,
         model: ModelSelection,
         cx: &mut App,
@@ -1703,11 +2425,7 @@ impl Cowork {
         )
     }
 
-    fn prepare_thread_for_sharing(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Entity<Thread> {
+    fn prepare_thread_for_sharing(&mut self, cx: &mut Context<Self>) -> Entity<Thread> {
         if let Some(thread) = self
             .active_thread_id
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
@@ -1715,8 +2433,10 @@ impl Cowork {
             return thread;
         }
 
-        let next_draft = Self::new_user_message_draft(self.local_participant_id, window, cx);
-        let draft = std::mem::replace(&mut self.new_thread_draft, next_draft);
+        let draft = std::mem::replace(
+            &mut self.new_thread_draft,
+            ThreadDraft::new(self.local_participant_id),
+        );
         let thread = Self::new_empty_local_thread(
             draft,
             self.local_participant_id,
@@ -2252,7 +2972,7 @@ impl Cowork {
             dialog.status = JoinStatus::Joining;
         });
         // Re-authored with the id the host assigns once the thread is joined.
-        let draft = Self::new_user_message_draft(self.local_participant_id, window, cx);
+        let draft = ThreadDraft::new(self.local_participant_id);
         let window_handle = window.window_handle();
         cx.notify();
 
@@ -2345,7 +3065,7 @@ impl Cowork {
     }
 
     fn toggle_sharing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let thread = self.prepare_thread_for_sharing(window, cx);
+        let thread = self.prepare_thread_for_sharing(cx);
         let thread_id = thread.read(cx).instance_id;
 
         match thread.read(cx).sharing.status() {
@@ -2389,11 +3109,8 @@ impl Cowork {
                     });
                     self.active_thread_id = None;
                     self.selection_message_id = None;
-                    self.new_thread_draft =
-                        Self::new_user_message_draft(self.local_participant_id, window, cx);
-                    Self::draft_composer(&self.new_thread_draft)
-                        .focus_handle(cx)
-                        .focus(window, cx);
+                    self.new_thread_draft = ThreadDraft::new(self.local_participant_id);
+                    self.focus_composer(window, cx);
                 }
                 if let Some(endpoint) = endpoint {
                     self.tokio_handle.spawn(async move {
@@ -2670,15 +3387,13 @@ impl Cowork {
         let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
             return;
         };
-        let thread = thread.read(cx);
-        let composer = Self::draft_composer(&thread.draft);
-        let can_write = thread.ownership.can_write();
+        let can_write = thread.read(cx).ownership.can_write();
         self.active_thread_id = Some(thread_id);
         self.selection_message_id = None;
         self.follow_generation = true;
         self.timeline_scroll_handle.scroll_to_bottom();
         if can_write {
-            composer.focus_handle(cx).focus(window, cx);
+            self.focus_composer(window, cx);
         }
         cx.notify();
     }
@@ -2726,13 +3441,10 @@ impl Cowork {
                         )
                         .active(self.active_thread_id.is_none())
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.new_thread_draft =
-                                Self::new_user_message_draft(this.local_participant_id, window, cx);
+                            this.new_thread_draft = ThreadDraft::new(this.local_participant_id);
                             this.active_thread_id = None;
                             this.selection_message_id = None;
-                            Self::draft_composer(&this.new_thread_draft)
-                                .focus_handle(cx)
-                                .focus(window, cx);
+                            this.focus_composer(window, cx);
                             cx.notify();
                         })),
                 )
@@ -2965,47 +3677,6 @@ impl Cowork {
             return;
         }
 
-        if event.keystroke.key == "escape" {
-            let Some(thread) = self
-                .active_thread_id
-                .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
-            else {
-                return;
-            };
-            let empty_comment_id = thread.read(cx).draft.comments.iter().find_map(|comment| {
-                let UserCommentBody::Editing { inline, composer } = &comment.body else {
-                    return None;
-                };
-                let focused_editor = if inline.focus_handle(cx).is_focused(window) {
-                    inline
-                } else if composer.focus_handle(cx).is_focused(window) {
-                    composer
-                } else {
-                    return None;
-                };
-                focused_editor
-                    .read(cx)
-                    .value()
-                    .trim()
-                    .is_empty()
-                    .then_some(comment.id)
-            });
-            let Some(comment_id) = empty_comment_id else {
-                return;
-            };
-
-            thread.update(cx, |thread, _| {
-                thread
-                    .draft
-                    .comments
-                    .retain(|comment| comment.id != comment_id);
-            });
-            window.prevent_default();
-            cx.stop_propagation();
-            cx.notify();
-            return;
-        }
-
         if event.keystroke.modifiers.control
             || event.keystroke.modifiers.platform
             || event.keystroke.modifiers.function
@@ -3062,91 +3733,29 @@ impl Cowork {
             target
         };
 
-        let inline_body = Self::new_comment_editor(initial_text, window, cx);
-        let composer_body = Self::new_comment_editor(initial_text, window, cx);
-        let comment_id = Uuid::new_v4();
-        thread.update(cx, |thread, _| {
-            let author = thread.participant_id;
-            thread.draft.comments.push(UserComment {
-                id: comment_id,
-                author,
-                reference: CommentReference {
-                    message_id,
-                    range: source_range,
-                    quote,
-                },
-                body: UserCommentBody::Editing {
-                    inline: inline_body.clone(),
-                    composer: composer_body.clone(),
-                },
-            });
-            thread.draft.comments_folded = false;
+        let (draft_id, comment_id) = thread.update(cx, |thread, _| {
+            let target = CommentTarget {
+                message_id,
+                range: source_range,
+                quote,
+            };
+            let draft = &mut thread.draft;
+            let comment_id = draft
+                .doc
+                .create_comment(draft.author.as_uuid(), target, initial_text);
+            draft.comments_folded = false;
+            (draft.id, comment_id)
         });
-        Self::synchronize_comment_editor(
-            &inline_body,
-            composer_body.clone(),
-            thread.clone(),
-            comment_id,
-            window.window_handle(),
-            cx,
-        );
-        Self::synchronize_comment_editor(
-            &composer_body,
-            inline_body.clone(),
-            thread,
-            comment_id,
-            window.window_handle(),
-            cx,
-        );
         TextSelection::clear(window, cx);
-        inline_body.focus_handle(cx).focus(window, cx);
+        self.focus_draft_editor(
+            draft_id,
+            EditorSlot::CommentInline(comment_id),
+            None,
+            window,
+            cx,
+        );
         window.prevent_default();
         cx.stop_propagation();
-        cx.notify();
-    }
-
-    fn synchronize_comment_editor(
-        source: &Entity<TextareaState>,
-        target: Entity<TextareaState>,
-        thread: Entity<Thread>,
-        comment_id: Uuid,
-        window_handle: AnyWindowHandle,
-        cx: &mut Context<Self>,
-    ) {
-        let source = source.clone();
-        cx.subscribe(
-            &source.clone(),
-            move |_, _, event: &InputEvent, cx| match event {
-                InputEvent::Change => {
-                    let value = source.read(cx).value();
-                    cx.defer({
-                        let value = value.clone();
-                        let target = target.clone();
-                        move |cx| {
-                            let _ = cx.update_window(window_handle, |_, window, cx| {
-                                if target.read(cx).value() != value {
-                                    target.update(cx, |target, cx| {
-                                        target.set_value(value, window, cx);
-                                    });
-                                }
-                            });
-                        }
-                    });
-                    cx.notify();
-                }
-                InputEvent::Blur if source.read(cx).value().trim().is_empty() => {
-                    thread.update(cx, |thread, _| {
-                        thread
-                            .draft
-                            .comments
-                            .retain(|comment| comment.id != comment_id);
-                    });
-                    cx.notify();
-                }
-                _ => {}
-            },
-        )
-        .detach();
     }
 
     fn toggle_comment_group(&mut self, group_id: Uuid, cx: &mut Context<Self>) {
@@ -3444,9 +4053,9 @@ impl Cowork {
         group: &UserMessageGroup,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let mut content = Vec::new();
+        let mut rows = Vec::new();
         if !group.comments.is_empty() {
-            content.push(
+            let mut content = vec![
                 Self::render_comment_group_toggle(
                     group.id,
                     group.comments.len(),
@@ -3454,35 +4063,44 @@ impl Cowork {
                     cx,
                 )
                 .into_any_element(),
-            );
+            ];
             if !group.comments_folded {
                 content.extend(group.comments.iter().map(Self::render_composer_comment));
             }
+            rows.push(Self::render_message_row(None, content));
         }
-        if !group.attachments.is_empty() {
-            content.push(
-                div()
-                    .w_full()
-                    .flex()
-                    .flex_wrap()
-                    .gap_1()
-                    .children(
-                        group
-                            .attachments
-                            .iter()
-                            .map(|attachment| self.render_attachment(attachment, None, cx)),
+        for (block_index, block) in group.blocks.iter().enumerate() {
+            let mut content = Vec::new();
+            if !block.attachments.is_empty() {
+                content.push(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_wrap()
+                        .gap_1()
+                        .children(
+                            block
+                                .attachments
+                                .iter()
+                                .map(|attachment| self.render_attachment(attachment, None, cx)),
+                        )
+                        .into_any_element(),
+                );
+            }
+            if !block.text.trim().is_empty() {
+                content.push(
+                    SelectableText::new(
+                        format!("timeline-user-text-{}", block.id),
+                        block.text.clone(),
                     )
+                    .document_order((index * 1_000 + block_index) as u64)
                     .into_any_element(),
-            );
-        }
-        if let UserMessageContent::Submitted { text, .. } = &group.content
-            && !text.trim().is_empty()
-        {
-            content.push(
-                SelectableText::new(format!("timeline-user-text-{}", group.id), text.clone())
-                    .document_order((index * 1_000 + content.len()) as u64)
-                    .into_any_element(),
-            );
+                );
+            }
+            rows.push(Self::render_message_row(
+                Some(MessageAuthor::User(block.author)),
+                content,
+            ));
         }
 
         div()
@@ -3495,6 +4113,21 @@ impl Cowork {
             )
             .w_full()
             .flex()
+            .flex_col()
+            .gap_3()
+            .children(rows)
+            .into_any_element()
+    }
+
+    /// One row of the timeline or composer: an avatar gutter, the content, and
+    /// a matching gap on the right.
+    fn render_message_row(
+        author: Option<MessageAuthor>,
+        content: impl IntoIterator<Item = gpui::AnyElement>,
+    ) -> gpui::Div {
+        div()
+            .w_full()
+            .flex()
             .items_start()
             .child(
                 div()
@@ -3502,7 +4135,7 @@ impl Cowork {
                     .flex_none()
                     .flex()
                     .justify_center()
-                    .child(Self::render_avatar(MessageAuthor::User(group.author))),
+                    .children(author.map(Self::render_avatar)),
             )
             .child(
                 div()
@@ -3514,7 +4147,6 @@ impl Cowork {
                     .children(content),
             )
             .child(div().w(px(40.)).flex_none())
-            .into_any_element()
     }
 
     fn toggle_thinking(&mut self, thread_id: Uuid, message_id: Uuid, cx: &mut Context<Self>) {
@@ -3828,16 +4460,10 @@ impl Cowork {
         messages
             .iter()
             .filter_map(|message| match message {
-                TimelineMessage::User(group) => {
-                    let UserMessageContent::Submitted { text, history_text } = &group.content
-                    else {
-                        return None;
-                    };
-                    Some(message_with_attachments(
-                        history_text.as_deref().unwrap_or(text),
-                        &group.attachments,
-                    ))
-                }
+                TimelineMessage::User(group) => Some(agent_message(
+                    group.history_preface.as_deref(),
+                    &group.blocks,
+                )),
                 TimelineMessage::Agent(message) if message.complete && !message.failed => {
                     let submitted_comments = message
                         .comment_group_id
@@ -4071,26 +4697,19 @@ impl Cowork {
         timeline.is_empty().then(|| Self::thread_title(prompt))
     }
 
-    fn editable_comment_body(comment: &UserComment, cx: &App) -> Option<SharedString> {
-        let UserCommentBody::Editing { inline, .. } = &comment.body else {
-            return None;
-        };
-        let value = inline.read(cx).value();
-        (!value.trim().is_empty()).then_some(value)
-    }
-
-    fn prompt_with_comments(
-        prompt: &str,
+    /// The instructions for answering a submission's comments, sent ahead of
+    /// its prompt blocks.
+    fn comments_preface(
         comments: &[UserComment],
         comment_ids: &[tools::CommentId],
         timeline: &[TimelineMessage],
-    ) -> String {
+    ) -> Option<String> {
         if comments.is_empty() {
-            return prompt.to_string();
+            return None;
         }
 
         let mut result = String::from(
-            "The user attached the following inline comments to immutable excerpts from the conversation. You MUST call `respond_to_comment` exactly once for every comment_id before finishing your response. Put the direct reply to that comment in the tool's `response` argument; do not repeat these replies in your final prose.\n",
+            "Participants attached the following inline comments to immutable excerpts from the conversation. You MUST call `respond_to_comment` exactly once for every comment_id before finishing your response. Put the direct reply to that comment in the tool's `response` argument; do not repeat these replies in your final prose.\n",
         );
         for (index, (comment, comment_id)) in comments.iter().zip(comment_ids.iter()).enumerate() {
             let UserCommentBody::Submitted(body) = &comment.body else {
@@ -4111,19 +4730,16 @@ impl Cowork {
                 .map(|index| index + 1)
                 .unwrap_or_default();
             result.push_str(&format!(
-                "\n{}. {} — Excerpt from assistant message {}:\n> {}\nComment: {}\n",
+                "\n{}. {} — {}, on an excerpt from assistant message {}:\n> {}\nComment: {}\n",
                 index + 1,
                 comment_id,
+                comment.author.display_name(),
                 message_number,
                 comment.reference.quote.replace('\n', "\n> "),
                 body.trim(),
             ));
         }
-        if !prompt.trim().is_empty() {
-            result.push_str("\nAdditional user message:\n");
-            result.push_str(prompt);
-        }
-        result
+        Some(result)
     }
 
     /// The draft the composer currently edits, or `None` for read-only threads.
@@ -4146,7 +4762,7 @@ impl Cowork {
         &mut self,
         draft_id: Uuid,
         cx: &mut Context<Self>,
-        update: impl FnOnce(&mut UserMessageGroup) -> R,
+        update: impl FnOnce(&mut ThreadDraft) -> R,
     ) -> Option<R> {
         if self.new_thread_draft.id == draft_id {
             return Some(update(&mut self.new_thread_draft));
@@ -4164,23 +4780,26 @@ impl Cowork {
         Some(thread.update(cx, |thread, _| update(&mut thread.draft)))
     }
 
-    fn focus_draft_composer(&self, draft_id: Uuid, window: &mut Window, cx: &mut App) {
-        if self.writable_draft_id(cx) == Some(draft_id)
-            && let Some(composer) = self.editable_composer(cx)
-        {
-            composer.focus_handle(cx).focus(window, cx);
-        }
-    }
-
     fn draft_is_loading_attachments(&self, draft_id: Uuid) -> bool {
         self.pending_attachments
             .iter()
             .any(|pending| pending.draft_id == draft_id)
     }
 
+    /// Where the attach button attaches to: the focused prompt block, or
+    /// otherwise a new block. Buttons do not take focus, so the editor the
+    /// user was typing in is still focused when one is clicked.
+    fn attachment_target_at_focus(&self, window: &Window, cx: &App) -> AttachmentTarget {
+        match self.focused_draft_editor(window, cx) {
+            Some((_, EditorSlot::Prompt(id), _)) => AttachmentTarget::Block(id),
+            _ => AttachmentTarget::NewBlock(Uuid::new_v4()),
+        }
+    }
+
     fn add_attachments(
         &mut self,
         draft_id: Uuid,
+        target: AttachmentTarget,
         sources: Vec<AttachmentSource>,
         cx: &mut Context<Self>,
     ) {
@@ -4196,6 +4815,7 @@ impl Cowork {
                 self.pending_attachments.push(PendingAttachment {
                     id,
                     draft_id,
+                    target,
                     name: source.name(),
                     is_image: source.looks_like_image(),
                     progress: None,
@@ -4251,12 +4871,12 @@ impl Cowork {
                 self.pending_attachments[index].progress = Some(progress);
             }
             AttachmentReadEvent::Finished(_, result) => {
-                self.pending_attachments.remove(index);
+                let target = self.pending_attachments.remove(index).target;
                 let result = result.and_then(|attachment| {
                     self.update_draft(draft_id, cx, |draft| {
                         let total = draft
-                            .attachments
-                            .iter()
+                            .attachment_bytes
+                            .values()
                             .map(FileAttachment::len)
                             .sum::<u64>();
                         anyhow::ensure!(
@@ -4265,7 +4885,20 @@ impl Cowork {
                             attachment.name,
                             format_bytes(MAX_MESSAGE_ATTACHMENT_BYTES)
                         );
-                        draft.attachments.push(attachment);
+                        let block = draft.attachment_block(target);
+                        let record = AttachmentRecord {
+                            id: AttachmentId::new(),
+                            name: attachment.name.clone(),
+                            kind: match attachment.content {
+                                FileAttachmentContent::Text(_) => AttachmentKind::Text,
+                                FileAttachmentContent::Png(_) => AttachmentKind::Png,
+                                FileAttachmentContent::Jpeg(_) => AttachmentKind::Jpeg,
+                            },
+                            size: attachment.len(),
+                            creator: draft.author.as_uuid(),
+                        };
+                        draft.attachment_bytes.insert(record.id, attachment);
+                        draft.doc.add_attachment(block, record);
                         Ok(())
                     })
                     // The draft is gone (sent, or its thread was closed).
@@ -4282,10 +4915,28 @@ impl Cowork {
         cx.notify();
     }
 
-    fn remove_attachment(&mut self, draft_id: Uuid, index: usize, cx: &mut Context<Self>) {
+    /// Removes an attachment, and its block too if that leaves the block
+    /// empty while nobody is typing in it.
+    fn remove_attachment(
+        &mut self,
+        draft_id: Uuid,
+        block: ItemId,
+        attachment: AttachmentId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let block_focused = self
+            .read_draft(draft_id, cx, |draft| {
+                draft
+                    .editor(EditorSlot::Prompt(block))
+                    .is_some_and(|editor| editor.focus_handle(cx).is_focused(window))
+            })
+            .unwrap_or(false);
         self.update_draft(draft_id, cx, |draft| {
-            if index < draft.attachments.len() {
-                draft.attachments.remove(index);
+            draft.doc.remove_attachment(attachment);
+            draft.attachment_bytes.remove(&attachment);
+            if !block_focused {
+                draft.remove_if_empty(block);
             }
         });
         self.attachment_errors
@@ -4308,12 +4959,14 @@ impl Cowork {
             multiple: true,
             prompt: Some("Attach text or images".into()),
         });
+        let target = self.attachment_target_at_focus(window, cx);
         cx.spawn_in(window, async move |this, cx| {
             let result = selected.await;
             _ = this.update_in(cx, |this, window, cx| {
                 match result {
                     Ok(Ok(Some(paths))) => this.add_attachments(
                         draft_id,
+                        target,
                         paths.into_iter().map(AttachmentSource::Path).collect(),
                         cx,
                     ),
@@ -4326,7 +4979,7 @@ impl Cowork {
                         cx.notify();
                     }
                 }
-                this.focus_draft_composer(draft_id, window, cx);
+                this.ensure_composer_focus(window, cx);
             });
         })
         .detach();
@@ -4341,8 +4994,22 @@ impl Cowork {
         let Some(draft_id) = self.writable_draft_id(cx) else {
             return;
         };
+        // Drops onto a block are handled by the block itself.
+        let target = AttachmentTarget::NewBlock(Uuid::new_v4());
+        self.drop_attachments_on(draft_id, target, paths, window, cx);
+    }
+
+    fn drop_attachments_on(
+        &mut self,
+        draft_id: Uuid,
+        target: AttachmentTarget,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.add_attachments(
             draft_id,
+            target,
             paths
                 .paths()
                 .iter()
@@ -4351,14 +5018,20 @@ impl Cowork {
                 .collect(),
             cx,
         );
-        self.focus_draft_composer(draft_id, window, cx);
+        self.ensure_composer_focus(window, cx);
     }
 
-    /// Runs before the composer's own paste so images and copied files become
-    /// attachments; plain text falls through to the text input.
-    fn paste_attachments(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
-        let Some(draft_id) = self.writable_draft_id(cx) else {
+    /// Runs before an editor's own paste so images and copied files become
+    /// attachments of the block being typed in; plain text, and anything
+    /// pasted into a comment, falls through to the text input.
+    fn paste_attachments(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((draft_id, slot, _)) = self.focused_draft_editor(window, cx) else {
             return;
+        };
+        let target = match slot {
+            EditorSlot::Prompt(id) => AttachmentTarget::Block(id),
+            EditorSlot::DraftPosition => AttachmentTarget::NewBlock(Uuid::new_v4()),
+            EditorSlot::CommentInline(_) | EditorSlot::CommentComposer(_) => return,
         };
         let Some(item) = cx.read_from_clipboard() else {
             return;
@@ -4368,7 +5041,7 @@ impl Cowork {
             return;
         }
         cx.stop_propagation();
-        self.add_attachments(draft_id, sources, cx);
+        self.add_attachments(draft_id, target, sources, cx);
     }
 
     fn render_pending_attachment(pending: &PendingAttachment) -> Attachment {
@@ -4407,10 +5080,12 @@ impl Cowork {
             )
     }
 
+    /// An attachment card, with a remove button when `removal` names the
+    /// draft and block it can be removed from.
     fn render_attachment(
         &self,
         attachment: &FileAttachment,
-        removal: Option<(Uuid, usize)>,
+        removal: Option<(Uuid, ItemId, AttachmentId)>,
         cx: &mut Context<Self>,
     ) -> Attachment {
         let size = format_bytes(attachment.len());
@@ -4433,17 +5108,17 @@ impl Cowork {
                 .title(AttachmentTitle::new(attachment.name.clone()))
                 .description(AttachmentDescription::new(description)),
         );
-        if let Some((draft_id, index)) = removal {
+        if let Some((draft_id, block, attachment_id)) = removal {
             card = card.actions(
                 AttachmentActions::new().child(
-                    Button::new(format!("remove-attachment-{draft_id}-{index}"))
+                    Button::new(format!("remove-attachment-{attachment_id}"))
                         .ghost()
                         .xsmall()
                         .icon(Icon::new(AssetIconName::X))
                         .accessibility_label(format!("Remove {}", attachment.name))
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.remove_attachment(draft_id, index, cx);
-                            this.focus_draft_composer(draft_id, window, cx);
+                            this.remove_attachment(draft_id, block, attachment_id, window, cx);
+                            this.ensure_composer_focus(window, cx);
                         })),
                 ),
             );
@@ -4518,94 +5193,83 @@ impl Cowork {
             return;
         }
 
-        let draft = active_thread
-            .as_ref()
-            .map(|thread| thread.read(cx).draft.clone())
-            .unwrap_or_else(|| self.new_thread_draft.clone());
-        if self.draft_is_loading_attachments(draft.id) {
+        let Some(draft_id) = self.writable_draft_id(cx) else {
+            return;
+        };
+        if self.draft_is_loading_attachments(draft_id) {
             return;
         }
-        let composer = Self::draft_composer(&draft);
-        let prompt = composer.read(cx).value().to_string();
-        let mut submitted_comments = Vec::new();
-        let mut remaining_comments = Vec::new();
-        for comment in &draft.comments {
-            if let Some(body) = Self::editable_comment_body(comment, cx) {
-                submitted_comments.push(UserComment {
-                    id: comment.id,
-                    author: comment.author,
-                    reference: comment.reference.clone(),
-                    body: UserCommentBody::Submitted(body),
-                });
-            } else {
-                remaining_comments.push(comment);
-            }
-        }
-        let has_comments = !submitted_comments.is_empty();
-        if prompt.trim().is_empty() && !has_comments && draft.attachments.is_empty() {
+        let focused = self
+            .focused_draft_editor(window, cx)
+            .map(|(_, slot, _)| slot);
+        let Some((comments, blocks, comments_folded)) = self
+            .update_draft(draft_id, cx, Self::take_submission)
+            .flatten()
+        else {
             return;
-        }
-        let remaining_comments = remaining_comments.into_iter().cloned().collect::<Vec<_>>();
+        };
+        // Only those whose item was just submitted move on.
+        let refocus = focused.is_none_or(|slot| {
+            slot.item().is_some_and(|id| {
+                !self
+                    .read_draft(draft_id, cx, |draft| draft.doc.contains(id))
+                    .unwrap_or(false)
+            })
+        });
         self.attachment_errors
-            .retain(|error| error.draft_id != draft.id);
+            .retain(|error| error.draft_id != draft_id);
 
         let timeline = active_thread
             .as_ref()
             .map(|thread| thread.read(cx).timeline.clone())
             .unwrap_or_default();
         let history = Self::rig_history(&timeline);
-        let turn_comments = Arc::new(TurnComments::new(submitted_comments.len()));
-        let agent_prompt = Self::prompt_with_comments(
-            &prompt,
-            &submitted_comments,
-            turn_comments.comment_ids(),
-            &timeline,
-        );
-        let submitted_comment_ids = submitted_comments
+        let turn_comments = Arc::new(TurnComments::new(comments.len()));
+        let preface = Self::comments_preface(&comments, turn_comments.comment_ids(), &timeline);
+        let prompt = agent_message(preface.as_deref(), &blocks);
+        let comment_ids = comments
             .iter()
             .map(|comment| comment.id)
             .collect::<Vec<_>>();
+        let has_comments = !comments.is_empty();
         let submitted_group = UserMessageGroup {
-            id: draft.id,
-            author: draft.author,
-            comments: submitted_comments,
-            attachments: draft.attachments.clone(),
-            content: UserMessageContent::Submitted {
-                text: prompt.clone(),
-                history_text: has_comments.then(|| agent_prompt.clone()),
-            },
-            comments_folded: has_comments || draft.comments_folded,
+            id: Uuid::new_v4(),
+            comments,
+            blocks,
+            history_preface: preface,
+            comments_folded: has_comments || comments_folded,
         };
-        let mut next_draft = Self::new_user_message_draft(draft.author, window, cx);
-        next_draft.comments = remaining_comments;
-        next_draft.comments_folded = !next_draft.comments.is_empty() && draft.comments_folded;
-        let next_composer = Self::draft_composer(&next_draft);
+        let comment_group_id = has_comments.then_some(submitted_group.id);
+        let title = submitted_group.title_text().to_owned();
 
         let thread_id = if let Some(thread) = active_thread {
             let thread_id = thread.read(cx).instance_id;
             thread.update(cx, |thread, cx| {
-                if let Some(title) = Self::title_for_first_message(&thread.timeline, &prompt) {
+                if let Some(title) = Self::title_for_first_message(&thread.timeline, &title) {
                     thread.emit(protocol::HostMessage::ThreadTitled(title), cx);
                 }
-                if let Some(message) = submitted_group.to_protocol() {
-                    thread.publish(protocol::HostMessage::UserMessage(message));
-                }
+                thread.publish(protocol::HostMessage::UserMessage(
+                    submitted_group.to_protocol(),
+                ));
                 thread.timeline.push(TimelineMessage::User(submitted_group));
-                thread.draft = next_draft;
             });
             thread_id
         } else {
+            // The draft moves into the new thread, keeping whatever was not
+            // submitted and any attachments still being read.
+            let draft = std::mem::replace(
+                &mut self.new_thread_draft,
+                ThreadDraft::new(self.local_participant_id),
+            );
             let thread = Self::new_local_thread(
-                Self::thread_title(&prompt),
+                Self::thread_title(&title),
                 vec![TimelineMessage::User(submitted_group)],
-                next_draft,
+                draft,
                 self.local_participant_id,
                 self.new_thread_model,
                 cx,
             );
             let thread_id = thread.read(cx).instance_id;
-            self.new_thread_draft =
-                Self::new_user_message_draft(self.local_participant_id, window, cx);
             self.thread_store.update(cx, |store, _| {
                 store.threads.push_front(thread.clone());
             });
@@ -4615,17 +5279,66 @@ impl Cowork {
 
         self.selection_message_id = None;
         self.follow_generation = true;
-        next_composer.focus_handle(cx).focus(window, cx);
+        if refocus {
+            self.focus_draft_editor(draft_id, EditorSlot::DraftPosition, None, window, cx);
+        }
         self.start_generation(
             thread_id,
-            message_with_attachments(&agent_prompt, &draft.attachments),
+            prompt,
             history,
-            has_comments.then_some(draft.id),
-            submitted_comment_ids,
+            comment_group_id,
+            comment_ids,
             turn_comments,
             cx,
         );
         self.timeline_scroll_handle.scroll_to_bottom();
+    }
+
+    /// Takes every non-empty item out of the draft, in draft order, as the
+    /// comments and prompt blocks of one submission. Empty items stay, such
+    /// as a comment nobody has written yet. Returns `None` when there is
+    /// nothing to submit.
+    fn take_submission(
+        draft: &mut ThreadDraft,
+    ) -> Option<(Vec<UserComment>, Vec<PromptBlock>, bool)> {
+        let items = draft
+            .doc
+            .items()
+            .into_iter()
+            .filter(|item| !item.is_empty())
+            .collect::<Vec<_>>();
+        if items.is_empty() {
+            return None;
+        }
+        let mut comments = Vec::new();
+        let mut blocks = Vec::new();
+        for item in &items {
+            let author = ParticipantId::from_uuid(item.creator);
+            match &item.kind {
+                DraftItemKind::Comment { target } => comments.push(UserComment {
+                    id: item.id.as_uuid(),
+                    author,
+                    reference: CommentReference {
+                        message_id: target.message_id,
+                        range: target.range.clone(),
+                        quote: target.quote.clone(),
+                    },
+                    body: UserCommentBody::Submitted(item.body.clone().into()),
+                }),
+                DraftItemKind::Prompt { attachments } => blocks.push(PromptBlock {
+                    id: item.id.as_uuid(),
+                    author,
+                    text: item.body.clone(),
+                    attachments: attachments
+                        .iter()
+                        .filter_map(|record| draft.attachment_bytes.get(&record.id).cloned())
+                        .collect(),
+                }),
+            }
+        }
+        let ids = items.iter().map(|item| item.id).collect::<Vec<_>>();
+        draft.remove_items(&ids);
+        Some((comments, blocks, draft.comments_folded))
     }
 
     fn timeline_scrolled(
@@ -4866,24 +5579,257 @@ impl Cowork {
         self.submit_composer(window, cx);
     }
 
-    fn focus_composer_at_end(composer: &Entity<TextareaState>, window: &mut Window, cx: &mut App) {
-        composer.update(cx, |composer, cx| {
-            let text = composer.text();
-            let end = text.offset_to_position(text.len());
-            composer.set_cursor_position(end, window, cx);
-        });
-    }
-
     fn render_composer_input(composer: &Entity<TextareaState>) -> gpui::Stateful<gpui::Div> {
         div()
-            .id("composer")
+            .id(("composer", composer.entity_id()))
             .debug_selector(|| "composer".to_owned())
-            .min_h(px(110.))
             .flex_1()
             .min_w_0()
             .flex()
             .flex_col()
             .child(Textarea::new(composer))
+    }
+
+    /// A composer editor. The last one is tall, so there is room to click
+    /// into, and it stays that tall when typing turns the draft position
+    /// into a block.
+    fn render_composer_editor(
+        editor: &Entity<TextareaState>,
+        last: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        Self::render_composer_input(editor)
+            .when(last, |this| this.min_h(px(110.)))
+            .on_click({
+                let editor = editor.clone();
+                cx.listener(move |_, _, window, cx| {
+                    editor.focus_handle(cx).focus(window, cx);
+                })
+            })
+    }
+
+    /// Whether the draft position is shown below the prompt blocks: always
+    /// when there are none, otherwise only while the user is there or files
+    /// are being read for a new block.
+    fn draft_row_visible(&self, draft: &ThreadDraft, window: &Window, cx: &App) -> bool {
+        !draft.doc.items().iter().any(|item| item.is_prompt())
+            || draft
+                .draft_position
+                .as_ref()
+                .is_some_and(|editor| editor.focus_handle(cx).is_focused(window))
+            || self.pending_attachments.iter().any(|pending| {
+                pending.draft_id == draft.id && draft.pending_block(pending.target).is_none()
+            })
+    }
+
+    /// The bottom-most editor of the composer.
+    fn last_composer_editor(&self, window: &Window, cx: &App) -> Option<Entity<TextareaState>> {
+        let draft_id = self.writable_draft_id(cx)?;
+        self.read_draft(draft_id, cx, |draft| {
+            if self.draft_row_visible(draft, window, cx) {
+                return draft.draft_position.clone();
+            }
+            let last_block = draft
+                .doc
+                .items()
+                .into_iter()
+                .rfind(|item| item.is_prompt())?;
+            draft.editor(EditorSlot::Prompt(last_block.id))
+        })?
+    }
+
+    fn composer_model(&self, draft_id: Uuid, window: &Window, cx: &App) -> Option<ComposerModel> {
+        self.read_draft(draft_id, cx, |draft| {
+            let blocks = draft
+                .doc
+                .items()
+                .into_iter()
+                .filter_map(|item| {
+                    let DraftItemKind::Prompt { attachments } = item.kind else {
+                        return None;
+                    };
+                    Some(ComposerBlock {
+                        id: item.id,
+                        creator: ParticipantId::from_uuid(item.creator),
+                        editor: draft.editor(EditorSlot::Prompt(item.id))?,
+                        attachments: attachments
+                            .iter()
+                            .filter_map(|record| {
+                                let bytes = draft.attachment_bytes.get(&record.id)?;
+                                Some((record.id, bytes.clone()))
+                            })
+                            .collect(),
+                    })
+                })
+                .collect();
+            let pending = self
+                .pending_attachments
+                .iter()
+                .filter(|pending| pending.draft_id == draft_id)
+                .map(|pending| {
+                    (
+                        draft.pending_block(pending.target),
+                        Self::render_pending_attachment(pending),
+                    )
+                })
+                .collect();
+            ComposerModel {
+                draft_id,
+                author: draft.author,
+                comments: draft.comment_views(),
+                comments_folded: draft.comments_folded,
+                blocks,
+                draft_position: draft.draft_position.clone(),
+                draft_row_visible: self.draft_row_visible(draft, window, cx),
+                pending,
+            }
+        })
+    }
+
+    /// The composer: the draft's comments, one row per prompt block, and the
+    /// draft position, followed by empty space that leads to the draft
+    /// position when clicked.
+    fn render_composer(
+        &self,
+        composer: ComposerModel,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let ComposerModel {
+            draft_id,
+            author,
+            comments,
+            comments_folded,
+            blocks,
+            draft_position,
+            draft_row_visible,
+            mut pending,
+        } = composer;
+        let mut rows = Vec::new();
+        if !comments.is_empty() {
+            let mut content = vec![
+                Self::render_comment_group_toggle(draft_id, comments.len(), comments_folded, cx)
+                    .into_any_element(),
+            ];
+            if !comments_folded {
+                content.extend(comments.iter().map(Self::render_composer_comment));
+            }
+            rows.push(Self::render_message_row(None, content).into_any_element());
+        }
+
+        let block_count = blocks.len();
+        for (index, block) in blocks.into_iter().enumerate() {
+            let last = !draft_row_visible && index + 1 == block_count;
+            let block_pending = pending
+                .extract_if(.., |(target, _)| *target == Some(block.id))
+                .map(|(_, pending)| pending)
+                .collect::<Vec<_>>();
+            let mut content = Vec::new();
+            if !block.attachments.is_empty() || !block_pending.is_empty() {
+                content.push(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_1()
+                        .children(block.attachments.iter().map(|(attachment_id, attachment)| {
+                            self.render_attachment(
+                                attachment,
+                                Some((draft_id, block.id, *attachment_id)),
+                                cx,
+                            )
+                        }))
+                        .children(block_pending)
+                        .into_any_element(),
+                );
+            }
+            content.push(Self::render_composer_editor(&block.editor, last, cx).into_any_element());
+            let block_id = block.id;
+            rows.push(
+                Self::render_message_row(Some(MessageAuthor::User(block.creator)), content)
+                    .can_drop(|value, _, _| {
+                        value
+                            .downcast_ref::<ExternalPaths>()
+                            .is_some_and(|paths| !paths.paths().is_empty())
+                    })
+                    .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
+                        this.drop_attachments_on(
+                            draft_id,
+                            AttachmentTarget::Block(block_id),
+                            paths,
+                            window,
+                            cx,
+                        );
+                        cx.stop_propagation();
+                    }))
+                    .into_any_element(),
+            );
+        }
+
+        let errors = self
+            .attachment_errors
+            .iter()
+            .filter(|error| error.draft_id == draft_id)
+            .map(|error| {
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xf87171))
+                    .child(error.message.clone())
+                    .into_any_element()
+            })
+            .collect::<Vec<_>>();
+        if draft_row_visible {
+            let mut content = Vec::new();
+            if !pending.is_empty() {
+                content.push(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_1()
+                        .children(pending.into_iter().map(|(_, pending)| pending))
+                        .into_any_element(),
+                );
+            }
+            content.extend(errors);
+            content.extend(
+                draft_position.as_ref().map(|editor| {
+                    Self::render_composer_editor(editor, true, cx).into_any_element()
+                }),
+            );
+            rows.push(
+                Self::render_message_row(Some(MessageAuthor::User(author)), content)
+                    .into_any_element(),
+            );
+        } else if !errors.is_empty() {
+            rows.push(Self::render_message_row(None, errors).into_any_element());
+        }
+
+        div()
+            .id("composer-area")
+            .w_full()
+            .flex_1()
+            .flex()
+            .flex_col()
+            .child(div().w_full().flex().flex_col().gap_3().children(rows))
+            .child(
+                div()
+                    .id("composer-empty-space")
+                    .w_full()
+                    .flex_1()
+                    .min_h(px(24.))
+                    .cursor_text()
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.focus_draft_editor(
+                            draft_id,
+                            EditorSlot::DraftPosition,
+                            None,
+                            window,
+                            cx,
+                        );
+                    })),
+            )
     }
 
     fn render_main_editor(
@@ -4894,17 +5840,16 @@ impl Cowork {
     ) -> impl IntoElement {
         self.render_generation = self.render_generation.wrapping_add(1);
         let active_thread_id = self.active_thread_id;
-        let (messages, draft, can_write) = active_thread_id
+        let (messages, draft_comments) = active_thread_id
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
             .map(|thread| {
                 let thread = thread.read(cx);
-                (
-                    thread.timeline.clone(),
-                    thread.draft.clone(),
-                    thread.ownership.can_write(),
-                )
+                (thread.timeline.clone(), thread.draft.comment_views())
             })
-            .unwrap_or_else(|| (Vec::new(), self.new_thread_draft.clone(), true));
+            .unwrap_or_else(|| (Vec::new(), self.new_thread_draft.comment_views()));
+        let composer = self
+            .writable_draft_id(cx)
+            .and_then(|draft_id| self.composer_model(draft_id, window, cx));
         let comments = messages
             .iter()
             .filter_map(|message| match message {
@@ -4912,8 +5857,8 @@ impl Cowork {
                 TimelineMessage::Agent(_) => None,
             })
             .flatten()
-            .chain(draft.comments.iter())
             .cloned()
+            .chain(draft_comments)
             .collect::<Vec<_>>();
         let sidebar_width = if self.sidebar_open {
             SIDEBAR_WIDTH
@@ -4959,47 +5904,8 @@ impl Cowork {
         self.segment_text_views
             .retain(|_, text_view| text_view.rendered_at == self.render_generation);
 
-        let composer_comments = draft
-            .comments
-            .iter()
-            .map(Self::render_composer_comment)
-            .collect::<Vec<_>>();
-        let composer_comment_count = composer_comments.len();
-        let composer_comment_group = (composer_comment_count > 0).then_some(draft.id);
-        let composer_comments_collapsed = draft.comments_folded;
-        let composer = Self::draft_composer(&draft);
-        let attachment_row = div()
-            .w_full()
-            .flex()
-            .flex_wrap()
-            .items_center()
-            .gap_1()
-            .children(
-                draft
-                    .attachments
-                    .iter()
-                    .enumerate()
-                    .map(|(index, attachment)| {
-                        self.render_attachment(attachment, Some((draft.id, index)), cx)
-                    }),
-            )
-            .children(
-                self.pending_attachments
-                    .iter()
-                    .filter(|pending| pending.draft_id == draft.id)
-                    .map(Self::render_pending_attachment),
-            );
-        let attachment_errors = self
-            .attachment_errors
-            .iter()
-            .filter(|error| error.draft_id == draft.id)
-            .map(|error| {
-                div()
-                    .text_xs()
-                    .text_color(rgb(0xf87171))
-                    .child(error.message.clone())
-            })
-            .collect::<Vec<_>>();
+        let can_write = composer.is_some();
+        let composer = composer.map(|composer| self.render_composer(composer, cx));
 
         div()
             .id("main-editor")
@@ -5033,87 +5939,9 @@ impl Cowork {
                                     div().when(index != 0, |this| this.mt_6()).child(message)
                                 },
                             ))
-                            .when(can_write, |this| {
-                                this.child(
-                                    div()
-                                        .id("composer-row")
-                                        .when(!messages.is_empty(), |this| this.mt_6())
-                                        .w_full()
-                                        .flex()
-                                        .items_start()
-                                        .child(
-                                            div()
-                                                .w(px(40.))
-                                                .flex_none()
-                                                .flex()
-                                                .justify_center()
-                                                .child(Self::render_avatar(MessageAuthor::User(
-                                                    draft.author,
-                                                ))),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("composer-column")
-                                                .flex_1()
-                                                .min_w_0()
-                                                .flex()
-                                                .flex_col()
-                                                .gap_3()
-                                                .when_some(
-                                                    composer_comment_group,
-                                                    |this, group_id| {
-                                                        this.child(
-                                                            Self::render_comment_group_toggle(
-                                                                group_id,
-                                                                composer_comment_count,
-                                                                composer_comments_collapsed,
-                                                                cx,
-                                                            ),
-                                                        )
-                                                    },
-                                                )
-                                                .when(!composer_comments_collapsed, |this| {
-                                                    this.children(composer_comments)
-                                                })
-                                                .when(
-                                                    !draft.attachments.is_empty()
-                                                        || self
-                                                            .draft_is_loading_attachments(draft.id),
-                                                    |this| this.child(attachment_row),
-                                                )
-                                                .children(attachment_errors)
-                                                .child(
-                                                    Self::render_composer_input(&composer)
-                                                        .capture_action(
-                                                            cx.listener(Self::paste_attachments),
-                                                        )
-                                                        .on_click({
-                                                            let composer = composer.clone();
-                                                            cx.listener(move |_, _, window, cx| {
-                                                                composer
-                                                                    .focus_handle(cx)
-                                                                    .focus(window, cx);
-                                                            })
-                                                        }),
-                                                ),
-                                        )
-                                        .child(div().w(px(40.)).flex_none()),
-                                )
-                                .child(
-                                    div()
-                                        .id("composer-empty-space")
-                                        .w_full()
-                                        .flex_1()
-                                        .min_h(px(24.))
-                                        .cursor_text()
-                                        .on_click({
-                                            let composer = composer.clone();
-                                            cx.listener(move |_, _, window, cx| {
-                                                Self::focus_composer_at_end(&composer, window, cx);
-                                            })
-                                        }),
-                                )
-                            })
+                            .children(composer.map(|composer| {
+                                composer.when(!messages.is_empty(), |this| this.mt_6())
+                            }))
                             .when(!can_write, |this| {
                                 this.child(
                                     div()
@@ -5146,7 +5974,10 @@ impl Cowork {
 impl Render for Cowork {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_model_picker(window, cx);
-        let composer = self.editable_composer(cx);
+        if let Some(draft_id) = self.writable_draft_id(cx) {
+            self.prepare_draft(draft_id, window, cx);
+        }
+        let composer = self.last_composer_editor(window, cx);
         let can_write = composer.is_some();
         let read_only_line_bounds = Rc::new(Cell::new(None));
 
@@ -5159,6 +5990,29 @@ impl Render for Cowork {
             .bg(rgb(0x1c1c1f))
             .on_action(cx.listener(Self::submit_composer_action))
             .on_key_down(cx.listener(Self::begin_inline_comment))
+            // Run before the focused editor's own handling, which they
+            // extend to the composer as a whole.
+            .capture_action(cx.listener(Self::paste_attachments))
+            .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
+                if this.move_between_draft_editors(true, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &MoveDown, window, cx| {
+                if this.move_between_draft_editors(false, window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &Escape, window, cx| {
+                if this.escape_empty_draft_item(window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &Backspace, window, cx| {
+                if this.backspace_out_of_empty_draft_item(window, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .child(self.render_top_bar(window, cx))
             .child(
                 div()
@@ -5256,11 +6110,7 @@ fn main() -> anyhow::Result<()> {
                 let tokio_handle = tokio_handle.clone();
                 let thread_store = cx.new(|_| ThreadStore::default());
                 let local_participant_id = ParticipantId::new();
-                let new_thread_draft =
-                    Cowork::new_user_message_draft(local_participant_id, window, cx);
-                Cowork::draft_composer(&new_thread_draft)
-                    .focus_handle(cx)
-                    .focus(window, cx);
+                let new_thread_draft = ThreadDraft::new(local_participant_id);
                 let cowork = cx.new(|cx| {
                     let window_activation_subscription =
                         cx.observe_window_activation(window, |_, window, _cx| {
@@ -5296,6 +6146,7 @@ fn main() -> anyhow::Result<()> {
                         _window_activation_subscription: window_activation_subscription,
                     }
                 });
+                cowork.update(cx, |cowork, cx| cowork.focus_composer(window, cx));
                 cx.new(|cx| Root::new(cowork, window, cx))
             }) {
                 eprintln!("failed to open Cowork window: {error}");
@@ -5313,6 +6164,7 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use draft::DraftItem;
     use gpui_base::TextSelectionLayer;
 
     fn annotate_markdown(markdown: &str, ranges: impl IntoIterator<Item = Range<usize>>) -> String {
@@ -5336,28 +6188,76 @@ mod tests {
 
     #[test]
     fn attachments_become_ollama_text_and_base64_image_parts() {
-        let attachments = vec![
-            text_attachment("say \"hi\".txt", "hello"),
-            FileAttachment {
-                name: "photo.png".into(),
-                content: FileAttachmentContent::Png(Arc::new(gpui::Image::from_bytes(
-                    gpui::ImageFormat::Png,
-                    vec![1, 2, 3],
-                ))),
-            },
-        ];
-        let RigMessage::User { content } = message_with_attachments("Question", &attachments)
-        else {
+        let author = ParticipantId::from_bytes([7; 16]);
+        let block = PromptBlock {
+            id: Uuid::new_v4(),
+            author,
+            text: "Question".into(),
+            attachments: vec![
+                text_attachment("say \"hi\".txt", "hello"),
+                FileAttachment {
+                    name: "photo.png".into(),
+                    content: FileAttachmentContent::Png(Arc::new(gpui::Image::from_bytes(
+                        gpui::ImageFormat::Png,
+                        vec![1, 2, 3],
+                    ))),
+                },
+            ],
+        };
+        let RigMessage::User { content } = agent_message(None, &[block]) else {
             panic!("expected user message");
         };
         assert_eq!(content.len(), 3);
-        assert!(matches!(&content[0], UserContent::Text(text) if text.text == "Question"));
+        assert!(
+            matches!(&content[0], UserContent::Text(text) if text.text == "Mossy Crane:\nQuestion")
+        );
         assert!(
             matches!(&content[1], UserContent::Text(text) if text.text == "<file name=\"say &quot;hi&quot;.txt\">\nhello\n</file>")
         );
         assert!(matches!(&content[2], UserContent::Image(image)
             if image.data == rig::message::DocumentSourceKind::Base64("AQID".into())
                 && image.media_type == Some(ImageMediaType::PNG)));
+    }
+
+    /// Comments come first, then each block under its creator's name with its
+    /// own attachments right after it.
+    #[test]
+    fn agent_message_keeps_attachments_with_their_blocks() {
+        let alice = ParticipantId::from_bytes([7; 16]);
+        let bob = ParticipantId::new();
+        let blocks = [
+            PromptBlock {
+                id: Uuid::new_v4(),
+                author: alice,
+                text: "Investigate the crash.".into(),
+                attachments: vec![text_attachment("crash.log", "boom")],
+            },
+            PromptBlock {
+                id: Uuid::new_v4(),
+                author: bob,
+                text: "Also check the logs.".into(),
+                attachments: Vec::new(),
+            },
+        ];
+        let RigMessage::User { content } = agent_message(Some("Comments first."), &blocks) else {
+            panic!("expected user message");
+        };
+        let texts = content
+            .iter()
+            .map(|part| match part {
+                UserContent::Text(text) => text.text.clone(),
+                _ => panic!("expected only text parts"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                "Comments first.".to_owned(),
+                "Mossy Crane:\nInvestigate the crash.".to_owned(),
+                "<file name=\"crash.log\">\nboom\n</file>".to_owned(),
+                format!("{}:\nAlso check the logs.", bob.display_name()),
+            ]
+        );
     }
 
     #[test]
@@ -5483,7 +6383,7 @@ mod tests {
         Cowork {
             sidebar_open: true,
             recents_open: true,
-            new_thread_draft: Cowork::new_user_message_draft(local_participant_id, window, cx),
+            new_thread_draft: ThreadDraft::new(local_participant_id),
             attachment_errors: Vec::new(),
             pending_attachments: Vec::new(),
             timeline_scroll_handle: ScrollHandle::new(),
@@ -5507,11 +6407,7 @@ mod tests {
         }
     }
 
-    fn test_thread(
-        thread_id: Uuid,
-        timeline: Vec<TimelineMessage>,
-        draft: UserMessageGroup,
-    ) -> Thread {
+    fn test_thread(thread_id: Uuid, timeline: Vec<TimelineMessage>, draft: ThreadDraft) -> Thread {
         Thread {
             instance_id: thread_id,
             summary: ThreadSummary {
@@ -5536,7 +6432,7 @@ mod tests {
         cx.update(gpui_component::init);
         let thread_id = Uuid::new_v4();
         let (view, cx) = cx.add_window_view(|window, cx| {
-            let draft = Cowork::new_user_message_draft(ParticipantId::new(), window, cx);
+            let draft = ThreadDraft::new(ParticipantId::new());
             let thread = cx.new(|_| test_thread(thread_id, Vec::new(), draft));
             let thread_store = cx.new(|_| ThreadStore {
                 threads: VecDeque::from([thread]),
@@ -5549,22 +6445,40 @@ mod tests {
         (cowork, thread_id, cx)
     }
 
+    /// The attachments of a thread's draft, in draft order.
     fn thread_draft_attachments(
         cowork: &Entity<Cowork>,
         thread_id: Uuid,
         cx: &mut gpui::VisualTestContext,
     ) -> Vec<FileAttachment> {
         cowork.read_with(cx, |cowork, cx| {
-            cowork
+            let thread = cowork
                 .thread_store
                 .read(cx)
                 .thread(thread_id, cx)
                 .expect("thread")
-                .read(cx)
-                .draft
-                .attachments
-                .clone()
+                .read(cx);
+            draft_attachments(&thread.draft)
         })
+    }
+
+    fn draft_attachments(draft: &ThreadDraft) -> Vec<FileAttachment> {
+        draft
+            .doc
+            .items()
+            .into_iter()
+            .flat_map(|item| match item.kind {
+                DraftItemKind::Prompt { attachments } => attachments,
+                DraftItemKind::Comment { .. } => Vec::new(),
+            })
+            .map(|record| {
+                draft
+                    .attachment_bytes
+                    .get(&record.id)
+                    .cloned()
+                    .expect("attachment bytes")
+            })
+            .collect()
     }
 
     #[gpui::test]
@@ -5578,7 +6492,12 @@ mod tests {
 
         cowork.update(cx, |cowork, cx| {
             let draft_id = cowork.writable_draft_id(cx).expect("writable thread");
-            cowork.add_attachments(draft_id, vec![AttachmentSource::Path(path.clone())], cx);
+            cowork.add_attachments(
+                draft_id,
+                AttachmentTarget::NewBlock(Uuid::new_v4()),
+                vec![AttachmentSource::Path(path.clone())],
+                cx,
+            );
             assert!(cowork.draft_is_loading_attachments(draft_id));
             cowork.active_thread_id = None;
         });
@@ -5591,7 +6510,7 @@ mod tests {
             [FileAttachment { content: FileAttachmentContent::Text(text), .. }] if text == "# Notes"
         ));
         cowork.read_with(cx, |cowork, _| {
-            assert!(cowork.new_thread_draft.attachments.is_empty());
+            assert!(draft_attachments(&cowork.new_thread_draft).is_empty());
             assert!(cowork.pending_attachments.is_empty());
         });
     }
@@ -5609,6 +6528,9 @@ mod tests {
         )));
 
         cowork.update_in(cx, |cowork, window, cx| {
+            // Pasting attaches to the block, or here the draft position, being
+            // typed in.
+            cowork.focus_composer(window, cx);
             cowork.paste_attachments(&Paste, window, cx);
         });
         cx.run_until_parked();
@@ -5844,21 +6766,21 @@ mod tests {
             };
             let thinking_view = cx.new(|cx| TextViewState::markdown("", cx));
             let thread_id = Uuid::new_v4();
-            let mut draft = Cowork::new_user_message_draft(ParticipantId::new(), window, cx);
+            let draft = ThreadDraft::new(ParticipantId::new());
             if let Some(range) = existing_comment_range.clone() {
-                draft.comments.push(UserComment {
-                    id: Uuid::new_v4(),
-                    author: draft.author,
-                    reference: CommentReference {
+                draft.doc.create_comment(
+                    draft.author.as_uuid(),
+                    CommentTarget {
                         message_id,
                         quote: markdown[range.clone()].into(),
                         range,
                     },
-                    body: UserCommentBody::Submitted("Existing comment".into()),
-                });
+                    "Existing comment",
+                );
             }
-            let comments = draft.comments.clone();
-            let composer = Cowork::draft_composer(&draft);
+            let comments = draft.comment_views();
+            // Stands in for the composer, which has focus before commenting.
+            let composer = Cowork::new_draft_editor("", window, cx);
             let timeline = vec![TimelineMessage::Agent(AgentMessage {
                 id: if target_comment_reply {
                     Uuid::new_v4()
@@ -5951,20 +6873,31 @@ mod tests {
                 .thread(cowork.active_thread_id.expect("active thread"), cx)
                 .expect("thread");
             let thread = thread.read(cx);
+            // New comments are appended after any existing one.
             let Some(comment) = thread
                 .draft
-                .comments
-                .iter()
-                .find(|comment| matches!(comment.body, UserCommentBody::Editing { .. }))
+                .comment_views()
+                .into_iter()
+                .last()
+                .filter(|comment| matches!(comment.body, UserCommentBody::Editing { .. }))
             else {
                 panic!("typing with the selection should create an editable comment");
             };
             assert_eq!(comment.reference.quote, expected_quote);
             assert_eq!(comment.reference.range, expected_range);
-            let UserCommentBody::Editing { inline, .. } = &comment.body else {
+            assert_eq!(comment.author, thread.draft.author);
+            let UserCommentBody::Editing { inline, composer } = &comment.body else {
                 unreachable!();
             };
             assert_eq!(inline.read(cx).value(), "x");
+            assert_eq!(composer.read(cx).value(), "x");
+        });
+        cx.update(|window, cx| {
+            let cowork = view.read(cx).cowork.read(cx);
+            let (_, slot, _) = cowork
+                .focused_draft_editor(window, cx)
+                .expect("a comment editor should have focus");
+            assert!(matches!(slot, EditorSlot::CommentInline(_)));
         });
 
         if let Some(expected_highlights) = expected_highlights_after_comment {
@@ -5977,8 +6910,7 @@ mod tests {
                     .expect("thread")
                     .read(cx)
                     .draft
-                    .comments
-                    .clone()
+                    .comment_views()
             });
             view.update(cx, |view, cx| {
                 view.comments = comments;
@@ -6174,13 +7106,14 @@ mod tests {
 
         let existing_timeline = vec![TimelineMessage::User(UserMessageGroup {
             id: Uuid::new_v4(),
-            author: ParticipantId::new(),
             comments: Vec::new(),
-            attachments: Vec::new(),
-            content: UserMessageContent::Submitted {
+            blocks: vec![PromptBlock {
+                id: Uuid::new_v4(),
+                author: ParticipantId::new(),
                 text: "Existing message".into(),
-                history_text: None,
-            },
+                attachments: Vec::new(),
+            }],
+            history_preface: None,
             comments_folded: false,
         })];
         assert_eq!(
@@ -6205,8 +7138,8 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(gpui_component::init);
-        let (view, cx) = cx.add_window_view(|window, cx| {
-            let draft = Cowork::new_user_message_draft(ParticipantId::new(), window, cx);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let draft = ThreadDraft::new(ParticipantId::new());
             let draft_id = draft.id;
             let thread =
                 Cowork::new_empty_local_thread(draft, ParticipantId::new(), OLLAMA_QWEN, cx);
@@ -6245,9 +7178,12 @@ mod tests {
             protocol::HostMessage::ThreadTitled("Explain this".into()),
             protocol::HostMessage::UserMessage(protocol::UserMessage {
                 id: user_message_id,
-                author: ParticipantId::new().into_bytes(),
-                text: "Explain this".into(),
-                attachments: Vec::new(),
+                blocks: vec![protocol::PromptBlock {
+                    id: Uuid::new_v4().into_bytes(),
+                    author: ParticipantId::new().into_bytes(),
+                    text: "Explain this".into(),
+                    attachments: Vec::new(),
+                }],
                 comments: vec![protocol::UserComment {
                     id: comment_id,
                     author: ParticipantId::new().into_bytes(),
@@ -6313,9 +7249,9 @@ mod tests {
 
         let host_participant = ParticipantId::new();
         let collaborator_participant = ParticipantId::new();
-        let (view, cx) = cx.add_window_view(|window, cx| ThreadMirrorTestView {
+        let (view, cx) = cx.add_window_view(|_, cx| ThreadMirrorTestView {
             host: Cowork::new_empty_local_thread(
-                Cowork::new_user_message_draft(ParticipantId::new(), window, cx),
+                ThreadDraft::new(ParticipantId::new()),
                 host_participant,
                 DEFAULT_MODEL,
                 cx,
@@ -6343,7 +7279,7 @@ mod tests {
                     participant_id: collaborator_participant.into_bytes(),
                     thread: view.host.read(cx).to_protocol(),
                 };
-                let draft = view.host.read(cx).draft.clone();
+                let draft = ThreadDraft::new(ParticipantId::new());
                 let collaborator =
                     cx.new(|cx| Thread::from_welcome(welcome, draft, ThreadSharing::NotShared, cx));
 
@@ -6395,8 +7331,8 @@ mod tests {
         cx: &mut gpui::TestAppContext,
     ) {
         cx.update(gpui_component::init);
-        let (view, cx) = cx.add_window_view(|window, cx| {
-            let draft = Cowork::new_user_message_draft(ParticipantId::new(), window, cx);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let draft = ThreadDraft::new(ParticipantId::new());
             EmptyThreadTestView {
                 thread: Cowork::new_empty_local_thread(
                     draft,
@@ -6508,8 +7444,8 @@ mod tests {
     #[gpui::test]
     fn running_agent_message_is_the_incomplete_one(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
-        let (view, cx) = cx.add_window_view(|window, cx| {
-            let draft = Cowork::new_user_message_draft(ParticipantId::new(), window, cx);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let draft = ThreadDraft::new(ParticipantId::new());
             EmptyThreadTestView {
                 thread: Cowork::new_empty_local_thread(
                     draft,
@@ -6641,28 +7577,6 @@ mod tests {
     }
 
     #[gpui::test]
-    fn focusing_empty_space_places_caret_at_composer_end(cx: &mut gpui::TestAppContext) {
-        cx.update(gpui_component::init);
-        let (view, cx) = cx.add_window_view(|window, cx| ComposerTestView {
-            composer: cx.new(|cx| TextareaState::new(window, cx)),
-        });
-        let composer = view.read_with(cx, |view, _| view.composer.clone());
-        cx.update(|window, cx| {
-            composer.update(cx, |state, cx| {
-                state.set_value("first line\nlast 🌿", window, cx);
-                state.set_cursor_position(gpui_base::input::Position::new(0, 0), window, cx);
-            });
-            Cowork::focus_composer_at_end(&composer, window, cx);
-        });
-        composer.read_with(cx, |state, _| {
-            assert_eq!(
-                state.cursor_position(),
-                gpui_base::input::Position::new(1, 6)
-            );
-        });
-    }
-
-    #[gpui::test]
     fn composer_grows_beyond_four_lines(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
         let (view, cx) = cx.add_window_view(|window, cx| {
@@ -6687,6 +7601,478 @@ mod tests {
         );
     }
 
+    /// A full `Cowork` window showing the draft of a new thread.
+    fn composer_test_cowork(
+        cx: &mut gpui::TestAppContext,
+    ) -> (
+        Entity<Cowork>,
+        tokio::runtime::Runtime,
+        &mut gpui::VisualTestContext,
+    ) {
+        cx.update(gpui_component::init);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let tokio_handle = runtime.handle().clone();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let thread_store = cx.new(|_| ThreadStore::default());
+            let cowork = cx.new(|cx| test_cowork(thread_store, None, tokio_handle, window, cx));
+            Root::new(cowork, window, cx)
+        });
+        let cowork = root.read_with(cx, |root, _| {
+            root.view()
+                .clone()
+                .downcast::<Cowork>()
+                .expect("root shows cowork")
+        });
+        // Focus and blur events are only delivered to an active window.
+        cx.update(|window, _| window.activate_window());
+        cx.update(|window, cx| cowork.update(cx, |cowork, cx| cowork.focus_composer(window, cx)));
+        cx.run_until_parked();
+        (cowork, runtime, cx)
+    }
+
+    fn new_thread_items(
+        cowork: &Entity<Cowork>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Vec<DraftItem> {
+        cowork.read_with(cx, |cowork, _| cowork.new_thread_draft.doc.items())
+    }
+
+    fn prompt_bodies(cowork: &Entity<Cowork>, cx: &mut gpui::VisualTestContext) -> Vec<String> {
+        new_thread_items(cowork, cx)
+            .into_iter()
+            .filter(|item| item.is_prompt())
+            .map(|item| item.body)
+            .collect()
+    }
+
+    fn focused_slot(
+        cowork: &Entity<Cowork>,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Option<EditorSlot> {
+        cx.update(|window, cx| {
+            cowork
+                .read(cx)
+                .focused_draft_editor(window, cx)
+                .map(|(_, slot, _)| slot)
+        })
+    }
+
+    #[gpui::test]
+    fn typing_at_the_draft_position_turns_it_into_a_block(cx: &mut gpui::TestAppContext) {
+        let (cowork, _runtime, cx) = composer_test_cowork(cx);
+        assert_eq!(focused_slot(&cowork, cx), Some(EditorSlot::DraftPosition));
+        let draft_position = cowork.read_with(cx, |cowork, _| {
+            cowork
+                .new_thread_draft
+                .draft_position
+                .clone()
+                .expect("draft position editor")
+        });
+
+        cx.simulate_input("hi");
+        cx.run_until_parked();
+
+        assert_eq!(prompt_bodies(&cowork, cx), ["hi"]);
+        let Some(EditorSlot::Prompt(id)) = focused_slot(&cowork, cx) else {
+            panic!("the new block should keep focus");
+        };
+        cowork.read_with(cx, |cowork, cx| {
+            let draft = &cowork.new_thread_draft;
+            // The same editor carries on, so typing is uninterrupted.
+            let block_editor = draft.editor(EditorSlot::Prompt(id)).expect("block editor");
+            assert_eq!(block_editor.entity_id(), draft_position.entity_id());
+            assert_eq!(block_editor.read(cx).value(), "hi");
+            let item = draft.doc.item(id).expect("block");
+            assert_eq!(item.creator, draft.author.as_uuid());
+            assert_ne!(
+                draft.draft_position.as_ref().map(Entity::entity_id),
+                Some(draft_position.entity_id())
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn up_and_down_move_between_blocks_and_the_draft_position(cx: &mut gpui::TestAppContext) {
+        let (cowork, _runtime, cx) = composer_test_cowork(cx);
+        cx.simulate_input("first");
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        assert_eq!(focused_slot(&cowork, cx), Some(EditorSlot::DraftPosition));
+
+        cx.simulate_input("second");
+        cx.run_until_parked();
+        assert_eq!(prompt_bodies(&cowork, cx), ["first", "second"]);
+        let items = new_thread_items(&cowork, cx);
+        assert_eq!(
+            focused_slot(&cowork, cx),
+            Some(EditorSlot::Prompt(items[1].id))
+        );
+
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        assert_eq!(
+            focused_slot(&cowork, cx),
+            Some(EditorSlot::Prompt(items[0].id))
+        );
+        // Up from the first line of the first editor stays put.
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        assert_eq!(
+            focused_slot(&cowork, cx),
+            Some(EditorSlot::Prompt(items[0].id))
+        );
+    }
+
+    #[gpui::test]
+    fn up_stays_inside_a_block_until_its_first_line(cx: &mut gpui::TestAppContext) {
+        let (cowork, _runtime, cx) = composer_test_cowork(cx);
+        cx.simulate_input("one");
+        cx.simulate_keystrokes("shift-enter");
+        cx.simulate_input("two");
+        cx.run_until_parked();
+        let first = new_thread_items(&cowork, cx)[0].id;
+        cx.simulate_keystrokes("down");
+        cx.run_until_parked();
+        assert_eq!(focused_slot(&cowork, cx), Some(EditorSlot::DraftPosition));
+
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        assert_eq!(focused_slot(&cowork, cx), Some(EditorSlot::Prompt(first)));
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        // Moved to the first line of the block rather than out of it.
+        assert_eq!(focused_slot(&cowork, cx), Some(EditorSlot::Prompt(first)));
+        cowork.read_with(cx, |cowork, cx| {
+            let editor = cowork
+                .new_thread_draft
+                .editor(EditorSlot::Prompt(first))
+                .expect("block editor");
+            assert!(editor.read(cx).cursor() <= "one".len());
+        });
+    }
+
+    #[gpui::test]
+    fn emptied_blocks_are_removed_by_escape_backspace_and_leaving(cx: &mut gpui::TestAppContext) {
+        let (cowork, _runtime, cx) = composer_test_cowork(cx);
+        cx.simulate_input("a");
+        cx.simulate_keystrokes("down");
+        cx.simulate_input("b");
+        cx.run_until_parked();
+        assert_eq!(prompt_bodies(&cowork, cx), ["a", "b"]);
+
+        // Emptying a block keeps it while the caret is in it; Escape removes
+        // it and returns to the draft position.
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        assert_eq!(prompt_bodies(&cowork, cx), ["a", ""]);
+        cx.simulate_keystrokes("escape");
+        cx.run_until_parked();
+        assert_eq!(prompt_bodies(&cowork, cx), ["a"]);
+        assert_eq!(focused_slot(&cowork, cx), Some(EditorSlot::DraftPosition));
+
+        // Backspace in the empty draft position steps back into the block,
+        // and once that is empty, Backspace removes it.
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        let first = new_thread_items(&cowork, cx)[0].id;
+        assert_eq!(focused_slot(&cowork, cx), Some(EditorSlot::Prompt(first)));
+        cx.simulate_keystrokes("backspace backspace");
+        cx.run_until_parked();
+        assert!(prompt_bodies(&cowork, cx).is_empty());
+        assert_eq!(focused_slot(&cowork, cx), Some(EditorSlot::DraftPosition));
+
+        // Leaving an emptied block removes it too.
+        cx.simulate_input("c");
+        cx.simulate_keystrokes("backspace");
+        cx.run_until_parked();
+        assert_eq!(prompt_bodies(&cowork, cx), [""]);
+        cx.update(|window, cx| {
+            cowork.update(cx, |cowork, cx| {
+                let draft_id = cowork.new_thread_draft.id;
+                cowork.focus_draft_editor(draft_id, EditorSlot::DraftPosition, None, window, cx);
+            });
+        });
+        // Focus changes are dispatched when the next frame is drawn.
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+        assert!(prompt_bodies(&cowork, cx).is_empty());
+    }
+
+    #[gpui::test]
+    fn both_editors_of_a_comment_show_the_same_text(cx: &mut gpui::TestAppContext) {
+        let (cowork, _runtime, cx) = composer_test_cowork(cx);
+        let comment = cowork.update(cx, |cowork, _| {
+            let draft = &cowork.new_thread_draft;
+            draft.doc.create_comment(
+                draft.author.as_uuid(),
+                CommentTarget {
+                    message_id: Uuid::new_v4(),
+                    range: 0..5,
+                    quote: "quote".into(),
+                },
+                "x",
+            )
+        });
+        cx.update(|window, cx| {
+            cowork.update(cx, |cowork, cx| {
+                let draft_id = cowork.new_thread_draft.id;
+                cowork.focus_draft_editor(
+                    draft_id,
+                    EditorSlot::CommentComposer(comment),
+                    Some(1),
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        cx.simulate_input("yz");
+        cx.run_until_parked();
+
+        cowork.read_with(cx, |cowork, cx| {
+            let draft = &cowork.new_thread_draft;
+            assert_eq!(draft.doc.body(comment).as_deref(), Some("xyz"));
+            let inline = draft
+                .editor(EditorSlot::CommentInline(comment))
+                .expect("inline editor");
+            assert_eq!(inline.read(cx).value(), "xyz");
+        });
+    }
+
+    #[gpui::test]
+    fn submissions_take_non_empty_items_and_leave_empty_ones(cx: &mut gpui::TestAppContext) {
+        let (cowork, _runtime, cx) = composer_test_cowork(cx);
+        let (empty_comment, submission) = cowork.update(cx, |cowork, _| {
+            let draft = &mut cowork.new_thread_draft;
+            let author = draft.author.as_uuid();
+            let target = CommentTarget {
+                message_id: Uuid::new_v4(),
+                range: 0..5,
+                quote: "quote".into(),
+            };
+            draft.doc.create_prompt(author, "first");
+            let empty_comment = draft.doc.create_comment(author, target.clone(), "  ");
+            draft.doc.create_comment(author, target, "why?");
+            draft.doc.create_prompt(author, "");
+            draft.doc.create_prompt(author, "second");
+            (empty_comment, Cowork::take_submission(draft))
+        });
+
+        let (comments, blocks, _) = submission.expect("something to submit");
+        assert_eq!(
+            blocks
+                .iter()
+                .map(|block| block.text.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+        assert!(matches!(
+            &comments[..],
+            [UserComment { body: UserCommentBody::Submitted(body), .. }] if body.as_ref() == "why?"
+        ));
+        let remaining = new_thread_items(&cowork, cx);
+        assert_eq!(remaining.len(), 2);
+        assert_eq!(remaining[0].id, empty_comment);
+        assert!(remaining.iter().all(DraftItem::is_empty));
+
+        let nothing_left = cowork.update(cx, |cowork, _| {
+            Cowork::take_submission(&mut cowork.new_thread_draft)
+        });
+        assert!(nothing_left.is_none());
+    }
+
+    #[gpui::test]
+    fn syncing_editors_leaves_an_ime_composition_alone(cx: &mut gpui::TestAppContext) {
+        let (cowork, _runtime, cx) = composer_test_cowork(cx);
+        cx.simulate_input("abc");
+        cx.run_until_parked();
+        let id = new_thread_items(&cowork, cx)[0].id;
+        let editor = cowork.read_with(cx, |cowork, _| {
+            cowork
+                .new_thread_draft
+                .editor(EditorSlot::Prompt(id))
+                .expect("block editor")
+        });
+
+        cx.update(|window, cx| {
+            editor.update(cx, |editor, cx| {
+                editor.replace_and_mark_text_in_range(None, "ka", None, window, cx);
+            });
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            let marked = editor.update(cx, |editor, cx| editor.marked_text_range(window, cx));
+            assert!(marked.is_some(), "the composition should still be active");
+            assert_eq!(editor.read(cx).value(), "abcka");
+        });
+    }
+
+    #[gpui::test]
+    fn the_attach_button_targets_the_focused_block_only(cx: &mut gpui::TestAppContext) {
+        let (cowork, _runtime, cx) = composer_test_cowork(cx);
+        let target = |cx: &mut gpui::VisualTestContext| {
+            cx.update(|window, cx| cowork.read(cx).attachment_target_at_focus(window, cx))
+        };
+        assert!(matches!(target(cx), AttachmentTarget::NewBlock(_)));
+
+        cx.simulate_input("block");
+        cx.run_until_parked();
+        let block = new_thread_items(&cowork, cx)[0].id;
+        assert_eq!(target(cx), AttachmentTarget::Block(block));
+
+        let comment = cowork.update(cx, |cowork, _| {
+            let draft = &cowork.new_thread_draft;
+            draft.doc.create_comment(
+                draft.author.as_uuid(),
+                CommentTarget {
+                    message_id: Uuid::new_v4(),
+                    range: 0..5,
+                    quote: "quote".into(),
+                },
+                "note",
+            )
+        });
+        cx.update(|window, cx| {
+            cowork.update(cx, |cowork, cx| {
+                let draft_id = cowork.new_thread_draft.id;
+                cowork.focus_draft_editor(
+                    draft_id,
+                    EditorSlot::CommentComposer(comment),
+                    None,
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+        assert!(matches!(target(cx), AttachmentTarget::NewBlock(_)));
+    }
+
+    #[gpui::test]
+    fn files_for_a_removed_block_land_in_a_new_one(cx: &mut gpui::TestAppContext) {
+        let (cowork, _runtime, cx) = composer_test_cowork(cx);
+        cx.simulate_input("block");
+        cx.run_until_parked();
+        let block = new_thread_items(&cowork, cx)[0].id;
+        let path = std::env::temp_dir().join(format!("cowork-{}.txt", Uuid::new_v4()));
+        std::fs::write(&path, "notes").expect("write test attachment");
+
+        cowork.update(cx, |cowork, cx| {
+            let draft_id = cowork.new_thread_draft.id;
+            cowork.add_attachments(
+                draft_id,
+                AttachmentTarget::Block(block),
+                vec![AttachmentSource::Path(path.clone())],
+                cx,
+            );
+            cowork.new_thread_draft.remove_items(&[block]);
+        });
+        cx.run_until_parked();
+        std::fs::remove_file(&path).expect("remove test attachment");
+
+        let items = new_thread_items(&cowork, cx);
+        assert_eq!(items.len(), 1);
+        assert_ne!(items[0].id, block);
+        assert!(matches!(
+            &items[0].kind,
+            DraftItemKind::Prompt { attachments } if attachments.len() == 1
+        ));
+        cowork.read_with(cx, |cowork, _| {
+            assert!(matches!(
+                draft_attachments(&cowork.new_thread_draft).as_slice(),
+                [FileAttachment { content: FileAttachmentContent::Text(text), .. }] if text == "notes"
+            ));
+        });
+    }
+
+    #[gpui::test]
+    fn submitting_keeps_focus_on_an_item_that_stays(cx: &mut gpui::TestAppContext) {
+        let (cowork, _runtime, cx) = composer_test_cowork(cx);
+        cx.simulate_input("question");
+        cx.run_until_parked();
+        let comment = cowork.update(cx, |cowork, _| {
+            let draft = &cowork.new_thread_draft;
+            draft.doc.create_comment(
+                draft.author.as_uuid(),
+                CommentTarget {
+                    message_id: Uuid::new_v4(),
+                    range: 0..5,
+                    quote: "quote".into(),
+                },
+                "",
+            )
+        });
+        cx.update(|window, cx| {
+            cowork.update(cx, |cowork, cx| {
+                let draft_id = cowork.new_thread_draft.id;
+                cowork.focus_draft_editor(
+                    draft_id,
+                    EditorSlot::CommentComposer(comment),
+                    None,
+                    window,
+                    cx,
+                );
+            });
+        });
+        cx.run_until_parked();
+
+        cx.update(|window, cx| {
+            cowork.update(cx, |cowork, cx| cowork.submit_composer(window, cx));
+        });
+        cx.run_until_parked();
+
+        assert_eq!(
+            focused_slot(&cowork, cx),
+            Some(EditorSlot::CommentComposer(comment))
+        );
+        cowork.read_with(cx, |cowork, cx| {
+            let thread = cowork
+                .active_thread(cx)
+                .expect("the submission started a thread");
+            let thread = thread.read(cx);
+            let remaining = thread.draft.doc.items();
+            assert_eq!(remaining.len(), 1);
+            assert_eq!(remaining[0].id, comment);
+            let [TimelineMessage::User(message), ..] = thread.timeline.as_slice() else {
+                panic!("expected the submitted message first");
+            };
+            assert_eq!(message.blocks.len(), 1);
+            assert_eq!(message.blocks[0].text, "question");
+            assert_eq!(thread.summary.title, "question");
+        });
+    }
+
+    #[test]
+    fn comment_instructions_name_each_comment_author() {
+        let author = ParticipantId::from_bytes([7; 16]);
+        let turn_comments = TurnComments::new(1);
+        let preface = Cowork::comments_preface(
+            &[UserComment {
+                id: Uuid::new_v4(),
+                author,
+                reference: CommentReference {
+                    message_id: Uuid::new_v4(),
+                    range: 0..5,
+                    quote: "quote".into(),
+                },
+                body: UserCommentBody::Submitted(" why? ".into()),
+            }],
+            turn_comments.comment_ids(),
+            &[],
+        )
+        .expect("comments need instructions");
+
+        assert!(preface.contains("comment_1 — Mossy Crane, on an excerpt"));
+        assert!(preface.contains("> quote\nComment: why?"));
+        assert_eq!(Cowork::comments_preface(&[], &[], &[]), None);
+    }
+
     #[gpui::test]
     fn participants_sit_beside_the_copy_link_button(cx: &mut gpui::TestAppContext) {
         cx.update(gpui_component::init);
@@ -6700,7 +8086,7 @@ mod tests {
         let tokio_handle = runtime.handle().clone();
         let thread_id = Uuid::new_v4();
         let (_, cx) = cx.add_window_view(|window, cx| {
-            let draft = Cowork::new_user_message_draft(ParticipantId::new(), window, cx);
+            let draft = ThreadDraft::new(ParticipantId::new());
             let mut thread = test_thread(thread_id, Vec::new(), draft);
             thread.participants = vec![
                 thread.participant_id,

@@ -6,11 +6,11 @@ Yrs document, and the protocol between host and collaborators.
 
 ## Status
 
-Step 1 of the [implementation order](#implementation-order) is done:
+Steps 1 and 2 of the [implementation order](#implementation-order) are done:
 participant identity, the protocol version handshake, shared model selection,
-and stopping from any participant. Collaborators are still read-only for the
-draft. The host's draft (one composer, pending comments, attachments) is
-local and unshared.
+stopping from any participant, and local Yrs drafts with prompt blocks,
+comments as items, per-block attachments, navigation, and empty-item removal.
+Collaborators are still read-only, and the draft is not yet synced.
 
 ## Summary
 
@@ -300,7 +300,8 @@ Also check the attached log.
 <attachment name="crash.log">...</attachment>
 ```
 
-The host titles a new thread from the first prompt block, as today.
+The host titles a new thread from the first prompt block, or from the first
+comment when a submission has only comments.
 
 Submitting while the agent is generating is rejected. Participants can keep
 editing the draft during generation.
