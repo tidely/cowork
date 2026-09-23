@@ -17,10 +17,9 @@ use gpui::{
     Animation, AnimationExt, AnyWindowHandle, App, AppContext, AssetSource, AsyncApp, Bounds,
     ClipboardItem, Context, Entity, Focusable, FontStyle, FontWeight, FutureExt, HighlightStyle,
     IntoElement, KeyBinding, KeyDownEvent, LineFragment, MouseButton, MouseDownEvent, MouseUpEvent,
-    PlatformInput, QuitMode, Render, ScrollHandle, ScrollWheelEvent, SharedString, SpringAnimation,
-    SpringConfig, Subscription, TitlebarOptions, WeakEntity, Window, WindowBounds,
-    WindowControlArea, WindowOptions, actions, canvas, div, img, point, prelude::*, px, rems, rgb,
-    rgba, size,
+    PlatformInput, QuitMode, Render, ScrollHandle, ScrollWheelEvent, SharedString, Subscription,
+    TitlebarOptions, WeakEntity, Window, WindowBounds, WindowControlArea, WindowOptions, actions,
+    canvas, div, img, point, prelude::*, px, rems, rgb, rgba, size,
 };
 use gpui_base::{
     GlobalState, SelectableText, TextSelection, TextSelectionLayer, TextView, TextViewDefaults,
@@ -29,8 +28,11 @@ use gpui_base::{
     text::{CodeBlock, SelectionFormat},
 };
 use gpui_component::{
-    Icon, Sizable as _,
-    button::{Button, ButtonCustomVariant, ButtonVariants as _},
+    Collapsible, Icon, Sizable as _, ThemeMode,
+    button::{Button, ButtonVariants as _},
+    sidebar::{
+        Sidebar, SidebarCollapsible, SidebarItem, SidebarMenu, SidebarMenuItem, SidebarToggleButton,
+    },
 };
 use gpui_kit_assets::IconName as AssetIconName;
 use iroh::{
@@ -178,7 +180,16 @@ fn highlight_code_block(block: &CodeBlock) -> Vec<(Range<usize>, HighlightStyle)
 
 gpui_kit_assets::icon_assets!(
     AppIconAssets,
-    [PanelLeftClose, PanelLeftOpen, SendHorizontal, Square]
+    [
+        ChevronDown,
+        ChevronRight,
+        PanelLeftClose,
+        PanelLeftOpen,
+        SendHorizontal,
+        Square,
+        SquarePen,
+        UsersRound,
+    ]
 );
 
 struct Assets;
@@ -769,6 +780,105 @@ struct ActiveGeneration {
     cancelled: Arc<AtomicBool>,
 }
 
+#[derive(Clone)]
+struct CoworkSidebarSection {
+    label: Option<SharedString>,
+    menu: SidebarMenu,
+    collapsed: bool,
+    open: bool,
+    on_label_click: Option<Rc<dyn Fn(&gpui::ClickEvent, &mut Window, &mut App)>>,
+}
+
+impl CoworkSidebarSection {
+    fn new(label: Option<impl Into<SharedString>>, menu: SidebarMenu) -> Self {
+        Self {
+            label: label.map(Into::into),
+            menu,
+            collapsed: false,
+            open: true,
+            on_label_click: None,
+        }
+    }
+
+    fn label_toggle(
+        mut self,
+        open: bool,
+        on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        self.open = open;
+        self.on_label_click = Some(Rc::new(on_click));
+        self
+    }
+}
+
+impl Collapsible for CoworkSidebarSection {
+    fn collapsed(mut self, collapsed: bool) -> Self {
+        self.collapsed = collapsed;
+        self
+    }
+
+    fn is_collapsed(&self) -> bool {
+        self.collapsed
+    }
+}
+
+impl SidebarItem for CoworkSidebarSection {
+    fn render(
+        self,
+        id: impl Into<gpui::ElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> impl IntoElement {
+        let id = id.into();
+        let open = self.open;
+        let on_label_click = self.on_label_click;
+
+        div()
+            .flex()
+            .flex_col()
+            .when_some(self.label, |this, label| {
+                this.child(
+                    div()
+                        .id(format!("{id}-label"))
+                        .h(px(38.))
+                        .flex()
+                        .items_end()
+                        .justify_between()
+                        .px_2()
+                        .pb_2()
+                        .text_sm()
+                        .text_color(rgb(0x71717a))
+                        .child(label)
+                        .when_some(on_label_click, |this, on_click| {
+                            this.cursor_pointer()
+                                .hover(|this| this.text_color(rgb(0xa1a1aa)))
+                                .on_click(move |event, window, cx| on_click(event, window, cx))
+                                .child(
+                                    Icon::new(if open {
+                                        AssetIconName::ChevronDown
+                                    } else {
+                                        AssetIconName::ChevronRight
+                                    })
+                                    .size_4()
+                                    .text_color(rgb(0xa1a1aa)),
+                                )
+                        }),
+                )
+            })
+            .when(open, |this| {
+                this.child(
+                    <SidebarMenu as SidebarItem>::render(
+                        self.menu.collapsed(self.collapsed),
+                        format!("{id}-menu"),
+                        window,
+                        cx,
+                    )
+                    .into_any_element(),
+                )
+            })
+    }
+}
+
 struct Cowork {
     sidebar_open: bool,
     recents_open: bool,
@@ -914,16 +1024,6 @@ impl Cowork {
     }
 
     fn render_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (icon, label) = if self.sidebar_open {
-            (AssetIconName::PanelLeftClose, "Hide sidebar")
-        } else {
-            (AssetIconName::PanelLeftOpen, "Show sidebar")
-        };
-        let variant = ButtonCustomVariant::new(cx)
-            .foreground(rgb(0xe4e4e7).into())
-            .hover(rgb(0x2d2d30).into())
-            .active(rgb(0x3a3a3e).into());
-
         div()
             .when(cfg!(target_os = "macos"), |this| {
                 this.ml(macos_sidebar_toggle_margin())
@@ -936,11 +1036,8 @@ impl Cowork {
                 }),
             )
             .child(
-                Button::new("toggle-sidebar")
-                    .custom(variant)
-                    .small()
-                    .icon(Icon::new(icon).size_4())
-                    .accessibility_label(label)
+                SidebarToggleButton::new()
+                    .collapsed(!self.sidebar_open)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.sidebar_open = !this.sidebar_open;
                         cx.notify();
@@ -1523,36 +1620,21 @@ impl Cowork {
         cx.notify();
     }
 
-    fn render_sidebar_thread(
+    fn sidebar_thread_item(
         &self,
         thread_id: Uuid,
         thread: &ThreadSummary,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        div()
-            .id(thread_id.to_string())
-            .h(px(30.))
-            .w_full()
-            .px_2()
-            .flex()
-            .items_center()
-            .rounded_md()
-            .cursor_pointer()
-            .when(self.active_thread_id == Some(thread_id), |this| {
-                this.bg(rgb(0x2d2d30))
-            })
-            .hover(|this| this.bg(rgb(0x3a3a3e)))
+    ) -> SidebarMenuItem {
+        SidebarMenuItem::new(thread.title.clone())
+            .min_h(px(30.))
+            .active(self.active_thread_id == Some(thread_id))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.open_thread(thread_id, window, cx);
             }))
-            .text_sm()
-            .text_color(rgb(0xd4d4d8))
-            .truncate()
-            .child(thread.title.clone())
-            .into_any_element()
     }
 
-    fn render_sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (collaborating_threads, recent_threads): (Vec<_>, Vec<_>) = self
             .thread_store
             .read(cx)
@@ -1567,141 +1649,90 @@ impl Cowork {
                 )
             })
             .partition(|(_, _, collaborating)| *collaborating);
-        let recents_arrow = div()
-            .size(px(16.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .child(if self.recents_open { "⌄" } else { "›" });
 
-        div()
-            .h_full()
-            .w(SIDEBAR_WIDTH)
-            .flex_none()
-            .overflow_hidden()
-            .child(
-                div()
-                    .h_full()
-                    .w(SIDEBAR_WIDTH)
-                    .flex_none()
-                    .flex()
-                    .flex_col()
-                    .bg(rgb(0x1c1c1f))
-                    .child(
-                        div()
-                            .h(px(42.))
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .px_3()
-                            .text_size(px(18.))
-                            .text_color(rgb(0xe4e4e7))
-                            .child("Cowork"),
-                    )
-                    .child(
-                        div()
-                            .id("new-chat")
-                            .h(px(34.))
-                            .mx_2()
-                            .px_2()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .when(self.active_thread_id.is_none(), |this| {
-                                this.bg(rgb(0x2d2d30))
-                            })
-                            .hover(|this| this.bg(rgb(0x3a3a3e)))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.new_thread_draft = Self::new_user_message_draft(window, cx);
-                                this.active_thread_id = None;
-                                this.selection_message_id = None;
-                                Self::draft_composer(&this.new_thread_draft)
-                                    .focus_handle(cx)
-                                    .focus(window, cx);
-                                cx.notify();
-                            }))
-                            .text_sm()
-                            .text_color(rgb(0xf4f4f5))
-                            .child("✎")
-                            .child("New chat"),
-                    )
-                    .child(
-                        div()
-                            .id("join-shared-thread")
-                            .h(px(34.))
-                            .mx_2()
-                            .px_2()
-                            .flex_none()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .rounded_md()
-                            .cursor_pointer()
-                            .hover(|this| this.bg(rgb(0x3a3a3e)))
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.open_join_dialog(window, cx);
-                            }))
-                            .text_sm()
-                            .text_color(rgb(0xf4f4f5))
-                            .child("🔗")
-                            .child("Join shared thread"),
-                    )
-                    .when(!collaborating_threads.is_empty(), |this| {
-                        this.child(
-                            div()
-                                .h(px(44.))
-                                .flex_none()
-                                .flex()
-                                .items_end()
-                                .px_3()
-                                .pb_2()
-                                .text_sm()
-                                .text_color(rgb(0x71717a))
-                                .child("Collaborating"),
+        let actions = CoworkSidebarSection::new(
+            None::<SharedString>,
+            SidebarMenu::new()
+                .child(
+                    SidebarMenuItem::new("New chat")
+                        .min_h(px(34.))
+                        .icon(
+                            Icon::new(AssetIconName::SquarePen)
+                                .size_4()
+                                .text_color(rgb(0xe4e4e7)),
                         )
-                        .child(
-                            div()
-                                .flex_none()
-                                .px_2()
-                                .children(collaborating_threads.iter().map(
-                                    |(thread_id, thread, _)| {
-                                        self.render_sidebar_thread(*thread_id, thread, cx)
-                                    },
-                                )),
+                        .active(self.active_thread_id.is_none())
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.new_thread_draft = Self::new_user_message_draft(window, cx);
+                            this.active_thread_id = None;
+                            this.selection_message_id = None;
+                            Self::draft_composer(&this.new_thread_draft)
+                                .focus_handle(cx)
+                                .focus(window, cx);
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    SidebarMenuItem::new("Join shared thread")
+                        .min_h(px(34.))
+                        .icon(
+                            Icon::new(AssetIconName::UsersRound)
+                                .size_4()
+                                .text_color(rgb(0xe4e4e7)),
                         )
-                    })
-                    .child(
-                        div()
-                            .id("toggle-recents")
-                            .h(px(44.))
-                            .flex_none()
-                            .flex()
-                            .items_end()
-                            .justify_between()
-                            .px_3()
-                            .pb_2()
-                            .cursor_pointer()
-                            .text_sm()
-                            .text_color(rgb(0x71717a))
-                            .hover(|this| this.text_color(rgb(0xa1a1aa)))
-                            .on_click(cx.listener(|this, _, _, cx| {
-                                this.recents_open = !this.recents_open;
-                                cx.notify();
-                            }))
-                            .child("Recents")
-                            .child(recents_arrow),
-                    )
-                    .when(self.recents_open, |this| {
-                        this.child(div().flex_1().min_h_0().overflow_hidden().px_2().children(
-                            recent_threads.iter().map(|(thread_id, thread, _)| {
-                                self.render_sidebar_thread(*thread_id, thread, cx)
-                            }),
-                        ))
-                    }),
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_join_dialog(window, cx);
+                        })),
+                ),
+        );
+
+        let collaborating =
+            CoworkSidebarSection::new(
+                Some("Collaborating"),
+                SidebarMenu::new().children(collaborating_threads.iter().map(
+                    |(thread_id, thread, _)| self.sidebar_thread_item(*thread_id, thread, cx),
+                )),
+            );
+
+        let recents =
+            CoworkSidebarSection::new(
+                Some("Recents"),
+                SidebarMenu::new().children(recent_threads.iter().map(|(thread_id, thread, _)| {
+                    self.sidebar_thread_item(*thread_id, thread, cx)
+                })),
             )
+            .label_toggle(
+                self.recents_open,
+                cx.listener(|this, _, _, cx| {
+                    this.recents_open = !this.recents_open;
+                    cx.notify();
+                }),
+            );
+
+        let sidebar = Sidebar::new("cowork-sidebar")
+            .w(SIDEBAR_WIDTH)
+            .bg(rgb(0x1c1c1f))
+            .border_r_0()
+            .collapsible(SidebarCollapsible::Offcanvas)
+            .collapsed(!self.sidebar_open)
+            .header(
+                div()
+                    .h(px(42.))
+                    .flex()
+                    .items_center()
+                    .px_2()
+                    .text_size(px(18.))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Cowork"),
+            )
+            .child(actions);
+        let sidebar = if collaborating_threads.is_empty() {
+            sidebar
+        } else {
+            sidebar.child(collaborating)
+        };
+
+        sidebar.child(recents)
     }
 
     fn render_join_dialog(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
@@ -3350,7 +3381,6 @@ impl Cowork {
         } else {
             Button::new("send-message")
                 .icon(Icon::new(AssetIconName::SendHorizontal))
-                .primary()
                 .small()
                 .accessibility_label("Send message")
                 .on_click(cx.listener(Self::composer_button_clicked))
@@ -3623,11 +3653,6 @@ impl Cowork {
 
 impl Render for Cowork {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let sidebar_width = if self.sidebar_open {
-            SIDEBAR_WIDTH
-        } else {
-            px(0.)
-        };
         let composer = self.editable_composer(cx);
         let read_only_line_bounds = Rc::new(Cell::new(None));
 
@@ -3649,15 +3674,7 @@ impl Render for Cowork {
                     .min_h_0()
                     .flex()
                     .overflow_hidden()
-                    .child(
-                        self.render_sidebar(cx).with_spring(
-                            "sidebar-width",
-                            SpringAnimation::new(SpringConfig::new(250., 30., 1.))
-                                .to(sidebar_width)
-                                .with_epsilon(0.25),
-                            |sidebar, width| sidebar.w(width),
-                        ),
-                    )
+                    .child(self.render_sidebar(cx))
                     .child(
                         div()
                             .h_full()
@@ -3698,6 +3715,7 @@ fn main() -> anyhow::Result<()> {
         .with_assets(Assets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
+            gpui_component::Theme::change(ThemeMode::Dark, None, cx);
             TextViewDefaults::new()
                 .with_code_block_highlighter(highlight_code_block)
                 .install(cx);
