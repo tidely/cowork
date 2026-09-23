@@ -6,11 +6,11 @@ Yrs document, and the protocol between host and collaborators.
 
 ## Status
 
-Not implemented. Today a shared thread has one host who can write and any
-number of read-only collaborators. The host's draft (one composer, pending
-comments, attachments) is local and unshared. See
-[Implementation order](#implementation-order) for how we get from there to
-this spec.
+Step 1 of the [implementation order](#implementation-order) is done:
+participant identity, the protocol version handshake, shared model selection,
+and stopping from any participant. Collaborators are still read-only for the
+draft. The host's draft (one composer, pending comments, attachments) is
+local and unshared.
 
 ## Summary
 

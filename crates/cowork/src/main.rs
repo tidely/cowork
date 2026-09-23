@@ -32,13 +32,13 @@ use gpui_base::{
     text::{CodeBlock, SelectionFormat},
 };
 use gpui_component::{
-    Collapsible, Disableable as _, Icon, IndexPath, Root, Sizable as _, ThemeMode, WindowExt as _,
+    Collapsible, Disableable as _, Icon, Root, Sizable as _, ThemeMode, WindowExt as _,
     attachment::{
         Attachment, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentMedia,
         AttachmentStatus, AttachmentTitle,
     },
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
-    combobox::{Combobox, ComboboxState},
+    combobox::{Combobox, ComboboxEvent, ComboboxState},
     dialog::{DialogDescription, DialogFooter, DialogHeader, DialogTitle},
     progress::Progress,
     searchable_list::{SearchableGroup, SearchableListItem, SearchableVec},
@@ -46,6 +46,7 @@ use gpui_component::{
     sidebar::{
         Sidebar, SidebarCollapsible, SidebarItem, SidebarMenu, SidebarMenuItem, SidebarToggleButton,
     },
+    tooltip::Tooltip,
 };
 use gpui_kit_assets::IconName as AssetIconName;
 use iroh::{
@@ -53,6 +54,7 @@ use iroh::{
     endpoint::{Accepting, Connection, presets},
 };
 use itertools::Itertools;
+use participant::ParticipantId;
 use rig::{
     completion::{
         Message as RigMessage,
@@ -77,6 +79,7 @@ use tokio::{
 use tools::{RespondToComment, RespondToCommentArgs, TurnComments};
 use uuid::Uuid;
 
+mod participant;
 mod protocol;
 
 const SIDEBAR_WIDTH: gpui::Pixels = px(275.);
@@ -580,11 +583,11 @@ actions!(cowork, [Quit, SubmitComposer]);
 
 #[derive(Clone, Copy)]
 enum MessageAuthor {
-    User,
+    User(ParticipantId),
     Agent,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum ModelProvider {
     Ollama,
 }
@@ -603,11 +606,35 @@ impl ModelProvider {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct ModelSelection {
     catalog_id: &'static str,
     provider: ModelProvider,
     model: &'static str,
+}
+
+const RECOMMENDED_QWEN: ModelSelection = ModelSelection {
+    catalog_id: "recommended-qwen-3.8-27b",
+    provider: ModelProvider::Ollama,
+    model: OLLAMA_MODEL,
+};
+const OLLAMA_QWEN: ModelSelection = ModelSelection {
+    catalog_id: "ollama-qwen-3.8-27b",
+    provider: ModelProvider::Ollama,
+    model: OLLAMA_MODEL,
+};
+/// Every model the picker offers. Collaborators select models by catalog id,
+/// so changing this catalog also requires bumping
+/// [`protocol::PROTOCOL_VERSION`].
+const MODEL_CATALOG: [ModelSelection; 2] = [RECOMMENDED_QWEN, OLLAMA_QWEN];
+const DEFAULT_MODEL: ModelSelection = RECOMMENDED_QWEN;
+
+impl ModelSelection {
+    fn from_catalog_id(catalog_id: &str) -> Option<Self> {
+        MODEL_CATALOG
+            .into_iter()
+            .find(|model| model.catalog_id == catalog_id)
+    }
 }
 
 #[derive(Clone)]
@@ -617,18 +644,10 @@ struct LanguageModel {
 }
 
 impl LanguageModel {
-    fn ollama(
-        catalog_id: &'static str,
-        name: impl Into<SharedString>,
-        model: &'static str,
-    ) -> Self {
+    fn new(name: impl Into<SharedString>, selection: ModelSelection) -> Self {
         Self {
             name: name.into(),
-            selection: ModelSelection {
-                catalog_id,
-                provider: ModelProvider::Ollama,
-                model,
-            },
+            selection,
         }
     }
 }
@@ -678,16 +697,10 @@ type ModelPickerState = ComboboxState<ModelPickerItems>;
 
 fn language_model_groups() -> ModelPickerItems {
     SearchableVec::new(vec![
-        SearchableGroup::new("Recommended").item(LanguageModel::ollama(
-            "recommended-qwen-3.8-27b",
-            "Qwen 3.8 27B",
-            OLLAMA_MODEL,
-        )),
-        SearchableGroup::new(ModelProvider::Ollama.label()).item(LanguageModel::ollama(
-            "ollama-qwen-3.8-27b",
-            "Qwen 3.8 27B",
-            OLLAMA_MODEL,
-        )),
+        SearchableGroup::new("Recommended")
+            .item(LanguageModel::new("Qwen 3.8 27B", RECOMMENDED_QWEN)),
+        SearchableGroup::new(ModelProvider::Ollama.label())
+            .item(LanguageModel::new("Qwen 3.8 27B", OLLAMA_QWEN)),
     ])
 }
 
@@ -723,6 +736,8 @@ struct AgentCommentResponse {
 #[derive(Clone)]
 struct UserMessageGroup {
     id: Uuid,
+    /// Who submitted the message, or for a draft, who is writing it.
+    author: ParticipantId,
     comments: Vec<UserComment>,
     attachments: Vec<FileAttachment>,
     content: UserMessageContent,
@@ -741,6 +756,7 @@ enum UserMessageContent {
 #[derive(Clone)]
 struct UserComment {
     id: Uuid,
+    author: ParticipantId,
     reference: CommentReference,
     body: UserCommentBody,
 }
@@ -812,10 +828,10 @@ enum ThreadSharing {
     },
     /// Mirroring someone else's thread.
     ///
-    /// `connection` and `host` are held rather than read: they keep the QUIC
-    /// connection and its protocol stream open, so replacing this state is what
-    /// disconnects. `host` is also where peer specific requests, such as
-    /// permission changes, will be sent from.
+    /// `endpoint` and `connection` are held rather than read: together with
+    /// `host` they keep the QUIC connection and its protocol stream open, so
+    /// replacing this state is what disconnects. Requests to the host, such as
+    /// selecting a model, are sent on `host`.
     #[allow(dead_code, reason = "fields are held open for their lifetime")]
     Connected {
         endpoint: Endpoint,
@@ -877,6 +893,13 @@ struct Thread {
     /// thread, so this must remain distinct from `summary.id`.
     instance_id: Uuid,
     summary: ThreadSummary,
+    /// Who the local user is in this thread: the app's own id for local and
+    /// hosted threads, the id the host assigned for mirrored ones.
+    participant_id: ParticipantId,
+    /// Connected participants in join order, starting with the host. Empty
+    /// while the thread is not shared.
+    participants: Vec<ParticipantId>,
+    model: ModelSelection,
     timeline: Vec<TimelineMessage>,
     draft: UserMessageGroup,
     generating: bool,
@@ -891,6 +914,7 @@ impl UserComment {
         };
         Some(protocol::UserComment {
             id: self.id.into_bytes(),
+            author: self.author.into_bytes(),
             reference: protocol::CommentReference {
                 message_id: self.reference.message_id.into_bytes(),
                 range: self.reference.range.clone(),
@@ -905,6 +929,7 @@ impl protocol::UserComment {
     fn into_native(self) -> UserComment {
         UserComment {
             id: Uuid::from_bytes(self.id),
+            author: ParticipantId::from_bytes(self.author),
             reference: CommentReference {
                 message_id: Uuid::from_bytes(self.reference.message_id),
                 range: self.reference.range,
@@ -922,6 +947,7 @@ impl UserMessageGroup {
         };
         Some(protocol::UserMessage {
             id: self.id.into_bytes(),
+            author: self.author.into_bytes(),
             text: text.clone(),
             comments: self
                 .comments
@@ -941,6 +967,7 @@ impl protocol::UserMessage {
     fn into_native(self) -> UserMessageGroup {
         UserMessageGroup {
             id: Uuid::from_bytes(self.id),
+            author: ParticipantId::from_bytes(self.author),
             comments: self
                 .comments
                 .into_iter()
@@ -1049,36 +1076,122 @@ impl protocol::TimelineMessage {
 
 impl Thread {
     /// Builds the local mirror of a thread hosted by someone else.
-    fn from_snapshot(
-        snapshot: protocol::ThreadSnapshot,
+    fn from_welcome(
+        welcome: protocol::Welcome,
         draft: UserMessageGroup,
         sharing: ThreadSharing,
         cx: &mut impl AppContext,
     ) -> Self {
-        let (summary, timeline) = snapshot.into_native(cx);
         let mut thread = Self {
             instance_id: Uuid::new_v4(),
-            summary,
+            summary: ThreadSummary {
+                id: Uuid::from_bytes(welcome.thread.id),
+                title: String::new(),
+            },
+            participant_id: ParticipantId::from_bytes(welcome.participant_id),
+            participants: Vec::new(),
+            model: DEFAULT_MODEL,
             timeline: Vec::new(),
             draft,
             generating: false,
             sharing,
             ownership: ThreadOwnership::Remote,
         };
-        thread.set_timeline(timeline);
+        thread.rebase(welcome, cx);
         thread
+    }
+
+    /// Replaces everything the host is authoritative for with its snapshot.
+    fn rebase(&mut self, welcome: protocol::Welcome, cx: &mut impl AppContext) {
+        let protocol::Welcome {
+            participant_id,
+            thread,
+        } = welcome;
+        self.participant_id = ParticipantId::from_bytes(participant_id);
+        self.draft.author = self.participant_id;
+        self.participants = thread
+            .participants
+            .iter()
+            .copied()
+            .map(ParticipantId::from_bytes)
+            .collect();
+        // Only a model this app does not know about can fail to resolve, and
+        // the protocol version check rules that out between matching apps.
+        if let Some(model) = ModelSelection::from_catalog_id(&thread.model) {
+            self.model = model;
+        }
+        let (summary, timeline) = thread.into_native(cx);
+        self.summary = summary;
+        self.set_timeline(timeline);
     }
 
     fn to_protocol(&self) -> protocol::ThreadSnapshot {
         protocol::ThreadSnapshot {
             id: self.summary.id.into_bytes(),
             title: self.summary.title.clone(),
+            participants: self
+                .participants
+                .iter()
+                .map(|participant| participant.into_bytes())
+                .collect(),
+            model: self.model.catalog_id.into(),
             messages: self
                 .timeline
                 .iter()
                 .filter_map(TimelineMessage::to_protocol)
                 .collect(),
         }
+    }
+
+    /// Sends a request to the host of a mirrored thread. Returns `false` when
+    /// this thread is not mirrored or the host is unreachable.
+    fn request(&self, request: protocol::CollaboratorMessage) -> bool {
+        let ThreadSharing::Connected { host, .. } = &self.sharing else {
+            return false;
+        };
+        match host.try_send(request) {
+            Ok(()) => true,
+            Err(error) => {
+                eprintln!("failed to send request to host: {error}");
+                false
+            }
+        }
+    }
+
+    /// Selects the thread's model on behalf of the local user.
+    ///
+    /// A mirrored thread shows the selection immediately and asks the host to
+    /// apply it; the host's broadcast then settles concurrent selections in
+    /// the same order on every participant.
+    fn select_model(&mut self, model: ModelSelection, cx: &mut impl AppContext) {
+        if self.model == model {
+            return;
+        }
+        if matches!(self.sharing, ThreadSharing::Connected { .. }) {
+            let sent = self.request(protocol::CollaboratorMessage::SelectModel {
+                catalog_id: model.catalog_id.into(),
+            });
+            // Showing a model the host never heard about would silently run
+            // the agent with a different one.
+            if sent {
+                self.model = model;
+            }
+        } else {
+            self.emit(
+                protocol::HostMessage::ModelSelected {
+                    catalog_id: model.catalog_id.into(),
+                },
+                cx,
+            );
+        }
+    }
+
+    /// The agent message currently being generated, if any.
+    fn running_agent_message_id(&self) -> Option<Uuid> {
+        self.timeline.iter().rev().find_map(|entry| match entry {
+            TimelineMessage::Agent(message) if !message.complete => Some(message.id),
+            _ => None,
+        })
     }
 
     /// Subscribes to this thread's events, returning `None` when it is not
@@ -1124,10 +1237,25 @@ impl Thread {
     /// Folds a thread event into the timeline.
     fn apply(&mut self, event: protocol::HostMessage, cx: &mut impl AppContext) {
         match event {
-            protocol::HostMessage::Welcome(snapshot) => {
-                let (summary, timeline) = snapshot.into_native(cx);
-                self.summary = summary;
-                self.set_timeline(timeline);
+            protocol::HostMessage::Welcome(welcome) => self.rebase(welcome, cx),
+            // Only ever sent in place of the first `Welcome`, which the join
+            // handshake consumes.
+            protocol::HostMessage::Rejected(_) => {}
+            protocol::HostMessage::ParticipantJoined(participant) => {
+                let participant = ParticipantId::from_bytes(participant);
+                if !self.participants.contains(&participant) {
+                    self.participants.push(participant);
+                }
+            }
+            protocol::HostMessage::ParticipantLeft(participant) => {
+                let participant = ParticipantId::from_bytes(participant);
+                self.participants
+                    .retain(|existing| *existing != participant);
+            }
+            protocol::HostMessage::ModelSelected { catalog_id } => {
+                if let Some(model) = ModelSelection::from_catalog_id(&catalog_id) {
+                    self.model = model;
+                }
             }
             protocol::HostMessage::ThreadTitled(title) => self.summary.title = title,
             protocol::HostMessage::UserMessage(message) => self
@@ -1396,20 +1524,89 @@ struct Cowork {
     join_dialog: Option<Entity<JoinDialog>>,
     tokio_handle: tokio::runtime::Handle,
     active_generations: HashMap<Uuid, ActiveGeneration>,
+    /// Who the local user is in the threads this app creates and hosts.
+    local_participant_id: ParticipantId,
+    /// The model new threads start with: the last one selected locally.
+    new_thread_model: ModelSelection,
+    /// Always shows the active thread's model; see [`Cowork::sync_model_picker`].
     model_picker: Entity<ModelPickerState>,
     model_picker_hovered: bool,
+    _model_picker_subscription: Subscription,
     _window_activation_subscription: Subscription,
 }
 
 impl Cowork {
-    fn new_model_picker(window: &mut Window, cx: &mut App) -> Entity<ModelPickerState> {
-        cx.new(|cx| {
-            ComboboxState::new(language_model_groups(), vec![IndexPath::new(0)], window, cx)
-                .searchable(true)
-        })
+    /// Creates the model picker and subscribes `Cowork` to the user's picks.
+    fn new_model_picker(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> (Entity<ModelPickerState>, Subscription) {
+        let picker = cx.new(|cx| {
+            let mut picker = ComboboxState::new(language_model_groups(), Vec::new(), window, cx)
+                .searchable(true);
+            picker.set_selected_values(&[DEFAULT_MODEL], window, cx);
+            picker
+        });
+        let subscription = cx.subscribe(&picker, Self::model_picker_event);
+        (picker, subscription)
     }
 
-    fn new_user_message_draft(window: &mut Window, cx: &mut App) -> UserMessageGroup {
+    fn model_picker_event(
+        &mut self,
+        _: Entity<ModelPickerState>,
+        event: &ComboboxEvent<ModelPickerItems>,
+        cx: &mut Context<Self>,
+    ) {
+        if let ComboboxEvent::Change(selection) = event
+            && let Some(model) = selection.first().copied()
+        {
+            self.select_model(model, cx);
+        }
+    }
+
+    /// Applies a model picked by the local user to the active thread, and to
+    /// every new thread from now on.
+    fn select_model(&mut self, model: ModelSelection, cx: &mut Context<Self>) {
+        self.new_thread_model = model;
+        if let Some(thread) = self.active_thread(cx) {
+            thread.update(cx, |thread, cx| thread.select_model(model, cx));
+        }
+        cx.notify();
+    }
+
+    fn active_thread(&self, cx: &App) -> Option<Entity<Thread>> {
+        self.active_thread_id
+            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
+    }
+
+    /// The model of the active thread, or of the thread about to be created.
+    fn active_model(&self, cx: &App) -> ModelSelection {
+        self.active_thread(cx)
+            .map(|thread| thread.read(cx).model)
+            .unwrap_or(self.new_thread_model)
+    }
+
+    /// Points the picker at the active thread's model.
+    ///
+    /// The picker is shared by every thread, while each thread has its own
+    /// model that collaborators can change at any time, so it is re-synced on
+    /// every render rather than at each of the places either can change.
+    /// Setting the selection does not emit a picker event, so this never feeds
+    /// back into [`Cowork::select_model`].
+    fn sync_model_picker(&self, window: &mut Window, cx: &mut App) {
+        let model = self.active_model(cx);
+        if self.model_picker.read(cx).selected_value() != Some(model) {
+            self.model_picker.update(cx, |picker, cx| {
+                picker.set_selected_values(&[model], window, cx);
+            });
+        }
+    }
+
+    fn new_user_message_draft(
+        author: ParticipantId,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> UserMessageGroup {
         let composer = cx.new(|cx| {
             let mut composer = TextareaState::new(window, cx).auto_grow(1, usize::MAX);
             composer.set_editor_style(InputEditorStyle {
@@ -1420,6 +1617,7 @@ impl Cowork {
         });
         UserMessageGroup {
             id: Uuid::new_v4(),
+            author,
             comments: Vec::new(),
             attachments: Vec::new(),
             content: UserMessageContent::Editing(composer),
@@ -1463,20 +1661,46 @@ impl Cowork {
         })
     }
 
-    fn new_empty_local_thread(draft: UserMessageGroup, cx: &mut App) -> Entity<Thread> {
+    fn new_local_thread(
+        title: String,
+        timeline: Vec<TimelineMessage>,
+        draft: UserMessageGroup,
+        participant_id: ParticipantId,
+        model: ModelSelection,
+        cx: &mut App,
+    ) -> Entity<Thread> {
         let thread_id = Uuid::new_v4();
         cx.new(|_| Thread {
             instance_id: thread_id,
             summary: ThreadSummary {
                 id: thread_id,
-                title: "New thread".into(),
+                title,
             },
-            timeline: Vec::new(),
+            participant_id,
+            participants: Vec::new(),
+            model,
+            timeline,
             draft,
             generating: false,
             sharing: ThreadSharing::NotShared,
             ownership: ThreadOwnership::Local,
         })
+    }
+
+    fn new_empty_local_thread(
+        draft: UserMessageGroup,
+        participant_id: ParticipantId,
+        model: ModelSelection,
+        cx: &mut App,
+    ) -> Entity<Thread> {
+        Self::new_local_thread(
+            "New thread".into(),
+            Vec::new(),
+            draft,
+            participant_id,
+            model,
+            cx,
+        )
     }
 
     fn prepare_thread_for_sharing(
@@ -1491,9 +1715,14 @@ impl Cowork {
             return thread;
         }
 
-        let next_draft = Self::new_user_message_draft(window, cx);
+        let next_draft = Self::new_user_message_draft(self.local_participant_id, window, cx);
         let draft = std::mem::replace(&mut self.new_thread_draft, next_draft);
-        let thread = Self::new_empty_local_thread(draft, cx);
+        let thread = Self::new_empty_local_thread(
+            draft,
+            self.local_participant_id,
+            self.new_thread_model,
+            cx,
+        );
         self.active_thread_id = Some(thread.read(cx).instance_id);
         self.thread_store.update(cx, |store, _| {
             store.threads.push_front(thread.clone());
@@ -1587,6 +1816,7 @@ impl Cowork {
                     endpoint,
                     events: broadcast::channel(THREAD_EVENT_CAPACITY).0,
                 };
+                thread.participants = vec![thread.participant_id];
             });
             if this.update(cx, |_, cx| cx.notify()).is_err() {
                 return;
@@ -1597,9 +1827,10 @@ impl Cowork {
             // before that wait in the channel.
             let thread = thread.downgrade();
             while let Ok(peer) = accepted_peers.recv().await {
+                let this = this.clone();
                 let thread = thread.clone();
                 cx.spawn(async move |cx| {
-                    if let Err(error) = Self::serve_peer(thread, peer, cx).await {
+                    if let Err(error) = Self::serve_peer(this, thread, peer, cx).await {
                         eprintln!("stopped serving collaborator: {error:#}");
                     }
                 })
@@ -1663,13 +1894,10 @@ impl Cowork {
             .context("Shared thread is no longer available.")
     }
 
-    /// Streams the shared thread to one collaborator for as long as it stays
-    /// connected.
-    ///
-    /// The collaborator is first re-based onto a snapshot, then fed the thread's
-    /// events verbatim. Peer specific requests flow the other way on the peer's
-    /// own channel.
+    /// Serves one collaborator for as long as it stays connected, keeping it
+    /// listed as a participant for exactly that long.
     async fn serve_peer(
+        cowork: WeakEntity<Self>,
         thread: WeakEntity<Thread>,
         peer: HostPeer,
         cx: &mut AsyncApp,
@@ -1679,39 +1907,87 @@ impl Cowork {
             .with_timeout(PEER_TIMEOUT, cx.background_executor())
             .await?
             .context("Peer closed before joining.")?;
-        anyhow::ensure!(
-            join == protocol::CollaboratorMessage::Join,
-            "Expected a join message, got {join:?}."
-        );
+        let protocol::CollaboratorMessage::Join { protocol_version } = join else {
+            anyhow::bail!("Expected a join message, got {join:?}.");
+        };
+        if protocol_version != protocol::PROTOCOL_VERSION {
+            let reason = format!(
+                "The host uses collaboration protocol version {}, but this app uses version \
+                 {protocol_version}. Both participants need the same version of Cowork.",
+                protocol::PROTOCOL_VERSION,
+            );
+            _ = peer.send(protocol::HostMessage::Rejected(reason)).await;
+            // Dropping the peer would tear down the connection right away,
+            // which may discard the rejection before it is delivered. The
+            // collaborator hangs up once it has read it.
+            while peer
+                .receive()
+                .with_timeout(PEER_TIMEOUT, cx.background_executor())
+                .await
+                .is_ok_and(|request| request.is_some())
+            {}
+            anyhow::bail!("Rejected a peer using protocol version {protocol_version}.");
+        }
 
-        // Drain peer specific requests so that a peer which stops reading its
-        // own replies can never stall the event stream it is subscribed to.
-        cx.spawn({
-            let requests = peer.incoming.clone();
-            async move |_| {
-                while let Ok(request) = requests.recv().await {
-                    match request {
-                        protocol::CollaboratorMessage::Join => {}
-                    }
-                }
-            }
-        })
-        .detach();
+        let participant_id = ParticipantId::new();
+        thread.update(cx, |thread, cx| {
+            thread.emit(
+                protocol::HostMessage::ParticipantJoined(participant_id.into_bytes()),
+                cx,
+            );
+        })?;
+        _ = cowork.update(cx, |_, cx| cx.notify());
 
-        let mut events = Self::send_snapshot(&thread, &peer, cx).await?;
+        let result = Self::serve_participant(&cowork, &thread, participant_id, &peer, cx).await;
+
+        _ = thread.update(cx, |thread, cx| {
+            thread.emit(
+                protocol::HostMessage::ParticipantLeft(participant_id.into_bytes()),
+                cx,
+            );
+        });
+        _ = cowork.update(cx, |_, cx| cx.notify());
+        result
+    }
+
+    /// Re-bases a joined collaborator onto a snapshot, then feeds it the
+    /// thread's events verbatim while handling its requests, until either
+    /// side goes away.
+    async fn serve_participant(
+        cowork: &WeakEntity<Self>,
+        thread: &WeakEntity<Thread>,
+        participant_id: ParticipantId,
+        peer: &HostPeer,
+        cx: &mut AsyncApp,
+    ) -> anyhow::Result<()> {
+        let mut events = Self::send_snapshot(thread, participant_id, peer, cx).await?;
         loop {
-            match events.recv().await {
-                Ok(event) => peer
-                    .send(event)
-                    .await
-                    .context("Peer stopped receiving thread events.")?,
-                // A peer that fell further behind than the event buffer has
-                // missed changes, so re-base it rather than applying deltas to
-                // a timeline that no longer matches the host's.
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    events = Self::send_snapshot(&thread, &peer, cx).await?;
+            tokio::select! {
+                event = events.recv() => match event {
+                    Ok(event) => peer
+                        .send(event)
+                        .await
+                        .context("Peer stopped receiving thread events.")?,
+                    // A peer that fell further behind than the event buffer
+                    // has missed changes, so re-base it rather than applying
+                    // deltas to a timeline that no longer matches the host's.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        events = Self::send_snapshot(thread, participant_id, peer, cx).await?;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                },
+                // Also how a disconnect is noticed while the thread is quiet.
+                request = peer.receive() => {
+                    let Some(request) = request else {
+                        return Ok(());
+                    };
+                    let Some(thread) = thread.upgrade() else {
+                        return Ok(());
+                    };
+                    cowork.update(cx, |cowork, cx| {
+                        cowork.collaborator_request(&thread, request, cx);
+                    })?;
                 }
-                Err(broadcast::error::RecvError::Closed) => return Ok(()),
             }
         }
     }
@@ -1720,6 +1996,7 @@ impl Cowork {
     /// exactly where the snapshot left off.
     async fn send_snapshot(
         thread: &WeakEntity<Thread>,
+        participant_id: ParticipantId,
         peer: &HostPeer,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<broadcast::Receiver<protocol::HostMessage>> {
@@ -1728,10 +2005,44 @@ impl Cowork {
                 Some((thread.to_protocol(), thread.subscribe()?))
             })?
             .context("Thread is no longer shared.")?;
-        peer.send(protocol::HostMessage::Welcome(snapshot))
-            .await
-            .context("Peer disconnected before receiving the thread snapshot.")?;
+        peer.send(protocol::HostMessage::Welcome(protocol::Welcome {
+            participant_id: participant_id.into_bytes(),
+            thread: snapshot,
+        }))
+        .await
+        .context("Peer disconnected before receiving the thread snapshot.")?;
         Ok(events)
+    }
+
+    /// Applies a request a collaborator sent to a thread this app hosts.
+    fn collaborator_request(
+        &mut self,
+        thread: &Entity<Thread>,
+        request: protocol::CollaboratorMessage,
+        cx: &mut Context<Self>,
+    ) {
+        match request {
+            // Only valid as the first message, which `serve_peer` consumes.
+            protocol::CollaboratorMessage::Join { .. } => {}
+            protocol::CollaboratorMessage::SelectModel { catalog_id } => {
+                let Some(model) = ModelSelection::from_catalog_id(&catalog_id) else {
+                    return;
+                };
+                thread.update(cx, |thread, cx| {
+                    thread.emit(
+                        protocol::HostMessage::ModelSelected {
+                            catalog_id: model.catalog_id.into(),
+                        },
+                        cx,
+                    );
+                });
+                cx.notify();
+            }
+            protocol::CollaboratorMessage::Stop { message_id } => {
+                let thread_id = thread.read(cx).instance_id;
+                self.cancel_generation(thread_id, Some(Uuid::from_bytes(message_id)), cx);
+            }
+        }
     }
 
     fn copy_endpoint_id(&mut self, cx: &mut Context<Self>) {
@@ -1940,7 +2251,8 @@ impl Cowork {
         dialog.update(cx, |dialog, _| {
             dialog.status = JoinStatus::Joining;
         });
-        let draft = Self::new_user_message_draft(window, cx);
+        // Re-authored with the id the host assigns once the thread is joined.
+        let draft = Self::new_user_message_draft(self.local_participant_id, window, cx);
         let window_handle = window.window_handle();
         cx.notify();
 
@@ -1954,17 +2266,21 @@ impl Cowork {
                 .await
                 .context("Timed out opening the peer protocol stream.")??;
             let host: ThreadHost = protocol::spawn_peer(tokio::io::join(recv, send));
-            host.send(protocol::CollaboratorMessage::Join)
-                .await
-                .context("Peer connection is no longer available.")?;
+            host.send(protocol::CollaboratorMessage::Join {
+                protocol_version: protocol::PROTOCOL_VERSION,
+            })
+            .await
+            .context("Peer connection is no longer available.")?;
             let welcome = tokio::time::timeout(PEER_TIMEOUT, host.receive())
                 .await
                 .context("Timed out waiting for the thread snapshot.")?
                 .context("Host closed the protocol stream before sending the thread snapshot.")?;
-            let protocol::HostMessage::Welcome(snapshot) = welcome else {
-                anyhow::bail!("Host sent a thread event before the thread snapshot.");
+            let welcome = match welcome {
+                protocol::HostMessage::Welcome(welcome) => welcome,
+                protocol::HostMessage::Rejected(reason) => anyhow::bail!(reason),
+                _ => anyhow::bail!("Host sent a thread event before the thread snapshot."),
             };
-            Ok::<_, anyhow::Error>((endpoint, connection, host, snapshot))
+            Ok::<_, anyhow::Error>((endpoint, connection, host, welcome))
         });
 
         cx.spawn(async move |this, cx| {
@@ -1972,7 +2288,7 @@ impl Cowork {
                 .await
                 .context("Join task failed.")
                 .and_then(|result| result);
-            let (endpoint, connection, host, snapshot) = match result {
+            let (endpoint, connection, host, welcome) = match result {
                 Ok(joined) => joined,
                 Err(error) => {
                     eprintln!("failed to join shared thread: {error:#}");
@@ -1987,8 +2303,8 @@ impl Cowork {
             let (requests, events) = host.split();
             let Ok((thread, thread_id)) = this.update(cx, move |this, cx| {
                 let thread = cx.new(|cx| {
-                    Thread::from_snapshot(
-                        snapshot,
+                    Thread::from_welcome(
+                        welcome,
                         draft,
                         ThreadSharing::Connected {
                             endpoint,
@@ -2044,6 +2360,7 @@ impl Cowork {
                     else {
                         return None;
                     };
+                    thread.participants.clear();
                     Some(endpoint)
                 });
                 if let Some(endpoint) = endpoint {
@@ -2072,7 +2389,8 @@ impl Cowork {
                     });
                     self.active_thread_id = None;
                     self.selection_message_id = None;
-                    self.new_thread_draft = Self::new_user_message_draft(window, cx);
+                    self.new_thread_draft =
+                        Self::new_user_message_draft(self.local_participant_id, window, cx);
                     Self::draft_composer(&self.new_thread_draft)
                         .focus_handle(cx)
                         .focus(window, cx);
@@ -2118,6 +2436,7 @@ impl Cowork {
             .small()
             .size(px(28.))
             .mr_1()
+            .debug_selector(|| "copy-endpoint-id".to_owned())
             .accessibility_label(if endpoint_copied {
                 "Endpoint link copied"
             } else {
@@ -2186,6 +2505,11 @@ impl Cowork {
                     .h_full()
                     .flex()
                     .items_center()
+                    .children(
+                        active_thread
+                            .as_ref()
+                            .and_then(|thread| Self::render_participants(thread.read(cx))),
+                    )
                     .when(sharing_status == SharingStatus::Shared, |this| {
                         this.child(copy_endpoint_button)
                     })
@@ -2255,6 +2579,89 @@ impl Cowork {
             )
     }
 
+    /// The connected participants of a shared thread as overlapping avatars,
+    /// in join order, each naming its participant on hover.
+    fn render_participants(thread: &Thread) -> Option<gpui::AnyElement> {
+        const MAX_VISIBLE: usize = 5;
+        const AVATAR_SIZE: f32 = 24.;
+        const AVATAR_OVERLAP: f32 = 6.;
+
+        if thread.participants.is_empty() {
+            return None;
+        }
+        let visible = thread.participants.len().min(MAX_VISIBLE);
+        let hidden = thread.participants.len() - visible;
+        let avatars = thread
+            .participants
+            .iter()
+            .take(MAX_VISIBLE)
+            .enumerate()
+            .map(|(index, &participant)| {
+                let name = if participant == thread.participant_id {
+                    format!("{} (you)", participant.display_name())
+                } else {
+                    participant.display_name()
+                };
+                Self::render_participant_avatar(participant, px(AVATAR_SIZE))
+                    // Separates overlapping avatars from each other.
+                    .border_2()
+                    .border_color(rgb(0x1c1c1f))
+                    .id(("participant", index))
+                    .when(index > 0, |this| this.ml(px(-AVATAR_OVERLAP)))
+                    .tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx))
+            });
+        // Flex layout measures overlapping (negatively margined) children as
+        // taking no room at all, so the row is sized explicitly.
+        let avatars_width =
+            AVATAR_SIZE + (AVATAR_SIZE - AVATAR_OVERLAP) * (visible.saturating_sub(1) as f32);
+
+        Some(
+            div()
+                .id("participants")
+                .debug_selector(|| "participants".to_owned())
+                .mr_2()
+                .flex_none()
+                .flex()
+                .items_center()
+                .occlude()
+                .child(
+                    div()
+                        .w(px(avatars_width))
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .children(avatars),
+                )
+                .when(hidden > 0, |this| {
+                    this.child(
+                        div()
+                            .ml_1()
+                            .text_xs()
+                            .text_color(rgb(0xa1a1aa))
+                            .child(format!("+{hidden}")),
+                    )
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// A participant's avatar, identical wherever they appear: their color
+    /// behind their initials.
+    fn render_participant_avatar(participant: ParticipantId, size: gpui::Pixels) -> gpui::Div {
+        div()
+            .size(size)
+            .flex()
+            .flex_none()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(rgb(participant.color()))
+            .text_size(px(9.))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(rgb(0xf4f4f5))
+            .child(participant.initials())
+    }
+
     fn open_thread(&mut self, thread_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         if self.thread_store.read(cx).thread(thread_id, cx).is_none() {
             return;
@@ -2319,7 +2726,8 @@ impl Cowork {
                         )
                         .active(self.active_thread_id.is_none())
                         .on_click(cx.listener(|this, _, window, cx| {
-                            this.new_thread_draft = Self::new_user_message_draft(window, cx);
+                            this.new_thread_draft =
+                                Self::new_user_message_draft(this.local_participant_id, window, cx);
                             this.active_thread_id = None;
                             this.selection_message_id = None;
                             Self::draft_composer(&this.new_thread_draft)
@@ -2658,8 +3066,10 @@ impl Cowork {
         let composer_body = Self::new_comment_editor(initial_text, window, cx);
         let comment_id = Uuid::new_v4();
         thread.update(cx, |thread, _| {
+            let author = thread.participant_id;
             thread.draft.comments.push(UserComment {
                 id: comment_id,
+                author,
                 reference: CommentReference {
                     message_id,
                     range: source_range,
@@ -2825,8 +3235,8 @@ impl Cowork {
                     .px_3()
                     .py_2()
                     .border_l_2()
-                    .border_color(rgb(USER_ACCENT))
-                    .child(Self::render_avatar(MessageAuthor::User))
+                    .border_color(rgb(comment.author.color()))
+                    .child(Self::render_avatar(MessageAuthor::User(comment.author)))
                     .child(body),
             )
             .into_any_element()
@@ -2885,8 +3295,8 @@ impl Cowork {
                                 .px_3()
                                 .py_2()
                                 .border_l_2()
-                                .border_color(rgb(USER_ACCENT))
-                                .child(Self::render_avatar(MessageAuthor::User))
+                                .border_color(rgb(comment.author.color()))
+                                .child(Self::render_avatar(MessageAuthor::User(comment.author)))
                                 .child(body),
                         ),
                 ),
@@ -2895,22 +3305,17 @@ impl Cowork {
     }
 
     fn render_avatar(author: MessageAuthor) -> gpui::Div {
-        div()
-            .size(px(22.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .overflow_hidden()
-            .rounded_full()
-            .when(matches!(author, MessageAuthor::User), |this| {
-                this.bg(rgb(USER_ACCENT))
-                    .text_xs()
-                    .text_color(rgb(0xf4f4f5))
-                    .child("U")
-            })
-            .when(matches!(author, MessageAuthor::Agent), |this| {
-                this.child(img(OLLAMA_AVATAR_PATH).size_full())
-            })
+        const SIZE: gpui::Pixels = px(22.);
+
+        match author {
+            MessageAuthor::User(participant) => Self::render_participant_avatar(participant, SIZE),
+            MessageAuthor::Agent => div()
+                .size(SIZE)
+                .flex_none()
+                .overflow_hidden()
+                .rounded_full()
+                .child(img(OLLAMA_AVATAR_PATH).size_full()),
+        }
     }
 
     fn markdown_style() -> TextViewStyle {
@@ -3097,7 +3502,7 @@ impl Cowork {
                     .flex_none()
                     .flex()
                     .justify_center()
-                    .child(Self::render_avatar(MessageAuthor::User)),
+                    .child(Self::render_avatar(MessageAuthor::User(group.author))),
             )
             .child(
                 div()
@@ -3486,6 +3891,7 @@ impl Cowork {
             return;
         };
         let message_id = Uuid::new_v4();
+        let selected_model = thread.read(cx).model;
         thread.update(cx, |thread, cx| {
             thread.emit(
                 protocol::HostMessage::AgentStarted {
@@ -3495,10 +3901,6 @@ impl Cowork {
                 cx,
             );
         });
-
-        let Some(selected_model) = self.model_picker.read(cx).selected_value() else {
-            return;
-        };
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let tool_comments = turn_comments.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
@@ -4049,13 +4451,40 @@ impl Cowork {
         card
     }
 
+    /// Stops the active thread's agent run, asking the host to when the
+    /// thread is mirrored.
     fn stop_generation(&mut self, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.active_thread_id else {
+        let Some(thread) = self.active_thread(cx) else {
             return;
         };
+        let thread = thread.read(cx);
+        if matches!(thread.sharing, ThreadSharing::Connected { .. }) {
+            if let Some(message_id) = thread.running_agent_message_id() {
+                thread.request(protocol::CollaboratorMessage::Stop {
+                    message_id: message_id.into_bytes(),
+                });
+            }
+            return;
+        }
+        let thread_id = thread.instance_id;
+        self.cancel_generation(thread_id, None, cx);
+    }
+
+    /// Cancels the agent run of a local or hosted thread. With `message_id`,
+    /// only a run still producing that message is cancelled, so a stale stop
+    /// request cannot cancel the run that followed it.
+    fn cancel_generation(
+        &mut self,
+        thread_id: Uuid,
+        message_id: Option<Uuid>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(generation) = self.active_generations.get(&thread_id) else {
             return;
         };
+        if message_id.is_some_and(|message_id| message_id != generation.message_id) {
+            return;
+        }
         generation.cancelled.store(true, Ordering::Release);
         generation.abort_handle.abort();
         cx.notify();
@@ -4104,6 +4533,7 @@ impl Cowork {
             if let Some(body) = Self::editable_comment_body(comment, cx) {
                 submitted_comments.push(UserComment {
                     id: comment.id,
+                    author: comment.author,
                     reference: comment.reference.clone(),
                     body: UserCommentBody::Submitted(body),
                 });
@@ -4137,6 +4567,7 @@ impl Cowork {
             .collect::<Vec<_>>();
         let submitted_group = UserMessageGroup {
             id: draft.id,
+            author: draft.author,
             comments: submitted_comments,
             attachments: draft.attachments.clone(),
             content: UserMessageContent::Submitted {
@@ -4145,7 +4576,7 @@ impl Cowork {
             },
             comments_folded: has_comments || draft.comments_folded,
         };
-        let mut next_draft = Self::new_user_message_draft(window, cx);
+        let mut next_draft = Self::new_user_message_draft(draft.author, window, cx);
         next_draft.comments = remaining_comments;
         next_draft.comments_folded = !next_draft.comments.is_empty() && draft.comments_folded;
         let next_composer = Self::draft_composer(&next_draft);
@@ -4164,20 +4595,17 @@ impl Cowork {
             });
             thread_id
         } else {
-            let thread_id = Uuid::new_v4();
-            let thread = cx.new(|_| Thread {
-                instance_id: thread_id,
-                summary: ThreadSummary {
-                    id: thread_id,
-                    title: Self::thread_title(&prompt),
-                },
-                timeline: vec![TimelineMessage::User(submitted_group)],
-                draft: next_draft,
-                generating: false,
-                sharing: ThreadSharing::NotShared,
-                ownership: ThreadOwnership::Local,
-            });
-            self.new_thread_draft = Self::new_user_message_draft(window, cx);
+            let thread = Self::new_local_thread(
+                Self::thread_title(&prompt),
+                vec![TimelineMessage::User(submitted_group)],
+                next_draft,
+                self.local_participant_id,
+                self.new_thread_model,
+                cx,
+            );
+            let thread_id = thread.read(cx).instance_id;
+            self.new_thread_draft =
+                Self::new_user_message_draft(self.local_participant_id, window, cx);
             self.thread_store.update(cx, |store, _| {
                 store.threads.push_front(thread.clone());
             });
@@ -4227,14 +4655,18 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let timeline_scroll_handle = self.timeline_scroll_handle.clone();
-        let show_button = composer.is_some();
+        let can_write = composer.is_some();
+        let active_thread = self.active_thread(cx);
+        // Collaborators cannot write to the draft yet, but they can still pick
+        // the model and stop the agent, like every participant.
+        let can_control = can_write
+            || active_thread
+                .as_ref()
+                .is_some_and(|thread| thread.read(cx).sharing.is_collaborating());
         let loading_attachments = self
             .writable_draft_id(cx)
             .is_some_and(|draft_id| self.draft_is_loading_attachments(draft_id));
-        let generating = self
-            .active_thread_id
-            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
-            .is_some_and(|thread| thread.read(cx).generating);
+        let generating = active_thread.is_some_and(|thread| thread.read(cx).generating);
         let selected_model_title = self
             .model_picker
             .read(cx)
@@ -4334,23 +4766,29 @@ impl Cowork {
                     }),
             );
         let button = if generating {
-            Button::new("stop-generation")
-                .icon(Icon::new(AssetIconName::Square))
-                .danger()
-                .small()
-                .accessibility_label("Stop generating")
-                .on_click(cx.listener(Self::composer_button_clicked))
+            Some(
+                Button::new("stop-generation")
+                    .icon(Icon::new(AssetIconName::Square))
+                    .danger()
+                    .small()
+                    .accessibility_label("Stop generating")
+                    .on_click(cx.listener(Self::composer_button_clicked)),
+            )
+        } else if can_write {
+            Some(
+                Button::new("send-message")
+                    .icon(Icon::new(AssetIconName::SendHorizontal))
+                    .small()
+                    .accessibility_label(if loading_attachments {
+                        "Send message (waiting for attachments)"
+                    } else {
+                        "Send message"
+                    })
+                    .disabled(loading_attachments)
+                    .on_click(cx.listener(Self::composer_button_clicked)),
+            )
         } else {
-            Button::new("send-message")
-                .icon(Icon::new(AssetIconName::SendHorizontal))
-                .small()
-                .accessibility_label(if loading_attachments {
-                    "Send message (waiting for attachments)"
-                } else {
-                    "Send message"
-                })
-                .disabled(loading_attachments)
-                .on_click(cx.listener(Self::composer_button_clicked))
+            None
         };
 
         div()
@@ -4402,7 +4840,7 @@ impl Cowork {
                 .right_0()
                 .h(px(1.)),
             )
-            .when(show_button, |this| {
+            .when(can_write, |this| {
                 this.child(
                     Button::new("add-attachment")
                         .icon(Icon::new(AssetIconName::Paperclip))
@@ -4411,9 +4849,11 @@ impl Cowork {
                         .accessibility_label("Attach files")
                         .on_click(cx.listener(Self::pick_attachments)),
                 )
-                .child(div().flex_1())
-                .child(model_picker)
-                .child(button)
+            })
+            .when(can_control, |this| {
+                this.child(div().flex_1())
+                    .child(model_picker)
+                    .children(button)
             })
     }
 
@@ -4607,7 +5047,9 @@ impl Cowork {
                                                 .flex_none()
                                                 .flex()
                                                 .justify_center()
-                                                .child(Self::render_avatar(MessageAuthor::User)),
+                                                .child(Self::render_avatar(MessageAuthor::User(
+                                                    draft.author,
+                                                ))),
                                         )
                                         .child(
                                             div()
@@ -4703,6 +5145,7 @@ impl Cowork {
 
 impl Render for Cowork {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_model_picker(window, cx);
         let composer = self.editable_composer(cx);
         let can_write = composer.is_some();
         let read_only_line_bounds = Rc::new(Cell::new(None));
@@ -4812,7 +5255,9 @@ fn main() -> anyhow::Result<()> {
             if let Err(error) = cx.open_window(window_options, move |window, cx| {
                 let tokio_handle = tokio_handle.clone();
                 let thread_store = cx.new(|_| ThreadStore::default());
-                let new_thread_draft = Cowork::new_user_message_draft(window, cx);
+                let local_participant_id = ParticipantId::new();
+                let new_thread_draft =
+                    Cowork::new_user_message_draft(local_participant_id, window, cx);
                 Cowork::draft_composer(&new_thread_draft)
                     .focus_handle(cx)
                     .focus(window, cx);
@@ -4823,6 +5268,8 @@ fn main() -> anyhow::Result<()> {
                                 window.on_next_frame(Cowork::end_stale_mouse_drag);
                             }
                         });
+                    let (model_picker, model_picker_subscription) =
+                        Cowork::new_model_picker(window, cx);
                     Cowork {
                         sidebar_open: true,
                         recents_open: true,
@@ -4841,8 +5288,11 @@ fn main() -> anyhow::Result<()> {
                         join_dialog: None,
                         tokio_handle,
                         active_generations: HashMap::new(),
-                        model_picker: Cowork::new_model_picker(window, cx),
+                        local_participant_id,
+                        new_thread_model: DEFAULT_MODEL,
+                        model_picker,
                         model_picker_hovered: false,
+                        _model_picker_subscription: model_picker_subscription,
                         _window_activation_subscription: window_activation_subscription,
                     }
                 });
@@ -5019,6 +5469,66 @@ mod tests {
         }
     }
 
+    /// A `Cowork` showing `active_thread_id` out of `thread_store`, for tests
+    /// that do not go through the app's window setup.
+    fn test_cowork(
+        thread_store: Entity<ThreadStore>,
+        active_thread_id: Option<Uuid>,
+        tokio_handle: tokio::runtime::Handle,
+        window: &mut Window,
+        cx: &mut Context<Cowork>,
+    ) -> Cowork {
+        let (model_picker, model_picker_subscription) = Cowork::new_model_picker(window, cx);
+        let local_participant_id = ParticipantId::new();
+        Cowork {
+            sidebar_open: true,
+            recents_open: true,
+            new_thread_draft: Cowork::new_user_message_draft(local_participant_id, window, cx),
+            attachment_errors: Vec::new(),
+            pending_attachments: Vec::new(),
+            timeline_scroll_handle: ScrollHandle::new(),
+            follow_generation: true,
+            thread_store,
+            active_thread_id,
+            selection_message_id: None,
+            segment_text_views: HashMap::new(),
+            render_generation: 0,
+            titlebar_click_armed: false,
+            copied_endpoint_id: None,
+            join_dialog: None,
+            tokio_handle,
+            active_generations: HashMap::new(),
+            local_participant_id,
+            new_thread_model: DEFAULT_MODEL,
+            model_picker,
+            model_picker_hovered: false,
+            _model_picker_subscription: model_picker_subscription,
+            _window_activation_subscription: cx.observe_window_activation(window, |_, _, _| {}),
+        }
+    }
+
+    fn test_thread(
+        thread_id: Uuid,
+        timeline: Vec<TimelineMessage>,
+        draft: UserMessageGroup,
+    ) -> Thread {
+        Thread {
+            instance_id: thread_id,
+            summary: ThreadSummary {
+                id: thread_id,
+                title: "Test".into(),
+            },
+            participant_id: ParticipantId::new(),
+            participants: Vec::new(),
+            model: DEFAULT_MODEL,
+            timeline,
+            draft,
+            generating: false,
+            sharing: ThreadSharing::NotShared,
+            ownership: ThreadOwnership::Local,
+        }
+    }
+
     fn attachment_test_cowork(
         cx: &mut gpui::TestAppContext,
         tokio_handle: tokio::runtime::Handle,
@@ -5026,43 +5536,13 @@ mod tests {
         cx.update(gpui_component::init);
         let thread_id = Uuid::new_v4();
         let (view, cx) = cx.add_window_view(|window, cx| {
-            let thread = cx.new(|cx| Thread {
-                instance_id: thread_id,
-                summary: ThreadSummary {
-                    id: thread_id,
-                    title: "Test".into(),
-                },
-                timeline: Vec::new(),
-                draft: Cowork::new_user_message_draft(window, cx),
-                generating: false,
-                sharing: ThreadSharing::NotShared,
-                ownership: ThreadOwnership::Local,
-            });
+            let draft = Cowork::new_user_message_draft(ParticipantId::new(), window, cx);
+            let thread = cx.new(|_| test_thread(thread_id, Vec::new(), draft));
             let thread_store = cx.new(|_| ThreadStore {
                 threads: VecDeque::from([thread]),
             });
-            let cowork = cx.new(|cx| Cowork {
-                sidebar_open: true,
-                recents_open: true,
-                new_thread_draft: Cowork::new_user_message_draft(window, cx),
-                attachment_errors: Vec::new(),
-                pending_attachments: Vec::new(),
-                timeline_scroll_handle: ScrollHandle::new(),
-                follow_generation: true,
-                thread_store,
-                active_thread_id: Some(thread_id),
-                selection_message_id: None,
-                segment_text_views: HashMap::new(),
-                render_generation: 0,
-                titlebar_click_armed: false,
-                copied_endpoint_id: None,
-                join_dialog: None,
-                tokio_handle,
-                active_generations: HashMap::new(),
-                model_picker: Cowork::new_model_picker(window, cx),
-                model_picker_hovered: false,
-                _window_activation_subscription: cx.observe_window_activation(window, |_, _, _| {}),
-            });
+            let cowork =
+                cx.new(|cx| test_cowork(thread_store, Some(thread_id), tokio_handle, window, cx));
             AttachmentTestRoot { cowork }
         });
         let cowork = view.read_with(cx, |root, _| root.cowork.clone());
@@ -5364,10 +5844,11 @@ mod tests {
             };
             let thinking_view = cx.new(|cx| TextViewState::markdown("", cx));
             let thread_id = Uuid::new_v4();
-            let mut draft = Cowork::new_user_message_draft(window, cx);
+            let mut draft = Cowork::new_user_message_draft(ParticipantId::new(), window, cx);
             if let Some(range) = existing_comment_range.clone() {
                 draft.comments.push(UserComment {
                     id: Uuid::new_v4(),
+                    author: draft.author,
                     reference: CommentReference {
                         message_id,
                         quote: markdown[range.clone()].into(),
@@ -5378,67 +5859,37 @@ mod tests {
             }
             let comments = draft.comments.clone();
             let composer = Cowork::draft_composer(&draft);
-            let thread = cx.new(|_| Thread {
-                instance_id: thread_id,
-                summary: ThreadSummary {
-                    id: thread_id,
-                    title: "Test".into(),
+            let timeline = vec![TimelineMessage::Agent(AgentMessage {
+                id: if target_comment_reply {
+                    Uuid::new_v4()
+                } else {
+                    message_id
                 },
-                timeline: vec![TimelineMessage::Agent(AgentMessage {
-                    id: if target_comment_reply {
-                        Uuid::new_v4()
-                    } else {
-                        message_id
-                    },
-                    comment_group_id: None,
-                    comment_responses: target_comment_reply
-                        .then(|| AgentCommentResponse {
-                            id: message_id,
-                            comment_id: Uuid::new_v4(),
-                            response: markdown.into(),
-                            response_view: text_view.clone(),
-                        })
-                        .into_iter()
-                        .collect(),
-                    thinking: String::new(),
-                    thinking_view,
-                    thinking_complete: true,
-                    thinking_expanded: false,
-                    text: main_text.into(),
-                    text_view: main_text_view,
-                    complete: true,
-                    failed: false,
-                })],
-                draft,
-                generating: false,
-                sharing: ThreadSharing::NotShared,
-                ownership: ThreadOwnership::Local,
-            });
+                comment_group_id: None,
+                comment_responses: target_comment_reply
+                    .then(|| AgentCommentResponse {
+                        id: message_id,
+                        comment_id: Uuid::new_v4(),
+                        response: markdown.into(),
+                        response_view: text_view.clone(),
+                    })
+                    .into_iter()
+                    .collect(),
+                thinking: String::new(),
+                thinking_view,
+                thinking_complete: true,
+                thinking_expanded: false,
+                text: main_text.into(),
+                text_view: main_text_view,
+                complete: true,
+                failed: false,
+            })];
+            let thread = cx.new(|_| test_thread(thread_id, timeline, draft));
             let thread_store = cx.new(|_| ThreadStore {
                 threads: VecDeque::from([thread]),
             });
-            let cowork = cx.new(|cx| Cowork {
-                sidebar_open: true,
-                recents_open: true,
-                new_thread_draft: Cowork::new_user_message_draft(window, cx),
-                attachment_errors: Vec::new(),
-                pending_attachments: Vec::new(),
-                timeline_scroll_handle: ScrollHandle::new(),
-                follow_generation: true,
-                thread_store,
-                active_thread_id: Some(thread_id),
-                selection_message_id: None,
-                segment_text_views: HashMap::new(),
-                render_generation: 0,
-                titlebar_click_armed: false,
-                copied_endpoint_id: None,
-                join_dialog: None,
-                tokio_handle,
-                active_generations: HashMap::new(),
-                model_picker: Cowork::new_model_picker(window, cx),
-                model_picker_hovered: false,
-                _window_activation_subscription: cx.observe_window_activation(window, |_, _, _| {}),
-            });
+            let cowork =
+                cx.new(|cx| test_cowork(thread_store, Some(thread_id), tokio_handle, window, cx));
             composer.focus_handle(cx).focus(window, cx);
             SelectionRoot {
                 cowork,
@@ -5723,6 +6174,7 @@ mod tests {
 
         let existing_timeline = vec![TimelineMessage::User(UserMessageGroup {
             id: Uuid::new_v4(),
+            author: ParticipantId::new(),
             comments: Vec::new(),
             attachments: Vec::new(),
             content: UserMessageContent::Submitted {
@@ -5754,9 +6206,10 @@ mod tests {
     ) {
         cx.update(gpui_component::init);
         let (view, cx) = cx.add_window_view(|window, cx| {
-            let draft = Cowork::new_user_message_draft(window, cx);
+            let draft = Cowork::new_user_message_draft(ParticipantId::new(), window, cx);
             let draft_id = draft.id;
-            let thread = Cowork::new_empty_local_thread(draft, cx);
+            let thread =
+                Cowork::new_empty_local_thread(draft, ParticipantId::new(), OLLAMA_QWEN, cx);
             EmptyThreadTestView { thread, draft_id }
         });
 
@@ -5766,6 +6219,8 @@ mod tests {
             assert_eq!(thread.draft.id, view.draft_id);
             assert_eq!(thread.summary.title, "New thread");
             assert_eq!(thread.ownership, ThreadOwnership::Local);
+            assert_eq!(thread.model, OLLAMA_QWEN);
+            assert!(thread.participants.is_empty());
             assert!(matches!(thread.sharing, ThreadSharing::NotShared));
         });
     }
@@ -5790,10 +6245,12 @@ mod tests {
             protocol::HostMessage::ThreadTitled("Explain this".into()),
             protocol::HostMessage::UserMessage(protocol::UserMessage {
                 id: user_message_id,
+                author: ParticipantId::new().into_bytes(),
                 text: "Explain this".into(),
                 attachments: Vec::new(),
                 comments: vec![protocol::UserComment {
                     id: comment_id,
+                    author: ParticipantId::new().into_bytes(),
                     reference: protocol::CommentReference {
                         message_id: Uuid::new_v4().into_bytes(),
                         range: 0..10,
@@ -5834,6 +6291,10 @@ mod tests {
                 text: "the answer.".into(),
             },
             protocol::HostMessage::AgentEnded { id, failure: None },
+            protocol::HostMessage::ParticipantJoined(ParticipantId::new().into_bytes()),
+            protocol::HostMessage::ModelSelected {
+                catalog_id: OLLAMA_QWEN.catalog_id.into(),
+            },
         ]
     }
 
@@ -5850,22 +6311,41 @@ mod tests {
         // The collaborator joins once the agent has started reasoning.
         let joined_after = 4;
 
+        let host_participant = ParticipantId::new();
+        let collaborator_participant = ParticipantId::new();
         let (view, cx) = cx.add_window_view(|window, cx| ThreadMirrorTestView {
-            host: Cowork::new_empty_local_thread(Cowork::new_user_message_draft(window, cx), cx),
+            host: Cowork::new_empty_local_thread(
+                Cowork::new_user_message_draft(ParticipantId::new(), window, cx),
+                host_participant,
+                DEFAULT_MODEL,
+                cx,
+            ),
             collaborator: None,
         });
 
         cx.update(|_, cx| {
             view.update(cx, |view, cx| {
+                view.host.update(cx, |thread, cx| {
+                    thread.participants = vec![thread.participant_id];
+                    thread.apply(
+                        protocol::HostMessage::ParticipantJoined(
+                            collaborator_participant.into_bytes(),
+                        ),
+                        cx,
+                    );
+                });
                 for event in events.iter().take(joined_after) {
                     view.host
                         .update(cx, |thread, cx| thread.apply(event.clone(), cx));
                 }
 
-                let snapshot = view.host.read(cx).to_protocol();
+                let welcome = protocol::Welcome {
+                    participant_id: collaborator_participant.into_bytes(),
+                    thread: view.host.read(cx).to_protocol(),
+                };
                 let draft = view.host.read(cx).draft.clone();
-                let collaborator = cx
-                    .new(|cx| Thread::from_snapshot(snapshot, draft, ThreadSharing::NotShared, cx));
+                let collaborator =
+                    cx.new(|cx| Thread::from_welcome(welcome, draft, ThreadSharing::NotShared, cx));
 
                 for event in events.iter().skip(joined_after) {
                     view.host
@@ -5887,6 +6367,15 @@ mod tests {
             assert_eq!(collaborator.to_protocol(), host.to_protocol());
             assert_eq!(collaborator.summary.id, host.summary.id);
             assert_ne!(collaborator.instance_id, host.instance_id);
+            assert_eq!(collaborator.participant_id, collaborator_participant);
+            assert_eq!(collaborator.draft.author, collaborator_participant);
+            assert_eq!(collaborator.participants, host.participants);
+            assert_eq!(collaborator.participants.len(), 3);
+            assert_eq!(
+                collaborator.participants[..2],
+                [host_participant, collaborator_participant]
+            );
+            assert_eq!(collaborator.model, OLLAMA_QWEN);
             assert!(!host.generating);
             assert!(!collaborator.generating);
 
@@ -5899,6 +6388,232 @@ mod tests {
             assert!(message.complete);
             assert!(!message.failed);
         });
+    }
+
+    #[gpui::test]
+    fn membership_events_are_idempotent_and_unknown_models_are_ignored(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let draft = Cowork::new_user_message_draft(ParticipantId::new(), window, cx);
+            EmptyThreadTestView {
+                thread: Cowork::new_empty_local_thread(
+                    draft,
+                    ParticipantId::new(),
+                    DEFAULT_MODEL,
+                    cx,
+                ),
+                draft_id: Uuid::nil(),
+            }
+        });
+        let first = ParticipantId::new();
+        let second = ParticipantId::new();
+
+        cx.update(|_, cx| {
+            let thread = view.read(cx).thread.clone();
+            thread.update(cx, |thread, cx| {
+                for event in [
+                    protocol::HostMessage::ParticipantJoined(first.into_bytes()),
+                    protocol::HostMessage::ParticipantJoined(second.into_bytes()),
+                    protocol::HostMessage::ParticipantJoined(first.into_bytes()),
+                    protocol::HostMessage::ModelSelected {
+                        catalog_id: "no-such-model".into(),
+                    },
+                ] {
+                    thread.apply(event, cx);
+                }
+                assert_eq!(thread.participants, [first, second]);
+                assert_eq!(thread.model, DEFAULT_MODEL);
+
+                thread.apply(
+                    protocol::HostMessage::ParticipantLeft(first.into_bytes()),
+                    cx,
+                );
+                thread.apply(
+                    protocol::HostMessage::ParticipantLeft(first.into_bytes()),
+                    cx,
+                );
+                assert_eq!(thread.participants, [second]);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn picked_models_apply_to_the_active_thread_and_new_threads(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let (cowork, thread_id, cx) = attachment_test_cowork(cx, runtime.handle().clone());
+
+        cowork.update_in(cx, |cowork, window, cx| {
+            let thread = cowork.active_thread(cx).expect("active thread");
+            assert_eq!(thread.read(cx).model, DEFAULT_MODEL);
+
+            // Picking a model changes the active thread and later new threads.
+            cowork.select_model(OLLAMA_QWEN, cx);
+            assert_eq!(thread.read(cx).model, OLLAMA_QWEN);
+            assert_eq!(cowork.new_thread_model, OLLAMA_QWEN);
+
+            // A change made by someone else only moves the picker along.
+            thread.update(cx, |thread, cx| {
+                thread.apply(
+                    protocol::HostMessage::ModelSelected {
+                        catalog_id: RECOMMENDED_QWEN.catalog_id.into(),
+                    },
+                    cx,
+                );
+            });
+            cowork.sync_model_picker(window, cx);
+            assert_eq!(
+                cowork.model_picker.read(cx).selected_value(),
+                Some(RECOMMENDED_QWEN)
+            );
+            assert_eq!(cowork.new_thread_model, OLLAMA_QWEN);
+
+            // Without an active thread the picker shows the new thread model.
+            cowork.active_thread_id = None;
+            cowork.sync_model_picker(window, cx);
+            assert_eq!(
+                cowork.model_picker.read(cx).selected_value(),
+                Some(OLLAMA_QWEN)
+            );
+            cowork.active_thread_id = Some(thread_id);
+        });
+    }
+
+    /// `sync_model_picker` runs on every render, so a catalog model the picker
+    /// cannot select would make it re-select and redraw forever.
+    #[gpui::test]
+    fn picker_can_select_every_catalog_model(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let (cowork, _, cx) = attachment_test_cowork(cx, runtime.handle().clone());
+
+        cowork.update_in(cx, |cowork, window, cx| {
+            for model in MODEL_CATALOG {
+                cowork.model_picker.update(cx, |picker, cx| {
+                    picker.set_selected_values(&[model], window, cx);
+                });
+                assert_eq!(cowork.model_picker.read(cx).selected_value(), Some(model));
+                assert_eq!(
+                    ModelSelection::from_catalog_id(model.catalog_id),
+                    Some(model)
+                );
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn running_agent_message_is_the_incomplete_one(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let draft = Cowork::new_user_message_draft(ParticipantId::new(), window, cx);
+            EmptyThreadTestView {
+                thread: Cowork::new_empty_local_thread(
+                    draft,
+                    ParticipantId::new(),
+                    DEFAULT_MODEL,
+                    cx,
+                ),
+                draft_id: Uuid::nil(),
+            }
+        });
+        let finished = Uuid::new_v4();
+        let running = Uuid::new_v4();
+
+        cx.update(|_, cx| {
+            let thread = view.read(cx).thread.clone();
+            thread.update(cx, |thread, cx| {
+                assert_eq!(thread.running_agent_message_id(), None);
+                for event in [
+                    protocol::HostMessage::AgentStarted {
+                        id: finished.into_bytes(),
+                        comment_group_id: None,
+                    },
+                    protocol::HostMessage::AgentEnded {
+                        id: finished.into_bytes(),
+                        failure: None,
+                    },
+                    protocol::HostMessage::AgentStarted {
+                        id: running.into_bytes(),
+                        comment_group_id: None,
+                    },
+                ] {
+                    thread.apply(event, cx);
+                }
+                assert_eq!(thread.running_agent_message_id(), Some(running));
+
+                thread.apply(
+                    protocol::HostMessage::AgentEnded {
+                        id: running.into_bytes(),
+                        failure: None,
+                    },
+                    cx,
+                );
+                assert_eq!(thread.running_agent_message_id(), None);
+            });
+        });
+    }
+
+    #[gpui::test]
+    fn collaborator_requests_select_models_and_stop_only_the_running_generation(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (cowork, thread_id, cx) = attachment_test_cowork(cx, runtime.handle().clone());
+        let running_message_id = Uuid::new_v4();
+        let task = runtime.spawn(std::future::pending::<()>());
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        cowork.update(cx, |cowork, cx| {
+            let thread = cowork.active_thread(cx).expect("active thread");
+            cowork.active_generations.insert(
+                thread_id,
+                ActiveGeneration {
+                    message_id: running_message_id,
+                    abort_handle: task.abort_handle(),
+                    cancelled: cancelled.clone(),
+                },
+            );
+
+            for request in [
+                protocol::CollaboratorMessage::SelectModel {
+                    catalog_id: "no-such-model".into(),
+                },
+                protocol::CollaboratorMessage::Stop {
+                    message_id: Uuid::new_v4().into_bytes(),
+                },
+            ] {
+                cowork.collaborator_request(&thread, request, cx);
+            }
+            assert_eq!(thread.read(cx).model, DEFAULT_MODEL);
+            assert!(!cancelled.load(Ordering::Acquire));
+
+            for request in [
+                protocol::CollaboratorMessage::SelectModel {
+                    catalog_id: OLLAMA_QWEN.catalog_id.into(),
+                },
+                protocol::CollaboratorMessage::Stop {
+                    message_id: running_message_id.into_bytes(),
+                },
+            ] {
+                cowork.collaborator_request(&thread, request, cx);
+            }
+            assert_eq!(thread.read(cx).model, OLLAMA_QWEN);
+            assert!(cancelled.load(Ordering::Acquire));
+            // Only the requesting peer picked it; new local threads keep the
+            // local user's choice.
+            assert_eq!(cowork.new_thread_model, DEFAULT_MODEL);
+        });
+        let aborted = runtime
+            .block_on(task)
+            .expect_err("generation task was aborted");
+        assert!(aborted.is_cancelled());
     }
 
     struct ComposerTestView {
@@ -5969,6 +6684,57 @@ mod tests {
         assert!(
             composer_bounds.size.height >= px(200.),
             "ten text lines should expand the composer, got {composer_bounds:?}"
+        );
+    }
+
+    #[gpui::test]
+    fn participants_sit_beside_the_copy_link_button(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let endpoint = runtime
+            .block_on(Endpoint::builder(presets::Minimal).bind())
+            .expect("bind endpoint");
+        let tokio_handle = runtime.handle().clone();
+        let thread_id = Uuid::new_v4();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let draft = Cowork::new_user_message_draft(ParticipantId::new(), window, cx);
+            let mut thread = test_thread(thread_id, Vec::new(), draft);
+            thread.participants = vec![
+                thread.participant_id,
+                ParticipantId::new(),
+                ParticipantId::new(),
+            ];
+            thread.sharing = ThreadSharing::Shared {
+                endpoint,
+                events: broadcast::channel(THREAD_EVENT_CAPACITY).0,
+            };
+            let thread = cx.new(|_| thread);
+            let thread_store = cx.new(|_| ThreadStore {
+                threads: VecDeque::from([thread]),
+            });
+            let cowork =
+                cx.new(|cx| test_cowork(thread_store, Some(thread_id), tokio_handle, window, cx));
+            Root::new(cowork, window, cx)
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+
+        let participants = cx
+            .debug_bounds("participants")
+            .expect("participants should be rendered");
+        let copy_button = cx
+            .debug_bounds("copy-endpoint-id")
+            .expect("copy link button should be rendered");
+
+        assert!(
+            participants.size.width >= px(24. * 3. - 6. * 2.),
+            "three overlapping avatars need room, got {participants:?}"
+        );
+        assert!(
+            participants.right() <= copy_button.left(),
+            "participants {participants:?} overlap the copy link button {copy_button:?}"
         );
     }
 
