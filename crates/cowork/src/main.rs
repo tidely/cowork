@@ -10,7 +10,7 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use agent::{Agent as StreamingAgent, AgentEvent};
@@ -517,6 +517,103 @@ fn offset_near_x(editor: &TextareaState, x: gpui::Pixels, last: bool) -> usize {
         .map_or(edge, |(offset, _)| offset)
 }
 
+/// The rectangles covering `selection` of `editor`'s text, one per visual
+/// line, in window coordinates.
+fn selection_rects(
+    editor: &TextareaState,
+    text: &str,
+    selection: Range<usize>,
+    text_bounds: Bounds<gpui::Pixels>,
+) -> Vec<Bounds<gpui::Pixels>> {
+    if selection.is_empty() {
+        return Vec::new();
+    }
+    let mut rects = Vec::new();
+    let mut line_start = selection.start;
+    loop {
+        let line_end = text[line_start..selection.end]
+            .find('\n')
+            .map_or(selection.end, |newline| line_start + newline);
+        if let (Some(start), Some(end)) = (
+            editor.range_to_bounds(&(line_start..line_start)),
+            editor.range_to_bounds(&(line_end..line_end)),
+        ) && start.size.height > px(0.)
+        {
+            let height = start.size.height;
+            // A selected empty line still shows as selected.
+            let min_width = if line_end < selection.end {
+                px(4.)
+            } else {
+                px(0.)
+            };
+            if same_visual_line(start.top(), end.top()) {
+                let width = (end.left() - start.left()).max(min_width);
+                rects.push(Bounds::new(start.origin, size(width, height)));
+            } else {
+                // The line wraps: the rest of its first row, whole rows in
+                // between, and its last row up to the end.
+                rects.push(Bounds::new(
+                    start.origin,
+                    size(text_bounds.right() - start.left(), height),
+                ));
+                let mut top = start.top() + height;
+                while top + px(1.) < end.top() {
+                    rects.push(Bounds::new(
+                        point(text_bounds.left(), top),
+                        size(text_bounds.size.width, height),
+                    ));
+                    top += height;
+                }
+                rects.push(Bounds::new(
+                    point(text_bounds.left(), end.top()),
+                    size((end.left() - text_bounds.left()).max(min_width), height),
+                ));
+            }
+        }
+        if line_end >= selection.end {
+            return rects;
+        }
+        line_start = line_end + 1;
+    }
+}
+
+/// A participant's name in their color, just above their caret at `origin`.
+fn paint_caret_label(
+    participant: ParticipantId,
+    origin: gpui::Point<gpui::Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    const FONT_SIZE: gpui::Pixels = px(10.);
+    const HEIGHT: gpui::Pixels = px(14.);
+
+    let name = SharedString::from(participant.display_name());
+    let run = TextRun {
+        len: name.len(),
+        font: window.text_style().font(),
+        color: rgb(0xf4f4f5).into(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let line = window
+        .text_system()
+        .shape_line(name, FONT_SIZE, &[run], None);
+    let label = Bounds::new(
+        point(origin.x, origin.y - HEIGHT),
+        size(line.width + px(8.), HEIGHT),
+    );
+    window.paint_quad(gpui::fill(label, rgb(participant.color())).corner_radii(px(3.)));
+    _ = line.paint(
+        point(label.left() + px(4.), label.top()),
+        HEIGHT,
+        gpui::TextAlign::Left,
+        None,
+        window,
+        cx,
+    );
+}
+
 fn same_visual_line(a: gpui::Pixels, b: gpui::Pixels) -> bool {
     a <= b + px(1.) && b <= a + px(1.)
 }
@@ -861,6 +958,9 @@ struct ThreadDraft {
     /// Blocks created for attachments picked together, so they share one.
     attachment_batches: HashMap<Uuid, ItemId>,
     comments_folded: bool,
+    /// Every participant's presence in this draft, including the host's echo
+    /// of the local user's own, with when it last changed.
+    presence: HashMap<ParticipantId, (protocol::Presence, Instant)>,
 }
 
 enum ItemEditors {
@@ -911,7 +1011,144 @@ impl ThreadDraft {
             draft_position: None,
             attachment_batches: HashMap::new(),
             comments_folded: false,
+            presence: HashMap::new(),
         }
+    }
+
+    /// Records a participant's presence. The time it last changed only moves
+    /// when their caret did, since that is what shows their name for a moment.
+    fn set_presence(&mut self, participant: ParticipantId, presence: protocol::Presence) {
+        let moved_at = match self.presence.get(&participant) {
+            Some((current, moved_at))
+                if current.focus == presence.focus && current.selection == presence.selection =>
+            {
+                *moved_at
+            }
+            _ => Instant::now(),
+        };
+        self.presence.insert(participant, (presence, moved_at));
+    }
+
+    /// Whether anyone other than `except` is focused in the item.
+    fn is_attended(&self, id: ItemId, except: Option<ParticipantId>) -> bool {
+        let focus = protocol::PresenceFocus::Item(id.as_uuid().into_bytes());
+        self.presence.iter().any(|(participant, (presence, _))| {
+            Some(*participant) != except && presence.focus == Some(focus)
+        })
+    }
+
+    /// Participants focused in the item, in join order.
+    fn editors_of(&self, id: ItemId, order: &[ParticipantId]) -> Vec<ParticipantId> {
+        let focus = protocol::PresenceFocus::Item(id.as_uuid().into_bytes());
+        self.participants_where(order, |presence| presence.focus == Some(focus))
+    }
+
+    /// Participants other than the local user at the draft position, in
+    /// join order.
+    fn others_at_draft_position(&self, order: &[ParticipantId]) -> Vec<ParticipantId> {
+        self.participants_where(order, |presence| {
+            presence.focus == Some(protocol::PresenceFocus::DraftPosition)
+        })
+        .into_iter()
+        .filter(|participant| *participant != self.author)
+        .collect()
+    }
+
+    /// Participants whose presence matches, in join order. Anyone missing
+    /// from `order` comes last, sorted, so the order never reshuffles.
+    fn participants_where(
+        &self,
+        order: &[ParticipantId],
+        matches: impl Fn(&protocol::Presence) -> bool,
+    ) -> Vec<ParticipantId> {
+        let mut participants = self
+            .presence
+            .iter()
+            .filter(|(_, (presence, _))| matches(presence))
+            .map(|(participant, _)| *participant)
+            .collect::<Vec<_>>();
+        participants.sort_by_key(|participant| {
+            (
+                order
+                    .iter()
+                    .position(|joined| joined == participant)
+                    .unwrap_or(usize::MAX),
+                participant.as_uuid(),
+            )
+        });
+        participants
+    }
+
+    /// The carets and selections of everyone else in the item, resolved
+    /// against this replica's text of it.
+    fn remote_carets(&self, id: ItemId, order: &[ParticipantId]) -> Vec<RemoteCaret> {
+        let others = self
+            .editors_of(id, order)
+            .into_iter()
+            .filter(|participant| *participant != self.author)
+            .collect::<Vec<_>>();
+        if others.is_empty() {
+            return Vec::new();
+        }
+        let Some(body) = self.doc.body(id) else {
+            return Vec::new();
+        };
+        others
+            .into_iter()
+            .filter_map(|participant| {
+                let (presence, changed) = self.presence.get(&participant)?;
+                let selection = presence.selection.as_ref()?;
+                let resolve = |anchor: &[u8]| {
+                    self.doc
+                        .resolve_anchor(id, anchor)
+                        .map(|offset| body.floor_char_boundary(offset))
+                };
+                let head = resolve(&selection.head)?;
+                let tail = resolve(&selection.anchor).unwrap_or(head);
+                Some(RemoteCaret {
+                    participant,
+                    selection: head.min(tail)..head.max(tail),
+                    head,
+                    moved_at: *changed,
+                })
+            })
+            .collect()
+    }
+
+    /// Everyone else at the draft position, which has no text to place a
+    /// caret in, so all of them sit at its start.
+    fn draft_position_carets(&self, order: &[ParticipantId]) -> Vec<RemoteCaret> {
+        self.others_at_draft_position(order)
+            .into_iter()
+            .filter_map(|participant| {
+                let (_, changed) = self.presence.get(&participant)?;
+                Some(RemoteCaret {
+                    participant,
+                    selection: 0..0,
+                    head: 0,
+                    moved_at: *changed,
+                })
+            })
+            .collect()
+    }
+
+    /// Whether anyone's presence announces files being read into the block.
+    fn has_announced_reads_into(&self, id: ItemId) -> bool {
+        let block = id.as_uuid().into_bytes();
+        self.presence.values().any(|(presence, _)| {
+            presence
+                .pending_reads
+                .iter()
+                .any(|read| read.block == Some(block))
+        })
+    }
+
+    /// Whether a participant other than the local user is reading files
+    /// into the draft.
+    fn others_are_reading_files(&self) -> bool {
+        self.presence.iter().any(|(participant, (presence, _))| {
+            *participant != self.author && !presence.pending_reads.is_empty()
+        })
     }
 
     fn slot_of(&self, editor: EntityId) -> Option<EditorSlot> {
@@ -1045,22 +1282,13 @@ impl ThreadDraft {
         true
     }
 
-    /// Removes an empty item the local user has left, if they created it.
+    /// Removes an empty item the local user is leaving, unless someone else
+    /// is in it. Returns whether it was removed.
     ///
-    /// Interim rule until presence (step 4 of the collaboration spec): the
-    /// spec removes an empty item once nobody is focused in it, but without
-    /// presence nobody knows whether someone else just started typing there,
-    /// so only the item's creator removes it. Step 4 replaces this with the
-    /// presence check.
-    fn remove_if_abandoned(&mut self, id: ItemId) -> bool {
-        if !self
-            .doc
-            .item(id)
-            .is_some_and(|item| item.creator == self.author.as_uuid())
-        {
-            return false;
-        }
-        self.remove_if_empty(id)
+    /// Presence travels separately from the draft, so someone who has just
+    /// entered the item can still lose it; that race is accepted.
+    fn remove_if_unattended(&mut self, id: ItemId) -> bool {
+        !self.is_attended(id, Some(self.author)) && self.remove_if_empty(id)
     }
 
     /// The block to attach a finished file to, creating it when needed.
@@ -1099,8 +1327,9 @@ impl ThreadDraft {
             .map(|item| item.id)
     }
 
-    /// The draft's comments as the timeline and composer render them.
-    fn comment_views(&self) -> Vec<UserComment> {
+    /// The draft's comments as the timeline and composer render them, with
+    /// who is in them (`order` is the thread's join order).
+    fn comment_views(&self, order: &[ParticipantId]) -> Vec<UserComment> {
         self.doc
             .items()
             .into_iter()
@@ -1115,20 +1344,53 @@ impl ThreadDraft {
                     },
                     _ => UserCommentBody::Submitted(item.body.into()),
                 };
+                let creator = ParticipantId::from_uuid(item.creator);
                 Some(UserComment {
                     id: item.id.as_uuid(),
-                    author: ParticipantId::from_uuid(item.creator),
+                    author: creator,
                     reference: CommentReference {
                         message_id: target.message_id,
                         range: target.range,
                         quote: target.quote,
                     },
                     body,
+                    presence: ItemPresence {
+                        editors: self
+                            .editors_of(item.id, order)
+                            .into_iter()
+                            .filter(|editor| *editor != creator)
+                            .collect(),
+                        carets: self.remote_carets(item.id, order),
+                    },
                 })
             })
             .collect()
     }
 }
+
+/// Who is in a draft item besides its creator, and where their carets are.
+#[derive(Clone, Default)]
+struct ItemPresence {
+    /// Participants focused in the item other than its creator, in join
+    /// order.
+    editors: Vec<ParticipantId>,
+    /// Everyone else's carets in the item.
+    carets: Vec<RemoteCaret>,
+}
+
+/// Another participant's caret and selection in an editor, as byte offsets
+/// into the text it shows.
+#[derive(Clone, Debug, PartialEq)]
+struct RemoteCaret {
+    participant: ParticipantId,
+    selection: Range<usize>,
+    head: usize,
+    /// When it last moved, which is when its name is shown for a moment.
+    moved_at: Instant,
+}
+
+/// How long a remote caret shows its participant's name after moving.
+const CARET_LABEL_DURATION: Duration = Duration::from_millis(1_500);
 
 /// Where a file being read will be attached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1142,6 +1404,8 @@ enum AttachmentTarget {
 struct UserComment {
     id: Uuid,
     author: ParticipantId,
+    /// Who is in a draft comment right now; empty once submitted.
+    presence: ItemPresence,
     reference: CommentReference,
     body: UserCommentBody,
 }
@@ -1322,6 +1586,7 @@ impl protocol::UserComment {
         UserComment {
             id: Uuid::from_bytes(self.id),
             author: ParticipantId::from_bytes(self.author),
+            presence: ItemPresence::default(),
             reference: CommentReference {
                 message_id: Uuid::from_bytes(self.reference.message_id),
                 range: self.reference.range,
@@ -1530,11 +1795,17 @@ impl Thread {
             participant_id,
             thread,
             draft,
+            presence,
         } = welcome;
         self.participant_id = ParticipantId::from_bytes(participant_id);
         self.draft.author = self.participant_id;
         if let Err(error) = self.draft.doc.apply_update(&draft) {
             eprintln!("failed to merge the host's draft: {error:#}");
+        }
+        self.draft.presence.clear();
+        for (participant, presence) in presence {
+            self.draft
+                .set_presence(ParticipantId::from_bytes(participant), presence);
         }
         self.participants = thread
             .participants
@@ -1604,6 +1875,76 @@ impl Thread {
         self.publish(protocol::HostMessage::DraftUpdate(update));
         self.draft.doc.validate()?;
         draft::verify_change(&before, &self.draft.doc.items(), author.as_uuid())
+    }
+
+    /// Tells the other participants where the local user is in the draft.
+    fn publish_presence(&mut self, presence: protocol::Presence, cx: &mut impl AppContext) {
+        match &self.sharing {
+            ThreadSharing::Shared { .. } => {
+                self.host_presence(self.participant_id, presence, cx);
+            }
+            ThreadSharing::Connected { .. } => {
+                self.request(protocol::CollaboratorMessage::Presence(presence));
+            }
+            ThreadSharing::NotShared | ThreadSharing::Sharing | ThreadSharing::Failed => {}
+        }
+    }
+
+    /// Records and broadcasts a participant's presence in a hosted thread.
+    ///
+    /// The host also removes an empty item the participant has just left if
+    /// nobody is in it anymore. Whoever leaves an item last removes it
+    /// themselves, but two people leaving at once each still see the other
+    /// there, so the host settles it.
+    fn host_presence(
+        &mut self,
+        participant: ParticipantId,
+        presence: protocol::Presence,
+        cx: &mut impl AppContext,
+    ) {
+        let left = self
+            .draft
+            .presence
+            .get(&participant)
+            .and_then(|(previous, _)| previous.focus)
+            .filter(|previous| Some(*previous) != presence.focus);
+        self.emit(
+            protocol::HostMessage::Presence {
+                participant: participant.into_bytes(),
+                presence,
+            },
+            cx,
+        );
+        self.remove_if_left_empty(left);
+    }
+
+    /// Removes the item behind `focus` if it is empty, nobody is in it, and
+    /// no files are on their way into it.
+    fn remove_if_left_empty(&mut self, focus: Option<protocol::PresenceFocus>) {
+        if let Some(protocol::PresenceFocus::Item(id)) = focus {
+            let id = ItemId::from_uuid(Uuid::from_bytes(id));
+            if !self.draft.is_attended(id, None)
+                && !self.draft.has_announced_reads_into(id)
+                && self.draft.remove_if_empty(id)
+            {
+                self.flush_draft();
+            }
+        }
+    }
+
+    /// Lets everyone know a collaborator has left, first removing the empty
+    /// item they were in if nobody else is in it either.
+    fn participant_left(&mut self, participant: ParticipantId, cx: &mut impl AppContext) {
+        let focus = self
+            .draft
+            .presence
+            .remove(&participant)
+            .and_then(|(presence, _)| presence.focus);
+        self.remove_if_left_empty(focus);
+        self.emit(
+            protocol::HostMessage::ParticipantLeft(participant.into_bytes()),
+            cx,
+        );
     }
 
     /// How many submissions this thread has accepted.
@@ -1722,6 +2063,14 @@ impl Thread {
                 let participant = ParticipantId::from_bytes(participant);
                 self.participants
                     .retain(|existing| *existing != participant);
+                self.draft.presence.remove(&participant);
+            }
+            protocol::HostMessage::Presence {
+                participant,
+                presence,
+            } => {
+                self.draft
+                    .set_presence(ParticipantId::from_bytes(participant), presence);
             }
             protocol::HostMessage::ModelSelected { catalog_id } => {
                 if let Some(model) = ModelSelection::from_catalog_id(&catalog_id) {
@@ -1967,12 +2316,15 @@ impl SidebarItem for CoworkSidebarSection {
 /// What the composer shows of a draft, read out of it for rendering.
 struct ComposerModel {
     draft_id: Uuid,
-    author: ParticipantId,
     comments: Vec<UserComment>,
     comments_folded: bool,
     blocks: Vec<ComposerBlock>,
     draft_position: Option<Entity<TextareaState>>,
     draft_row_visible: bool,
+    /// The avatar the draft position row leads with, and those layered on it.
+    draft_position_people: (ParticipantId, Vec<ParticipantId>),
+    /// Everyone else's carets at the draft position.
+    draft_position_presence: ItemPresence,
     /// Files being read, by the block they will land in; `None` is the draft
     /// position.
     pending: Vec<(Option<ItemId>, Attachment)>,
@@ -1981,10 +2333,12 @@ struct ComposerModel {
 struct ComposerBlock {
     id: ItemId,
     creator: ParticipantId,
+    presence: ItemPresence,
     editor: Entity<TextareaState>,
     attachments: Vec<(AttachmentId, FileAttachment)>,
 }
 
+#[derive(Clone)]
 struct PendingAttachment {
     id: Uuid,
     draft_id: Uuid,
@@ -2028,6 +2382,9 @@ struct Cowork {
     /// removed, by a submission or by someone else, the caret can move to
     /// the draft position instead of vanishing.
     typing_in: Option<(Uuid, EntityId, gpui::FocusHandle)>,
+    /// The presence last sent for each shared thread, by instance id.
+    published_presence: HashMap<Uuid, protocol::Presence>,
+    caret_label_refresh: Option<gpui::Task<()>>,
     /// The model new threads start with: the last one selected locally.
     new_thread_model: ModelSelection,
     /// Always shows the active thread's model; see [`Cowork::sync_model_picker`].
@@ -2341,7 +2698,7 @@ impl Cowork {
                 if still_in_item || self.has_pending_reads(draft_id, id, cx) {
                     return;
                 }
-                self.update_draft(draft_id, cx, |draft| draft.remove_if_abandoned(id));
+                self.update_draft(draft_id, cx, |draft| draft.remove_if_unattended(id));
                 cx.notify();
             }
             InputEvent::Focus => {
@@ -2461,6 +2818,119 @@ impl Cowork {
         }
     }
 
+    /// Where the local user is in `thread`'s draft, as others should see it.
+    fn local_presence(&self, thread: &Thread, cx: &App) -> protocol::Presence {
+        let draft = &thread.draft;
+        let slot = self
+            .typing_in
+            .as_ref()
+            .filter(|(typing_draft, _, _)| {
+                *typing_draft == draft.id && self.active_thread_id == Some(thread.instance_id)
+            })
+            .and_then(|(_, editor, _)| draft.slot_of(*editor));
+        let focus = slot.map(|slot| match slot.item() {
+            Some(id) => protocol::PresenceFocus::Item(id.as_uuid().into_bytes()),
+            None => protocol::PresenceFocus::DraftPosition,
+        });
+        let selection = slot
+            .and_then(|slot| Some((slot.item()?, draft.editor(slot)?)))
+            .and_then(|(id, editor)| {
+                let editor = editor.read(cx);
+                let range = editor.selected_range();
+                let head = editor.cursor();
+                let tail = if head == range.start {
+                    range.end
+                } else {
+                    range.start
+                };
+                Some(protocol::PresenceSelection {
+                    anchor: draft.doc.anchor(id, tail)?,
+                    head: draft.doc.anchor(id, head)?,
+                })
+            });
+        let pending_reads = self
+            .pending_attachments
+            .iter()
+            .filter(|pending| pending.draft_id == draft.id)
+            .map(|pending| protocol::PendingRead {
+                id: pending.id.into_bytes(),
+                name: pending.name.clone(),
+                is_image: pending.is_image,
+                progress: pending
+                    .progress
+                    .map(|progress| progress.clamp(0., 100.) as u8),
+                block: draft
+                    .pending_block(pending.target)
+                    .map(|id| id.as_uuid().into_bytes()),
+            })
+            .collect();
+        protocol::Presence {
+            focus,
+            selection,
+            pending_reads,
+        }
+    }
+
+    /// Sends the local user's presence in every shared thread whose has
+    /// changed since it was last sent.
+    fn publish_presence(&mut self, cx: &mut Context<Self>) {
+        let threads = self.thread_store.read(cx).threads.clone();
+        let mut collaborating = HashSet::new();
+        for thread in threads {
+            let (thread_id, presence) = {
+                let thread = thread.read(cx);
+                if !matches!(
+                    thread.sharing,
+                    ThreadSharing::Shared { .. } | ThreadSharing::Connected { .. }
+                ) {
+                    continue;
+                }
+                (thread.instance_id, self.local_presence(thread, cx))
+            };
+            collaborating.insert(thread_id);
+            if self.published_presence.get(&thread_id) == Some(&presence) {
+                continue;
+            }
+            self.published_presence.insert(thread_id, presence.clone());
+            thread.update(cx, |thread, cx| thread.publish_presence(presence, cx));
+        }
+        // Sharing again starts over, with everyone joining learning it anew.
+        self.published_presence
+            .retain(|thread_id, _| collaborating.contains(thread_id));
+    }
+
+    /// Redraws once the caret labels shown now have expired.
+    fn schedule_caret_label_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.caret_label_refresh.is_some() {
+            return;
+        }
+        let Some(thread) = self.active_thread(cx) else {
+            return;
+        };
+        let now = Instant::now();
+        let Some(expires_in) = thread
+            .read(cx)
+            .draft
+            .presence
+            .values()
+            .filter_map(|(_, changed)| {
+                (*changed + CARET_LABEL_DURATION).checked_duration_since(now)
+            })
+            .min()
+        else {
+            return;
+        };
+        self.caret_label_refresh = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(expires_in + Duration::from_millis(20))
+                .await;
+            _ = this.update(cx, |this, cx| {
+                this.caret_label_refresh = None;
+                cx.notify();
+            });
+        }));
+    }
+
     /// Whether files are still being read into the block `id`.
     fn has_pending_reads(&self, draft_id: Uuid, id: ItemId, cx: &App) -> bool {
         self.read_draft(draft_id, cx, |draft| {
@@ -2515,14 +2985,20 @@ impl Cowork {
         let Some(id) = slot.item() else {
             return false;
         };
-        if !self
-            .update_draft(draft_id, cx, |draft| draft.remove_if_empty(id))
-            .unwrap_or(false)
-        {
+        if !self.item_is_empty(draft_id, id, cx) {
             return false;
         }
+        // Kept while someone else is in it, but the caret moves on either way.
+        self.update_draft(draft_id, cx, |draft| draft.remove_if_unattended(id));
         self.focus_draft_editor(draft_id, EditorSlot::DraftPosition, None, window, cx);
         true
+    }
+
+    fn item_is_empty(&self, draft_id: Uuid, id: ItemId, cx: &App) -> bool {
+        self.read_draft(draft_id, cx, |draft| {
+            draft.doc.item(id).is_some_and(|item| item.is_empty())
+        })
+        .unwrap_or(false)
     }
 
     /// Backspace in an empty item removes it, and in the empty draft position
@@ -2548,12 +3024,11 @@ impl Cowork {
             .map(|index| chain[index].clone());
         match slot.item() {
             Some(id) => {
-                if !self
-                    .update_draft(draft_id, cx, |draft| draft.remove_if_empty(id))
-                    .unwrap_or(false)
-                {
+                if !self.item_is_empty(draft_id, id, cx) {
                     return false;
                 }
+                // Kept while someone else is in it; the caret moves anyway.
+                self.update_draft(draft_id, cx, |draft| draft.remove_if_unattended(id));
             }
             None if previous.is_none() => return false,
             None => {}
@@ -2844,12 +3319,7 @@ impl Cowork {
 
         let result = Self::serve_participant(&cowork, &thread, participant_id, &peer, cx).await;
 
-        _ = thread.update(cx, |thread, cx| {
-            thread.emit(
-                protocol::HostMessage::ParticipantLeft(participant_id.into_bytes()),
-                cx,
-            );
-        });
+        _ = thread.update(cx, |thread, cx| thread.participant_left(participant_id, cx));
         _ = cowork.update(cx, |_, cx| cx.notify());
         result
     }
@@ -2904,11 +3374,20 @@ impl Cowork {
         peer: &HostPeer,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<broadcast::Receiver<protocol::HostMessage>> {
-        let (snapshot, draft, events) = thread
+        let (snapshot, draft, presence, events) = thread
             .update(cx, |thread, _| {
+                let presence = thread
+                    .draft
+                    .presence
+                    .iter()
+                    .map(|(participant, (presence, _))| {
+                        (participant.into_bytes(), presence.clone())
+                    })
+                    .collect();
                 Some((
                     thread.to_protocol(),
                     thread.draft.doc.encode_state(),
+                    presence,
                     thread.subscribe()?,
                 ))
             })?
@@ -2917,6 +3396,7 @@ impl Cowork {
             participant_id: participant_id.into_bytes(),
             thread: snapshot,
             draft,
+            presence,
         }))
         .await
         .context("Peer disconnected before receiving the thread snapshot.")?;
@@ -2956,11 +3436,17 @@ impl Cowork {
                 // A stale sequence means another submission won the race;
                 // everyone sees that one.
                 // TODO: tell the submitter why a submission was not accepted.
-                if !stale && !self.draft_is_loading_attachments(draft_id) {
+                if !stale && !self.draft_is_loading_attachments(draft_id, cx) {
                     self.accept_submission(draft_id, Some(thread.clone()), cx);
                     let thread_id = thread.read(cx).instance_id;
                     self.thread_updated(thread_id, cx);
                 }
+            }
+            protocol::CollaboratorMessage::Presence(presence) => {
+                thread.update(cx, |thread, cx| {
+                    thread.host_presence(participant, presence, cx);
+                });
+                cx.notify();
             }
             protocol::CollaboratorMessage::SelectModel { catalog_id } => {
                 let Some(model) = ModelSelection::from_catalog_id(&catalog_id) else {
@@ -3301,9 +3787,18 @@ impl Cowork {
 
         cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
+                // Carets move constantly; they only need a redraw, not the
+                // timeline following new output.
+                let presence_only = matches!(event, protocol::HostMessage::Presence { .. });
                 thread.update(cx, |thread, cx| thread.apply(event, cx));
                 if this
-                    .update(cx, |this, cx| this.thread_updated(thread_id, cx))
+                    .update(cx, |this, cx| {
+                        if presence_only {
+                            cx.notify();
+                        } else {
+                            this.thread_updated(thread_id, cx);
+                        }
+                    })
                     .is_err()
                 {
                     return;
@@ -3354,6 +3849,7 @@ impl Cowork {
                         return None;
                     };
                     thread.participants.clear();
+                    thread.draft.presence.clear();
                     Some(endpoint)
                 });
                 if let Some(endpoint) = endpoint {
@@ -4090,9 +4586,14 @@ impl Cowork {
                 .into_any_element(),
             UserCommentBody::Editing { inline, .. } => div()
                 .id(format!("comment-editor-inline-{}", comment.id))
+                .relative()
                 .flex_1()
                 .min_w_0()
                 .child(Textarea::new(inline))
+                .child(Self::render_remote_carets(
+                    inline,
+                    comment.presence.carets.clone(),
+                ))
                 .into_any_element(),
         };
 
@@ -4114,7 +4615,10 @@ impl Cowork {
                     .py_2()
                     .border_l_2()
                     .border_color(rgb(comment.author.color()))
-                    .child(Self::render_avatar(MessageAuthor::User(comment.author)))
+                    .child(Self::render_layered_avatars(
+                        comment.author,
+                        &comment.presence.editors,
+                    ))
                     .child(body),
             )
             .into_any_element()
@@ -4129,9 +4633,14 @@ impl Cowork {
                 .into_any_element(),
             UserCommentBody::Editing { composer, .. } => div()
                 .id(format!("comment-editor-composer-{}", comment.id))
+                .relative()
                 .flex_1()
                 .min_w_0()
                 .child(Textarea::new(composer))
+                .child(Self::render_remote_carets(
+                    composer,
+                    comment.presence.carets.clone(),
+                ))
                 .into_any_element(),
         };
 
@@ -4174,7 +4683,10 @@ impl Cowork {
                                 .py_2()
                                 .border_l_2()
                                 .border_color(rgb(comment.author.color()))
-                                .child(Self::render_avatar(MessageAuthor::User(comment.author)))
+                                .child(Self::render_layered_avatars(
+                                    comment.author,
+                                    &comment.presence.editors,
+                                ))
                                 .child(body),
                         ),
                 ),
@@ -4336,7 +4848,7 @@ impl Cowork {
             if !group.comments_folded {
                 content.extend(group.comments.iter().map(Self::render_composer_comment));
             }
-            rows.push(Self::render_message_row(None, content));
+            rows.push(Self::render_comment_group_row(&group.comments, content));
         }
         for (block_index, block) in group.blocks.iter().enumerate() {
             let mut content = Vec::new();
@@ -4386,6 +4898,153 @@ impl Cowork {
             .gap_3()
             .children(rows)
             .into_any_element()
+    }
+
+    /// The row of a group of comments. Its gutter shows who wrote them, so
+    /// that a folded group is still recognizably someone's message.
+    fn render_comment_group_row(
+        comments: &[UserComment],
+        content: impl IntoIterator<Item = gpui::AnyElement>,
+    ) -> gpui::Div {
+        let authors = Self::comment_authors(comments);
+        match authors.split_first() {
+            Some((first, rest)) => Self::render_presence_row(*first, rest, content),
+            None => Self::render_message_row(None, content),
+        }
+    }
+
+    /// The distinct authors of `comments`, in the order they first commented.
+    fn comment_authors(comments: &[UserComment]) -> Vec<ParticipantId> {
+        comments.iter().fold(Vec::new(), |mut authors, comment| {
+            if !authors.contains(&comment.author) {
+                authors.push(comment.author);
+            }
+            authors
+        })
+    }
+
+    /// A composer row whose gutter shows `primary` with everyone else in the
+    /// row layered below it.
+    fn render_presence_row(
+        primary: ParticipantId,
+        others: &[ParticipantId],
+        content: impl IntoIterator<Item = gpui::AnyElement>,
+    ) -> gpui::Div {
+        Self::render_message_row(None, content)
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(40.))
+                    .flex()
+                    .justify_center()
+                    .child(Self::render_layered_avatars(primary, others)),
+            )
+            .relative()
+    }
+
+    /// A participant's avatar with smaller avatars of `others` overlapping
+    /// its lower edge. Positioned absolutely so that people coming and going
+    /// never move the row's text.
+    fn render_layered_avatars(primary: ParticipantId, others: &[ParticipantId]) -> gpui::Div {
+        const MAX_OTHERS: usize = 2;
+        const SMALL: gpui::Pixels = px(14.);
+        const STEP: f32 = 10.;
+
+        let hidden = others.len().saturating_sub(MAX_OTHERS);
+        let mut layered = others
+            .iter()
+            .take(MAX_OTHERS)
+            .map(|&participant| {
+                Self::render_participant_avatar(participant, SMALL)
+                    .text_size(px(6.))
+                    .border_1()
+                    .border_color(rgb(0x18181b))
+            })
+            .collect::<Vec<_>>();
+        if hidden > 0 {
+            layered.push(
+                div()
+                    .size(SMALL)
+                    .flex()
+                    .flex_none()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgb(0x18181b))
+                    .bg(rgb(0x3f3f46))
+                    .text_size(px(7.))
+                    .text_color(rgb(0xf4f4f5))
+                    .child(format!("+{hidden}")),
+            );
+        }
+        let count = layered.len();
+        div()
+            .relative()
+            .child(Self::render_avatar(MessageAuthor::User(primary)))
+            .children(layered.into_iter().enumerate().map(|(index, avatar)| {
+                // Centered under the primary avatar, fanned out sideways.
+                let offset = (index as f32 - (count as f32 - 1.) / 2.) * STEP;
+                avatar.absolute().top(px(14.)).left(px(11. - 7. + offset))
+            }))
+    }
+
+    /// Paints other participants' carets and selections over `editor`.
+    fn render_remote_carets(
+        editor: &Entity<TextareaState>,
+        carets: Vec<RemoteCaret>,
+    ) -> impl IntoElement {
+        let editor = editor.clone();
+        canvas(
+            |_, _, _| (),
+            move |_, _, window, cx| {
+                // Laid out first: the editor cannot stay borrowed while
+                // painting.
+                let layout = {
+                    let editor = editor.read(cx);
+                    let text = editor.value();
+                    let Some(text_bounds) = editor.text_bounds() else {
+                        return;
+                    };
+                    carets
+                        .iter()
+                        .map(|caret| {
+                            let clamp = |offset: usize| text.floor_char_boundary(offset);
+                            let selection =
+                                clamp(caret.selection.start)..clamp(caret.selection.end);
+                            let head = clamp(caret.head);
+                            (
+                                caret,
+                                selection_rects(editor, &text, selection, text_bounds),
+                                editor.range_to_bounds(&(head..head)),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for (caret, selection, head) in layout {
+                    let color = caret.participant.color();
+                    for rect in selection {
+                        window.paint_quad(gpui::fill(rect, rgba((color << 8) | 0x40)));
+                    }
+                    let Some(head) = head else {
+                        continue;
+                    };
+                    window.paint_quad(gpui::fill(
+                        Bounds::new(head.origin, size(px(2.), head.size.height)),
+                        rgb(color),
+                    ));
+                    if caret.moved_at.elapsed() < CARET_LABEL_DURATION {
+                        paint_caret_label(caret.participant, head.origin, window, cx);
+                    }
+                }
+            },
+        )
+        .absolute()
+        .top_0()
+        .left_0()
+        .size_full()
     }
 
     /// One row of the timeline or composer: an avatar gutter, the content, and
@@ -5058,10 +5717,15 @@ impl Cowork {
         }))
     }
 
-    fn draft_is_loading_attachments(&self, draft_id: Uuid) -> bool {
+    /// Whether anyone, the local user or another participant, is still
+    /// reading files into the draft, which holds submission back.
+    fn draft_is_loading_attachments(&self, draft_id: Uuid, cx: &App) -> bool {
         self.pending_attachments
             .iter()
             .any(|pending| pending.draft_id == draft_id)
+            || self
+                .read_draft(draft_id, cx, ThreadDraft::others_are_reading_files)
+                .unwrap_or(false)
     }
 
     /// Where the attach button attaches to: the focused prompt block, or
@@ -5113,6 +5777,7 @@ impl Cowork {
                 (id, source)
             })
             .collect::<Vec<_>>();
+        self.publish_presence(cx);
         cx.notify();
         let (sender, mut receiver) = mpsc::unbounded_channel();
         cx.background_executor()
@@ -5202,6 +5867,9 @@ impl Cowork {
                 }
             }
         }
+        // Also sent from render, but a hidden window may not render, and
+        // others cannot submit while a read is announced.
+        self.publish_presence(cx);
         cx.notify();
     }
 
@@ -5226,7 +5894,7 @@ impl Cowork {
             draft.doc.remove_attachment(attachment);
             draft.attachment_bytes.remove(&attachment);
             if !block_focused {
-                draft.remove_if_abandoned(block);
+                draft.remove_if_unattended(block);
             }
         });
         self.attachment_errors
@@ -5484,7 +6152,7 @@ impl Cowork {
         let Some(draft_id) = self.writable_draft_id(cx) else {
             return;
         };
-        if self.draft_is_loading_attachments(draft_id) {
+        if self.draft_is_loading_attachments(draft_id, cx) {
             return;
         }
 
@@ -5630,6 +6298,7 @@ impl Cowork {
                 DraftItemKind::Comment { target } => comments.push(UserComment {
                     id: item.id.as_uuid(),
                     author,
+                    presence: ItemPresence::default(),
                     reference: CommentReference {
                         message_id: target.message_id,
                         range: target.range.clone(),
@@ -5693,7 +6362,7 @@ impl Cowork {
             .is_some_and(|draft_id| self.draft_accepts_attachments(draft_id, cx));
         let loading_attachments = self
             .writable_draft_id(cx)
-            .is_some_and(|draft_id| self.draft_is_loading_attachments(draft_id));
+            .is_some_and(|draft_id| self.draft_is_loading_attachments(draft_id, cx));
         let generating = active_thread.is_some_and(|thread| thread.read(cx).generating);
         let selected_model_title = self
             .model_picker
@@ -5902,6 +6571,7 @@ impl Cowork {
         div()
             .id(("composer", composer.entity_id()))
             .debug_selector(|| "composer".to_owned())
+            .relative()
             .flex_1()
             .min_w_0()
             .flex()
@@ -5928,7 +6598,7 @@ impl Cowork {
     }
 
     /// Whether the draft position is shown below the prompt blocks: always
-    /// when there are none, otherwise only while the user is there or files
+    /// when there are none, otherwise only while someone is there or files
     /// are being read for a new block.
     fn draft_row_visible(&self, draft: &ThreadDraft, window: &Window, cx: &App) -> bool {
         !draft.doc.items().iter().any(|item| item.is_prompt())
@@ -5936,9 +6606,85 @@ impl Cowork {
                 .draft_position
                 .as_ref()
                 .is_some_and(|editor| editor.focus_handle(cx).is_focused(window))
-            || self.pending_attachments.iter().any(|pending| {
-                pending.draft_id == draft.id && draft.pending_block(pending.target).is_none()
-            })
+            || !draft.others_at_draft_position(&[]).is_empty()
+            || self
+                .pending_reads(draft)
+                .iter()
+                .any(|pending| draft.pending_block(pending.target).is_none())
+    }
+
+    /// Every file being read into the draft: the local user's, and those
+    /// others announce in their presence.
+    fn pending_reads(&self, draft: &ThreadDraft) -> Vec<PendingAttachment> {
+        let local = self
+            .pending_attachments
+            .iter()
+            .filter(|pending| pending.draft_id == draft.id)
+            .cloned();
+        let remote = draft
+            .presence
+            .iter()
+            .filter(|(participant, _)| **participant != draft.author)
+            .flat_map(|(_, (presence, _))| &presence.pending_reads)
+            .map(|read| PendingAttachment {
+                id: Uuid::from_bytes(read.id),
+                draft_id: draft.id,
+                target: match read.block {
+                    Some(block) => {
+                        AttachmentTarget::Block(ItemId::from_uuid(Uuid::from_bytes(block)))
+                    }
+                    // Never matches a batch, so it is shown at the draft
+                    // position like the local user's reads for new blocks.
+                    None => AttachmentTarget::NewBlock(Uuid::nil()),
+                },
+                name: read.name.clone(),
+                is_image: read.is_image,
+                progress: read.progress.map(f32::from),
+            });
+        local.chain(remote).collect()
+    }
+
+    /// Whose avatars the draft position row shows: everyone while the draft
+    /// has no blocks, otherwise those at it. The local user comes first when
+    /// included, and stands alone in an unshared thread.
+    fn draft_position_people(
+        draft: &ThreadDraft,
+        participants: &[ParticipantId],
+        window: &Window,
+        cx: &App,
+    ) -> (ParticipantId, Vec<ParticipantId>) {
+        let local_there = draft
+            .draft_position
+            .as_ref()
+            .is_some_and(|editor| editor.focus_handle(cx).is_focused(window));
+        let others = if draft.doc.items().iter().any(|item| item.is_prompt()) {
+            draft.others_at_draft_position(participants)
+        } else {
+            participants
+                .iter()
+                .copied()
+                .filter(|participant| *participant != draft.author)
+                .collect()
+        };
+        let local_included = local_there
+            || participants.is_empty()
+            || !draft.doc.items().iter().any(|item| item.is_prompt());
+        match (local_included, others.split_first()) {
+            (false, Some((first, rest))) => (*first, rest.to_vec()),
+            _ => (draft.author, others),
+        }
+    }
+
+    /// The thread's participants in join order, for the draft `draft_id`.
+    fn draft_participants(&self, draft_id: Uuid, cx: &App) -> Vec<ParticipantId> {
+        self.thread_store
+            .read(cx)
+            .threads
+            .iter()
+            .map(|thread| thread.read(cx))
+            .find(|thread| thread.draft.id == draft_id)
+            .map(|thread| thread.participants.clone())
+            .unwrap_or_default()
     }
 
     /// The bottom-most editor of the composer.
@@ -5958,6 +6704,7 @@ impl Cowork {
     }
 
     fn composer_model(&self, draft_id: Uuid, window: &Window, cx: &App) -> Option<ComposerModel> {
+        let participants = self.draft_participants(draft_id, cx);
         self.read_draft(draft_id, cx, |draft| {
             let blocks = draft
                 .doc
@@ -5967,9 +6714,18 @@ impl Cowork {
                     let DraftItemKind::Prompt { attachments } = item.kind else {
                         return None;
                     };
+                    let creator = ParticipantId::from_uuid(item.creator);
                     Some(ComposerBlock {
                         id: item.id,
-                        creator: ParticipantId::from_uuid(item.creator),
+                        creator,
+                        presence: ItemPresence {
+                            editors: draft
+                                .editors_of(item.id, &participants)
+                                .into_iter()
+                                .filter(|editor| *editor != creator)
+                                .collect(),
+                            carets: draft.remote_carets(item.id, &participants),
+                        },
                         editor: draft.editor(EditorSlot::Prompt(item.id))?,
                         attachments: attachments
                             .iter()
@@ -5982,9 +6738,8 @@ impl Cowork {
                 })
                 .collect();
             let pending = self
-                .pending_attachments
+                .pending_reads(draft)
                 .iter()
-                .filter(|pending| pending.draft_id == draft_id)
                 .map(|pending| {
                     (
                         draft.pending_block(pending.target),
@@ -5994,12 +6749,21 @@ impl Cowork {
                 .collect();
             ComposerModel {
                 draft_id,
-                author: draft.author,
-                comments: draft.comment_views(),
+                comments: draft.comment_views(&participants),
                 comments_folded: draft.comments_folded,
                 blocks,
                 draft_position: draft.draft_position.clone(),
                 draft_row_visible: self.draft_row_visible(draft, window, cx),
+                draft_position_people: Self::draft_position_people(
+                    draft,
+                    &participants,
+                    window,
+                    cx,
+                ),
+                draft_position_presence: ItemPresence {
+                    editors: Vec::new(),
+                    carets: draft.draft_position_carets(&participants),
+                },
                 pending,
             }
         })
@@ -6015,12 +6779,13 @@ impl Cowork {
     ) -> gpui::Stateful<gpui::Div> {
         let ComposerModel {
             draft_id,
-            author,
             comments,
             comments_folded,
             blocks,
             draft_position,
             draft_row_visible,
+            draft_position_people,
+            draft_position_presence,
             mut pending,
         } = composer;
         let mut rows = Vec::new();
@@ -6032,7 +6797,7 @@ impl Cowork {
             if !comments_folded {
                 content.extend(comments.iter().map(Self::render_composer_comment));
             }
-            rows.push(Self::render_message_row(None, content).into_any_element());
+            rows.push(Self::render_comment_group_row(&comments, content).into_any_element());
         }
 
         let block_count = blocks.len();
@@ -6062,10 +6827,17 @@ impl Cowork {
                         .into_any_element(),
                 );
             }
-            content.push(Self::render_composer_editor(&block.editor, last, cx).into_any_element());
+            content.push(
+                Self::render_composer_editor(&block.editor, last, cx)
+                    .child(Self::render_remote_carets(
+                        &block.editor,
+                        block.presence.carets,
+                    ))
+                    .into_any_element(),
+            );
             let block_id = block.id;
             rows.push(
-                Self::render_message_row(Some(MessageAuthor::User(block.creator)), content)
+                Self::render_presence_row(block.creator, &block.presence.editors, content)
                     .can_drop(|value, _, _| {
                         value
                             .downcast_ref::<ExternalPaths>()
@@ -6112,15 +6884,16 @@ impl Cowork {
                 );
             }
             content.extend(errors);
-            content.extend(
-                draft_position.as_ref().map(|editor| {
-                    Self::render_composer_editor(editor, true, cx).into_any_element()
-                }),
-            );
-            rows.push(
-                Self::render_message_row(Some(MessageAuthor::User(author)), content)
-                    .into_any_element(),
-            );
+            content.extend(draft_position.as_ref().map(|editor| {
+                Self::render_composer_editor(editor, true, cx)
+                    .child(Self::render_remote_carets(
+                        editor,
+                        draft_position_presence.carets,
+                    ))
+                    .into_any_element()
+            }));
+            let (primary, others) = draft_position_people;
+            rows.push(Self::render_presence_row(primary, &others, content).into_any_element());
         } else if !errors.is_empty() {
             rows.push(Self::render_message_row(None, errors).into_any_element());
         }
@@ -6163,9 +6936,12 @@ impl Cowork {
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
             .map(|thread| {
                 let thread = thread.read(cx);
-                (thread.timeline.clone(), thread.draft.comment_views())
+                (
+                    thread.timeline.clone(),
+                    thread.draft.comment_views(&thread.participants),
+                )
             })
-            .unwrap_or_else(|| (Vec::new(), self.new_thread_draft.comment_views()));
+            .unwrap_or_else(|| (Vec::new(), self.new_thread_draft.comment_views(&[])));
         let composer = self
             .writable_draft_id(cx)
             .and_then(|draft_id| self.composer_model(draft_id, window, cx));
@@ -6296,6 +7072,8 @@ impl Render for Cowork {
         if let Some(draft_id) = self.writable_draft_id(cx) {
             self.prepare_draft(draft_id, window, cx);
         }
+        self.publish_presence(cx);
+        self.schedule_caret_label_refresh(cx);
         let composer = self.last_composer_editor(window, cx);
         let can_write = composer.is_some();
         let read_only_line_bounds = Rc::new(Cell::new(None));
@@ -6459,6 +7237,8 @@ fn main() -> anyhow::Result<()> {
                         active_generations: HashMap::new(),
                         local_participant_id,
                         typing_in: None,
+                        published_presence: HashMap::new(),
+                        caret_label_refresh: None,
                         new_thread_model: DEFAULT_MODEL,
                         model_picker,
                         model_picker_hovered: false,
@@ -6720,6 +7500,8 @@ mod tests {
             active_generations: HashMap::new(),
             local_participant_id,
             typing_in: None,
+            published_presence: HashMap::new(),
+            caret_label_refresh: None,
             new_thread_model: DEFAULT_MODEL,
             model_picker,
             model_picker_hovered: false,
@@ -6819,7 +7601,7 @@ mod tests {
                 vec![AttachmentSource::Path(path.clone())],
                 cx,
             );
-            assert!(cowork.draft_is_loading_attachments(draft_id));
+            assert!(cowork.draft_is_loading_attachments(draft_id, cx));
             cowork.active_thread_id = None;
         });
         cx.run_until_parked();
@@ -7099,7 +7881,7 @@ mod tests {
                     "Existing comment",
                 );
             }
-            let comments = draft.comment_views();
+            let comments = draft.comment_views(&[]);
             // Stands in for the composer, which has focus before commenting.
             let composer = Cowork::new_draft_editor("", window, cx);
             let timeline = vec![TimelineMessage::Agent(AgentMessage {
@@ -7197,7 +7979,7 @@ mod tests {
             // New comments are appended after any existing one.
             let Some(comment) = thread
                 .draft
-                .comment_views()
+                .comment_views(&[])
                 .into_iter()
                 .last()
                 .filter(|comment| matches!(comment.body, UserCommentBody::Editing { .. }))
@@ -7231,7 +8013,7 @@ mod tests {
                     .expect("thread")
                     .read(cx)
                     .draft
-                    .comment_views()
+                    .comment_views(&[])
             });
             view.update(cx, |view, cx| {
                 view.comments = comments;
@@ -7600,6 +8382,7 @@ mod tests {
                     participant_id: collaborator_participant.into_bytes(),
                     thread: view.host.read(cx).to_protocol(),
                     draft: view.host.read(cx).draft.doc.encode_state(),
+                    presence: Vec::new(),
                 };
                 let draft = ThreadDraft::new(ParticipantId::new());
                 let collaborator =
@@ -8382,6 +9165,7 @@ mod tests {
             &[UserComment {
                 id: Uuid::new_v4(),
                 author,
+                presence: ItemPresence::default(),
                 reference: CommentReference {
                     message_id: Uuid::new_v4(),
                     range: 0..5,
@@ -8792,13 +9576,47 @@ mod tests {
     }
 
     #[test]
-    fn only_the_creator_removes_an_item_it_left_empty() {
+    fn caret_labels_only_reappear_when_the_caret_moves() {
         let mut draft = ThreadDraft::new(ParticipantId::new());
-        let own = draft.doc.create_prompt(draft.author.as_uuid(), "");
-        let others = draft.doc.create_prompt(Uuid::new_v4(), "");
+        let other = ParticipantId::new();
+        let at_draft_position = protocol::Presence {
+            focus: Some(protocol::PresenceFocus::DraftPosition),
+            ..Default::default()
+        };
+        draft.set_presence(other, at_draft_position.clone());
+        let moved_at = draft.presence[&other].1;
 
-        assert!(!draft.remove_if_abandoned(others));
-        assert!(draft.remove_if_abandoned(own));
+        std::thread::sleep(Duration::from_millis(5));
+        let mut reading = at_draft_position.clone();
+        reading.pending_reads.push(protocol::PendingRead {
+            id: [1; 16],
+            name: "big.png".into(),
+            is_image: true,
+            progress: Some(10),
+            block: None,
+        });
+        draft.set_presence(other, reading);
+        assert_eq!(draft.presence[&other].1, moved_at);
+
+        draft.set_presence(other, protocol::Presence::default());
+        assert!(draft.presence[&other].1 > moved_at);
+    }
+
+    #[test]
+    fn empty_items_someone_else_is_in_are_kept() {
+        let mut draft = ThreadDraft::new(ParticipantId::new());
+        let attended = draft.doc.create_prompt(Uuid::new_v4(), "");
+        let unattended = draft.doc.create_prompt(Uuid::new_v4(), "");
+        let in_item = |id: ItemId| protocol::Presence {
+            focus: Some(protocol::PresenceFocus::Item(id.as_uuid().into_bytes())),
+            ..Default::default()
+        };
+        draft.set_presence(ParticipantId::new(), in_item(attended));
+        // The local user's own presence does not count.
+        draft.set_presence(draft.author, in_item(unattended));
+
+        assert!(!draft.remove_if_unattended(attended));
+        assert!(draft.remove_if_unattended(unattended));
         assert_eq!(
             draft
                 .doc
@@ -8806,7 +9624,7 @@ mod tests {
                 .into_iter()
                 .map(|item| item.id)
                 .collect::<Vec<_>>(),
-            [others]
+            [attended]
         );
     }
 
@@ -8825,6 +9643,7 @@ mod tests {
                 messages: Vec::new(),
             },
             draft: host_draft.encode_state(),
+            presence: Vec::new(),
         };
 
         let thread = cx.new(|cx| {
@@ -8959,6 +9778,315 @@ mod tests {
             this.collaborator.read_with(this.cx, |collaborator, cx| {
                 collaborator.active_thread_id.is_none()
                     && collaborator.thread_store.read(cx).threads.is_empty()
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn the_host_sees_where_the_collaborator_is_typing(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let host_thread = session.host_thread.clone();
+        let collaborator_id =
+            collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id);
+        let block = session.items(&host_thread)[0].id;
+
+        let collaborator = session.collaborator.clone();
+        session.focus(&collaborator);
+        session.wait_until("the host sees the collaborator in the block", |this| {
+            host_thread.read_with(this.cx, |thread, _| {
+                thread.draft.editors_of(block, &thread.participants) == [collaborator_id]
+            })
+        });
+        let caret = host_thread.read_with(session.cx, |thread, _| {
+            thread.draft.remote_carets(block, &thread.participants)
+        });
+        let end = "from the host".len();
+        assert!(matches!(
+            caret.as_slice(),
+            [RemoteCaret { participant, head, selection, .. }]
+                if *participant == collaborator_id && *head == end && *selection == (end..end)
+        ));
+
+        // The caret follows what the collaborator types, and the host's
+        // composer lists them as an editor of the host's block.
+        session.cx.simulate_input("!!");
+        session.wait_until("the caret moves along", |this| {
+            host_thread.read_with(this.cx, |thread, _| {
+                thread
+                    .draft
+                    .remote_carets(block, &thread.participants)
+                    .first()
+                    .is_some_and(|caret| caret.head == end + 2)
+            })
+        });
+        let host = session.host.clone();
+        let editors = session.cx.update(|window, cx| {
+            let host = host.read(cx);
+            let draft_id = host_thread.read(cx).draft.id;
+            let model = host.composer_model(draft_id, window, cx).expect("composer");
+            model.blocks[0].presence.editors.clone()
+        });
+        assert_eq!(editors, [collaborator_id]);
+
+        // Leaving the draft clears the presence.
+        collaborator.update(session.cx, |collaborator, cx| {
+            collaborator.active_thread_id = None;
+            cx.notify();
+        });
+        session.wait_until("the host sees the collaborator leave the block", |this| {
+            host_thread.read_with(this.cx, |thread, _| {
+                thread
+                    .draft
+                    .editors_of(block, &thread.participants)
+                    .is_empty()
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn the_host_sees_the_collaborators_selection(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let host_thread = session.host_thread.clone();
+        let block = session.items(&host_thread)[0].id;
+        let collaborator = session.collaborator.clone();
+        session.focus(&collaborator);
+        session.settle();
+        session
+            .cx
+            .simulate_keystrokes("shift-left shift-left shift-left shift-left");
+        let end = "from the host".len();
+        session.wait_until("the host sees the selection", |this| {
+            host_thread.read_with(this.cx, |thread, _| {
+                thread
+                    .draft
+                    .remote_carets(block, &thread.participants)
+                    .first()
+                    .is_some_and(|caret| caret.selection == (end - 4..end) && caret.head == end - 4)
+            })
+        });
+    }
+
+    #[test]
+    fn comment_groups_show_each_author_once_in_comment_order() {
+        let (alice, bob) = (ParticipantId::new(), ParticipantId::new());
+        let comment = |author| UserComment {
+            id: Uuid::new_v4(),
+            author,
+            presence: ItemPresence::default(),
+            reference: CommentReference {
+                message_id: Uuid::new_v4(),
+                range: 0..1,
+                quote: "q".into(),
+            },
+            body: UserCommentBody::Submitted("c".into()),
+        };
+        assert_eq!(
+            Cowork::comment_authors(&[comment(bob), comment(alice), comment(bob)]),
+            [bob, alice]
+        );
+        assert!(Cowork::comment_authors(&[]).is_empty());
+    }
+
+    #[gpui::test]
+    fn an_empty_block_stays_while_someone_else_is_in_it(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let host_thread = session.host_thread.clone();
+        let block = session.items(&host_thread)[0].id;
+        let host = session.host.clone();
+        host.update(session.cx, |host, cx| {
+            let draft_id = host_thread.read(cx).draft.id;
+            host.update_draft(draft_id, cx, |draft| {
+                draft.doc.set_body(block, "");
+            });
+        });
+        let collaborator = session.collaborator.clone();
+        session.focus(&collaborator);
+        session.wait_until("the host sees the collaborator in the block", |this| {
+            host_thread.read_with(this.cx, |thread, _| thread.draft.is_attended(block, None))
+        });
+
+        // The host cannot remove it while the collaborator is in it.
+        let removed = host_thread.update(session.cx, |thread, _| {
+            thread.draft.remove_if_unattended(block)
+        });
+        assert!(!removed);
+
+        // The collaborator, although not its creator, removes it on leaving.
+        session.cx.update(|window, cx| {
+            collaborator.update(cx, |collaborator, cx| {
+                let draft_id = collaborator_thread.read(cx).draft.id;
+                collaborator.focus_draft_editor(
+                    draft_id,
+                    EditorSlot::DraftPosition,
+                    None,
+                    window,
+                    cx,
+                );
+            });
+        });
+        session.wait_until("the block is removed everywhere", |this| {
+            this.items(&host_thread).is_empty() && this.items(&collaborator_thread).is_empty()
+        });
+    }
+
+    #[gpui::test]
+    fn the_host_removes_the_empty_block_a_leaving_collaborator_was_in(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let host_thread = session.host_thread.clone();
+        let collaborator = session.collaborator.clone();
+        let block = collaborator.update(session.cx, |collaborator, cx| {
+            let draft_id = collaborator_thread.read(cx).draft.id;
+            collaborator
+                .update_draft(draft_id, cx, |draft| {
+                    draft.doc.create_prompt(draft.author.as_uuid(), "")
+                })
+                .expect("draft")
+        });
+        session.cx.update(|window, cx| {
+            collaborator.update(cx, |collaborator, cx| {
+                let draft_id = collaborator_thread.read(cx).draft.id;
+                collaborator.focus_draft_editor(
+                    draft_id,
+                    EditorSlot::Prompt(block),
+                    None,
+                    window,
+                    cx,
+                );
+            });
+        });
+        session.wait_until("the host sees the collaborator in the block", |this| {
+            host_thread.read_with(this.cx, |thread, _| thread.draft.is_attended(block, None))
+        });
+
+        // Closing the collaborator's end disconnects it.
+        collaborator_thread.update(session.cx, |thread, _| {
+            thread.sharing = ThreadSharing::NotShared;
+        });
+        session.wait_until("the host drops the collaborator and the block", |this| {
+            host_thread.read_with(this.cx, |thread, _| {
+                thread.participants.len() == 1 && !thread.draft.doc.contains(block)
+            })
+        });
+        assert_eq!(session.bodies(&host_thread), ["from the host"]);
+    }
+
+    /// Two people leaving an empty block at once each still see the other
+    /// in it; the host removes it once both are gone.
+    #[gpui::test]
+    fn the_host_removes_an_empty_block_everyone_left(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let host_thread = session.host_thread.clone();
+        let block = session.items(&host_thread)[0].id;
+        let collaborator_id =
+            collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id);
+        let host = session.host.clone();
+        host.update(session.cx, |host, cx| {
+            let draft_id = host_thread.read(cx).draft.id;
+            host.update_draft(draft_id, cx, |draft| {
+                draft.doc.set_body(block, "");
+            });
+        });
+        let in_block = protocol::Presence {
+            focus: Some(protocol::PresenceFocus::Item(block.as_uuid().into_bytes())),
+            ..Default::default()
+        };
+        let host_id = host_thread.read_with(session.cx, |thread, _| thread.participant_id);
+        host_thread.update(session.cx, |thread, cx| {
+            thread.host_presence(host_id, in_block.clone(), cx);
+            thread.host_presence(collaborator_id, in_block, cx);
+            // The host leaves first: the collaborator is still there.
+            thread.host_presence(host_id, protocol::Presence::default(), cx);
+            assert!(thread.draft.doc.contains(block));
+            thread.host_presence(collaborator_id, protocol::Presence::default(), cx);
+            assert!(!thread.draft.doc.contains(block));
+        });
+        session.wait_until("the collaborator sees the block go", |this| {
+            this.items(&collaborator_thread).is_empty()
+        });
+    }
+
+    #[gpui::test]
+    fn sharing_again_announces_the_hosts_presence_again(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let host_thread = session.host_thread.clone();
+        let host = session.host.clone();
+        session.focus(&host);
+        session.settle();
+        let host_id = host_thread.read_with(session.cx, |thread, _| thread.participant_id);
+        let announced = |session: &mut Collaboration| {
+            host_thread.read_with(session.cx, |thread, _| {
+                thread.draft.presence.contains_key(&host_id)
+            })
+        };
+        assert!(announced(&mut session));
+
+        host_thread.update(session.cx, |thread, _| {
+            thread.draft.presence.clear();
+            thread.sharing = ThreadSharing::NotShared;
+        });
+        session.settle();
+        let endpoint = session
+            ._runtime
+            .block_on(Endpoint::builder(presets::Minimal).bind())
+            .expect("bind endpoint");
+        host_thread.update(session.cx, |thread, _| {
+            thread.sharing = ThreadSharing::Shared {
+                endpoint,
+                events: broadcast::channel(THREAD_EVENT_CAPACITY).0,
+            };
+        });
+        session.settle();
+        assert!(announced(&mut session));
+    }
+
+    #[gpui::test]
+    fn files_the_host_is_reading_hold_back_everyones_submission(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let host_thread = session.host_thread.clone();
+        let host = session.host.clone();
+        host.update(session.cx, |host, cx| {
+            let draft_id = host_thread.read(cx).draft.id;
+            host.pending_attachments.push(PendingAttachment {
+                id: Uuid::new_v4(),
+                draft_id,
+                target: AttachmentTarget::NewBlock(Uuid::new_v4()),
+                name: "big.png".into(),
+                is_image: true,
+                progress: Some(30.),
+            });
+            cx.notify();
+        });
+        let collaborator = session.collaborator.clone();
+        session.wait_until("the collaborator sees the pending read", |this| {
+            collaborator.read_with(this.cx, |collaborator, cx| {
+                let draft_id = collaborator_thread.read(cx).draft.id;
+                collaborator.draft_is_loading_attachments(draft_id, cx)
+            })
+        });
+        let pending = collaborator.read_with(session.cx, |collaborator, cx| {
+            collaborator.pending_reads(&collaborator_thread.read(cx).draft)
+        });
+        assert!(matches!(
+            pending.as_slice(),
+            [PendingAttachment { name, progress: Some(progress), .. }]
+                if name == "big.png" && *progress == 30.
+        ));
+
+        host.update(session.cx, |host, cx| {
+            host.pending_attachments.clear();
+            cx.notify();
+        });
+        session.wait_until("the collaborator sees the read finish", |this| {
+            !collaborator.read_with(this.cx, |collaborator, cx| {
+                let draft_id = collaborator_thread.read(cx).draft.id;
+                collaborator.draft_is_loading_attachments(draft_id, cx)
             })
         });
     }

@@ -6,16 +6,31 @@ Yrs document, and the protocol between host and collaborators.
 
 ## Status
 
-Steps 1 to 3 of the [implementation order](#implementation-order) are done:
+Steps 1 to 4 of the [implementation order](#implementation-order) are done:
 participant identity, the protocol version handshake, shared model selection,
 stopping from any participant, Yrs drafts with prompt blocks, comments as
-items, per-block attachments, navigation, and empty-item removal, and the
-draft synced through the host with host-coordinated submission.
+items, per-block attachments, navigation, and empty-item removal, the draft
+synced through the host with host-coordinated submission, and presence.
 
-Two interim rules apply until later steps replace them; see
-[Implementation order](#implementation-order). Not yet implemented: telling a
-collaborator why the host rejected their submission (generating, attachments
-loading); the request is currently dropped silently.
+Collaborators cannot attach files until step 5; see
+[Implementation order](#implementation-order). Not yet implemented:
+
+- telling a collaborator why the host rejected their submission (generating,
+  attachments loading); the request is currently dropped silently;
+- showing names when hovering a remote caret or an avatar (names show only
+  briefly after a caret moves, and on the top bar's avatars);
+- validating collaborators' presence at the host (e.g. announced file reads);
+- showing others' selections in agent messages, which needs a gpui-kit
+  addition; see [gpui-kit-text-view-highlights.md](gpui-kit-text-view-highlights.md).
+
+Implementation notes on presence:
+
+- Presence is published whenever it changes, checked on every frame and
+  whenever a file read starts or ends. It is not coalesced.
+- Besides each participant removing an empty item they leave while nobody
+  else is in it, the host removes an empty item as soon as presence shows
+  everyone has left it, since two people leaving at once would each still see
+  the other there.
 
 ## Summary
 
@@ -514,15 +529,8 @@ document needs no schema version or compatibility with older clients.
 3. **Draft sync**: sync the draft through the host, make collaborators
    writable, and submit through the host with sequence numbers.
 4. **Presence**: remote carets and selections, avatar gutters, and
-   presence-aware removal.
-
-   **Replace the interim removal rule.** Without presence, nobody can tell
-   whether someone else is typing in an item. Until this step, an empty item
-   is removed automatically (on blur, or when its last attachment is
-   removed) only by its creator. Escape and Backspace still remove any empty
-   item. This step replaces the creator check with "nobody else is focused in
-   it" (`ThreadDraft::remove_if_abandoned`), and adds the host's cleanup of
-   empty items a disconnecting participant was focused in.
+   presence-aware removal (`ThreadDraft::remove_if_unattended`), replacing
+   the creator-only removal rule used during step 3.
 5. **Attachment transfer**: send bytes separately with progress and stored
    status, and reference attachments by ID in published messages and
    `Welcome`.

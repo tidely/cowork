@@ -1,5 +1,6 @@
 use yrs::{
-    Array, ArrayPrelim, ClientID, Map, MapPrelim, Text, TextPrelim, Transact,
+    Array, ArrayPrelim, Assoc, ClientID, ID, IndexScope, Map, MapPrelim, StickyIndex, Text,
+    TextPrelim, Transact,
     branch::{Branch, BranchPtr},
     types::Attrs,
 };
@@ -1318,4 +1319,334 @@ fn verify_change_rejects_forbidden_changes() {
         },
     });
     rejected(&after, "was modified");
+}
+
+// 10. Anchors
+
+fn text_edit(range: std::ops::Range<usize>, insert: &str) -> TextEdit {
+    TextEdit {
+        range,
+        insert: insert.to_owned(),
+    }
+}
+
+/// Byte offset of the first occurrence of `needle` in `item`'s body.
+fn offset_of(draft: &Draft, item: ItemId, needle: &str) -> usize {
+    draft.body(item).unwrap().find(needle).unwrap()
+}
+
+/// Inserts `text` at the end of `item`'s body.
+fn append(draft: &Draft, item: ItemId, text: &str) {
+    let len = draft.body(item).unwrap().len();
+    assert!(draft.edit_body(item, &text_edit(len..len, text)));
+}
+
+/// Every offset of `item`'s body round-trips on both replicas when on a char boundary and is
+/// refused otherwise.
+fn assert_round_trips(a: &Draft, b: &Draft, item: ItemId) {
+    let body = a.body(item).unwrap();
+    assert_eq!(b.body(item).as_deref(), Some(body.as_str()));
+    for offset in 0..=body.len() + 1 {
+        let anchor = a.anchor(item, offset);
+        if offset <= body.len() && body.is_char_boundary(offset) {
+            let anchor = anchor.unwrap_or_else(|| panic!("no anchor at {offset} of {body:?}"));
+            assert_eq!(a.resolve_anchor(item, &anchor), Some(offset), "{body:?}");
+            assert_eq!(b.resolve_anchor(item, &anchor), Some(offset), "{body:?}");
+        } else {
+            assert_eq!(anchor, None, "offset {offset} of {body:?}");
+        }
+    }
+}
+
+#[test]
+fn anchor_round_trip_with_multibyte_text() {
+    let draft = Draft::new();
+    let crab = draft.create_prompt(participant(), "é🦀");
+    let empty = draft.create_prompt(participant(), "");
+    let replica = replica_of(&draft);
+
+    // Start, between the chars, end; inside "é" (1) and inside "🦀" (3..6) is refused.
+    for (offset, expected) in [
+        (0, true),
+        (1, false),
+        (2, true),
+        (3, false),
+        (5, false),
+        (6, true),
+    ] {
+        assert_eq!(draft.anchor(crab, offset).is_some(), expected, "{offset}");
+    }
+    assert_round_trips(&draft, &replica, crab);
+
+    assert!(draft.anchor(empty, 0).is_some());
+    assert_eq!(draft.anchor(empty, 1), None);
+    assert_round_trips(&draft, &replica, empty);
+
+    assert_eq!(draft.anchor(ItemId::new(), 0), None);
+}
+
+#[test]
+fn anchor_round_trip_across_many_items() {
+    // Multi-byte text before the anchor within the same Yrs item is what the byte-offset
+    // conversion has to get right, so build a body out of several items, some split remotely.
+    let a = Draft::new();
+    let id = a.create_prompt(participant(), "éé🦀ab");
+    let b = replica_of(&a);
+    assert_round_trips(&a, &b, id);
+
+    assert!(a.edit_body(id, &text_edit(0..0, "ü🦀")));
+    append(&a, id, "ñ😀z");
+    assert!(b.edit_body(id, &text_edit(4..4, "日本")));
+    sync(&a, &b);
+    assert!(b.edit_body(id, &text_edit(0..2, "")));
+    let before_a = offset_of(&a, id, "a");
+    assert!(a.edit_body(id, &text_edit(before_a..before_a, "ß")));
+    sync(&a, &b);
+
+    assert_round_trips(&a, &b, id);
+    assert_round_trips(&b, &a, id);
+}
+
+#[test]
+fn anchor_follows_remote_edits() {
+    let a = Draft::new();
+    let id = a.create_prompt(participant(), "héllo 🦀 wörld");
+    let b = replica_of(&a);
+
+    let before_w = offset_of(&a, id, "w");
+    let anchor = a.anchor(id, before_w).unwrap();
+
+    // B inserts before the anchor and deletes after it; A edits before it concurrently.
+    assert!(b.edit_body(id, &text_edit(0..0, "¡Hola! ")));
+    let rld = offset_of(&b, id, "rld");
+    assert!(b.edit_body(id, &text_edit(rld..rld + 3, "")));
+    assert!(a.edit_body(id, &text_edit(1..3, "e")));
+    // Not synced yet: each side resolves against what it has.
+    assert_eq!(a.resolve_anchor(id, &anchor), Some(before_w - 1));
+    assert_eq!(
+        b.resolve_anchor(id, &anchor),
+        Some(before_w + "¡Hola! ".len())
+    );
+
+    sync(&a, &b);
+    assert_eq!(a.body(id).as_deref(), Some("¡Hola! hello 🦀 wö"));
+    let expected = "¡Hola! hello 🦀 ".len();
+    assert_eq!(a.resolve_anchor(id, &anchor), Some(expected));
+    assert_eq!(b.resolve_anchor(id, &anchor), Some(expected));
+}
+
+#[test]
+fn insert_at_anchor_lands_before_it() {
+    let a = Draft::new();
+    let id = a.create_prompt(participant(), "ab🦀cd");
+    let b = replica_of(&a);
+    let anchor = a.anchor(id, 2).unwrap();
+
+    // Someone else types exactly at the anchor: the anchor stays with "🦀", after their text.
+    assert!(b.edit_body(id, &text_edit(2..2, "XY")));
+    sync(&a, &b);
+    assert_eq!(a.body(id).as_deref(), Some("abXY🦀cd"));
+    assert_eq!(a.resolve_anchor(id, &anchor), Some(4));
+    assert_eq!(b.resolve_anchor(id, &anchor), Some(4));
+
+    // The same happens when the anchor's owner types there, so they re-anchor after typing.
+    assert!(a.edit_body(id, &text_edit(4..4, "é")));
+    assert_eq!(a.resolve_anchor(id, &anchor), Some(6));
+    sync(&a, &b);
+
+    // Text inserted right after the anchored char doesn't move the anchor.
+    assert!(b.edit_body(id, &text_edit(10..10, "!")));
+    sync(&a, &b);
+    assert_eq!(a.body(id).as_deref(), Some("abXYé🦀!cd"));
+    assert_eq!(b.resolve_anchor(id, &anchor), Some(6));
+}
+
+#[test]
+fn anchor_at_end_stays_at_end() {
+    let a = Draft::new();
+    let id = a.create_prompt(participant(), "hi 🦀");
+    let empty = a.create_prompt(participant(), "");
+    let b = replica_of(&a);
+    let end = a.anchor(id, "hi 🦀".len()).unwrap();
+    let empty_end = a.anchor(empty, 0).unwrap();
+
+    // The anchor's owner keeps typing at the end: their caret stays at the end for everyone.
+    append(&a, id, "é");
+    append(&a, id, "!");
+    assert_eq!(a.resolve_anchor(id, &end), Some(10));
+    sync(&a, &b);
+    assert_eq!(b.resolve_anchor(id, &end), Some(10));
+
+    // Someone else appending moves it along too, like inserting at any other anchor.
+    append(&b, id, " ok");
+    sync(&a, &b);
+    assert_eq!(a.body(id).as_deref(), Some("hi 🦀é! ok"));
+    assert_eq!(a.resolve_anchor(id, &end), Some(13));
+    assert_eq!(b.resolve_anchor(id, &end), Some(13));
+
+    assert_eq!(b.resolve_anchor(empty, &empty_end), Some(0));
+    assert!(b.set_body(empty, "日本").is_some());
+    sync(&a, &b);
+    assert_eq!(a.resolve_anchor(empty, &empty_end), Some(6));
+
+    // Deleting everything brings it back to 0.
+    assert!(a.set_body(id, "").is_some());
+    assert_eq!(a.resolve_anchor(id, &end), Some(0));
+}
+
+#[test]
+fn anchor_into_deleted_text() {
+    let a = Draft::new();
+    let id = a.create_prompt(participant(), "héllo wörld 🦀");
+    let b = replica_of(&a);
+    let at_o = a.anchor(id, offset_of(&a, id, "ö")).unwrap();
+    let at_crab = a.anchor(id, offset_of(&a, id, "🦀")).unwrap();
+
+    // Delete "o wörl" on B: the anchor on "ö" falls back to where the deleted text was.
+    let start = offset_of(&b, id, "o w");
+    assert!(b.edit_body(id, &text_edit(start..offset_of(&b, id, "d"), "")));
+    sync(&a, &b);
+    assert_eq!(a.body(id).as_deref(), Some("hélld 🦀"));
+    for draft in [&a, &b] {
+        assert_eq!(draft.resolve_anchor(id, &at_o), Some(start));
+        assert_eq!(
+            draft.resolve_anchor(id, &at_crab),
+            Some(offset_of(&a, id, "🦀"))
+        );
+    }
+
+    // Replace the whole body: every anchor resolves to a valid offset.
+    assert!(a.set_body(id, "日本語").is_some());
+    sync(&a, &b);
+    for draft in [&a, &b] {
+        for anchor in [&at_o, &at_crab] {
+            let offset = draft.resolve_anchor(id, anchor).unwrap();
+            let body = draft.body(id).unwrap();
+            assert!(offset <= body.len() && body.is_char_boundary(offset));
+        }
+    }
+
+    assert!(a.set_body(id, "").is_some());
+    assert_eq!(a.resolve_anchor(id, &at_o), Some(0));
+}
+
+#[test]
+fn anchor_before_its_text_arrives() {
+    let a = Draft::new();
+    let id = a.create_prompt(participant(), "abc");
+    let b = replica_of(&a);
+    append(&a, id, "déf");
+    let anchor = a.anchor(id, offset_of(&a, id, "f")).unwrap();
+
+    assert_eq!(b.resolve_anchor(id, &anchor), None);
+    sync(&a, &b);
+    assert_eq!(b.resolve_anchor(id, &anchor), Some(6));
+}
+
+#[test]
+fn resolve_anchor_rejects_other_items_and_removed_items() {
+    let a = Draft::new();
+    let first = a.create_prompt(participant(), "first");
+    let second = a.create_comment(participant(), target("quote"), "second");
+    let empty = a.create_prompt(participant(), "");
+    let b = replica_of(&a);
+
+    let anchors = [
+        a.anchor(first, 0).unwrap(),
+        a.anchor(first, 2).unwrap(),
+        a.anchor(first, 5).unwrap(),
+        a.anchor(empty, 0).unwrap(),
+    ];
+    for anchor in &anchors {
+        assert_eq!(a.resolve_anchor(second, anchor), None);
+        assert_eq!(b.resolve_anchor(second, anchor), None);
+        assert_eq!(a.resolve_anchor(ItemId::new(), anchor), None);
+    }
+    let second_anchor = a.anchor(second, 3).unwrap();
+    assert_eq!(a.resolve_anchor(first, &second_anchor), None);
+    assert_eq!(a.resolve_anchor(second, &second_anchor), Some(3));
+
+    a.remove_items(&[first, empty]);
+    sync(&a, &b);
+    for anchor in &anchors {
+        for draft in [&a, &b] {
+            assert_eq!(draft.resolve_anchor(first, anchor), None);
+            assert_eq!(draft.resolve_anchor(empty, anchor), None);
+        }
+    }
+    assert_eq!(b.resolve_anchor(second, &second_anchor), Some(3));
+}
+
+#[test]
+fn resolve_anchor_rejects_garbage() {
+    let draft = Draft::new();
+    let id = draft.create_prompt(participant(), "héllo");
+    let valid = draft.anchor(id, 1).unwrap();
+
+    let root = StickyIndex::new(IndexScope::Root(ITEMS.into()), Assoc::After).encode_v1();
+    let unknown_client =
+        StickyIndex::from_id(ID::new(ClientID::new(12345), 0), Assoc::After).encode_v1();
+    let mut trailing = valid.clone();
+    trailing.push(0);
+    // A client id beyond 53 bits, which Yrs' own decoder debug-asserts on.
+    let huge_client = [
+        0, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x7f, 0, 0,
+    ];
+    let cases: Vec<Vec<u8>> = vec![
+        vec![],
+        vec![0],
+        vec![3, 0],
+        vec![0xff; 16],
+        valid[..valid.len() - 1].to_vec(),
+        trailing,
+        huge_client.to_vec(),
+        vec![1, 5, b'i', b't'],
+        root,
+        unknown_client,
+    ];
+    for bytes in &cases {
+        assert_eq!(draft.resolve_anchor(id, bytes), None, "{bytes:?}");
+    }
+
+    // Arbitrary bytes never panic, and whatever they resolve to is a valid offset. Half the
+    // inputs use only small bytes, which often form well-formed anchors with bogus ids.
+    let mut state = 0x2545_f491_4f6c_dd1d_u64;
+    for len in 0..4096 {
+        let modulus = if len % 2 == 0 { 8 } else { 256 };
+        let bytes: Vec<u8> = (0..len % 24)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                (state % modulus) as u8
+            })
+            .collect();
+        if let Some(offset) = draft.resolve_anchor(id, &bytes) {
+            assert!(draft.body(id).unwrap().is_char_boundary(offset));
+        }
+    }
+
+    assert_eq!(draft.resolve_anchor(id, &valid), Some(1));
+}
+
+#[test]
+fn anchors_are_standard_sticky_indices_and_record_nothing() {
+    let draft = Draft::new();
+    let id = draft.create_prompt(participant(), "é🦀x");
+    draft.take_local_update();
+
+    for offset in [0, 2, 6, 7] {
+        let anchor = draft.anchor(id, offset).unwrap();
+        let decoded = StickyIndex::decode_v1(&anchor).unwrap();
+        assert_eq!(anchor::decode_anchor(&anchor).as_ref(), Some(&decoded));
+        assert_eq!(decoded.assoc, Assoc::After);
+        assert_eq!(draft.resolve_anchor(id, &anchor), Some(offset));
+    }
+
+    // `Before` anchors (not made by this crate) resolve right after their char.
+    let at_crab = StickyIndex::decode_v1(&draft.anchor(id, 2).unwrap()).unwrap();
+    let before = StickyIndex::from_id(*at_crab.id().unwrap(), Assoc::Before);
+    assert_eq!(draft.resolve_anchor(id, &before.encode_v1()), Some(6));
+
+    assert_eq!(draft.take_local_update(), None);
 }

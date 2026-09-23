@@ -33,6 +33,7 @@
 //! [`Draft::take_local_update`]; changes merged in with [`Draft::apply_update`] never are, so a
 //! replica never echoes other participants' content back as its own.
 
+mod anchor;
 mod item;
 mod text_edit;
 mod validate;

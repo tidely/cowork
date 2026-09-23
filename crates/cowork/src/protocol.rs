@@ -19,7 +19,7 @@ pub(crate) const PEER_CHANNEL_CAPACITY: usize = 128;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 3;
+pub(crate) const PROTOCOL_VERSION: u32 = 4;
 
 /// A request from a collaborator to the host.
 ///
@@ -43,6 +43,44 @@ pub(crate) enum CollaboratorMessage {
     /// collaborator has seen, so a submission that raced another one is
     /// ignored instead of submitting whatever was typed in between.
     Submit { sequence: u64 },
+    /// Replaces the collaborator's presence.
+    Presence(Presence),
+}
+
+/// Where a participant is in the draft and what they are doing there.
+/// Ephemeral: it is never part of the draft document.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Presence {
+    pub(crate) focus: Option<PresenceFocus>,
+    /// Only while focused in an item: anchors in its body, made with
+    /// `draft::Draft::anchor`.
+    pub(crate) selection: Option<PresenceSelection>,
+    /// Files the participant is reading into the draft.
+    pub(crate) pending_reads: Vec<PendingRead>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PresenceFocus {
+    DraftPosition,
+    Item(uuid::Bytes),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PresenceSelection {
+    pub(crate) anchor: Vec<u8>,
+    /// Where the caret is.
+    pub(crate) head: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingRead {
+    pub(crate) id: uuid::Bytes,
+    pub(crate) name: String,
+    pub(crate) is_image: bool,
+    /// Percent read, once known.
+    pub(crate) progress: Option<u8>,
+    /// The block the file will be attached to, or `None` for a new block.
+    pub(crate) block: Option<uuid::Bytes>,
 }
 
 /// A change to a shared thread, authored by the host.
@@ -69,6 +107,11 @@ pub(crate) enum HostMessage {
     ModelSelected { catalog_id: String },
     /// A Yrs update to the draft, made by the host or a collaborator.
     DraftUpdate(Vec<u8>),
+    /// A participant's presence changed.
+    Presence {
+        participant: uuid::Bytes,
+        presence: Presence,
+    },
     /// The thread was named, which happens on its first user message.
     ThreadTitled(String),
     /// A user message was appended to the timeline.
@@ -117,6 +160,8 @@ pub(crate) struct Welcome {
     pub(crate) thread: ThreadSnapshot,
     /// The full state of the draft as a Yrs update.
     pub(crate) draft: Vec<u8>,
+    /// Every connected participant's presence.
+    pub(crate) presence: Vec<(uuid::Bytes, Presence)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,6 +342,23 @@ where
 mod tests {
     use super::*;
 
+    fn sample_presence() -> Presence {
+        Presence {
+            focus: Some(PresenceFocus::Item([5; 16])),
+            selection: Some(PresenceSelection {
+                anchor: vec![1],
+                head: vec![2],
+            }),
+            pending_reads: vec![PendingRead {
+                id: [6; 16],
+                name: "notes.txt".into(),
+                is_image: false,
+                progress: Some(40),
+                block: None,
+            }],
+        }
+    }
+
     fn round_trip(message: &HostMessage) -> HostMessage {
         let encoded = postcard::to_stdvec(message).expect("encode protocol message");
         postcard::from_bytes(&encoded).expect("decode protocol message")
@@ -352,6 +414,7 @@ mod tests {
             participant_id: [12; 16],
             thread: snapshot,
             draft: vec![1, 2, 3],
+            presence: vec![([12; 16], sample_presence())],
         });
 
         assert_eq!(round_trip(&message), message);
@@ -383,6 +446,10 @@ mod tests {
                 catalog_id: "catalog-model".into(),
             },
             HostMessage::DraftUpdate(vec![4, 5, 6]),
+            HostMessage::Presence {
+                participant: [1; 16],
+                presence: sample_presence(),
+            },
         ] {
             assert_eq!(round_trip(&message), message);
         }
@@ -399,6 +466,7 @@ mod tests {
             },
             CollaboratorMessage::DraftUpdate(vec![7, 8]),
             CollaboratorMessage::Submit { sequence: 3 },
+            CollaboratorMessage::Presence(sample_presence()),
         ] {
             let encoded = postcard::to_stdvec(&message).expect("encode protocol message");
             let decoded: CollaboratorMessage =
