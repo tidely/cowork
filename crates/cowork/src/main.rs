@@ -1014,6 +1014,7 @@ struct Cowork {
     tokio_handle: tokio::runtime::Handle,
     active_generations: HashMap<Uuid, ActiveGeneration>,
     model_picker: Entity<ModelPickerState>,
+    model_picker_hovered: bool,
     _window_activation_subscription: Subscription,
 }
 
@@ -3523,7 +3524,9 @@ impl Cowork {
             .width();
         // Icon + chevron + two gaps + button padding + Combobox's custom-trigger slot gap.
         let model_picker_width = title_width + px(62.);
+        let model_picker_hovered = self.model_picker_hovered;
         let model_picker = div()
+            .id("model-picker-container")
             .w(model_picker_width)
             .min_w_0()
             .h(px(28.))
@@ -3534,6 +3537,12 @@ impl Cowork {
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 GlobalState::suppress_text_selection(cx);
             })
+            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
+                if this.model_picker_hovered != *hovered {
+                    this.model_picker_hovered = *hovered;
+                    cx.notify();
+                }
+            }))
             .child(
                 Combobox::new(&self.model_picker)
                     .search_placeholder("Search models...")
@@ -3542,7 +3551,7 @@ impl Cowork {
                     .appearance(false)
                     .small()
                     .p_0()
-                    .render_trigger(|trigger, _, _| {
+                    .render_trigger(move |trigger, _, _| {
                         let selected_model = trigger.selection().first().map(|(_, model)| model);
                         let title = selected_model
                             .map(LanguageModel::title)
@@ -3567,7 +3576,7 @@ impl Cowork {
                                     .gap_1()
                                     .rounded_md()
                                     .cursor_pointer()
-                                    .hover(|this| this.bg(rgb(0x2d2d30)))
+                                    .when(model_picker_hovered, |this| this.bg(rgb(0x2d2d30)))
                                     .text_sm()
                                     .text_color(rgb(0xd4d4d8))
                                     .when_some(provider, |this, provider| {
@@ -4003,6 +4012,7 @@ fn main() -> anyhow::Result<()> {
                         tokio_handle,
                         active_generations: HashMap::new(),
                         model_picker: Cowork::new_model_picker(window, cx),
+                        model_picker_hovered: false,
                         _window_activation_subscription: window_activation_subscription,
                     }
                 });
@@ -4323,6 +4333,7 @@ mod tests {
                 tokio_handle,
                 active_generations: HashMap::new(),
                 model_picker: Cowork::new_model_picker(window, cx),
+                model_picker_hovered: false,
                 _window_activation_subscription: cx.observe_window_activation(window, |_, _, _| {}),
             });
             composer.focus_handle(cx).focus(window, cx);
