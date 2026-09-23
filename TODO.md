@@ -1,11 +1,3 @@
-## Refactor
-
-### Use gpui-component for dialogs
-
-https://gpui-kit.com/component/dialog/
-
-### Use List/Tree/Sidebar for sidebar
-
 ## New Features
 
 ### Add permissions to sharing
