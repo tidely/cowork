@@ -29,9 +29,8 @@ use gpui_base::{
     text::{CodeBlock, SelectionFormat},
 };
 use gpui_component::{
-    Icon, Sizable as _, Theme as ComponentTheme, ThemeMode,
-    button::{Button, ButtonVariants as _},
-    sidebar::SidebarToggleButton,
+    Icon, Sizable as _,
+    button::{Button, ButtonCustomVariant, ButtonVariants as _},
 };
 use gpui_kit_assets::IconName as AssetIconName;
 use iroh::{
@@ -915,6 +914,16 @@ impl Cowork {
     }
 
     fn render_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let (icon, label) = if self.sidebar_open {
+            (AssetIconName::PanelLeftClose, "Hide sidebar")
+        } else {
+            (AssetIconName::PanelLeftOpen, "Show sidebar")
+        };
+        let variant = ButtonCustomVariant::new(cx)
+            .foreground(rgb(0xe4e4e7).into())
+            .hover(rgb(0x2d2d30).into())
+            .active(rgb(0x3a3a3e).into());
+
         div()
             .when(cfg!(target_os = "macos"), |this| {
                 this.ml(macos_sidebar_toggle_margin())
@@ -927,8 +936,11 @@ impl Cowork {
                 }),
             )
             .child(
-                SidebarToggleButton::new()
-                    .collapsed(!self.sidebar_open)
+                Button::new("toggle-sidebar")
+                    .custom(variant)
+                    .small()
+                    .icon(Icon::new(icon).size_4())
+                    .accessibility_label(label)
                     .on_click(cx.listener(|this, _, _, cx| {
                         this.sidebar_open = !this.sidebar_open;
                         cx.notify();
@@ -3686,7 +3698,6 @@ fn main() -> anyhow::Result<()> {
         .with_assets(Assets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
-            ComponentTheme::change(ThemeMode::Dark, None, cx);
             TextViewDefaults::new()
                 .with_code_block_highlighter(highlight_code_block)
                 .install(cx);
