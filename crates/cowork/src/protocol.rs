@@ -2,15 +2,22 @@ use anyhow::Context as _;
 use futures::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
 /// Bounds how much memory a single frame from a peer can make us buffer.
 ///
-/// Attachments travel inline, so this must fit a user message at the
-/// attachment limit, and a `Welcome` snapshot of a thread with several such
-/// messages. A snapshot that grows beyond it cannot be sent.
-const MAX_FRAME_LENGTH: usize = 256 * 1024 * 1024;
+/// Attachment bytes travel in chunks, so frames only need to fit text: a
+/// `Welcome` snapshot of a long thread. A snapshot that grows beyond it cannot
+/// be sent.
+const MAX_FRAME_LENGTH: usize = 16 * 1024 * 1024;
 pub(crate) const PEER_CHANNEL_CAPACITY: usize = 128;
+/// How many bulk messages may wait to be written. Kept small, since anything
+/// queued here is written before later bulk messages but after every waiting
+/// control message.
+const BULK_CHANNEL_CAPACITY: usize = 2;
+/// The largest piece of an attachment sent at once, so that a large file
+/// holds up other messages for no longer than one chunk takes to write.
+pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 
 /// Host and collaborator must speak the same version exactly. Bump it on any
 /// change to the messages below or to the model catalog.
@@ -19,7 +26,7 @@ pub(crate) const PEER_CHANNEL_CAPACITY: usize = 128;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 4;
+pub(crate) const PROTOCOL_VERSION: u32 = 5;
 
 /// A request from a collaborator to the host.
 ///
@@ -45,6 +52,35 @@ pub(crate) enum CollaboratorMessage {
     Submit { sequence: u64 },
     /// Replaces the collaborator's presence.
     Presence(Presence),
+    /// The collaborator stopped uploading a file whose record is gone, so
+    /// the host can discard what it received. Sent on the bulk queue, after
+    /// the file's last chunk.
+    AttachmentCancelled(uuid::Bytes),
+    /// Part of a file the collaborator attached to the draft. Sent on the
+    /// bulk queue; see [`Peer::bulk`].
+    AttachmentData(AttachmentChunk),
+}
+
+/// One piece of an attachment's bytes, in order. Every piece names the file,
+/// so it can be put together without its draft record, which may arrive
+/// later.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AttachmentChunk {
+    pub(crate) id: uuid::Bytes,
+    pub(crate) name: String,
+    pub(crate) kind: AttachmentKind,
+    /// The size of the whole file.
+    pub(crate) total: u64,
+    /// Where in the file `bytes` start.
+    pub(crate) offset: u64,
+    pub(crate) bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum AttachmentKind {
+    Text,
+    Png,
+    Jpeg,
 }
 
 /// Where a participant is in the draft and what they are doing there.
@@ -112,6 +148,15 @@ pub(crate) enum HostMessage {
         participant: uuid::Bytes,
         presence: Presence,
     },
+    /// The host holds every byte of an attachment `uploader` added, so it can
+    /// be submitted. The bytes follow as `AttachmentData` to everyone else.
+    AttachmentStored {
+        id: uuid::Bytes,
+        uploader: uuid::Bytes,
+    },
+    /// Part of an attachment's bytes, relayed by the host. Sent on the bulk
+    /// queue; see [`Peer::bulk`].
+    AttachmentData(AttachmentChunk),
     /// The thread was named, which happens on its first user message.
     ThreadTitled(String),
     /// A user message was appended to the timeline.
@@ -162,6 +207,9 @@ pub(crate) struct Welcome {
     pub(crate) draft: Vec<u8>,
     /// Every connected participant's presence.
     pub(crate) presence: Vec<(uuid::Bytes, Presence)>,
+    /// The attachments whose bytes the host holds. They follow the welcome
+    /// as `AttachmentData`.
+    pub(crate) stored_attachments: Vec<uuid::Bytes>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -195,20 +243,17 @@ pub(crate) struct PromptBlock {
     /// The participant who created the block.
     pub(crate) author: uuid::Bytes,
     pub(crate) text: String,
-    pub(crate) attachments: Vec<Attachment>,
+    /// The block's files; their bytes travel separately as `AttachmentData`.
+    pub(crate) attachments: Vec<AttachmentRef>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Attachment {
+pub(crate) struct AttachmentRef {
+    pub(crate) id: uuid::Bytes,
     pub(crate) name: String,
-    pub(crate) content: AttachmentContent,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum AttachmentContent {
-    Text(String),
-    Png(Vec<u8>),
-    Jpeg(Vec<u8>),
+    pub(crate) kind: AttachmentKind,
+    pub(crate) size: u64,
+    pub(crate) creator: uuid::Bytes,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -259,6 +304,11 @@ fn codec() -> LengthDelimitedCodec {
 /// collaborator's half.
 pub(crate) struct Peer<Outgoing, Incoming> {
     pub(crate) outgoing: async_channel::Sender<Outgoing>,
+    /// For attachment bytes. Whatever waits on `outgoing` is written first,
+    /// so large files never hold up draft updates or presence. Messages
+    /// already queued on `outgoing` are written before later bulk ones, but
+    /// anything still on its way to `outgoing` can be overtaken.
+    pub(crate) bulk: async_channel::Sender<Outgoing>,
     pub(crate) incoming: async_channel::Receiver<Incoming>,
 }
 
@@ -274,13 +324,15 @@ impl<Outgoing, Incoming> Peer<Outgoing, Incoming> {
         self.incoming.recv().await.ok()
     }
 
+    /// The control and bulk senders, and the receiver.
     pub(crate) fn split(
         self,
     ) -> (
         async_channel::Sender<Outgoing>,
+        async_channel::Sender<Outgoing>,
         async_channel::Receiver<Incoming>,
     ) {
-        (self.outgoing, self.incoming)
+        (self.outgoing, self.bulk, self.incoming)
     }
 }
 
@@ -298,42 +350,66 @@ where
     Incoming: DeserializeOwned + Send + 'static,
 {
     let (outgoing_sender, outgoing_receiver) = async_channel::bounded(PEER_CHANNEL_CAPACITY);
+    let (bulk_sender, bulk_receiver) = async_channel::bounded::<Outgoing>(BULK_CHANNEL_CAPACITY);
     let (incoming_sender, incoming_receiver) = async_channel::bounded(PEER_CHANNEL_CAPACITY);
+    let (read, write) = tokio::io::split(stream);
+    // Dropped when writing ends, which ends reading too, so that dropping the
+    // `Peer` closes the connection.
+    let (writing, stopped_writing) = tokio::sync::oneshot::channel::<()>();
 
+    // Writing and reading run separately: a write waiting for the other side
+    // to catch up, as a large file can make it, must never stop this side
+    // reading, or two sides sending at once would wait on each other forever.
     tokio::spawn(async move {
-        let mut framed = Framed::new(stream, codec());
-
+        let _writing = writing;
+        let mut writer = FramedWrite::new(write, codec());
         loop {
-            tokio::select! {
+            let message = tokio::select! {
+                // Control messages first, so bulk data waits for them.
+                biased;
                 message = outgoing_receiver.recv() => {
                     let Ok(message) = message else {
                         break;
                     };
-                    let bytes = postcard::to_stdvec(&message)
-                        .context("Failed to encode protocol message.")?;
-                    framed
-                        .send(bytes.into())
-                        .await
-                        .context("Failed to send protocol message.")?;
+                    message
                 }
-                frame = framed.next() => {
-                    let Some(frame) = frame.transpose().context("Failed to receive protocol message.")? else {
-                        break;
-                    };
-                    let message = postcard::from_bytes(&frame)
-                        .context("Failed to decode protocol message.")?;
-                    if incoming_sender.send(message).await.is_err() {
-                        break;
-                    }
-                }
+                Ok(message) = bulk_receiver.recv() => message,
+            };
+            let bytes =
+                postcard::to_stdvec(&message).context("Failed to encode protocol message.")?;
+            writer
+                .send(bytes.into())
+                .await
+                .context("Failed to send protocol message.")?;
+        }
+        Ok::<_, anyhow::Error>(())
+    });
+    tokio::spawn(async move {
+        let mut reader = FramedRead::new(read, codec());
+        let mut stopped_writing = stopped_writing;
+        loop {
+            let frame = tokio::select! {
+                _ = &mut stopped_writing => break,
+                frame = reader.next() => frame,
+            };
+            let Some(frame) = frame
+                .transpose()
+                .context("Failed to receive protocol message.")?
+            else {
+                break;
+            };
+            let message =
+                postcard::from_bytes(&frame).context("Failed to decode protocol message.")?;
+            if incoming_sender.send(message).await.is_err() {
+                break;
             }
         }
-
         Ok::<_, anyhow::Error>(())
     });
 
     Peer {
         outgoing: outgoing_sender,
+        bulk: bulk_sender,
         incoming: incoming_receiver,
     }
 }
@@ -359,6 +435,103 @@ mod tests {
         }
     }
 
+    fn sample_chunk() -> AttachmentChunk {
+        AttachmentChunk {
+            id: [14; 16],
+            name: "notes.txt".into(),
+            kind: AttachmentKind::Text,
+            total: 7,
+            offset: 2,
+            bytes: b"tail".to_vec(),
+        }
+    }
+
+    /// Control messages are written before bulk ones that were waiting at
+    /// the same time.
+    /// Both sides sending bulk data at once still read each other's control
+    /// messages.
+    #[tokio::test]
+    async fn bulk_transfers_both_ways_do_not_block_reading() {
+        // Far smaller than what is sent, so both writers have to wait.
+        let (near, far) = tokio::io::duplex(8 * 1024);
+        let host: Peer<HostMessage, CollaboratorMessage> = spawn_peer(near);
+        let collaborator: Peer<CollaboratorMessage, HostMessage> = spawn_peer(far);
+        let chunk = AttachmentChunk {
+            bytes: vec![0; ATTACHMENT_CHUNK_SIZE],
+            ..sample_chunk()
+        };
+        let host_bulk = host.bulk.clone();
+        let host_chunk = chunk.clone();
+        tokio::spawn(async move {
+            while host_bulk
+                .send(HostMessage::AttachmentData(host_chunk.clone()))
+                .await
+                .is_ok()
+            {}
+        });
+        let collaborator_bulk = collaborator.bulk.clone();
+        tokio::spawn(async move {
+            while collaborator_bulk
+                .send(CollaboratorMessage::AttachmentData(chunk.clone()))
+                .await
+                .is_ok()
+            {}
+        });
+        host.send(HostMessage::ParticipantJoined([1; 16]))
+            .await
+            .expect("send control");
+        collaborator
+            .send(CollaboratorMessage::Submit { sequence: 1 })
+            .await
+            .expect("send control");
+
+        let received = async {
+            let host_got = async {
+                loop {
+                    if let Some(CollaboratorMessage::Submit { .. }) = host.receive().await {
+                        return;
+                    }
+                }
+            };
+            let collaborator_got = async {
+                loop {
+                    if let Some(HostMessage::ParticipantJoined(_)) = collaborator.receive().await {
+                        return;
+                    }
+                }
+            };
+            tokio::join!(host_got, collaborator_got);
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), received)
+            .await
+            .expect("both control messages arrive");
+    }
+
+    #[tokio::test]
+    async fn control_messages_overtake_waiting_bulk_messages() {
+        let (near, far) = tokio::io::duplex(1 << 20);
+        let sender: Peer<HostMessage, CollaboratorMessage> = spawn_peer(near);
+        let receiver: Peer<CollaboratorMessage, HostMessage> = spawn_peer(far);
+        // Both queued before the writer task first runs.
+        sender
+            .bulk
+            .try_send(HostMessage::AttachmentData(sample_chunk()))
+            .expect("queue bulk");
+        sender
+            .outgoing
+            .try_send(HostMessage::ParticipantJoined([1; 16]))
+            .expect("queue control");
+
+        assert_eq!(
+            receiver.receive().await,
+            Some(HostMessage::ParticipantJoined([1; 16]))
+        );
+        assert_eq!(
+            receiver.receive().await,
+            Some(HostMessage::AttachmentData(sample_chunk()))
+        );
+    }
+
     fn round_trip(message: &HostMessage) -> HostMessage {
         let encoded = postcard::to_stdvec(message).expect("encode protocol message");
         postcard::from_bytes(&encoded).expect("decode protocol message")
@@ -378,9 +551,12 @@ mod tests {
                         id: [13; 16],
                         author: [11; 16],
                         text: "Question".into(),
-                        attachments: vec![Attachment {
+                        attachments: vec![AttachmentRef {
+                            id: [14; 16],
                             name: "notes.txt".into(),
-                            content: AttachmentContent::Text("Details".into()),
+                            kind: AttachmentKind::Text,
+                            size: 7,
+                            creator: [11; 16],
                         }],
                     }],
                     comments: vec![UserComment {
@@ -415,6 +591,7 @@ mod tests {
             thread: snapshot,
             draft: vec![1, 2, 3],
             presence: vec![([12; 16], sample_presence())],
+            stored_attachments: vec![[14; 16]],
         });
 
         assert_eq!(round_trip(&message), message);
@@ -450,6 +627,11 @@ mod tests {
                 participant: [1; 16],
                 presence: sample_presence(),
             },
+            HostMessage::AttachmentStored {
+                id: [14; 16],
+                uploader: [1; 16],
+            },
+            HostMessage::AttachmentData(sample_chunk()),
         ] {
             assert_eq!(round_trip(&message), message);
         }
@@ -467,6 +649,7 @@ mod tests {
             CollaboratorMessage::DraftUpdate(vec![7, 8]),
             CollaboratorMessage::Submit { sequence: 3 },
             CollaboratorMessage::Presence(sample_presence()),
+            CollaboratorMessage::AttachmentData(sample_chunk()),
         ] {
             let encoded = postcard::to_stdvec(&message).expect("encode protocol message");
             let decoded: CollaboratorMessage =

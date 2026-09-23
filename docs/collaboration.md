@@ -6,17 +6,18 @@ Yrs document, and the protocol between host and collaborators.
 
 ## Status
 
-Steps 1 to 4 of the [implementation order](#implementation-order) are done:
+All five steps of the [implementation order](#implementation-order) are done:
 participant identity, the protocol version handshake, shared model selection,
 stopping from any participant, Yrs drafts with prompt blocks, comments as
 items, per-block attachments, navigation, and empty-item removal, the draft
-synced through the host with host-coordinated submission, and presence.
+synced through the host with host-coordinated submission, presence, and
+attachment transfer.
 
-Collaborators cannot attach files until step 5; see
-[Implementation order](#implementation-order). Not yet implemented:
+Not yet implemented:
 
 - telling a collaborator why the host rejected their submission (generating,
-  attachments loading); the request is currently dropped silently;
+  attachments loading, size limit); the request is currently dropped
+  silently;
 - showing names when hovering a remote caret or an avatar (names show only
   briefly after a caret moves, and on the top bar's avatars);
 - validating collaborators' presence at the host (e.g. announced file reads);
@@ -31,6 +32,27 @@ Implementation notes on presence:
   else is in it, the host removes an empty item as soon as presence shows
   everyone has left it, since two people leaving at once would each still see
   the other there.
+
+Implementation notes on attachment transfer:
+
+- Each connection has a control queue and a small bulk queue. Attachment
+  bytes travel on the bulk queue in 64 KiB chunks, and the writer always
+  sends waiting control messages first, so a large file delays draft updates
+  and presence by at most one chunk. Reading runs separately from writing,
+  so two sides sending files at once never wait on each other.
+- A collaborator whose upload's record disappears stops uploading and sends
+  `AttachmentCancelled` on the bulk queue, after its last chunk, so the host
+  discards what it received. Participants ignore pieces of files they have
+  discarded.
+- Bytes and the draft record that announces them travel separately and can
+  arrive in either order. Every chunk names the file, so it can be put
+  together without the record; the host stores an upload once both are there.
+- The host discards a file when an update removes its record, or when its
+  uploader leaves before finishing. Collaborators keep every file they have,
+  even ones they remove themselves: a submission can include a file that is
+  being removed at the same time, and the host sends each file only once.
+- The per-message size limit is checked when a file is added, against the
+  records already in the draft, and again by whoever accepts a submission.
 
 ## Summary
 

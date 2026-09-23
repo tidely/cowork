@@ -124,7 +124,7 @@ const MAX_ATTACHMENT_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 /// Text is inlined into the prompt, so keep it well within `OLLAMA_CONTEXT_TOKENS`.
 const MAX_TEXT_ATTACHMENT_BYTES: u64 = 256 * 1024;
-/// Every attachment of a message travels in a single protocol frame.
+/// Largest total of the attachments submitted together.
 const MAX_MESSAGE_ATTACHMENT_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Clone)]
@@ -152,38 +152,100 @@ impl FileAttachment {
         }
     }
 
-    fn to_protocol(&self) -> protocol::Attachment {
-        protocol::Attachment {
-            name: self.name.clone(),
-            content: match &self.content {
-                FileAttachmentContent::Text(text) => {
-                    protocol::AttachmentContent::Text(text.clone())
-                }
-                FileAttachmentContent::Png(image) => {
-                    protocol::AttachmentContent::Png(image.bytes().to_vec())
-                }
-                FileAttachmentContent::Jpeg(image) => {
-                    protocol::AttachmentContent::Jpeg(image.bytes().to_vec())
-                }
-            },
+    /// The file's bytes as they travel between participants.
+    fn bytes(&self) -> &[u8] {
+        match &self.content {
+            FileAttachmentContent::Text(text) => text.as_bytes(),
+            FileAttachmentContent::Png(image) | FileAttachmentContent::Jpeg(image) => image.bytes(),
         }
+    }
+
+    fn kind(&self) -> AttachmentKind {
+        match self.content {
+            FileAttachmentContent::Text(_) => AttachmentKind::Text,
+            FileAttachmentContent::Png(_) => AttachmentKind::Png,
+            FileAttachmentContent::Jpeg(_) => AttachmentKind::Jpeg,
+        }
+    }
+
+    /// Rebuilds a file another participant sent.
+    fn from_bytes(name: String, kind: AttachmentKind, bytes: Vec<u8>) -> anyhow::Result<Self> {
+        let content =
+            match kind {
+                AttachmentKind::Text => FileAttachmentContent::Text(
+                    String::from_utf8(bytes).context("A text attachment is not UTF-8.")?,
+                ),
+                AttachmentKind::Png => FileAttachmentContent::Png(Arc::new(
+                    gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes),
+                )),
+                AttachmentKind::Jpeg => FileAttachmentContent::Jpeg(Arc::new(
+                    gpui::Image::from_bytes(gpui::ImageFormat::Jpeg, bytes),
+                )),
+            };
+        Ok(Self { name, content })
     }
 }
 
-impl protocol::Attachment {
-    fn into_native(self) -> FileAttachment {
-        FileAttachment {
-            name: self.name,
-            content: match self.content {
-                protocol::AttachmentContent::Text(text) => FileAttachmentContent::Text(text),
-                protocol::AttachmentContent::Png(bytes) => FileAttachmentContent::Png(Arc::new(
-                    gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes),
-                )),
-                protocol::AttachmentContent::Jpeg(bytes) => FileAttachmentContent::Jpeg(Arc::new(
-                    gpui::Image::from_bytes(gpui::ImageFormat::Jpeg, bytes),
-                )),
-            },
+/// The largest file of a kind anyone may attach.
+fn max_attachment_size(kind: AttachmentKind) -> u64 {
+    match kind {
+        AttachmentKind::Text => MAX_TEXT_ATTACHMENT_BYTES,
+        AttachmentKind::Png | AttachmentKind::Jpeg => MAX_IMAGE_ATTACHMENT_BYTES,
+    }
+}
+
+fn kind_to_protocol(kind: AttachmentKind) -> protocol::AttachmentKind {
+    match kind {
+        AttachmentKind::Text => protocol::AttachmentKind::Text,
+        AttachmentKind::Png => protocol::AttachmentKind::Png,
+        AttachmentKind::Jpeg => protocol::AttachmentKind::Jpeg,
+    }
+}
+
+fn kind_from_protocol(kind: protocol::AttachmentKind) -> AttachmentKind {
+    match kind {
+        protocol::AttachmentKind::Text => AttachmentKind::Text,
+        protocol::AttachmentKind::Png => AttachmentKind::Png,
+        protocol::AttachmentKind::Jpeg => AttachmentKind::Jpeg,
+    }
+}
+
+fn record_to_protocol(record: &AttachmentRecord) -> protocol::AttachmentRef {
+    protocol::AttachmentRef {
+        id: record.id.as_uuid().into_bytes(),
+        name: record.name.clone(),
+        kind: kind_to_protocol(record.kind),
+        size: record.size,
+        creator: record.creator.into_bytes(),
+    }
+}
+
+fn record_from_protocol(record: protocol::AttachmentRef) -> AttachmentRecord {
+    AttachmentRecord {
+        id: AttachmentId::from_uuid(Uuid::from_bytes(record.id)),
+        name: record.name,
+        kind: kind_from_protocol(record.kind),
+        size: record.size,
+        creator: Uuid::from_bytes(record.creator),
+    }
+}
+
+/// A file whose bytes are still arriving from another participant.
+struct IncomingFile {
+    name: String,
+    kind: AttachmentKind,
+    total: u64,
+    bytes: Vec<u8>,
+    /// Who is sending it; `None` when it comes from the host.
+    uploader: Option<ParticipantId>,
+}
+
+impl IncomingFile {
+    fn progress(&self) -> f32 {
+        if self.total == 0 {
+            return 100.;
         }
+        (self.bytes.len() as f64 / self.total as f64 * 100.) as f32
     }
 }
 
@@ -426,8 +488,12 @@ fn escape_xml_attribute(value: &str) -> String {
 
 /// The user message sent to the agent for one submission: the comment
 /// instructions, then every prompt block under its creator's name, each
-/// followed by its own attachments.
-fn agent_message(preface: Option<&str>, blocks: &[PromptBlock]) -> RigMessage {
+/// followed by its own attachments, whose bytes come from `files`.
+fn agent_message(
+    preface: Option<&str>,
+    blocks: &[PromptBlock],
+    files: &HashMap<AttachmentId, FileAttachment>,
+) -> RigMessage {
     let mut content = preface
         .map(UserContent::text)
         .into_iter()
@@ -438,7 +504,13 @@ fn agent_message(preface: Option<&str>, blocks: &[PromptBlock]) -> RigMessage {
             block.author.display_name(),
             block.text
         )));
-        content.extend(block.attachments.iter().map(attachment_content));
+        content.extend(
+            block
+                .attachments
+                .iter()
+                .filter_map(|record| files.get(&record.id))
+                .map(attachment_content),
+        );
     }
     RigMessage::User { content }
 }
@@ -930,11 +1002,13 @@ struct PromptBlock {
     id: Uuid,
     author: ParticipantId,
     text: String,
-    attachments: Vec<FileAttachment>,
+    /// The block's files; their bytes are in the thread's
+    /// [`ThreadDraft::files`].
+    attachments: Vec<AttachmentRecord>,
 }
 
 /// A thread's pending request: the shared draft document, the bytes of the
-/// files it references, and the local editors showing its items.
+/// thread's files, and the local editors showing its items.
 ///
 /// Editors are created lazily by [`Cowork::prepare_draft`] because they need
 /// a window, and they are kept in sync with the document there too.
@@ -945,7 +1019,24 @@ struct ThreadDraft {
     /// Who the local user is in this draft.
     author: ParticipantId,
     doc: Draft,
-    attachment_bytes: HashMap<AttachmentId, FileAttachment>,
+    /// The bytes of every file this participant has of the thread: the
+    /// draft's, and those of messages submitted from it. Kept with the draft
+    /// because a new thread's draft becomes its thread's.
+    files: HashMap<AttachmentId, FileAttachment>,
+    /// Files whose bytes are still arriving from another participant.
+    incoming: HashMap<AttachmentId, IncomingFile>,
+    /// The files the host holds every byte of, which is what submitting
+    /// them needs.
+    stored: HashSet<AttachmentId>,
+    /// How many bytes of each of the local user's files have been sent to
+    /// the host so far, while they are being sent.
+    uploads: HashMap<AttachmentId, u64>,
+    /// Files discarded here, whose pieces still in flight are ignored.
+    discarded: HashSet<AttachmentId>,
+    /// Whether removing a file from the draft keeps its bytes. Joined
+    /// threads do: a removal can race a submission that includes the file,
+    /// and the host sends every file only once.
+    keeps_removed_files: bool,
     editors: HashMap<ItemId, ItemEditors>,
     /// The text each item editor last agreed on with the document. An editor
     /// catches up with others' edits only when it is next drawn, so a
@@ -1005,7 +1096,12 @@ impl ThreadDraft {
             id: Uuid::new_v4(),
             author,
             doc: Draft::new(),
-            attachment_bytes: HashMap::new(),
+            files: HashMap::new(),
+            incoming: HashMap::new(),
+            stored: HashSet::new(),
+            uploads: HashMap::new(),
+            discarded: HashSet::new(),
+            keeps_removed_files: false,
             editors: HashMap::new(),
             synced_text: HashMap::new(),
             draft_position: None,
@@ -1258,6 +1354,23 @@ impl ThreadDraft {
             })
             .map(|record| record.id)
             .collect::<Vec<_>>();
+        self.take_items(ids);
+        for attachment in attachments {
+            self.drop_removed_file(attachment);
+        }
+    }
+
+    /// Forgets a file whose record was removed, unless this draft keeps
+    /// removed files.
+    fn drop_removed_file(&mut self, id: AttachmentId) {
+        if !self.keeps_removed_files {
+            self.drop_file(id);
+        }
+    }
+
+    /// Removes items and their editors, keeping their files, as a
+    /// submission needs them.
+    fn take_items(&mut self, ids: &[ItemId]) {
         self.doc.remove_items(ids);
         for id in ids {
             if let Some(editors) = self.editors.remove(id) {
@@ -1268,9 +1381,147 @@ impl ThreadDraft {
         }
         self.attachment_batches
             .retain(|_, block| !ids.contains(block));
-        for attachment in attachments {
-            self.attachment_bytes.remove(&attachment);
+    }
+
+    /// Forgets everything about a file.
+    fn drop_file(&mut self, id: AttachmentId) {
+        self.files.remove(&id);
+        self.incoming.remove(&id);
+        self.stored.remove(&id);
+        self.uploads.remove(&id);
+        self.discarded.insert(id);
+    }
+
+    /// The attachment records of the draft's prompt blocks, in draft order.
+    fn attachment_records(&self) -> Vec<AttachmentRecord> {
+        self.doc
+            .items()
+            .into_iter()
+            .flat_map(|item| match item.kind {
+                DraftItemKind::Prompt { attachments } => attachments,
+                DraftItemKind::Comment { .. } => Vec::new(),
+            })
+            .collect()
+    }
+
+    /// Whether a file of a non-empty block is not with the host yet, which
+    /// holds submission back.
+    fn has_unstored_attachments(&self) -> bool {
+        self.doc
+            .items()
+            .into_iter()
+            .filter(|item| !item.is_empty())
+            .flat_map(|item| match item.kind {
+                DraftItemKind::Prompt { attachments } => attachments,
+                DraftItemKind::Comment { .. } => Vec::new(),
+            })
+            .any(|record| !self.stored.contains(&record.id))
+    }
+
+    /// Adds a received piece of a file. Returns the file once every byte
+    /// has arrived, or an error when the piece breaks the rules for it.
+    ///
+    /// Pieces of files already complete, or that continue a file this
+    /// participant has discarded or never started, are ignored: they can
+    /// still be in flight after a removal.
+    fn receive_chunk(
+        &mut self,
+        chunk: protocol::AttachmentChunk,
+        uploader: Option<ParticipantId>,
+    ) -> anyhow::Result<Option<AttachmentId>> {
+        let id = AttachmentId::from_uuid(Uuid::from_bytes(chunk.id));
+        let kind = kind_from_protocol(chunk.kind);
+        anyhow::ensure!(
+            chunk.total <= max_attachment_size(kind),
+            "{} is larger than attachments may be",
+            chunk.name
+        );
+        if self.files.contains_key(&id) || self.discarded.contains(&id) {
+            return Ok(None);
         }
+        if chunk.offset == 0 {
+            if let Some(uploader) = uploader {
+                let budget = 2 * MAX_MESSAGE_ATTACHMENT_BYTES;
+                let buffered = |incoming: &HashMap<AttachmentId, IncomingFile>| {
+                    incoming
+                        .iter()
+                        .filter(|(other, file)| **other != id && file.uploader == Some(uploader))
+                        .map(|(_, file)| file.total)
+                        .sum::<u64>()
+                };
+                if buffered(&self.incoming) + chunk.total > budget {
+                    // Complete files still waiting for a record that may
+                    // never come, e.g. attached to a block removed at the
+                    // same time, make room first.
+                    self.incoming.retain(|_, file| {
+                        file.uploader != Some(uploader) || file.bytes.len() as u64 != file.total
+                    });
+                }
+                anyhow::ensure!(
+                    buffered(&self.incoming) + chunk.total <= budget,
+                    "Too many attachment bytes in flight"
+                );
+            }
+            self.incoming.insert(
+                id,
+                IncomingFile {
+                    name: chunk.name,
+                    kind,
+                    total: chunk.total,
+                    bytes: Vec::with_capacity(chunk.total as usize),
+                    uploader,
+                },
+            );
+        }
+        let Some(file) = self.incoming.get_mut(&id) else {
+            return Ok(None);
+        };
+        if file.uploader != uploader
+            || file.kind != kind
+            || file.total != chunk.total
+            || file.bytes.len() as u64 != chunk.offset
+        {
+            // Out of step, e.g. restarted after a removal: start over.
+            self.incoming.remove(&id);
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            chunk.offset + chunk.bytes.len() as u64 <= file.total,
+            "{} has more bytes than announced",
+            file.name
+        );
+        file.bytes.extend_from_slice(&chunk.bytes);
+        Ok((file.bytes.len() as u64 == file.total).then_some(id))
+    }
+
+    /// Turns a completely received file into one this participant has.
+    fn complete_file(&mut self, id: AttachmentId) -> anyhow::Result<()> {
+        let Some(file) = self.incoming.remove(&id) else {
+            return Ok(());
+        };
+        let attachment = FileAttachment::from_bytes(file.name, file.kind, file.bytes)?;
+        self.files.insert(id, attachment);
+        Ok(())
+    }
+
+    /// The piece of a file this participant has that starts at `offset`,
+    /// or `None` once past its end or when the file is gone.
+    fn chunk(&self, id: AttachmentId, offset: u64) -> Option<protocol::AttachmentChunk> {
+        let file = self.files.get(&id)?;
+        let bytes = file.bytes();
+        let start = usize::try_from(offset).ok()?;
+        if start >= bytes.len() && !(start == 0 && bytes.is_empty()) {
+            return None;
+        }
+        let end = (start + protocol::ATTACHMENT_CHUNK_SIZE).min(bytes.len());
+        Some(protocol::AttachmentChunk {
+            id: id.as_uuid().into_bytes(),
+            name: file.name.clone(),
+            kind: kind_to_protocol(file.kind()),
+            total: bytes.len() as u64,
+            offset,
+            bytes: bytes[start..end].to_vec(),
+        })
     }
 
     /// Removes the item if it is empty. Returns whether it was removed.
@@ -1483,6 +1734,8 @@ enum ThreadSharing {
     /// closes `host` and drops `link`, which is what disconnects.
     Connected {
         host: async_channel::Sender<protocol::CollaboratorMessage>,
+        /// For attachment bytes; see [`protocol::Peer::bulk`].
+        uploads: async_channel::Sender<protocol::CollaboratorMessage>,
         /// `None` when the peer is not reached over the network, as in tests.
         link: Option<PeerLink>,
     },
@@ -1634,11 +1887,7 @@ impl PromptBlock {
             id: self.id.into_bytes(),
             author: self.author.into_bytes(),
             text: self.text.clone(),
-            attachments: self
-                .attachments
-                .iter()
-                .map(FileAttachment::to_protocol)
-                .collect(),
+            attachments: self.attachments.iter().map(record_to_protocol).collect(),
         }
     }
 }
@@ -1662,7 +1911,7 @@ impl protocol::UserMessage {
                     attachments: block
                         .attachments
                         .into_iter()
-                        .map(protocol::Attachment::into_native)
+                        .map(record_from_protocol)
                         .collect(),
                 })
                 .collect(),
@@ -1796,7 +2045,15 @@ impl Thread {
             thread,
             draft,
             presence,
+            stored_attachments,
         } = welcome;
+        self.draft.stored = stored_attachments
+            .into_iter()
+            .map(|id| AttachmentId::from_uuid(Uuid::from_bytes(id)))
+            .collect();
+        let stored = &self.draft.stored;
+        self.draft.uploads.retain(|id, _| !stored.contains(id));
+        self.draft.keeps_removed_files = true;
         self.participant_id = ParticipantId::from_bytes(participant_id);
         self.draft.author = self.participant_id;
         if let Err(error) = self.draft.doc.apply_update(&draft) {
@@ -1871,10 +2128,104 @@ impl Thread {
         update: Vec<u8>,
     ) -> anyhow::Result<()> {
         let before = self.draft.doc.items();
+        let attachments_before = self.draft.attachment_records();
         self.draft.doc.apply_update(&update)?;
         self.publish(protocol::HostMessage::DraftUpdate(update));
         self.draft.doc.validate()?;
-        draft::verify_change(&before, &self.draft.doc.items(), author.as_uuid())
+        draft::verify_change(&before, &self.draft.doc.items(), author.as_uuid())?;
+
+        // The host keeps only the bytes of files still attached; submitted
+        // ones leave the draft through the host's own submission instead.
+        let attachments = self.draft.attachment_records();
+        for removed in attachments_before
+            .iter()
+            .filter(|record| !attachments.iter().any(|kept| kept.id == record.id))
+        {
+            self.draft.drop_file(removed.id);
+        }
+        // Bytes can arrive before the record that announces them.
+        let complete = self
+            .draft
+            .incoming
+            .iter()
+            .filter(|(_, file)| {
+                file.uploader == Some(author) && file.bytes.len() as u64 == file.total
+            })
+            .map(|(id, _)| *id)
+            .collect::<Vec<_>>();
+        for id in complete {
+            self.store_upload(author, id)?;
+        }
+        Ok(())
+    }
+
+    /// Takes a piece of a file a collaborator is uploading.
+    fn receive_upload(
+        &mut self,
+        uploader: ParticipantId,
+        chunk: protocol::AttachmentChunk,
+    ) -> anyhow::Result<()> {
+        if let Some(id) = self.draft.receive_chunk(chunk, Some(uploader))? {
+            self.store_upload(uploader, id)?;
+        }
+        Ok(())
+    }
+
+    /// Stores a completely uploaded file once its record is in the draft,
+    /// and announces it. Until the record arrives it waits in `incoming`.
+    fn store_upload(&mut self, uploader: ParticipantId, id: AttachmentId) -> anyhow::Result<()> {
+        let Some(record) = self
+            .draft
+            .attachment_records()
+            .into_iter()
+            .find(|record| record.id == id)
+        else {
+            return Ok(());
+        };
+        let Some(file) = self.draft.incoming.get(&id) else {
+            return Ok(());
+        };
+        anyhow::ensure!(
+            record.creator == uploader.as_uuid()
+                && record.size == file.total
+                && record.kind == file.kind,
+            "{} does not match its attachment record",
+            file.name
+        );
+        self.draft.complete_file(id)?;
+        self.publish_stored(id, uploader);
+        Ok(())
+    }
+
+    /// The stored files `participant` needs the bytes of: all but the ones
+    /// they attached themselves. Timeline files come first, in order.
+    fn files_for(&self, participant: ParticipantId) -> Vec<AttachmentId> {
+        let timeline = self.timeline.iter().flat_map(|message| match message {
+            TimelineMessage::User(group) => group
+                .blocks
+                .iter()
+                .flat_map(|block| block.attachments.clone())
+                .collect(),
+            TimelineMessage::Agent(_) => Vec::new(),
+        });
+        timeline
+            .chain(self.draft.attachment_records())
+            .filter(|record| {
+                record.creator != participant.as_uuid()
+                    && self.draft.stored.contains(&record.id)
+                    && self.draft.files.contains_key(&record.id)
+            })
+            .map(|record| record.id)
+            .collect()
+    }
+
+    /// Marks a file as held by the host and tells everyone.
+    fn publish_stored(&mut self, id: AttachmentId, uploader: ParticipantId) {
+        self.draft.stored.insert(id);
+        self.publish(protocol::HostMessage::AttachmentStored {
+            id: id.as_uuid().into_bytes(),
+            uploader: uploader.into_bytes(),
+        });
     }
 
     /// Tells the other participants where the local user is in the draft.
@@ -1935,6 +2286,27 @@ impl Thread {
     /// Lets everyone know a collaborator has left, first removing the empty
     /// item they were in if nobody else is in it either.
     fn participant_left(&mut self, participant: ParticipantId, cx: &mut impl AppContext) {
+        // Files they had not finished uploading can never be submitted.
+        let unfinished = self
+            .draft
+            .attachment_records()
+            .into_iter()
+            .filter(|record| {
+                record.creator == participant.as_uuid() && !self.draft.stored.contains(&record.id)
+            })
+            .map(|record| record.id)
+            .collect::<Vec<_>>();
+        for id in &unfinished {
+            self.draft.doc.remove_attachment(*id);
+        }
+        self.draft
+            .incoming
+            .retain(|_, file| file.uploader != Some(participant));
+        for id in unfinished {
+            self.draft.drop_file(id);
+        }
+        self.flush_draft();
+
         let focus = self
             .draft
             .presence
@@ -2071,6 +2443,23 @@ impl Thread {
             } => {
                 self.draft
                     .set_presence(ParticipantId::from_bytes(participant), presence);
+            }
+            protocol::HostMessage::AttachmentStored { id, .. } => {
+                let id = AttachmentId::from_uuid(Uuid::from_bytes(id));
+                self.draft.stored.insert(id);
+                self.draft.uploads.remove(&id);
+            }
+            // Only ever relayed by the host, which holds every file.
+            protocol::HostMessage::AttachmentData(chunk) => {
+                match self.draft.receive_chunk(chunk, None) {
+                    Ok(Some(id)) => {
+                        if let Err(error) = self.draft.complete_file(id) {
+                            eprintln!("failed to read a received attachment: {error:#}");
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => eprintln!("ignored attachment data: {error:#}"),
+                }
             }
             protocol::HostMessage::ModelSelected { catalog_id } => {
                 if let Some(model) = ModelSelection::from_catalog_id(&catalog_id) {
@@ -2313,6 +2702,61 @@ impl SidebarItem for CoworkSidebarSection {
     }
 }
 
+/// What an attachment card shows, read out of a thread for rendering.
+struct AttachmentCard {
+    id: AttachmentId,
+    name: String,
+    kind: AttachmentKind,
+    size: u64,
+    image: Option<Arc<gpui::Image>>,
+    transfer: Option<Transfer>,
+}
+
+/// A file on its way, with the percent done.
+#[derive(Clone, Copy)]
+enum Transfer {
+    Uploading(f32),
+    Downloading(f32),
+}
+
+impl AttachmentCard {
+    fn new(draft: &ThreadDraft, record: &AttachmentRecord) -> Self {
+        let file = draft.files.get(&record.id);
+        let percent = |done: u64| {
+            if record.size == 0 {
+                100.
+            } else {
+                (done as f64 / record.size as f64 * 100.) as f32
+            }
+        };
+        let transfer = if let Some(sent) = draft.uploads.get(&record.id) {
+            Some(Transfer::Uploading(percent(*sent)))
+        } else if file.is_none() {
+            Some(Transfer::Downloading(
+                draft
+                    .incoming
+                    .get(&record.id)
+                    .map_or(0., IncomingFile::progress),
+            ))
+        } else {
+            None
+        };
+        Self {
+            id: record.id,
+            name: record.name.clone(),
+            kind: record.kind,
+            size: record.size,
+            image: file.and_then(|file| match &file.content {
+                FileAttachmentContent::Png(image) | FileAttachmentContent::Jpeg(image) => {
+                    Some(image.clone())
+                }
+                FileAttachmentContent::Text(_) => None,
+            }),
+            transfer,
+        }
+    }
+}
+
 /// What the composer shows of a draft, read out of it for rendering.
 struct ComposerModel {
     draft_id: Uuid,
@@ -2335,7 +2779,7 @@ struct ComposerBlock {
     creator: ParticipantId,
     presence: ItemPresence,
     editor: Entity<TextareaState>,
-    attachments: Vec<(AttachmentId, FileAttachment)>,
+    attachments: Vec<AttachmentCard>,
 }
 
 #[derive(Clone)]
@@ -3334,22 +3778,75 @@ impl Cowork {
         peer: &HostPeer,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<()> {
-        let mut events = Self::send_snapshot(thread, participant_id, peer, cx).await?;
+        let (mut events, files) = Self::send_snapshot(thread, participant_id, peer, cx).await?;
+        // Files to send, each with how far it got, one chunk at a time on the
+        // bulk queue so they never hold up anything else.
+        let mut sends = files.iter().map(|id| (*id, 0)).collect::<VecDeque<_>>();
+        let mut queued = files.into_iter().collect::<HashSet<_>>();
         loop {
+            let chunk = match sends.front() {
+                Some(&(id, offset)) => {
+                    thread.update(cx, |thread, _| thread.draft.chunk(id, offset))?
+                }
+                None => None,
+            };
+            if sends.front().is_some() && chunk.is_none() {
+                // Removed since.
+                sends.pop_front();
+                continue;
+            }
+            let bulk = peer.bulk.clone();
+            let send_chunk = async move {
+                match chunk {
+                    Some(chunk) => {
+                        let next = chunk.offset + chunk.bytes.len() as u64;
+                        let done = next >= chunk.total;
+                        bulk.send(protocol::HostMessage::AttachmentData(chunk))
+                            .await
+                            .map(|()| (next, done))
+                    }
+                    None => std::future::pending().await,
+                }
+            };
             tokio::select! {
+                biased;
                 event = events.recv() => match event {
-                    Ok(event) => peer
-                        .send(event)
-                        .await
-                        .context("Peer stopped receiving thread events.")?,
+                    Ok(event) => {
+                        if let protocol::HostMessage::AttachmentStored { id, uploader } = &event
+                            && *uploader != participant_id.into_bytes()
+                        {
+                            let id = AttachmentId::from_uuid(Uuid::from_bytes(*id));
+                            if queued.insert(id) {
+                                sends.push_back((id, 0));
+                            }
+                        }
+                        peer.send(event)
+                            .await
+                            .context("Peer stopped receiving thread events.")?;
+                    }
                     // A peer that fell further behind than the event buffer
                     // has missed changes, so re-base it rather than applying
                     // deltas to a timeline that no longer matches the host's.
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        events = Self::send_snapshot(thread, participant_id, peer, cx).await?;
+                        let files;
+                        (events, files) =
+                            Self::send_snapshot(thread, participant_id, peer, cx).await?;
+                        for id in files {
+                            if queued.insert(id) {
+                                sends.push_back((id, 0));
+                            }
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
                 },
+                sent = send_chunk => {
+                    let (next, done) = sent.context("Peer stopped receiving attachments.")?;
+                    if done {
+                        sends.pop_front();
+                    } else if let Some(front) = sends.front_mut() {
+                        front.1 = next;
+                    }
+                }
                 // Also how a disconnect is noticed while the thread is quiet.
                 request = peer.receive() => {
                     let Some(request) = request else {
@@ -3367,14 +3864,18 @@ impl Cowork {
     }
 
     /// Sends a peer a full snapshot and returns a subscription that resumes
-    /// exactly where the snapshot left off.
+    /// exactly where the snapshot left off, with the files the peer needs the
+    /// bytes of.
     async fn send_snapshot(
         thread: &WeakEntity<Thread>,
         participant_id: ParticipantId,
         peer: &HostPeer,
         cx: &mut AsyncApp,
-    ) -> anyhow::Result<broadcast::Receiver<protocol::HostMessage>> {
-        let (snapshot, draft, presence, events) = thread
+    ) -> anyhow::Result<(
+        broadcast::Receiver<protocol::HostMessage>,
+        Vec<AttachmentId>,
+    )> {
+        let (snapshot, draft, presence, stored_attachments, files, events) = thread
             .update(cx, |thread, _| {
                 let presence = thread
                     .draft
@@ -3384,10 +3885,18 @@ impl Cowork {
                         (participant.into_bytes(), presence.clone())
                     })
                     .collect();
+                let stored = thread
+                    .draft
+                    .stored
+                    .iter()
+                    .map(|id| id.as_uuid().into_bytes())
+                    .collect();
                 Some((
                     thread.to_protocol(),
                     thread.draft.doc.encode_state(),
                     presence,
+                    stored,
+                    thread.files_for(participant_id),
                     thread.subscribe()?,
                 ))
             })?
@@ -3397,10 +3906,11 @@ impl Cowork {
             thread: snapshot,
             draft,
             presence,
+            stored_attachments,
         }))
         .await
         .context("Peer disconnected before receiving the thread snapshot.")?;
-        Ok(events)
+        Ok((events, files))
     }
 
     /// Applies a request a collaborator sent to a thread this app hosts.
@@ -3437,10 +3947,30 @@ impl Cowork {
                 // everyone sees that one.
                 // TODO: tell the submitter why a submission was not accepted.
                 if !stale && !self.draft_is_loading_attachments(draft_id, cx) {
-                    self.accept_submission(draft_id, Some(thread.clone()), cx);
+                    self.accept_submission(draft_id, Some(thread.clone()), false, cx);
                     let thread_id = thread.read(cx).instance_id;
                     self.thread_updated(thread_id, cx);
                 }
+            }
+            protocol::CollaboratorMessage::AttachmentCancelled(id) => {
+                let id = AttachmentId::from_uuid(Uuid::from_bytes(id));
+                thread.update(cx, |thread, _| {
+                    let draft = &mut thread.draft;
+                    let theirs = draft
+                        .incoming
+                        .get(&id)
+                        .is_some_and(|file| file.uploader == Some(participant));
+                    if theirs {
+                        draft.incoming.remove(&id);
+                        draft.discarded.insert(id);
+                    }
+                });
+            }
+            protocol::CollaboratorMessage::AttachmentData(chunk) => {
+                thread
+                    .update(cx, |thread, _| thread.receive_upload(participant, chunk))
+                    .with_context(|| format!("Invalid attachment data from {participant:?}."))?;
+                cx.notify();
             }
             protocol::CollaboratorMessage::Presence(presence) => {
                 thread.update(cx, |thread, cx| {
@@ -3753,7 +4283,7 @@ impl Cowork {
         link: Option<PeerLink>,
         cx: &mut Context<Self>,
     ) -> Uuid {
-        let (host_requests, events) = host.split();
+        let (host_requests, uploads, events) = host.split();
         let (requests, queued_requests) = async_channel::unbounded();
         cx.background_spawn(async move {
             while let Ok(request) = queued_requests.recv().await {
@@ -3772,6 +4302,7 @@ impl Cowork {
                 draft,
                 ThreadSharing::Connected {
                     host: requests,
+                    uploads,
                     link,
                 },
                 cx,
@@ -3789,7 +4320,11 @@ impl Cowork {
             while let Ok(event) = events.recv().await {
                 // Carets move constantly; they only need a redraw, not the
                 // timeline following new output.
-                let presence_only = matches!(event, protocol::HostMessage::Presence { .. });
+                let presence_only = matches!(
+                    event,
+                    protocol::HostMessage::Presence { .. }
+                        | protocol::HostMessage::AttachmentData(_)
+                );
                 thread.update(cx, |thread, cx| thread.apply(event, cx));
                 if this
                     .update(cx, |this, cx| {
@@ -4828,10 +5363,12 @@ impl Cowork {
         }
     }
 
+    /// A submitted user message; `cards` holds each block's attachments.
     fn render_user_message_group(
         &self,
         index: usize,
         group: &UserMessageGroup,
+        cards: Vec<Vec<AttachmentCard>>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let mut rows = Vec::new();
@@ -4850,9 +5387,9 @@ impl Cowork {
             }
             rows.push(Self::render_comment_group_row(&group.comments, content));
         }
-        for (block_index, block) in group.blocks.iter().enumerate() {
+        for (block_index, (block, cards)) in group.blocks.iter().zip(cards).enumerate() {
             let mut content = Vec::new();
-            if !block.attachments.is_empty() {
+            if !cards.is_empty() {
                 content.push(
                     div()
                         .w_full()
@@ -4860,10 +5397,9 @@ impl Cowork {
                         .flex_wrap()
                         .gap_1()
                         .children(
-                            block
-                                .attachments
+                            cards
                                 .iter()
-                                .map(|attachment| self.render_attachment(attachment, None, cx)),
+                                .map(|card| self.render_attachment(card, None, cx)),
                         )
                         .into_any_element(),
                 );
@@ -5370,7 +5906,28 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         match message {
-            TimelineMessage::User(group) => self.render_user_message_group(index, group, cx),
+            TimelineMessage::User(group) => {
+                let cards = self
+                    .thread_store
+                    .read(cx)
+                    .thread(thread_id, cx)
+                    .map(|thread| {
+                        let draft = &thread.read(cx).draft;
+                        group
+                            .blocks
+                            .iter()
+                            .map(|block| {
+                                block
+                                    .attachments
+                                    .iter()
+                                    .map(|record| AttachmentCard::new(draft, record))
+                                    .collect()
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                self.render_user_message_group(index, group, cards, cx)
+            }
             TimelineMessage::Agent(message) => self.render_agent_message(
                 thread_id,
                 index,
@@ -5384,13 +5941,17 @@ impl Cowork {
         }
     }
 
-    fn rig_history(messages: &[TimelineMessage]) -> Vec<RigMessage> {
+    fn rig_history(
+        messages: &[TimelineMessage],
+        files: &HashMap<AttachmentId, FileAttachment>,
+    ) -> Vec<RigMessage> {
         messages
             .iter()
             .filter_map(|message| match message {
                 TimelineMessage::User(group) => Some(agent_message(
                     group.history_preface.as_deref(),
                     &group.blocks,
+                    files,
                 )),
                 TimelineMessage::Agent(message) if message.complete && !message.failed => {
                     let submitted_comments = message
@@ -5717,14 +6278,16 @@ impl Cowork {
         }))
     }
 
-    /// Whether anyone, the local user or another participant, is still
-    /// reading files into the draft, which holds submission back.
+    /// Whether files are still on their way: being read by anyone, or not
+    /// yet with the host. Either holds submission back.
     fn draft_is_loading_attachments(&self, draft_id: Uuid, cx: &App) -> bool {
         self.pending_attachments
             .iter()
             .any(|pending| pending.draft_id == draft_id)
             || self
-                .read_draft(draft_id, cx, ThreadDraft::others_are_reading_files)
+                .read_draft(draft_id, cx, |draft| {
+                    draft.others_are_reading_files() || draft.has_unstored_attachments()
+                })
                 .unwrap_or(false)
     }
 
@@ -5738,18 +6301,6 @@ impl Cowork {
         }
     }
 
-    /// Whether files can be attached to the draft. Not yet in joined
-    /// threads: attachment bytes only reach the host once attachment
-    /// transfer (step 5 of the collaboration spec) exists.
-    fn draft_accepts_attachments(&self, draft_id: Uuid, cx: &App) -> bool {
-        self.new_thread_draft.id == draft_id
-            || self.thread_store.read(cx).threads.iter().any(|thread| {
-                let thread = thread.read(cx);
-                thread.draft.id == draft_id
-                    && !matches!(thread.sharing, ThreadSharing::Connected { .. })
-            })
-    }
-
     fn add_attachments(
         &mut self,
         draft_id: Uuid,
@@ -5757,7 +6308,7 @@ impl Cowork {
         sources: Vec<AttachmentSource>,
         cx: &mut Context<Self>,
     ) {
-        if sources.is_empty() || !self.draft_accepts_attachments(draft_id, cx) {
+        if sources.is_empty() {
             return;
         }
         self.attachment_errors
@@ -5829,10 +6380,11 @@ impl Cowork {
                 let target = self.pending_attachments.remove(index).target;
                 let result = result.and_then(|attachment| {
                     self.update_draft(draft_id, cx, |draft| {
+                        // By the records: others' files may not be here yet.
                         let total = draft
-                            .attachment_bytes
-                            .values()
-                            .map(FileAttachment::len)
+                            .attachment_records()
+                            .iter()
+                            .map(|record| record.size)
                             .sum::<u64>();
                         anyhow::ensure!(
                             total + attachment.len() <= MAX_MESSAGE_ATTACHMENT_BYTES,
@@ -5844,20 +6396,22 @@ impl Cowork {
                         let record = AttachmentRecord {
                             id: AttachmentId::new(),
                             name: attachment.name.clone(),
-                            kind: match attachment.content {
-                                FileAttachmentContent::Text(_) => AttachmentKind::Text,
-                                FileAttachmentContent::Png(_) => AttachmentKind::Png,
-                                FileAttachmentContent::Jpeg(_) => AttachmentKind::Jpeg,
-                            },
+                            kind: attachment.kind(),
                             size: attachment.len(),
                             creator: draft.author.as_uuid(),
                         };
-                        draft.attachment_bytes.insert(record.id, attachment);
+                        let id = record.id;
+                        draft.files.insert(id, attachment);
                         draft.doc.add_attachment(block, record);
-                        Ok(())
+                        Ok(Some(id))
                     })
                     // The draft is gone (sent, or its thread was closed).
-                    .unwrap_or(Ok(()))
+                    .unwrap_or(Ok(None))
+                });
+                let result = result.map(|added| {
+                    if let Some(id) = added {
+                        self.attachment_added(draft_id, id, cx);
+                    }
                 });
                 if let Err(error) = result {
                     self.attachment_errors.push(AttachmentError {
@@ -5871,6 +6425,101 @@ impl Cowork {
         // others cannot submit while a read is announced.
         self.publish_presence(cx);
         cx.notify();
+    }
+
+    /// Gets a file the local user just attached to whoever needs it: the host
+    /// announces it, as it already holds the bytes; a collaborator uploads
+    /// it to the host, which announces it once it has every byte.
+    fn attachment_added(&mut self, draft_id: Uuid, id: AttachmentId, cx: &mut Context<Self>) {
+        let thread = self.draft_thread(draft_id, cx);
+        let joined = thread.as_ref().is_some_and(|thread| {
+            matches!(thread.read(cx).sharing, ThreadSharing::Connected { .. })
+        });
+        match thread {
+            Some(thread) if joined => self.start_upload(thread, id, cx),
+            Some(thread) => thread.update(cx, |thread, cx| {
+                let uploader = thread.participant_id.into_bytes();
+                thread.emit(
+                    protocol::HostMessage::AttachmentStored {
+                        id: id.as_uuid().into_bytes(),
+                        uploader,
+                    },
+                    cx,
+                );
+            }),
+            None => {
+                self.update_draft(draft_id, cx, |draft| draft.stored.insert(id));
+            }
+        }
+    }
+
+    /// Sends a file of a joined thread's draft to its host, one chunk at a
+    /// time. Stops early once the file is removed.
+    fn start_upload(&mut self, thread: Entity<Thread>, id: AttachmentId, cx: &mut Context<Self>) {
+        let ThreadSharing::Connected { uploads, .. } = &thread.read(cx).sharing else {
+            return;
+        };
+        let uploads = uploads.clone();
+        let thread = thread.downgrade();
+        cx.spawn(async move |this, cx| {
+            let mut offset = 0;
+            loop {
+                let Ok(chunk) = thread.update(cx, |thread, _| {
+                    thread.draft.chunk(id, offset).filter(|_| {
+                        thread
+                            .draft
+                            .attachment_records()
+                            .iter()
+                            .any(|record| record.id == id)
+                    })
+                }) else {
+                    return;
+                };
+                let Some(chunk) = chunk else {
+                    // Removed: lets the host discard what it has, which the
+                    // bulk queue delivers after every chunk sent before.
+                    _ = uploads
+                        .send(protocol::CollaboratorMessage::AttachmentCancelled(
+                            id.as_uuid().into_bytes(),
+                        ))
+                        .await;
+                    return;
+                };
+                let next = chunk.offset + chunk.bytes.len() as u64;
+                let total = chunk.total;
+                if uploads
+                    .send(protocol::CollaboratorMessage::AttachmentData(chunk))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                let updated = thread.update(cx, |thread, _| {
+                    // Until the host confirms it has every byte.
+                    if !thread.draft.stored.contains(&id) {
+                        thread.draft.uploads.insert(id, next);
+                    }
+                });
+                if updated.is_err() || this.update(cx, |_, cx| cx.notify()).is_err() {
+                    return;
+                }
+                if next >= total {
+                    return;
+                }
+                offset = next;
+            }
+        })
+        .detach();
+    }
+
+    /// The thread whose draft is `draft_id`, if it has one yet.
+    fn draft_thread(&self, draft_id: Uuid, cx: &App) -> Option<Entity<Thread>> {
+        self.thread_store
+            .read(cx)
+            .threads
+            .iter()
+            .find(|thread| thread.read(cx).draft.id == draft_id)
+            .cloned()
     }
 
     /// Removes an attachment, and its block too if that leaves the block
@@ -5892,7 +6541,7 @@ impl Cowork {
             .unwrap_or(false);
         self.update_draft(draft_id, cx, |draft| {
             draft.doc.remove_attachment(attachment);
-            draft.attachment_bytes.remove(&attachment);
+            draft.drop_removed_file(attachment);
             if !block_focused {
                 draft.remove_if_unattended(block);
             }
@@ -6043,30 +6692,54 @@ impl Cowork {
     /// draft and block it can be removed from.
     fn render_attachment(
         &self,
-        attachment: &FileAttachment,
+        attachment: &AttachmentCard,
         removal: Option<(Uuid, ItemId, AttachmentId)>,
         cx: &mut Context<Self>,
     ) -> Attachment {
-        let size = format_bytes(attachment.len());
-        let (media, description) = match &attachment.content {
-            FileAttachmentContent::Text(_) => (
-                AttachmentMedia::new().child(Icon::new(AssetIconName::FileText)),
-                format!("Text · {size}"),
-            ),
-            FileAttachmentContent::Png(image) => (
-                AttachmentMedia::new().src(image.clone()),
-                format!("PNG · {size}"),
-            ),
-            FileAttachmentContent::Jpeg(image) => (
-                AttachmentMedia::new().src(image.clone()),
-                format!("JPEG · {size}"),
-            ),
+        let size = format_bytes(attachment.size);
+        let label = match attachment.kind {
+            AttachmentKind::Text => "Text",
+            AttachmentKind::Png => "PNG",
+            AttachmentKind::Jpeg => "JPEG",
         };
-        let mut card = Attachment::new().xsmall().media(media).content(
-            AttachmentContent::new()
-                .title(AttachmentTitle::new(attachment.name.clone()))
-                .description(AttachmentDescription::new(description)),
-        );
+        let media = match (&attachment.image, attachment.kind) {
+            (Some(image), _) => AttachmentMedia::new().src(image.clone()),
+            (None, AttachmentKind::Text) => {
+                AttachmentMedia::new().child(Icon::new(AssetIconName::FileText))
+            }
+            (None, _) => AttachmentMedia::new().child(Icon::new(AssetIconName::Image)),
+        };
+        let (description, progress) = match attachment.transfer {
+            None => (format!("{label} · {size}"), None),
+            Some(Transfer::Uploading(progress)) => {
+                (format!("Uploading · {progress:.0}%"), Some(progress))
+            }
+            Some(Transfer::Downloading(progress)) => {
+                (format!("Downloading · {progress:.0}%"), Some(progress))
+            }
+        };
+        let mut content = AttachmentContent::new()
+            .title(AttachmentTitle::new(attachment.name.clone()))
+            .description(AttachmentDescription::new(description));
+        if let Some(progress) = progress {
+            content = content.child(
+                Progress::new(format!("attachment-transfer-{}", attachment.id))
+                    .xsmall()
+                    .w(px(140.))
+                    .value(progress)
+                    .accessibility_label(format!("Transferring {}", attachment.name)),
+            );
+        }
+        let mut card = Attachment::new()
+            .xsmall()
+            .when_some(attachment.transfer, |card, transfer| {
+                card.status(match transfer {
+                    Transfer::Uploading(_) => AttachmentStatus::Uploading,
+                    Transfer::Downloading(_) => AttachmentStatus::Pending,
+                })
+            })
+            .media(media)
+            .content(content);
         if let Some((draft_id, block, attachment_id)) = removal {
             card = card.actions(
                 AttachmentActions::new().child(
@@ -6173,7 +6846,7 @@ impl Cowork {
             return;
         }
 
-        if self.accept_submission(draft_id, active_thread, cx) {
+        if self.accept_submission(draft_id, active_thread, true, cx) {
             self.selection_message_id = None;
             self.follow_generation = true;
             self.timeline_scroll_handle.scroll_to_bottom();
@@ -6188,13 +6861,47 @@ impl Cowork {
     /// Submits a local or hosted thread's draft: publishes its non-empty
     /// items as one user message and starts the agent on it. Without a
     /// thread, the draft starts a new one. Returns whether anything was
-    /// submitted.
+    /// submitted. Rejections are shown when the local user submitted.
     fn accept_submission(
         &mut self,
         draft_id: Uuid,
         active_thread: Option<Entity<Thread>>,
+        submitted_locally: bool,
         cx: &mut Context<Self>,
     ) -> bool {
+        // Checked again here, as several participants' files add up.
+        let attached = self
+            .read_draft(draft_id, cx, |draft| {
+                draft
+                    .doc
+                    .items()
+                    .into_iter()
+                    .filter(|item| !item.is_empty())
+                    .flat_map(|item| match item.kind {
+                        DraftItemKind::Prompt { attachments } => attachments,
+                        DraftItemKind::Comment { .. } => Vec::new(),
+                    })
+                    .map(|record| record.size)
+                    .sum::<u64>()
+            })
+            .unwrap_or(0);
+        if attached > MAX_MESSAGE_ATTACHMENT_BYTES {
+            // TODO: tell a collaborator who submitted, too.
+            if !submitted_locally {
+                return false;
+            }
+            self.attachment_errors
+                .retain(|error| error.draft_id != draft_id);
+            self.attachment_errors.push(AttachmentError {
+                draft_id,
+                message: format!(
+                    "Attachments on one message can total at most {}",
+                    format_bytes(MAX_MESSAGE_ATTACHMENT_BYTES)
+                ),
+            });
+            cx.notify();
+            return false;
+        }
         let Some((comments, blocks, comments_folded)) = self
             .update_draft(draft_id, cx, Self::take_submission)
             .flatten()
@@ -6204,14 +6911,17 @@ impl Cowork {
         self.attachment_errors
             .retain(|error| error.draft_id != draft_id);
 
-        let timeline = active_thread
-            .as_ref()
-            .map(|thread| thread.read(cx).timeline.clone())
-            .unwrap_or_default();
-        let history = Self::rig_history(&timeline);
+        let (timeline, files) = match &active_thread {
+            Some(thread) => {
+                let thread = thread.read(cx);
+                (thread.timeline.clone(), thread.draft.files.clone())
+            }
+            None => (Vec::new(), self.new_thread_draft.files.clone()),
+        };
+        let history = Self::rig_history(&timeline, &files);
         let turn_comments = Arc::new(TurnComments::new(comments.len()));
         let preface = Self::comments_preface(&comments, turn_comments.comment_ids(), &timeline);
-        let prompt = agent_message(preface.as_deref(), &blocks);
+        let prompt = agent_message(preface.as_deref(), &blocks, &files);
         let comment_ids = comments
             .iter()
             .map(|comment| comment.id)
@@ -6310,15 +7020,13 @@ impl Cowork {
                     id: item.id.as_uuid(),
                     author,
                     text: item.body.clone(),
-                    attachments: attachments
-                        .iter()
-                        .filter_map(|record| draft.attachment_bytes.get(&record.id).cloned())
-                        .collect(),
+                    attachments: attachments.clone(),
                 }),
             }
         }
         let ids = items.iter().map(|item| item.id).collect::<Vec<_>>();
-        draft.remove_items(&ids);
+        // Their files stay: the submitted message shows and sends them.
+        draft.take_items(&ids);
         Some((comments, blocks, draft.comments_folded))
     }
 
@@ -6357,9 +7065,7 @@ impl Cowork {
             || active_thread
                 .as_ref()
                 .is_some_and(|thread| thread.read(cx).sharing.is_collaborating());
-        let can_attach = self
-            .writable_draft_id(cx)
-            .is_some_and(|draft_id| self.draft_accepts_attachments(draft_id, cx));
+
         let loading_attachments = self
             .writable_draft_id(cx)
             .is_some_and(|draft_id| self.draft_is_loading_attachments(draft_id, cx));
@@ -6544,10 +7250,6 @@ impl Cowork {
                         .ghost()
                         .small()
                         .accessibility_label("Attach files")
-                        .disabled(!can_attach)
-                        .when(!can_attach, |this| {
-                            this.tooltip("Attaching files in joined threads is not available yet")
-                        })
                         .on_click(cx.listener(Self::pick_attachments)),
                 )
             })
@@ -6729,10 +7431,7 @@ impl Cowork {
                         editor: draft.editor(EditorSlot::Prompt(item.id))?,
                         attachments: attachments
                             .iter()
-                            .filter_map(|record| {
-                                let bytes = draft.attachment_bytes.get(&record.id)?;
-                                Some((record.id, bytes.clone()))
-                            })
+                            .map(|record| AttachmentCard::new(draft, record))
                             .collect(),
                     })
                 })
@@ -6816,10 +7515,10 @@ impl Cowork {
                         .flex_wrap()
                         .items_center()
                         .gap_1()
-                        .children(block.attachments.iter().map(|(attachment_id, attachment)| {
+                        .children(block.attachments.iter().map(|attachment| {
                             self.render_attachment(
                                 attachment,
-                                Some((draft_id, block.id, *attachment_id)),
+                                Some((draft_id, block.id, attachment.id)),
                                 cx,
                             )
                         }))
@@ -7286,25 +7985,45 @@ mod tests {
         }
     }
 
+    /// Records for `files`, and the files by id, as a thread holds them.
+    fn attached(
+        files: impl IntoIterator<Item = FileAttachment>,
+    ) -> (Vec<AttachmentRecord>, HashMap<AttachmentId, FileAttachment>) {
+        files
+            .into_iter()
+            .map(|file| {
+                let record = AttachmentRecord {
+                    id: AttachmentId::new(),
+                    name: file.name.clone(),
+                    kind: file.kind(),
+                    size: file.len(),
+                    creator: Uuid::new_v4(),
+                };
+                (record.clone(), (record.id, file))
+            })
+            .unzip()
+    }
+
     #[test]
     fn attachments_become_ollama_text_and_base64_image_parts() {
         let author = ParticipantId::from_bytes([7; 16]);
+        let (records, files) = attached([
+            text_attachment("say \"hi\".txt", "hello"),
+            FileAttachment {
+                name: "photo.png".into(),
+                content: FileAttachmentContent::Png(Arc::new(gpui::Image::from_bytes(
+                    gpui::ImageFormat::Png,
+                    vec![1, 2, 3],
+                ))),
+            },
+        ]);
         let block = PromptBlock {
             id: Uuid::new_v4(),
             author,
             text: "Question".into(),
-            attachments: vec![
-                text_attachment("say \"hi\".txt", "hello"),
-                FileAttachment {
-                    name: "photo.png".into(),
-                    content: FileAttachmentContent::Png(Arc::new(gpui::Image::from_bytes(
-                        gpui::ImageFormat::Png,
-                        vec![1, 2, 3],
-                    ))),
-                },
-            ],
+            attachments: records,
         };
-        let RigMessage::User { content } = agent_message(None, &[block]) else {
+        let RigMessage::User { content } = agent_message(None, &[block], &files) else {
             panic!("expected user message");
         };
         assert_eq!(content.len(), 3);
@@ -7325,12 +8044,13 @@ mod tests {
     fn agent_message_keeps_attachments_with_their_blocks() {
         let alice = ParticipantId::from_bytes([7; 16]);
         let bob = ParticipantId::new();
+        let (records, files) = attached([text_attachment("crash.log", "boom")]);
         let blocks = [
             PromptBlock {
                 id: Uuid::new_v4(),
                 author: alice,
                 text: "Investigate the crash.".into(),
-                attachments: vec![text_attachment("crash.log", "boom")],
+                attachments: records,
             },
             PromptBlock {
                 id: Uuid::new_v4(),
@@ -7339,7 +8059,8 @@ mod tests {
                 attachments: Vec::new(),
             },
         ];
-        let RigMessage::User { content } = agent_message(Some("Comments first."), &blocks) else {
+        let RigMessage::User { content } = agent_message(Some("Comments first."), &blocks, &files)
+        else {
             panic!("expected user message");
         };
         let texts = content
@@ -7576,7 +8297,7 @@ mod tests {
             })
             .map(|record| {
                 draft
-                    .attachment_bytes
+                    .files
                     .get(&record.id)
                     .cloned()
                     .expect("attachment bytes")
@@ -8383,6 +9104,7 @@ mod tests {
                     thread: view.host.read(cx).to_protocol(),
                     draft: view.host.read(cx).draft.doc.encode_state(),
                     presence: Vec::new(),
+                    stored_attachments: Vec::new(),
                 };
                 let draft = ThreadDraft::new(ParticipantId::new());
                 let collaborator =
@@ -9222,15 +9944,23 @@ mod tests {
         let (host_in_relay, host_in) = async_channel::unbounded();
         let (collaborator_out, collaborator_out_relay) = async_channel::unbounded();
         let (collaborator_in_relay, collaborator_in) = async_channel::unbounded();
-        relay::<protocol::HostMessage>(host_out_relay, collaborator_in_relay, cx);
-        relay::<protocol::CollaboratorMessage>(collaborator_out_relay, host_in_relay, cx);
+        // Bulk messages get their own relay, so they may arrive before
+        // control messages sent earlier, like on the wire.
+        let (host_bulk, host_bulk_relay) = async_channel::bounded(2);
+        let (collaborator_bulk, collaborator_bulk_relay) = async_channel::bounded(2);
+        relay::<protocol::HostMessage>(host_out_relay, collaborator_in_relay.clone(), cx);
+        relay::<protocol::HostMessage>(host_bulk_relay, collaborator_in_relay, cx);
+        relay::<protocol::CollaboratorMessage>(collaborator_out_relay, host_in_relay.clone(), cx);
+        relay::<protocol::CollaboratorMessage>(collaborator_bulk_relay, host_in_relay, cx);
         (
             protocol::Peer {
                 outgoing: host_out,
+                bulk: host_bulk,
                 incoming: host_in,
             },
             protocol::Peer {
                 outgoing: collaborator_out,
+                bulk: collaborator_bulk,
                 incoming: collaborator_in,
             },
         )
@@ -9644,6 +10374,7 @@ mod tests {
             },
             draft: host_draft.encode_state(),
             presence: Vec::new(),
+            stored_attachments: Vec::new(),
         };
 
         let thread = cx.new(|cx| {
@@ -10089,6 +10820,351 @@ mod tests {
                 collaborator.draft_is_loading_attachments(draft_id, cx)
             })
         });
+    }
+
+    /// A text file big enough to take several chunks.
+    fn big_text_file() -> (PathBuf, String) {
+        let text = "0123456789abcdef\n".repeat(9_000);
+        assert!(text.len() > 2 * protocol::ATTACHMENT_CHUNK_SIZE);
+        let path = std::env::temp_dir().join(format!("cowork-{}.txt", Uuid::new_v4()));
+        std::fs::write(&path, &text).expect("write test attachment");
+        (path, text)
+    }
+
+    fn file_text(draft: &ThreadDraft, id: AttachmentId) -> Option<String> {
+        match &draft.files.get(&id)?.content {
+            FileAttachmentContent::Text(text) => Some(text.clone()),
+            _ => None,
+        }
+    }
+
+    #[gpui::test]
+    fn a_collaborators_file_is_uploaded_and_stored(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let host_thread = session.host_thread.clone();
+        let block = session.items(&host_thread)[0].id;
+        let (path, text) = big_text_file();
+
+        let collaborator = session.collaborator.clone();
+        collaborator.update(session.cx, |collaborator, cx| {
+            let draft_id = collaborator_thread.read(cx).draft.id;
+            collaborator.add_attachments(
+                draft_id,
+                AttachmentTarget::Block(block),
+                vec![AttachmentSource::Path(path.clone())],
+                cx,
+            );
+        });
+        session.wait_until("the host stores the upload", |this| {
+            collaborator_thread.read_with(this.cx, |thread, _| {
+                thread.draft.uploads.is_empty() && thread.draft.stored.len() == 1
+            })
+        });
+        std::fs::remove_file(&path).expect("remove test attachment");
+
+        let record = host_thread.read_with(session.cx, |thread, _| {
+            let records = thread.draft.attachment_records();
+            assert_eq!(records.len(), 1);
+            let record = records[0].clone();
+            assert!(thread.draft.stored.contains(&record.id));
+            assert_eq!(
+                file_text(&thread.draft, record.id).as_deref(),
+                Some(text.as_str())
+            );
+            assert!(thread.draft.incoming.is_empty());
+            record
+        });
+        let collaborator_id =
+            collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id);
+        assert_eq!(record.creator, collaborator_id.as_uuid());
+        // Nothing holds the collaborator's submission back anymore.
+        collaborator.read_with(session.cx, |collaborator, cx| {
+            let draft_id = collaborator_thread.read(cx).draft.id;
+            assert!(!collaborator.draft_is_loading_attachments(draft_id, cx));
+        });
+
+        // Submitting sends it along, and the submitted message shows it.
+        collaborator_thread.read_with(session.cx, |thread, _| {
+            thread.request(protocol::CollaboratorMessage::Submit { sequence: 0 });
+        });
+        session.wait_until("the collaborator sees the submission", |this| {
+            collaborator_thread.read_with(this.cx, |thread, _| thread.submission_count() == 1)
+        });
+        collaborator_thread.read_with(session.cx, |thread, _| {
+            let [TimelineMessage::User(message), ..] = thread.timeline.as_slice() else {
+                panic!("expected the submitted message first");
+            };
+            assert_eq!(message.blocks[0].attachments, std::slice::from_ref(&record));
+            assert!(thread.draft.files.contains_key(&record.id));
+        });
+        host_thread.read_with(session.cx, |thread, _| {
+            let files = &thread.draft.files;
+            let [TimelineMessage::User(message), ..] = thread.timeline.as_slice() else {
+                panic!("expected the submitted message first");
+            };
+            let RigMessage::User { content } = agent_message(None, &message.blocks, files) else {
+                panic!("expected a user message");
+            };
+            assert!(content.iter().any(
+                |part| matches!(part, UserContent::Text(part) if part.text.contains("0123456789abcdef"))
+            ));
+        });
+    }
+
+    #[gpui::test]
+    fn the_hosts_files_are_downloaded_by_collaborators(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let host_thread = session.host_thread.clone();
+        let block = session.items(&host_thread)[0].id;
+        let (path, text) = big_text_file();
+
+        let host = session.host.clone();
+        host.update(session.cx, |host, cx| {
+            let draft_id = host_thread.read(cx).draft.id;
+            host.add_attachments(
+                draft_id,
+                AttachmentTarget::Block(block),
+                vec![AttachmentSource::Path(path.clone())],
+                cx,
+            );
+        });
+        session.wait_until("the collaborator has the file", |this| {
+            collaborator_thread.read_with(this.cx, |thread, _| thread.draft.files.len() == 1)
+        });
+        std::fs::remove_file(&path).expect("remove test attachment");
+        collaborator_thread.read_with(session.cx, |thread, _| {
+            let record = &thread.draft.attachment_records()[0];
+            assert!(thread.draft.stored.contains(&record.id));
+            assert_eq!(
+                file_text(&thread.draft, record.id).as_deref(),
+                Some(text.as_str())
+            );
+        });
+    }
+
+    #[gpui::test]
+    fn files_left_unfinished_by_a_leaving_collaborator_are_removed(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let host_thread = session.host_thread.clone();
+        let block = session.items(&host_thread)[0].id;
+        // A record whose bytes never come.
+        let collaborator = session.collaborator.clone();
+        collaborator.update(session.cx, |collaborator, cx| {
+            let draft_id = collaborator_thread.read(cx).draft.id;
+            collaborator.update_draft(draft_id, cx, |draft| {
+                draft.doc.add_attachment(
+                    block,
+                    AttachmentRecord {
+                        id: AttachmentId::new(),
+                        name: "never.txt".into(),
+                        kind: AttachmentKind::Text,
+                        size: 10,
+                        creator: draft.author.as_uuid(),
+                    },
+                );
+            });
+        });
+        session.wait_until("the host sees the record", |this| {
+            host_thread.read_with(this.cx, |thread, _| {
+                thread.draft.attachment_records().len() == 1
+            })
+        });
+        // Nobody can submit it while its bytes are missing.
+        let host = session.host.clone();
+        host.read_with(session.cx, |host, cx| {
+            let draft_id = host_thread.read(cx).draft.id;
+            assert!(host.draft_is_loading_attachments(draft_id, cx));
+        });
+
+        collaborator_thread.update(session.cx, |thread, _| {
+            thread.sharing = ThreadSharing::NotShared;
+        });
+        session.wait_until("the host removes the record", |this| {
+            host_thread.read_with(this.cx, |thread, _| {
+                thread.participants.len() == 1 && thread.draft.attachment_records().is_empty()
+            })
+        });
+        assert_eq!(session.bodies(&host_thread), ["from the host"]);
+    }
+
+    /// Bytes and the record announcing them travel separately, so the bytes
+    /// can come first.
+    #[gpui::test]
+    fn uploads_wait_for_their_record(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let host = cx.new(|_| {
+            test_thread(
+                Uuid::new_v4(),
+                Vec::new(),
+                ThreadDraft::new(ParticipantId::new()),
+            )
+        });
+        let uploader = ParticipantId::new();
+        let file = text_attachment("notes.txt", "some notes");
+        let mut sender = ThreadDraft::new(uploader);
+        let block = sender.doc.create_prompt(uploader.as_uuid(), "");
+        let record = AttachmentRecord {
+            id: AttachmentId::new(),
+            name: file.name.clone(),
+            kind: file.kind(),
+            size: file.len(),
+            creator: uploader.as_uuid(),
+        };
+        sender.files.insert(record.id, file);
+        sender.doc.add_attachment(block, record.clone());
+        let update = sender.doc.take_local_update().expect("an update");
+        let chunk = sender.chunk(record.id, 0).expect("a chunk");
+
+        host.update(cx, |host, _| {
+            host.receive_upload(uploader, chunk).expect("valid data");
+            assert!(!host.draft.stored.contains(&record.id));
+            host.apply_collaborator_update(uploader, update)
+                .expect("valid update");
+            assert!(host.draft.stored.contains(&record.id));
+            assert_eq!(
+                file_text(&host.draft, record.id).as_deref(),
+                Some("some notes")
+            );
+            // Removing the record discards the file.
+            let removal = Draft::new();
+            removal
+                .apply_update(&host.draft.doc.encode_state())
+                .expect("copy the draft");
+            removal.remove_attachment(record.id);
+            let update = removal.take_local_update().expect("an update");
+            host.apply_collaborator_update(uploader, update)
+                .expect("valid update");
+            assert!(!host.draft.files.contains_key(&record.id));
+            // A piece still in flight is ignored rather than started over.
+            let late = sender.chunk(record.id, 0).expect("a chunk");
+            host.receive_upload(uploader, late).expect("ignored");
+            assert!(host.draft.incoming.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn a_cancelled_upload_is_discarded(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let (cowork, _, cx) = attachment_test_cowork(cx, runtime.handle().clone());
+        let uploader = ParticipantId::new();
+        let mut sender = ThreadDraft::new(uploader);
+        let id = AttachmentId::new();
+        let text = "x".repeat(protocol::ATTACHMENT_CHUNK_SIZE + 1);
+        sender.files.insert(id, text_attachment("big.txt", &text));
+        let first = sender.chunk(id, 0).expect("a chunk");
+        let second = sender
+            .chunk(id, protocol::ATTACHMENT_CHUNK_SIZE as u64)
+            .expect("a chunk");
+
+        cowork.update(cx, |cowork, cx| {
+            let thread = cowork.active_thread(cx).expect("thread");
+            for request in [
+                protocol::CollaboratorMessage::AttachmentData(first),
+                protocol::CollaboratorMessage::AttachmentCancelled(id.as_uuid().into_bytes()),
+                protocol::CollaboratorMessage::AttachmentData(second),
+            ] {
+                cowork
+                    .collaborator_request(&thread, uploader, request, cx)
+                    .expect("valid request");
+            }
+            let draft = &thread.read(cx).draft;
+            assert!(draft.incoming.is_empty());
+            assert!(!draft.files.contains_key(&id));
+        });
+    }
+
+    #[gpui::test]
+    fn joining_peers_are_sent_the_files_they_do_not_have(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let joiner = ParticipantId::new();
+        let (timeline_records, timeline_files) = attached([text_attachment("old.txt", "old")]);
+        let timeline = vec![TimelineMessage::User(UserMessageGroup {
+            id: Uuid::new_v4(),
+            comments: Vec::new(),
+            blocks: vec![PromptBlock {
+                id: Uuid::new_v4(),
+                author: ParticipantId::new(),
+                text: "earlier".into(),
+                attachments: timeline_records.clone(),
+            }],
+            history_preface: None,
+            comments_folded: false,
+        })];
+        let thread = cx.new(|_| {
+            let mut draft = ThreadDraft::new(ParticipantId::new());
+            let block = draft.doc.create_prompt(draft.author.as_uuid(), "");
+            let mut own = timeline_files;
+            for (creator, name) in [
+                (Uuid::new_v4(), "new.txt"),
+                (joiner.as_uuid(), "theirs.txt"),
+            ] {
+                let file = text_attachment(name, name);
+                let record = AttachmentRecord {
+                    id: AttachmentId::new(),
+                    name: name.into(),
+                    kind: file.kind(),
+                    size: file.len(),
+                    creator,
+                };
+                draft.doc.add_attachment(block, record.clone());
+                own.insert(record.id, file);
+            }
+            draft.stored = own.keys().copied().collect();
+            draft.files = own;
+            test_thread(Uuid::new_v4(), timeline, draft)
+        });
+
+        thread.read_with(cx, |thread, _| {
+            let names = thread
+                .files_for(joiner)
+                .into_iter()
+                .map(|id| thread.draft.files[&id].name.clone())
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["old.txt", "new.txt"]);
+        });
+    }
+
+    #[test]
+    fn files_are_chunked_and_put_back_together() {
+        let text = "x".repeat(protocol::ATTACHMENT_CHUNK_SIZE * 2 + 5);
+        let mut sender = ThreadDraft::new(ParticipantId::new());
+        let id = AttachmentId::new();
+        sender.files.insert(id, text_attachment("big.txt", &text));
+        let mut receiver = ThreadDraft::new(ParticipantId::new());
+
+        let mut offset = 0;
+        let mut chunks = 0;
+        let completed = loop {
+            let chunk = sender.chunk(id, offset).expect("a chunk");
+            assert!(chunk.bytes.len() <= protocol::ATTACHMENT_CHUNK_SIZE);
+            offset = chunk.offset + chunk.bytes.len() as u64;
+            chunks += 1;
+            if let Some(done) = receiver.receive_chunk(chunk, None).expect("valid chunk") {
+                break done;
+            }
+        };
+        assert_eq!(chunks, 3);
+        assert_eq!(completed, id);
+        assert!(sender.chunk(id, offset).is_none());
+        receiver.complete_file(id).expect("a text file");
+        assert_eq!(file_text(&receiver, id), Some(text));
+
+        // A piece that continues nothing is ignored, and an oversized file
+        // is refused.
+        let mut stray = sender
+            .chunk(id, protocol::ATTACHMENT_CHUNK_SIZE as u64)
+            .expect("chunk");
+        stray.id = [9; 16];
+        assert_eq!(receiver.receive_chunk(stray, None).expect("ignored"), None);
+        let mut oversized = sender.chunk(id, 0).expect("chunk");
+        oversized.id = [8; 16];
+        oversized.total = MAX_TEXT_ATTACHMENT_BYTES + 1;
+        assert!(receiver.receive_chunk(oversized, None).is_err());
     }
 
     #[gpui::test]
