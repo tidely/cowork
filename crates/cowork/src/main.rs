@@ -2,7 +2,9 @@ use std::{
     borrow::Cow,
     cell::Cell,
     collections::{HashMap, HashSet, VecDeque, hash_map::Entry},
+    io::Read as _,
     ops::Range,
+    path::{Path, PathBuf},
     rc::Rc,
     sync::{
         Arc, OnceLock,
@@ -13,26 +15,34 @@ use std::{
 
 use agent::{Agent as StreamingAgent, AgentEvent};
 use anyhow::Context as _;
+use base64::Engine as _;
 use gpui::{
     Animation, AnimationExt, AnyWindowHandle, App, AppContext, AssetSource, AsyncApp, Bounds,
-    ClipboardItem, Context, Entity, Focusable, FontStyle, FontWeight, FutureExt, HighlightStyle,
-    IntoElement, KeyBinding, KeyDownEvent, LineFragment, MouseButton, MouseDownEvent, MouseUpEvent,
-    PlatformInput, QuitMode, Render, ScrollHandle, ScrollWheelEvent, SharedString, Subscription,
-    TextRun, TitlebarOptions, WeakEntity, Window, WindowBounds, WindowControlArea, WindowOptions,
-    actions, canvas, div, img, point, prelude::*, px, rems, rgb, rgba, size,
+    ClipboardEntry, ClipboardItem, Context, Entity, ExternalPaths, Focusable, FontStyle,
+    FontWeight, FutureExt, HighlightStyle, IntoElement, KeyBinding, KeyDownEvent, LineFragment,
+    MouseButton, MouseDownEvent, MouseUpEvent, PathPromptOptions, PlatformInput, QuitMode, Render,
+    ScrollHandle, ScrollWheelEvent, SharedString, Subscription, TextRun, TitlebarOptions,
+    WeakEntity, Window, WindowBounds, WindowControlArea, WindowOptions, actions, canvas, div, img,
+    point, prelude::*, px, rems, rgb, rgba, size,
 };
 use gpui_base::{
     GlobalState, SelectableText, TextSelection, TextView, TextViewDefaults, TextViewState,
     TextViewStyle, Textarea,
-    input::{Input, InputEditorStyle, InputEvent, InputState, TextareaState},
+    input::{Input, InputEditorStyle, InputEvent, InputState, Paste, RopeExt as _, TextareaState},
     text::{CodeBlock, SelectionFormat},
 };
 use gpui_component::{
     Collapsible, Disableable as _, Icon, IndexPath, Root, Sizable as _, ThemeMode, WindowExt as _,
+    attachment::{
+        Attachment, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentMedia,
+        AttachmentStatus, AttachmentTitle,
+    },
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     combobox::{Combobox, ComboboxState},
     dialog::{DialogDescription, DialogFooter, DialogHeader, DialogTitle},
+    progress::Progress,
     searchable_list::{SearchableGroup, SearchableListItem, SearchableVec},
+    shimmer::ShimmerText,
     sidebar::{
         Sidebar, SidebarCollapsible, SidebarItem, SidebarMenu, SidebarMenuItem, SidebarToggleButton,
     },
@@ -44,7 +54,10 @@ use iroh::{
 };
 use itertools::Itertools;
 use rig::{
-    completion::Message as RigMessage,
+    completion::{
+        Message as RigMessage,
+        message::{ImageMediaType, UserContent},
+    },
     prelude::*,
     providers::ollama::wire::Ollama,
     streaming::{BlockClose, Delta, StreamEvent},
@@ -69,6 +82,10 @@ mod protocol;
 const SIDEBAR_WIDTH: gpui::Pixels = px(275.);
 const TOP_BAR_HEIGHT: gpui::Pixels = px(40.);
 const BOTTOM_BAR_DIVIDER_THRESHOLD: gpui::Pixels = px(24.);
+/// `SidebarToggleButton` is a small icon button (`size_6`, 24px) centered in
+/// the top bar; matching its top gap on the left keeps it evenly inset from
+/// the window corner.
+const SIDEBAR_TOGGLE_INSET: gpui::Pixels = px((40. - 24.) / 2.);
 const MACOS_TRAFFIC_LIGHT_X_INSET: gpui::Pixels = px(12.);
 const MACOS_TRAFFIC_LIGHT_SIZE: gpui::Pixels = px(14.);
 const MACOS_TRAFFIC_LIGHT_SPACING: gpui::Pixels = px(6.);
@@ -88,6 +105,337 @@ const THREAD_EVENT_CAPACITY: usize = 1024;
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
 static SYNTAX_THEME: OnceLock<Option<Theme>> = OnceLock::new();
+
+/// Largest file or clipboard image we will read before inspecting it. Larger
+/// than the image limit so uncompressed screenshots (BMP, TIFF) can still be
+/// converted to PNG.
+const MAX_ATTACHMENT_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+/// Largest encoded image sent to the model, in line with common provider limits.
+const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+/// Text is inlined into the prompt, so keep it well within `OLLAMA_CONTEXT_TOKENS`.
+const MAX_TEXT_ATTACHMENT_BYTES: u64 = 256 * 1024;
+/// Every attachment of a message travels in a single protocol frame.
+const MAX_MESSAGE_ATTACHMENT_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Clone)]
+struct FileAttachment {
+    name: String,
+    content: FileAttachmentContent,
+}
+
+/// Images are held as `gpui::Image` so thumbnails are decoded and cached once
+/// rather than rehashed on every frame.
+#[derive(Clone)]
+enum FileAttachmentContent {
+    Text(String),
+    Png(Arc<gpui::Image>),
+    Jpeg(Arc<gpui::Image>),
+}
+
+impl FileAttachment {
+    fn len(&self) -> u64 {
+        match &self.content {
+            FileAttachmentContent::Text(text) => text.len() as u64,
+            FileAttachmentContent::Png(image) | FileAttachmentContent::Jpeg(image) => {
+                image.bytes().len() as u64
+            }
+        }
+    }
+
+    fn to_protocol(&self) -> protocol::Attachment {
+        protocol::Attachment {
+            name: self.name.clone(),
+            content: match &self.content {
+                FileAttachmentContent::Text(text) => {
+                    protocol::AttachmentContent::Text(text.clone())
+                }
+                FileAttachmentContent::Png(image) => {
+                    protocol::AttachmentContent::Png(image.bytes().to_vec())
+                }
+                FileAttachmentContent::Jpeg(image) => {
+                    protocol::AttachmentContent::Jpeg(image.bytes().to_vec())
+                }
+            },
+        }
+    }
+}
+
+impl protocol::Attachment {
+    fn into_native(self) -> FileAttachment {
+        FileAttachment {
+            name: self.name,
+            content: match self.content {
+                protocol::AttachmentContent::Text(text) => FileAttachmentContent::Text(text),
+                protocol::AttachmentContent::Png(bytes) => FileAttachmentContent::Png(Arc::new(
+                    gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes),
+                )),
+                protocol::AttachmentContent::Jpeg(bytes) => FileAttachmentContent::Jpeg(Arc::new(
+                    gpui::Image::from_bytes(gpui::ImageFormat::Jpeg, bytes),
+                )),
+            },
+        }
+    }
+}
+
+enum AttachmentSource {
+    Path(PathBuf),
+    ClipboardImage(gpui::Image),
+}
+
+impl AttachmentSource {
+    fn name(&self) -> String {
+        match self {
+            Self::Path(path) => path
+                .file_name()
+                .unwrap_or(path.as_os_str())
+                .to_string_lossy()
+                .into_owned(),
+            Self::ClipboardImage(_) => "Pasted image".to_owned(),
+        }
+    }
+
+    fn looks_like_image(&self) -> bool {
+        match self {
+            Self::Path(path) => image::ImageFormat::from_path(path).is_ok(),
+            Self::ClipboardImage(_) => true,
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KB", "MB", "GB", "TB"];
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut value = bytes as f64 / 1024.;
+    let mut unit = 0;
+    while value >= 1024. && unit + 1 < UNITS.len() {
+        value /= 1024.;
+        unit += 1;
+    }
+    if value < 10. {
+        format!("{value:.1} {}", UNITS[unit])
+    } else {
+        format!("{value:.0} {}", UNITS[unit])
+    }
+}
+
+fn load_attachment(
+    source: AttachmentSource,
+    on_progress: impl FnMut(f32),
+) -> anyhow::Result<FileAttachment> {
+    let name = source.name();
+    match source {
+        AttachmentSource::Path(path) => {
+            let bytes = read_attachment_file(&path, &name, on_progress)?;
+            attachment_from_bytes(name, bytes)
+        }
+        AttachmentSource::ClipboardImage(image) => {
+            anyhow::ensure!(
+                image.bytes.len() as u64 <= MAX_ATTACHMENT_SOURCE_BYTES,
+                "The pasted image is larger than {}",
+                format_bytes(MAX_ATTACHMENT_SOURCE_BYTES)
+            );
+            let content = image_content(image.bytes)
+                .map_err(|_| anyhow::anyhow!("The pasted image format is not supported"))?;
+            let extension = match content {
+                FileAttachmentContent::Jpeg(_) => "jpg",
+                _ => "png",
+            };
+            let attachment = FileAttachment {
+                name: format!("{name}.{extension}"),
+                content,
+            };
+            ensure_image_size(&attachment)?;
+            Ok(attachment)
+        }
+    }
+}
+
+fn read_attachment_file(
+    path: &Path,
+    name: &str,
+    mut on_progress: impl FnMut(f32),
+) -> anyhow::Result<Vec<u8>> {
+    let file = std::fs::File::open(path).with_context(|| format!("Cannot read {name}"))?;
+    let total = file.metadata().ok().map(|metadata| metadata.len());
+    let too_large = || {
+        anyhow::anyhow!(
+            "{name} is larger than {}",
+            format_bytes(MAX_ATTACHMENT_SOURCE_BYTES)
+        )
+    };
+    if total.is_some_and(|total| total > MAX_ATTACHMENT_SOURCE_BYTES) {
+        return Err(too_large());
+    }
+    // Read one byte past the limit so files that grew after `metadata` are caught.
+    let mut file = file.take(MAX_ATTACHMENT_SOURCE_BYTES + 1);
+    let mut bytes = Vec::with_capacity(total.unwrap_or(0) as usize);
+    let mut buffer = [0; 256 * 1024];
+    let mut last_progress = 0;
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("Cannot read {name}"))?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+        if bytes.len() as u64 > MAX_ATTACHMENT_SOURCE_BYTES {
+            return Err(too_large());
+        }
+        if let Some(total) = total.filter(|total| *total > 0) {
+            let progress = ((bytes.len() as f64 / total as f64) * 100.).min(100.) as u32;
+            if progress > last_progress {
+                last_progress = progress;
+                on_progress(progress as f32);
+            }
+        }
+    }
+    Ok(bytes)
+}
+
+/// Classifies an attachment by its content rather than its extension: images
+/// are recognized by their signature, anything else must be UTF-8 text.
+fn attachment_from_bytes(name: String, bytes: Vec<u8>) -> anyhow::Result<FileAttachment> {
+    match image_content(bytes) {
+        Ok(content) => {
+            let attachment = FileAttachment { name, content };
+            ensure_image_size(&attachment)?;
+            Ok(attachment)
+        }
+        Err(bytes) => {
+            let text = String::from_utf8(bytes)
+                .ok()
+                .filter(|text| !text.contains('\0'))
+                .with_context(|| format!("{name} is not a text file or a supported image"))?;
+            anyhow::ensure!(
+                text.len() as u64 <= MAX_TEXT_ATTACHMENT_BYTES,
+                "{name} is {}; text files can be at most {}",
+                format_bytes(text.len() as u64),
+                format_bytes(MAX_TEXT_ATTACHMENT_BYTES)
+            );
+            Ok(FileAttachment {
+                name,
+                content: FileAttachmentContent::Text(text),
+            })
+        }
+    }
+}
+
+fn ensure_image_size(attachment: &FileAttachment) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        attachment.len() <= MAX_IMAGE_ATTACHMENT_BYTES,
+        "{} is {}; images can be at most {}",
+        attachment.name,
+        format_bytes(attachment.len()),
+        format_bytes(MAX_IMAGE_ATTACHMENT_BYTES)
+    );
+    Ok(())
+}
+
+/// Keeps PNG and JPEG as they are and converts other common image formats to
+/// PNG. Hands the bytes back when they are not a supported image.
+fn image_content(bytes: Vec<u8>) -> Result<FileAttachmentContent, Vec<u8>> {
+    let format = match image::guess_format(&bytes) {
+        Ok(image::ImageFormat::Png) => {
+            return Ok(FileAttachmentContent::Png(Arc::new(
+                gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes),
+            )));
+        }
+        Ok(image::ImageFormat::Jpeg) => {
+            return Ok(FileAttachmentContent::Jpeg(Arc::new(
+                gpui::Image::from_bytes(gpui::ImageFormat::Jpeg, bytes),
+            )));
+        }
+        // Signatures like BMP's "BM" can also start a text file, so these
+        // only count as images if they actually decode.
+        Ok(
+            format @ (image::ImageFormat::Gif
+            | image::ImageFormat::WebP
+            | image::ImageFormat::Bmp
+            | image::ImageFormat::Tiff),
+        ) => format,
+        _ => return Err(bytes),
+    };
+    let Ok(decoded) = image::load_from_memory_with_format(&bytes, format) else {
+        return Err(bytes);
+    };
+    let mut png = Vec::new();
+    if decoded
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .is_err()
+    {
+        return Err(bytes);
+    }
+    Ok(FileAttachmentContent::Png(Arc::new(
+        gpui::Image::from_bytes(gpui::ImageFormat::Png, png),
+    )))
+}
+
+/// Files copied in a file manager are attached, as are images unless the
+/// clipboard also holds text (spreadsheets put a rendered image next to the
+/// cells, for example). Everything else is left to the regular text paste.
+fn clipboard_attachment_sources(item: &ClipboardItem) -> Vec<AttachmentSource> {
+    let paths = item
+        .entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            ClipboardEntry::ExternalPaths(paths) => Some(paths.paths()),
+            _ => None,
+        })
+        .flatten()
+        .cloned()
+        .map(AttachmentSource::Path)
+        .collect::<Vec<_>>();
+    if !paths.is_empty() {
+        return paths;
+    }
+    let has_text = item.entries().iter().any(
+        |entry| matches!(entry, ClipboardEntry::String(text) if !text.text().trim().is_empty()),
+    );
+    if has_text {
+        return Vec::new();
+    }
+    item.entries()
+        .iter()
+        .filter_map(|entry| match entry {
+            ClipboardEntry::Image(image) => Some(AttachmentSource::ClipboardImage(image.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn escape_xml_attribute(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn message_with_attachments(text: &str, attachments: &[FileAttachment]) -> RigMessage {
+    let mut content = vec![UserContent::text(text)];
+    for attachment in attachments {
+        content.push(match &attachment.content {
+            FileAttachmentContent::Text(body) => UserContent::text(format!(
+                "<file name=\"{}\">\n{body}\n</file>",
+                escape_xml_attribute(&attachment.name)
+            )),
+            FileAttachmentContent::Png(image) => UserContent::image_base64(
+                base64::engine::general_purpose::STANDARD.encode(image.bytes()),
+                Some(ImageMediaType::PNG),
+                None,
+            ),
+            FileAttachmentContent::Jpeg(image) => UserContent::image_base64(
+                base64::engine::general_purpose::STANDARD.encode(image.bytes()),
+                Some(ImageMediaType::JPEG),
+                None,
+            ),
+        });
+    }
+    RigMessage::User { content }
+}
 
 fn endpoint_id_input_is_complete(input: &str) -> bool {
     input.trim().len() == ENDPOINT_ID_TEXT_LENGTH
@@ -200,6 +548,10 @@ gpui_kit_assets::icon_assets!(
         Square,
         SquarePen,
         UsersRound,
+        Paperclip,
+        FileText,
+        Image,
+        X,
     ]
 );
 
@@ -372,6 +724,7 @@ struct AgentCommentResponse {
 struct UserMessageGroup {
     id: Uuid,
     comments: Vec<UserComment>,
+    attachments: Vec<FileAttachment>,
     content: UserMessageContent,
     comments_folded: bool,
 }
@@ -575,6 +928,11 @@ impl UserMessageGroup {
                 .iter()
                 .filter_map(UserComment::to_protocol)
                 .collect(),
+            attachments: self
+                .attachments
+                .iter()
+                .map(FileAttachment::to_protocol)
+                .collect(),
         })
     }
 }
@@ -587,6 +945,11 @@ impl protocol::UserMessage {
                 .comments
                 .into_iter()
                 .map(protocol::UserComment::into_native)
+                .collect(),
+            attachments: self
+                .attachments
+                .into_iter()
+                .map(protocol::Attachment::into_native)
                 .collect(),
             content: UserMessageContent::Submitted {
                 text: self.text,
@@ -997,10 +1360,30 @@ impl SidebarItem for CoworkSidebarSection {
     }
 }
 
+struct PendingAttachment {
+    id: Uuid,
+    draft_id: Uuid,
+    name: String,
+    is_image: bool,
+    progress: Option<f32>,
+}
+
+enum AttachmentReadEvent {
+    Progress(Uuid, f32),
+    Finished(Uuid, anyhow::Result<FileAttachment>),
+}
+
+struct AttachmentError {
+    draft_id: Uuid,
+    message: String,
+}
+
 struct Cowork {
     sidebar_open: bool,
     recents_open: bool,
     new_thread_draft: UserMessageGroup,
+    attachment_errors: Vec<AttachmentError>,
+    pending_attachments: Vec<PendingAttachment>,
     timeline_scroll_handle: ScrollHandle,
     follow_generation: bool,
     thread_store: Entity<ThreadStore>,
@@ -1038,6 +1421,7 @@ impl Cowork {
         UserMessageGroup {
             id: Uuid::new_v4(),
             comments: Vec::new(),
+            attachments: Vec::new(),
             content: UserMessageContent::Editing(composer),
             comments_folded: false,
         }
@@ -1153,8 +1537,10 @@ impl Cowork {
 
     fn render_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .when(cfg!(target_os = "macos"), |this| {
-                this.ml(macos_sidebar_toggle_margin())
+            .ml(if cfg!(target_os = "macos") {
+                macos_sidebar_toggle_margin()
+            } else {
+                SIDEBAR_TOGGLE_INSET
             })
             .on_mouse_down(
                 MouseButton::Left,
@@ -2668,6 +3054,22 @@ impl Cowork {
                 content.extend(group.comments.iter().map(Self::render_composer_comment));
             }
         }
+        if !group.attachments.is_empty() {
+            content.push(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .children(
+                        group
+                            .attachments
+                            .iter()
+                            .map(|attachment| self.render_attachment(attachment, None, cx)),
+                    )
+                    .into_any_element(),
+            );
+        }
         if let UserMessageContent::Submitted { text, .. } = &group.content
             && !text.trim().is_empty()
         {
@@ -2979,16 +3381,9 @@ impl Cowork {
                     .children(submitted_comment_content)
                     .when(waiting, |this| {
                         this.child(
-                            div()
-                                .text_color(rgb(0x8b8b95))
-                                .child("Thinking…")
-                                .with_animation(
-                                    ("agent-waiting", index),
-                                    Animation::new(Duration::from_millis(900)).repeat(),
-                                    |label, delta| {
-                                        label.opacity(if delta < 0.5 { 1. } else { 0.45 })
-                                    },
-                                ),
+                            ShimmerText::new("Thinking…")
+                                .id(("agent-waiting", index))
+                                .text_color(rgb(0x8b8b95)),
                         )
                     })
                     .children(thinking)
@@ -3033,7 +3428,10 @@ impl Cowork {
                     else {
                         return None;
                     };
-                    Some(RigMessage::user(history_text.as_deref().unwrap_or(text)))
+                    Some(message_with_attachments(
+                        history_text.as_deref().unwrap_or(text),
+                        &group.attachments,
+                    ))
                 }
                 TimelineMessage::Agent(message) if message.complete && !message.failed => {
                     let submitted_comments = message
@@ -3077,7 +3475,7 @@ impl Cowork {
     fn start_generation(
         &mut self,
         thread_id: Uuid,
-        prompt: String,
+        prompt: RigMessage,
         mut history: Vec<RigMessage>,
         comment_group_id: Option<Uuid>,
         comment_ids: Vec<Uuid>,
@@ -3116,7 +3514,7 @@ impl Cowork {
                     "num_ctx": OLLAMA_CONTEXT_TOKENS,
                     "think": "medium"
                 }))
-                .run(RigMessage::user(prompt), &mut history, move |event| {
+                .run(prompt, &mut history, move |event| {
                     _ = sender.send(event);
                 })
                 .await?;
@@ -3326,6 +3724,331 @@ impl Cowork {
         result
     }
 
+    /// The draft the composer currently edits, or `None` for read-only threads.
+    fn writable_draft_id(&self, cx: &App) -> Option<Uuid> {
+        match self
+            .active_thread_id
+            .and_then(|id| self.thread_store.read(cx).thread(id, cx))
+        {
+            Some(thread) => {
+                let thread = thread.read(cx);
+                thread.ownership.can_write().then_some(thread.draft.id)
+            }
+            None => Some(self.new_thread_draft.id),
+        }
+    }
+
+    /// Finds a writable draft wherever it lives, so work started on one thread
+    /// still lands there after the user switches to another.
+    fn update_draft<R>(
+        &mut self,
+        draft_id: Uuid,
+        cx: &mut Context<Self>,
+        update: impl FnOnce(&mut UserMessageGroup) -> R,
+    ) -> Option<R> {
+        if self.new_thread_draft.id == draft_id {
+            return Some(update(&mut self.new_thread_draft));
+        }
+        let thread = self
+            .thread_store
+            .read(cx)
+            .threads
+            .iter()
+            .find(|thread| {
+                let thread = thread.read(cx);
+                thread.ownership.can_write() && thread.draft.id == draft_id
+            })
+            .cloned()?;
+        Some(thread.update(cx, |thread, _| update(&mut thread.draft)))
+    }
+
+    fn focus_draft_composer(&self, draft_id: Uuid, window: &mut Window, cx: &mut App) {
+        if self.writable_draft_id(cx) == Some(draft_id)
+            && let Some(composer) = self.editable_composer(cx)
+        {
+            composer.focus_handle(cx).focus(window, cx);
+        }
+    }
+
+    fn draft_is_loading_attachments(&self, draft_id: Uuid) -> bool {
+        self.pending_attachments
+            .iter()
+            .any(|pending| pending.draft_id == draft_id)
+    }
+
+    fn add_attachments(
+        &mut self,
+        draft_id: Uuid,
+        sources: Vec<AttachmentSource>,
+        cx: &mut Context<Self>,
+    ) {
+        if sources.is_empty() {
+            return;
+        }
+        self.attachment_errors
+            .retain(|error| error.draft_id != draft_id);
+        let entries = sources
+            .into_iter()
+            .map(|source| {
+                let id = Uuid::new_v4();
+                self.pending_attachments.push(PendingAttachment {
+                    id,
+                    draft_id,
+                    name: source.name(),
+                    is_image: source.looks_like_image(),
+                    progress: None,
+                });
+                (id, source)
+            })
+            .collect::<Vec<_>>();
+        cx.notify();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        cx.background_executor()
+            .spawn(async move {
+                for (id, source) in entries {
+                    let result = load_attachment(source, |progress| {
+                        _ = sender.send(AttachmentReadEvent::Progress(id, progress));
+                    });
+                    _ = sender.send(AttachmentReadEvent::Finished(id, result));
+                }
+            })
+            .detach();
+        cx.spawn(async move |this, cx| {
+            while let Some(event) = receiver.recv().await {
+                if this
+                    .update(cx, |this, cx| {
+                        this.attachment_read_event(draft_id, event, cx)
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        })
+        .detach();
+    }
+
+    fn attachment_read_event(
+        &mut self,
+        draft_id: Uuid,
+        event: AttachmentReadEvent,
+        cx: &mut Context<Self>,
+    ) {
+        let id = match &event {
+            AttachmentReadEvent::Progress(id, _) | AttachmentReadEvent::Finished(id, _) => *id,
+        };
+        let Some(index) = self
+            .pending_attachments
+            .iter()
+            .position(|pending| pending.id == id)
+        else {
+            return;
+        };
+        match event {
+            AttachmentReadEvent::Progress(_, progress) => {
+                self.pending_attachments[index].progress = Some(progress);
+            }
+            AttachmentReadEvent::Finished(_, result) => {
+                self.pending_attachments.remove(index);
+                let result = result.and_then(|attachment| {
+                    self.update_draft(draft_id, cx, |draft| {
+                        let total = draft
+                            .attachments
+                            .iter()
+                            .map(FileAttachment::len)
+                            .sum::<u64>();
+                        anyhow::ensure!(
+                            total + attachment.len() <= MAX_MESSAGE_ATTACHMENT_BYTES,
+                            "Cannot attach {}: attachments on one message can total at most {}",
+                            attachment.name,
+                            format_bytes(MAX_MESSAGE_ATTACHMENT_BYTES)
+                        );
+                        draft.attachments.push(attachment);
+                        Ok(())
+                    })
+                    // The draft is gone (sent, or its thread was closed).
+                    .unwrap_or(Ok(()))
+                });
+                if let Err(error) = result {
+                    self.attachment_errors.push(AttachmentError {
+                        draft_id,
+                        message: error.to_string(),
+                    });
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    fn remove_attachment(&mut self, draft_id: Uuid, index: usize, cx: &mut Context<Self>) {
+        self.update_draft(draft_id, cx, |draft| {
+            if index < draft.attachments.len() {
+                draft.attachments.remove(index);
+            }
+        });
+        self.attachment_errors
+            .retain(|error| error.draft_id != draft_id);
+        cx.notify();
+    }
+
+    fn pick_attachments(
+        &mut self,
+        _: &gpui::ClickEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(draft_id) = self.writable_draft_id(cx) else {
+            return;
+        };
+        let selected = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach text or images".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let result = selected.await;
+            _ = this.update_in(cx, |this, window, cx| {
+                match result {
+                    Ok(Ok(Some(paths))) => this.add_attachments(
+                        draft_id,
+                        paths.into_iter().map(AttachmentSource::Path).collect(),
+                        cx,
+                    ),
+                    Ok(Ok(None)) | Err(_) => {}
+                    Ok(Err(error)) => {
+                        this.attachment_errors.push(AttachmentError {
+                            draft_id,
+                            message: format!("Could not choose files: {error}"),
+                        });
+                        cx.notify();
+                    }
+                }
+                this.focus_draft_composer(draft_id, window, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn drop_attachments(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(draft_id) = self.writable_draft_id(cx) else {
+            return;
+        };
+        self.add_attachments(
+            draft_id,
+            paths
+                .paths()
+                .iter()
+                .cloned()
+                .map(AttachmentSource::Path)
+                .collect(),
+            cx,
+        );
+        self.focus_draft_composer(draft_id, window, cx);
+    }
+
+    /// Runs before the composer's own paste so images and copied files become
+    /// attachments; plain text falls through to the text input.
+    fn paste_attachments(&mut self, _: &Paste, _: &mut Window, cx: &mut Context<Self>) {
+        let Some(draft_id) = self.writable_draft_id(cx) else {
+            return;
+        };
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+        let sources = clipboard_attachment_sources(&item);
+        if sources.is_empty() {
+            return;
+        }
+        cx.stop_propagation();
+        self.add_attachments(draft_id, sources, cx);
+    }
+
+    fn render_pending_attachment(pending: &PendingAttachment) -> Attachment {
+        let icon = if pending.is_image {
+            AssetIconName::Image
+        } else {
+            AssetIconName::FileText
+        };
+        let description = pending.progress.map_or_else(
+            || "Preparing".to_owned(),
+            |progress| format!("Reading · {progress:.0}%"),
+        );
+        Attachment::new()
+            .xsmall()
+            .status(if pending.progress.is_some() {
+                AttachmentStatus::Uploading
+            } else {
+                AttachmentStatus::Pending
+            })
+            .media(AttachmentMedia::new().child(Icon::new(icon)))
+            .content(
+                AttachmentContent::new()
+                    .title(
+                        AttachmentTitle::new(pending.name.clone())
+                            .status(AttachmentStatus::Complete),
+                    )
+                    .description(AttachmentDescription::new(description))
+                    .child(
+                        Progress::new(format!("attachment-progress-{}", pending.id))
+                            .xsmall()
+                            .w(px(140.))
+                            .loading(pending.progress.is_none())
+                            .value(pending.progress.unwrap_or(0.))
+                            .accessibility_label(format!("Reading {}", pending.name)),
+                    ),
+            )
+    }
+
+    fn render_attachment(
+        &self,
+        attachment: &FileAttachment,
+        removal: Option<(Uuid, usize)>,
+        cx: &mut Context<Self>,
+    ) -> Attachment {
+        let size = format_bytes(attachment.len());
+        let (media, description) = match &attachment.content {
+            FileAttachmentContent::Text(_) => (
+                AttachmentMedia::new().child(Icon::new(AssetIconName::FileText)),
+                format!("Text · {size}"),
+            ),
+            FileAttachmentContent::Png(image) => (
+                AttachmentMedia::new().src(image.clone()),
+                format!("PNG · {size}"),
+            ),
+            FileAttachmentContent::Jpeg(image) => (
+                AttachmentMedia::new().src(image.clone()),
+                format!("JPEG · {size}"),
+            ),
+        };
+        let mut card = Attachment::new().xsmall().media(media).content(
+            AttachmentContent::new()
+                .title(AttachmentTitle::new(attachment.name.clone()))
+                .description(AttachmentDescription::new(description)),
+        );
+        if let Some((draft_id, index)) = removal {
+            card = card.actions(
+                AttachmentActions::new().child(
+                    Button::new(format!("remove-attachment-{draft_id}-{index}"))
+                        .ghost()
+                        .xsmall()
+                        .icon(Icon::new(AssetIconName::X))
+                        .accessibility_label(format!("Remove {}", attachment.name))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.remove_attachment(draft_id, index, cx);
+                            this.focus_draft_composer(draft_id, window, cx);
+                        })),
+                ),
+            );
+        }
+        card
+    }
+
     fn stop_generation(&mut self, cx: &mut Context<Self>) {
         let Some(thread_id) = self.active_thread_id else {
             return;
@@ -3370,6 +4093,9 @@ impl Cowork {
             .as_ref()
             .map(|thread| thread.read(cx).draft.clone())
             .unwrap_or_else(|| self.new_thread_draft.clone());
+        if self.draft_is_loading_attachments(draft.id) {
+            return;
+        }
         let composer = Self::draft_composer(&draft);
         let prompt = composer.read(cx).value().to_string();
         let mut submitted_comments = Vec::new();
@@ -3386,10 +4112,12 @@ impl Cowork {
             }
         }
         let has_comments = !submitted_comments.is_empty();
-        if prompt.trim().is_empty() && !has_comments {
+        if prompt.trim().is_empty() && !has_comments && draft.attachments.is_empty() {
             return;
         }
         let remaining_comments = remaining_comments.into_iter().cloned().collect::<Vec<_>>();
+        self.attachment_errors
+            .retain(|error| error.draft_id != draft.id);
 
         let timeline = active_thread
             .as_ref()
@@ -3410,6 +4138,7 @@ impl Cowork {
         let submitted_group = UserMessageGroup {
             id: draft.id,
             comments: submitted_comments,
+            attachments: draft.attachments.clone(),
             content: UserMessageContent::Submitted {
                 text: prompt.clone(),
                 history_text: has_comments.then(|| agent_prompt.clone()),
@@ -3461,7 +4190,7 @@ impl Cowork {
         next_composer.focus_handle(cx).focus(window, cx);
         self.start_generation(
             thread_id,
-            agent_prompt,
+            message_with_attachments(&agent_prompt, &draft.attachments),
             history,
             has_comments.then_some(draft.id),
             submitted_comment_ids,
@@ -3499,6 +4228,9 @@ impl Cowork {
     ) -> impl IntoElement {
         let timeline_scroll_handle = self.timeline_scroll_handle.clone();
         let show_button = composer.is_some();
+        let loading_attachments = self
+            .writable_draft_id(cx)
+            .is_some_and(|draft_id| self.draft_is_loading_attachments(draft_id));
         let generating = self
             .active_thread_id
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
@@ -3612,7 +4344,12 @@ impl Cowork {
             Button::new("send-message")
                 .icon(Icon::new(AssetIconName::SendHorizontal))
                 .small()
-                .accessibility_label("Send message")
+                .accessibility_label(if loading_attachments {
+                    "Send message (waiting for attachments)"
+                } else {
+                    "Send message"
+                })
+                .disabled(loading_attachments)
                 .on_click(cx.listener(Self::composer_button_clicked))
         };
 
@@ -3665,7 +4402,19 @@ impl Cowork {
                 .right_0()
                 .h(px(1.)),
             )
-            .when(show_button, |this| this.child(model_picker).child(button))
+            .when(show_button, |this| {
+                this.child(
+                    Button::new("add-attachment")
+                        .icon(Icon::new(AssetIconName::Paperclip))
+                        .ghost()
+                        .small()
+                        .accessibility_label("Attach files")
+                        .on_click(cx.listener(Self::pick_attachments)),
+                )
+                .child(div().flex_1())
+                .child(model_picker)
+                .child(button)
+            })
     }
 
     fn submit_composer_action(
@@ -3675,6 +4424,14 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) {
         self.submit_composer(window, cx);
+    }
+
+    fn focus_composer_at_end(composer: &Entity<TextareaState>, window: &mut Window, cx: &mut App) {
+        composer.update(cx, |composer, cx| {
+            let text = composer.text();
+            let end = text.offset_to_position(text.len());
+            composer.set_cursor_position(end, window, cx);
+        });
     }
 
     fn render_composer_input(composer: &Entity<TextareaState>) -> gpui::Stateful<gpui::Div> {
@@ -3771,6 +4528,38 @@ impl Cowork {
         let composer_comment_group = (composer_comment_count > 0).then_some(draft.id);
         let composer_comments_collapsed = draft.comments_folded;
         let composer = Self::draft_composer(&draft);
+        let attachment_row = div()
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .children(
+                draft
+                    .attachments
+                    .iter()
+                    .enumerate()
+                    .map(|(index, attachment)| {
+                        self.render_attachment(attachment, Some((draft.id, index)), cx)
+                    }),
+            )
+            .children(
+                self.pending_attachments
+                    .iter()
+                    .filter(|pending| pending.draft_id == draft.id)
+                    .map(Self::render_pending_attachment),
+            );
+        let attachment_errors = self
+            .attachment_errors
+            .iter()
+            .filter(|error| error.draft_id == draft.id)
+            .map(|error| {
+                div()
+                    .text_xs()
+                    .text_color(rgb(0xf87171))
+                    .child(error.message.clone())
+            })
+            .collect::<Vec<_>>();
 
         div()
             .id("main-editor")
@@ -3793,17 +4582,22 @@ impl Cowork {
                     .child(
                         div()
                             .w_full()
-                            .py_6()
+                            .pt_6()
+                            .min_h_full()
                             .flex()
                             .flex_col()
-                            .gap_6()
                             .text_sm()
                             .text_color(rgb(0xd4d4d8))
-                            .children(timeline_messages)
+                            .children(timeline_messages.into_iter().enumerate().map(
+                                |(index, message)| {
+                                    div().when(index != 0, |this| this.mt_6()).child(message)
+                                },
+                            ))
                             .when(can_write, |this| {
                                 this.child(
                                     div()
                                         .id("composer-row")
+                                        .when(!messages.is_empty(), |this| this.mt_6())
                                         .w_full()
                                         .flex()
                                         .items_start()
@@ -3839,8 +4633,18 @@ impl Cowork {
                                                 .when(!composer_comments_collapsed, |this| {
                                                     this.children(composer_comments)
                                                 })
+                                                .when(
+                                                    !draft.attachments.is_empty()
+                                                        || self
+                                                            .draft_is_loading_attachments(draft.id),
+                                                    |this| this.child(attachment_row),
+                                                )
+                                                .children(attachment_errors)
                                                 .child(
                                                     Self::render_composer_input(&composer)
+                                                        .capture_action(
+                                                            cx.listener(Self::paste_attachments),
+                                                        )
                                                         .on_click({
                                                             let composer = composer.clone();
                                                             cx.listener(move |_, _, window, cx| {
@@ -3853,11 +4657,26 @@ impl Cowork {
                                         )
                                         .child(div().w(px(40.)).flex_none()),
                                 )
+                                .child(
+                                    div()
+                                        .id("composer-empty-space")
+                                        .w_full()
+                                        .flex_1()
+                                        .min_h(px(24.))
+                                        .cursor_text()
+                                        .on_click({
+                                            let composer = composer.clone();
+                                            cx.listener(move |_, _, window, cx| {
+                                                Self::focus_composer_at_end(&composer, window, cx);
+                                            })
+                                        }),
+                                )
                             })
                             .when(!can_write, |this| {
                                 this.child(
                                     div()
                                         .id("read-only-thread")
+                                        .when(!messages.is_empty(), |this| this.mt_6())
                                         .relative()
                                         .w_full()
                                         .flex()
@@ -3885,6 +4704,7 @@ impl Cowork {
 impl Render for Cowork {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let composer = self.editable_composer(cx);
+        let can_write = composer.is_some();
         let read_only_line_bounds = Rc::new(Cell::new(None));
 
         div()
@@ -3913,6 +4733,14 @@ impl Render for Cowork {
                             .min_w_0()
                             .flex()
                             .flex_col()
+                            .when(can_write, |this| {
+                                this.can_drop(|value, _, _| {
+                                    value
+                                        .downcast_ref::<ExternalPaths>()
+                                        .is_some_and(|paths| !paths.paths().is_empty())
+                                })
+                                .on_drop(cx.listener(Self::drop_attachments))
+                            })
                             .child(self.render_main_editor(
                                 read_only_line_bounds.clone(),
                                 window,
@@ -3999,6 +4827,8 @@ fn main() -> anyhow::Result<()> {
                         sidebar_open: true,
                         recents_open: true,
                         new_thread_draft,
+                        attachment_errors: Vec::new(),
+                        pending_attachments: Vec::new(),
                         timeline_scroll_handle: ScrollHandle::new(),
                         follow_generation: true,
                         thread_store,
@@ -4037,6 +4867,277 @@ mod tests {
 
     fn annotate_markdown(markdown: &str, ranges: impl IntoIterator<Item = Range<usize>>) -> String {
         Cowork::annotate_markdown_with_source_offsets(markdown, ranges).0
+    }
+
+    fn encoded_image(width: u32, format: image::ImageFormat) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(width, 2))
+            .write_to(&mut std::io::Cursor::new(&mut bytes), format)
+            .expect("encode test image");
+        bytes
+    }
+
+    fn text_attachment(name: &str, text: &str) -> FileAttachment {
+        FileAttachment {
+            name: name.into(),
+            content: FileAttachmentContent::Text(text.into()),
+        }
+    }
+
+    #[test]
+    fn attachments_become_ollama_text_and_base64_image_parts() {
+        let attachments = vec![
+            text_attachment("say \"hi\".txt", "hello"),
+            FileAttachment {
+                name: "photo.png".into(),
+                content: FileAttachmentContent::Png(Arc::new(gpui::Image::from_bytes(
+                    gpui::ImageFormat::Png,
+                    vec![1, 2, 3],
+                ))),
+            },
+        ];
+        let RigMessage::User { content } = message_with_attachments("Question", &attachments)
+        else {
+            panic!("expected user message");
+        };
+        assert_eq!(content.len(), 3);
+        assert!(matches!(&content[0], UserContent::Text(text) if text.text == "Question"));
+        assert!(
+            matches!(&content[1], UserContent::Text(text) if text.text == "<file name=\"say &quot;hi&quot;.txt\">\nhello\n</file>")
+        );
+        assert!(matches!(&content[2], UserContent::Image(image)
+            if image.data == rig::message::DocumentSourceKind::Base64("AQID".into())
+                && image.media_type == Some(ImageMediaType::PNG)));
+    }
+
+    #[test]
+    fn attachments_are_classified_by_content() {
+        let source = attachment_from_bytes("main.rs".into(), b"fn main() {}".to_vec())
+            .expect("any UTF-8 file is text");
+        assert!(matches!(source.content, FileAttachmentContent::Text(_)));
+
+        let starts_like_bmp = attachment_from_bytes("notes".into(), b"BMW notes".to_vec())
+            .expect("text with an image-like signature is still text");
+        assert!(matches!(
+            starts_like_bmp.content,
+            FileAttachmentContent::Text(_)
+        ));
+
+        let binary = attachment_from_bytes("app.exe".into(), vec![0x4d, 0x5a, 0x00, 0xff]);
+        assert!(binary.is_err());
+
+        let png = encoded_image(2, image::ImageFormat::Png);
+        let kept = attachment_from_bytes("photo".into(), png.clone()).expect("png");
+        assert!(matches!(kept.content, FileAttachmentContent::Png(image) if image.bytes() == png));
+
+        let jpeg =
+            attachment_from_bytes("photo".into(), encoded_image(2, image::ImageFormat::Jpeg))
+                .expect("jpeg");
+        assert!(matches!(jpeg.content, FileAttachmentContent::Jpeg(_)));
+
+        let bmp = attachment_from_bytes(
+            "screen.bmp".into(),
+            encoded_image(2, image::ImageFormat::Bmp),
+        )
+        .expect("bmp");
+        assert!(matches!(bmp.content, FileAttachmentContent::Png(image)
+            if image::guess_format(image.bytes()).ok() == Some(image::ImageFormat::Png)));
+    }
+
+    #[test]
+    fn oversized_text_attachments_are_rejected() {
+        let limit = MAX_TEXT_ATTACHMENT_BYTES as usize;
+        assert!(attachment_from_bytes("ok.txt".into(), vec![b'a'; limit]).is_ok());
+        let error = attachment_from_bytes("big.txt".into(), vec![b'a'; limit + 1])
+            .err()
+            .expect("text over the limit")
+            .to_string();
+        assert_eq!(error, "big.txt is 256 KB; text files can be at most 256 KB");
+    }
+
+    #[test]
+    fn reading_attachment_file_reports_progress() {
+        let path = std::env::temp_dir().join(format!("cowork-{}.txt", Uuid::new_v4()));
+        let body = "a".repeat(400_000);
+        std::fs::write(&path, &body).expect("write test attachment");
+        let mut progress = Vec::new();
+        let result = read_attachment_file(&path, "test.txt", |value| progress.push(value));
+        std::fs::remove_file(&path).expect("remove test attachment");
+        assert_eq!(result.expect("read attachment"), body.as_bytes());
+        assert!(progress.len() >= 2);
+        assert!(progress.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(progress.last(), Some(&100.));
+    }
+
+    #[test]
+    fn byte_counts_are_human_readable() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(1023), "1023 B");
+        assert_eq!(format_bytes(1024), "1.0 KB");
+        assert_eq!(format_bytes(1536), "1.5 KB");
+        assert_eq!(format_bytes(400_000), "391 KB");
+        assert_eq!(format_bytes(10 * 1024 * 1024), "10 MB");
+    }
+
+    #[test]
+    fn clipboard_prefers_files_then_text_then_images() {
+        let image = gpui::Image::from_bytes(gpui::ImageFormat::Png, vec![1]);
+        let image_only = ClipboardItem::new_image(&image);
+        assert!(matches!(
+            clipboard_attachment_sources(&image_only).as_slice(),
+            [AttachmentSource::ClipboardImage(_)]
+        ));
+
+        let text_only = ClipboardItem::new_string("hello".into());
+        assert!(clipboard_attachment_sources(&text_only).is_empty());
+
+        let mut text_and_image = ClipboardItem::new_string("A1\tB1".into());
+        text_and_image
+            .entries
+            .push(ClipboardEntry::Image(image.clone()));
+        assert!(clipboard_attachment_sources(&text_and_image).is_empty());
+
+        let mut files_and_text = ClipboardItem::new_string("notes.txt".into());
+        files_and_text
+            .entries
+            .push(ClipboardEntry::ExternalPaths(ExternalPaths(
+                vec![PathBuf::from("notes.txt")].into(),
+            )));
+        assert!(matches!(
+            clipboard_attachment_sources(&files_and_text).as_slice(),
+            [AttachmentSource::Path(path)] if path == Path::new("notes.txt")
+        ));
+    }
+
+    struct AttachmentTestRoot {
+        cowork: Entity<Cowork>,
+    }
+
+    impl Render for AttachmentTestRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+        }
+    }
+
+    fn attachment_test_cowork(
+        cx: &mut gpui::TestAppContext,
+        tokio_handle: tokio::runtime::Handle,
+    ) -> (Entity<Cowork>, Uuid, &mut gpui::VisualTestContext) {
+        cx.update(gpui_component::init);
+        let thread_id = Uuid::new_v4();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let thread = cx.new(|cx| Thread {
+                instance_id: thread_id,
+                summary: ThreadSummary {
+                    id: thread_id,
+                    title: "Test".into(),
+                },
+                timeline: Vec::new(),
+                draft: Cowork::new_user_message_draft(window, cx),
+                generating: false,
+                sharing: ThreadSharing::NotShared,
+                ownership: ThreadOwnership::Local,
+            });
+            let thread_store = cx.new(|_| ThreadStore {
+                threads: VecDeque::from([thread]),
+            });
+            let cowork = cx.new(|cx| Cowork {
+                sidebar_open: true,
+                recents_open: true,
+                new_thread_draft: Cowork::new_user_message_draft(window, cx),
+                attachment_errors: Vec::new(),
+                pending_attachments: Vec::new(),
+                timeline_scroll_handle: ScrollHandle::new(),
+                follow_generation: true,
+                thread_store,
+                active_thread_id: Some(thread_id),
+                selection_message_id: None,
+                segment_text_views: HashMap::new(),
+                render_generation: 0,
+                titlebar_click_armed: false,
+                copied_endpoint_id: None,
+                join_dialog: None,
+                tokio_handle,
+                active_generations: HashMap::new(),
+                model_picker: Cowork::new_model_picker(window, cx),
+                model_picker_hovered: false,
+                _window_activation_subscription: cx.observe_window_activation(window, |_, _, _| {}),
+            });
+            AttachmentTestRoot { cowork }
+        });
+        let cowork = view.read_with(cx, |root, _| root.cowork.clone());
+        (cowork, thread_id, cx)
+    }
+
+    fn thread_draft_attachments(
+        cowork: &Entity<Cowork>,
+        thread_id: Uuid,
+        cx: &mut gpui::VisualTestContext,
+    ) -> Vec<FileAttachment> {
+        cowork.read_with(cx, |cowork, cx| {
+            cowork
+                .thread_store
+                .read(cx)
+                .thread(thread_id, cx)
+                .expect("thread")
+                .read(cx)
+                .draft
+                .attachments
+                .clone()
+        })
+    }
+
+    #[gpui::test]
+    fn attachments_land_on_their_thread_after_switching_away(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let (cowork, thread_id, cx) = attachment_test_cowork(cx, runtime.handle().clone());
+        let path = std::env::temp_dir().join(format!("cowork-{}.md", Uuid::new_v4()));
+        std::fs::write(&path, "# Notes").expect("write test attachment");
+
+        cowork.update(cx, |cowork, cx| {
+            let draft_id = cowork.writable_draft_id(cx).expect("writable thread");
+            cowork.add_attachments(draft_id, vec![AttachmentSource::Path(path.clone())], cx);
+            assert!(cowork.draft_is_loading_attachments(draft_id));
+            cowork.active_thread_id = None;
+        });
+        cx.run_until_parked();
+        std::fs::remove_file(&path).expect("remove test attachment");
+
+        let attachments = thread_draft_attachments(&cowork, thread_id, cx);
+        assert!(matches!(
+            attachments.as_slice(),
+            [FileAttachment { content: FileAttachmentContent::Text(text), .. }] if text == "# Notes"
+        ));
+        cowork.read_with(cx, |cowork, _| {
+            assert!(cowork.new_thread_draft.attachments.is_empty());
+            assert!(cowork.pending_attachments.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn pasting_an_image_attaches_it_to_the_draft(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let (cowork, thread_id, cx) = attachment_test_cowork(cx, runtime.handle().clone());
+        let bmp = encoded_image(3, image::ImageFormat::Bmp);
+        cx.write_to_clipboard(ClipboardItem::new_image(&gpui::Image::from_bytes(
+            gpui::ImageFormat::Bmp,
+            bmp,
+        )));
+
+        cowork.update_in(cx, |cowork, window, cx| {
+            cowork.paste_attachments(&Paste, window, cx);
+        });
+        cx.run_until_parked();
+
+        let attachments = thread_draft_attachments(&cowork, thread_id, cx);
+        assert!(matches!(
+            attachments.as_slice(),
+            [FileAttachment { name, content: FileAttachmentContent::Png(_) }] if name == "Pasted image.png"
+        ));
     }
 
     #[test]
@@ -4320,6 +5421,8 @@ mod tests {
                 sidebar_open: true,
                 recents_open: true,
                 new_thread_draft: Cowork::new_user_message_draft(window, cx),
+                attachment_errors: Vec::new(),
+                pending_attachments: Vec::new(),
                 timeline_scroll_handle: ScrollHandle::new(),
                 follow_generation: true,
                 thread_store,
@@ -4621,6 +5724,7 @@ mod tests {
         let existing_timeline = vec![TimelineMessage::User(UserMessageGroup {
             id: Uuid::new_v4(),
             comments: Vec::new(),
+            attachments: Vec::new(),
             content: UserMessageContent::Submitted {
                 text: "Existing message".into(),
                 history_text: None,
@@ -4687,6 +5791,7 @@ mod tests {
             protocol::HostMessage::UserMessage(protocol::UserMessage {
                 id: user_message_id,
                 text: "Explain this".into(),
+                attachments: Vec::new(),
                 comments: vec![protocol::UserComment {
                     id: comment_id,
                     reference: protocol::CommentReference {
@@ -4818,6 +5923,28 @@ mod tests {
         fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             div().size_full().child(Textarea::new(&self.editor))
         }
+    }
+
+    #[gpui::test]
+    fn focusing_empty_space_places_caret_at_composer_end(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|window, cx| ComposerTestView {
+            composer: cx.new(|cx| TextareaState::new(window, cx)),
+        });
+        let composer = view.read_with(cx, |view, _| view.composer.clone());
+        cx.update(|window, cx| {
+            composer.update(cx, |state, cx| {
+                state.set_value("first line\nlast 🌿", window, cx);
+                state.set_cursor_position(gpui_base::input::Position::new(0, 0), window, cx);
+            });
+            Cowork::focus_composer_at_end(&composer, window, cx);
+        });
+        composer.read_with(cx, |state, _| {
+            assert_eq!(
+                state.cursor_position(),
+                gpui_base::input::Position::new(1, 6)
+            );
+        });
     }
 
     #[gpui::test]

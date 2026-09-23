@@ -4,7 +4,12 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
-const MAX_FRAME_LENGTH: usize = 16 * 1024 * 1024;
+/// Bounds how much memory a single frame from a peer can make us buffer.
+///
+/// Attachments travel inline, so this must fit a user message at the
+/// attachment limit, and a `Welcome` snapshot of a thread with several such
+/// messages. A snapshot that grows beyond it cannot be sent.
+const MAX_FRAME_LENGTH: usize = 256 * 1024 * 1024;
 pub(crate) const PEER_CHANNEL_CAPACITY: usize = 128;
 
 /// A request from a collaborator to the host.
@@ -88,6 +93,20 @@ pub(crate) struct UserMessage {
     pub(crate) id: uuid::Bytes,
     pub(crate) text: String,
     pub(crate) comments: Vec<UserComment>,
+    pub(crate) attachments: Vec<Attachment>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Attachment {
+    pub(crate) name: String,
+    pub(crate) content: AttachmentContent,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum AttachmentContent {
+    Text(String),
+    Png(Vec<u8>),
+    Jpeg(Vec<u8>),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -233,6 +252,10 @@ mod tests {
                 TimelineMessage::User(UserMessage {
                     id: [2; 16],
                     text: "Question".into(),
+                    attachments: vec![Attachment {
+                        name: "notes.txt".into(),
+                        content: AttachmentContent::Text("Details".into()),
+                    }],
                     comments: vec![UserComment {
                         id: [3; 16],
                         reference: CommentReference {
