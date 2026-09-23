@@ -1,273 +1,608 @@
-# Collaborative prompts
+# Collaborative drafts
+
+This is the specification for how Cowork participants prepare, edit, and
+submit agent requests together. It defines user-facing behavior, the shared
+Yrs document, and the protocol between host and collaborators.
 
 ## Status
 
-This document describes the intended collaboration behavior for Cowork. It is a planning document, not an implementation description. Confirmed behavior is separated from open questions so the design can be refined without losing the original requirements.
+Not implemented. Today a shared thread has one host who can write and any
+number of read-only collaborators. The host's draft (one composer, pending
+comments, attachments) is local and unshared. See
+[Implementation order](#implementation-order) for how we get from there to
+this spec.
 
-## Goals
+## Summary
 
-A shared thread should let several participants prepare prompts together without forcing everyone into one text field.
-
-- Participants write independent prompts by default.
-- A participant may create multiple prompt blocks.
-- Any participant may deliberately join and co-edit another prompt block.
-- Everyone sees text edits and collaborator cursors update live.
-- Submitting combines the current prompt blocks and sends one request to the agent.
-- The creator and current editors of each prompt block are visually identifiable.
-- Existing single-user behavior should remain unchanged for unshared threads.
+- Every thread has one draft, backed by one Yrs document, whether or not the
+  thread is shared.
+- The draft is an ordered collection of **items**: prompt blocks and comments.
+  Prompt blocks carry their own attachments.
+- Every participant can create, edit, and remove every item. The creator is
+  attribution, not a permission.
+- Participants write independent prompt blocks by default and co-edit a block
+  by deliberately moving into it.
+- Live cursors, selections, focus, and attachment reads are shared as
+  ephemeral presence, outside the document.
+- Anyone can submit, stop the agent, or change the model. The host
+  coordinates so each submission happens exactly once.
 
 ## Terminology
 
-- **Participant**: A user connected to a shared thread.
-- **Prompt block**: One independently editable text entry in the collaborative composer. A participant can own more than one block.
-- **Creator**: The participant who caused a prompt block to be created.
-- **Editor**: A participant whose cursor or selection is currently inside a prompt block. The creator may or may not be a current editor.
-- **Draft position**: The empty composer position where a participant can begin a new independent prompt block.
-- **Submission**: An ordered snapshot of the nonempty prompt blocks sent to the agent as one request.
+- **Participant**: someone connected to a shared thread, including the host.
+- **Host**: the participant whose endpoint serves the thread. The host runs
+  the agent and holds the authoritative copy of all shared state.
+- **Item**: one prompt block or one comment in the draft.
+- **Prompt block**: an independently editable prompt with its own
+  attachments.
+- **Comment**: an editable note targeting an excerpt of an assistant message.
+- **Creator**: the participant who created an item.
+- **Editor**: a participant whose focus is currently inside an item.
+- **Draft position**: the empty spot below the last prompt block. Typing
+  there creates a new prompt block.
+- **Submission**: an ordered snapshot of the draft's non-empty items, published
+  as one immutable user message and sent to the agent as one request.
 
-## Composer behavior
+## Participants and identity
 
-### Empty composer
+- The host assigns each collaborator a random participant UUID when it joins,
+  and returns it in `Welcome`. The host generates its own UUID once per app
+  launch and uses it for its local threads too.
+- Reconnecting is a fresh join with a new participant UUID. Items created
+  earlier keep their original creator.
+- Display names are two filler words (e.g. "Amber Otter") and a color, both
+  derived deterministically from the UUID. Every client computes the same
+  result, so names are never transmitted. Names are not authoritative and
+  may collide.
+- Identity will later be tied to real accounts or keys by mapping an
+  authenticated identity to a participant UUID at the host. Nothing in the
+  document depends on how identity is established.
 
-When all prompt blocks are empty:
+## The draft
 
-1. Every participant sees one empty composer position.
-2. Every participant's cursor blinks at the same visual position.
-3. The overlapping cursors may use participant-specific colors, but they must not create separate visible rows while nobody has typed.
-4. No participant owns visible content yet.
+### Composer layout
 
-The shared empty position is primarily a visual and presence affordance. Whether empty drafts exist as CRDT records before typing remains an implementation decision.
+The composer column is shown below the timeline for every participant:
 
-### Creating independent prompt blocks
+1. **Comments**: all draft comments, in draft order, under a collapsible
+   "N comments" toggle. Collapsing is local UI state.
+2. **Prompt blocks**: in draft order. Each block shows its attachment row
+   above its text, like the current composer.
+3. **Draft position**: an empty row below the last block. It is rendered only
+   when there are no blocks or when at least one participant is there.
+   Clicking the empty space below the blocks moves the local participant
+   there.
 
-Independent prompts are the default behavior.
+The shared order spans all items, but the composer always groups by kind:
+comments first, then prompt blocks. Relative order within each group follows
+the shared order.
 
-1. The first participant who types at the shared empty position creates a prompt block.
-2. That participant remains in the newly created block and continues typing there.
-3. The other participants' draft cursors move to a new empty composer position below the created block.
-4. Typing at that lower position creates a separate prompt block owned by the participant who typed.
-5. If a participant later moves below the existing blocks and starts typing again, a new prompt block is created even if that participant already owns an earlier block.
-6. Prompt blocks appear in document order, matching their positions in the composer.
+### Avatars
 
-Example:
+Each prompt block has an avatar gutter, like timeline messages:
 
-1. Alice types and creates block A.
-2. Bob's cursor moves below A. Bob types and creates block B.
-3. Alice moves below B and types again, creating block C.
-4. The order submitted to the agent is A, B, C.
+- The creator's avatar is primary, even when the creator is not editing.
+- Other current editors are shown as smaller avatars layered beside it, in
+  a deterministic order (join order) that does not reshuffle on presence
+  updates.
+- At most the creator plus two editors are shown, then "+N".
+- The layout reserves space so avatar changes never shift text horizontally.
+- Hovering an avatar shows the participant's name.
 
-Ownership identifies who created a block; it does not grant exclusive editing rights.
+The draft position row shows the avatars of participants who are at it. When
+the draft is empty, everyone's avatar is layered on that single row.
 
-### Joining an existing prompt block
+Comment cards show their creator's avatar inside the card, as today, with
+editors layered beside it. Ownership of every comment must be clear.
 
-A participant can intentionally edit an existing block instead of creating an independent one.
+### Creating prompt blocks
 
-- Clicking text places the participant's cursor in that prompt block.
-- Pressing Up from the draft position moves into the nearest appropriate prompt block above it.
-- Once joined, participants can edit the same text concurrently.
-- Selections, cursor movement, insertion, replacement, and deletion should retain the native text editing behavior provided by Cowork's GPUI text component.
-- Leaving a block does not change its creator.
-- A participant can return to the draft position to create another independently owned block.
+Independent prompts are the default.
 
-Exact Up/Down behavior at wrapped visual lines and block boundaries must be specified before implementation. See [Open questions](#open-questions).
+1. When the draft is empty, every participant's caret sits at the same draft
+   position. Overlapping carets use participant colors and never create
+   separate rows.
+2. Typing at the draft position creates a prompt block. The typist becomes
+   its creator and stays in it.
+3. Everyone else at the draft position remains at the draft position, which
+   now renders below the new block.
+4. Typing at the draft position always creates a new block, even if that
+   participant already created others.
+5. New blocks are appended to the end of the shared order.
+6. If two participants type at the draft position concurrently, two blocks
+   are created. Yrs orders the concurrent inserts identically on every
+   replica.
 
-### Remote cursors and selections
+Adding an attachment while at the draft position also creates a new block,
+with an empty body and that attachment.
 
-- Each participant has a stable color for the duration of a collaboration session.
-- Remote cursors and selections update without taking local keyboard focus.
-- Cursor and selection positions use CRDT-relative anchors so concurrent edits do not corrupt their positions.
-- Presence state is ephemeral and must not be stored as durable document content.
-- Disconnecting removes a participant's live cursor and editor avatar after an appropriate presence timeout.
+### Joining and navigating
 
-### Block avatars
+- Clicking into any item places the caret there.
+- Up and Down move through one navigation chain in visual order: expanded
+  composer comments, then prompt blocks, then the draft position.
+- Up/Down leave an item only from its first or last **visual** line
+  (respecting wrapping). The caret enters the adjacent item on its nearest
+  visual line, keeping horizontal position where possible.
+- Down from the last line of the last block moves to the draft position. Up
+  from the draft position moves into the last block.
+- A collapsed comment group is skipped. Inline comment editors in the
+  timeline keep Up/Down within themselves.
+- Once in an item, participants edit concurrently with character-level
+  merging. Native Textarea behavior (selection, IME, replace, delete) is
+  preserved.
+- Leaving an item never changes its creator.
 
-Each prompt block has an avatar gutter consistent with the timeline's existing layout.
+### Removing items
 
-- The creator's avatar is the primary avatar.
-- If other participants are editing the block, their avatars are layered beside or partially over the creator avatar.
-- Layering must preserve recognizable colors or initials and should expose all active editors without making the text jump horizontally.
-- Avatar order must be deterministic to avoid reshuffling on every presence update.
-- Participants who are merely viewing the thread do not appear on a block; only the creator and current editors do.
-- The UI should distinguish the creator from additional editors, even when the creator is not currently editing the block.
+Empty items disappear naturally when nobody is using them:
 
-The exact maximum visible avatar count and overflow treatment are still open.
+- An item is **empty** when its body has no non-whitespace content and, for
+  prompt blocks, it has no attachments.
+- When a participant's focus leaves an empty item and presence shows nobody
+  else focused in it, that participant removes it.
+- **Escape** in an empty item removes it (if nobody else is focused in it)
+  and moves the caret to the draft position.
+- **Backspace** in an empty item removes it (if nobody else is focused in it)
+  and moves the caret to the end of the previous stop in the navigation
+  chain.
+- If others are focused in the empty item, it stays. The last to leave
+  removes it.
+- When a participant disconnects, the host removes empty items that the
+  participant was focused in and nobody else is.
+- Switching to another window or application does not count as leaving.
 
-## Submission behavior
+A removal can race with someone else entering the item. Their concurrent
+edits are lost. This is accepted.
 
-Pressing Ctrl-Enter, or Cmd-Enter on macOS, from any collaborative prompt block requests one shared submission.
+### Comments
 
-1. Capture a consistent, ordered snapshot of all nonempty prompt blocks.
-2. Combine the blocks into one prompt in document order.
-3. Submit exactly one request to the agent.
-4. Make the submitted user content immutable in the timeline.
-5. Show the same submitted content and streaming agent response to every participant.
-6. Deduplicate concurrent submission requests so simultaneous key presses cannot start duplicate agent runs for the same composer revision.
+- Typing while an excerpt of an assistant message (or an agent reply to a
+  comment) is selected creates a comment targeting that excerpt, with the
+  typed character as its first content.
+- Comments can target messages that are still generating. Streaming only
+  appends to a message's source, so a target range stays valid.
+- Every participant sees every draft comment: highlighted in the target
+  message, with an inline editor next to it, and as a card in the composer.
+  Both editors edit the same shared text and show remote carets.
+- A comment's target is fixed at creation.
+- Comments have no attachments. Pasting files into a comment editor inserts
+  only text.
 
-Empty blocks do not contribute to the combined prompt. Whitespace-only blocks should be treated as empty unless later requirements say otherwise.
+### Attachments
 
-The separator and attribution format used to combine blocks are intentionally unspecified. The agent may eventually need participant attribution, but that should not be assumed until the prompt format is chosen.
+Attachments belong to a prompt block. Anybody can add or remove any
+attachment. File bytes are sent over the protocol, never stored in the
+document.
 
-Existing behavior that allows composing the next response while an agent is generating should be preserved. The lifecycle of collaborative blocks after submission still needs a product decision.
+**Choosing the target block**:
 
-## Shared document model
+- Pasting or dropping onto a block attaches to that block.
+- The paperclip button attaches to the focused prompt block.
+- Otherwise (draft position, a comment, or no focus), a new block is created.
 
-The model should be inspired by `irohproxy`:
+**Lifecycle**:
 
-- Yrs owns collaborative document content.
-- Iroh transports encoded CRDT updates between peers.
-- CRDT transactions remain synchronous and never cross an `await`.
-- UI and transport replicas exchange encoded updates rather than sharing Yrs transactions or UI offsets across threads.
-- Public text positions are UTF-8 byte offsets at the application boundary and are translated to Yrs's internal indexing.
-- Cursor and selection preservation uses opaque CRDT-relative anchors.
-- Bounded channels bridge GPUI and the Tokio-owned network session.
-- Local edits remain optimistic and must not block on the network.
-- Reconnection uses state vectors and diffs rather than assuming every acknowledgement was received.
+1. **Reading**: the adding participant reads the file locally. Presence
+   advertises the pending read (name, whether it is an image, progress,
+   target block), so everyone sees a placeholder chip with a progress bar.
+2. **Uploading**: once read, the adder appends an attachment record to the
+   target block and streams the bytes to the host. If the target block was
+   removed in the meantime, a new block is created for it.
+3. **Stored**: when the host has every byte, it announces the attachment as
+   stored.
+4. **Downloading**: the host relays bytes to every other participant. Each
+   participant's chip shows a progress bar until the bytes are available
+   locally.
 
-### Proposed logical schema
+Only the host needs the bytes to send. A participant can submit as soon as
+the host has stored every attachment, even if other participants are still
+downloading.
 
-The exact Yrs types may change during prototyping, but the document needs to represent at least:
+**Failure and removal**:
+
+- A failed local read removes the placeholder. The error is shown only to
+  the adder, as today.
+- If the adder disconnects before the upload finishes, the host removes the
+  record and discards the partial bytes.
+- Removing an attachment while it uploads cancels the upload. The host
+  discards bytes for attachments no longer referenced by the draft or the
+  timeline.
+- Existing size limits apply: per file when adding, and the per-message total
+  across all submitted blocks when submitting.
+
+### Presence
+
+Each participant publishes one presence state:
 
 ```text
-ThreadDocument
-  prompt_order: ordered collection of PromptBlockId
-  prompt_blocks: map PromptBlockId -> PromptBlock
-
-PromptBlock
-  id: stable unique identifier
-  creator_id: ParticipantId
-  text: collaborative text
-  creation metadata needed for deterministic ordering
+Presence
+├── focus: none | draft position | item ID
+├── selection: anchor and head as Yrs sticky indices in the focused body
+└── pending reads: [name, is image, progress, target block or new block]
 ```
 
-A prompt block is the unit of ownership, ordering, navigation, avatar display, and submission. It must not be modeled as one fixed field per participant because a participant may create multiple blocks.
+- Presence is sent through the host, which rebroadcasts it tagged with the
+  participant UUID. Only the latest state matters, so updates may be
+  coalesced.
+- The host drops a participant's presence when its connection closes, so no
+  timeouts are needed.
+- Remote carets and selections are painted in the participant's color and
+  never move local focus. A caret shows the participant's name when hovered
+  or briefly after it moves.
+- Presence is never stored in the document.
 
-Participant display names, avatar details, cursors, selections, focus, and connectivity belong to ephemeral presence state. They should not be mixed into the durable prompt text unless a small stable creator identifier is required for block attribution.
+## Thread controls
 
-### Ordering and creation
+### Submission
 
-Creating a block and inserting its identifier into document order must be one logical operation. Concurrent block creation must converge to the same deterministic order on every replica.
+Pressing Ctrl-Enter (Cmd-Enter on macOS) in any composer editor or at the
+draft position, or clicking Send, submits the whole draft for everyone.
 
-A block should have a stable identifier independent of its current vector index. This permits concurrent insertion and future insertion of comments or other timeline elements without invalidating identity.
+Send is enabled for everyone when:
 
-### Submission coordination
+- the agent is not generating;
+- the draft contains at least one non-empty item;
+- no participant has a pending attachment read; and
+- the host has stored every attachment in non-empty blocks.
 
-CRDT convergence alone does not guarantee exactly-once agent submission. The collaboration protocol needs an authoritative coordinator, expected to be the participant hosting the shared Iroh endpoint initially.
+The host accepts a submission as follows:
 
-A submission request should identify the document revision or submission generation it targets. The coordinator should:
+1. The submitter sends `Submit` with the submission sequence it has seen. It
+   sends all its pending draft updates first, on the same ordered stream, so
+   its own edits are always included.
+2. The host ignores a stale sequence: someone else's submission was already
+   accepted and everyone sees it.
+3. From its replica, the host snapshots every non-empty comment and every
+   non-empty prompt block (with attachments), in draft order. This includes
+   blocks others are still typing in.
+4. In one transaction, the host removes exactly the snapshotted items from
+   the draft. Empty items stay, for example a comment someone has not started
+   typing yet.
+5. The host broadcasts that draft update and the published user message with
+   the next sequence number, then starts the agent run.
+6. Edits that arrive for removed items are discarded. Participants whose
+   focused item was submitted move to the draft position.
 
-1. Accept at most one submission for that generation.
-2. Snapshot the converged ordered blocks.
-3. Start the agent operation.
-4. Broadcast the accepted submission identity and streaming response events.
-5. Reject or coalesce duplicate requests.
+Other rejections (generating, empty, attachments not stored, size limit) are
+reported only to the submitter.
 
-Behavior when the host is missing updates at the instant another participant submits needs to be defined. A short synchronization handshake may be required before the snapshot is accepted.
+**Published user message**: one timeline entry, rendered like today:
 
-## UI state and networking boundaries
+- a collapsible comment group, each card showing its creator's avatar; then
+- one row per prompt block, with the creator's avatar in the gutter, its
+  attachment row, and its text.
 
-Each collaborative thread will eventually need state beyond the current shared/unshared marker:
+A single-block submission looks like the current user message.
 
-- Iroh endpoint or client connection lifecycle
-- Local participant identity
-- Peer membership and presence
-- UI-side CRDT replica
-- Transport-side CRDT replica
-- Outbound update queue and acknowledgement state
-- Submission coordinator state
-- Agent stream state shared with peers
-- Connection and synchronization errors visible in the UI
+**Agent prompt**: the same format for shared and local threads.
 
-The Tokio runtime owns asynchronous Iroh transport. GPUI entities own renderable state and native text editor instances. Communication across that boundary uses bounded channels or coalescible snapshots so neither runtime blocks the other.
+- Comments come first, as today, each labeled with its creator's name. The
+  agent must still call `respond_to_comment` once per comment.
+- Each prompt block follows, in order, preceded by its creator's name.
+- Each block's attachments stay with that block, using today's encoding.
+- Mentions (once supported) render as `@Name`.
 
-A prompt block's CRDT text and its GPUI editor state are related but distinct. Applying remote text must preserve local selection, IME composition, and focus. Remote updates should be deferred or reconciled safely while IME composition is active, following the approach demonstrated by `irohproxy`.
+Illustrative, not normative:
 
-## Interaction scenarios
+```text
+The user attached the following inline comments ...
 
-These scenarios form the initial acceptance checklist.
+1. <comment id> — Amber Otter, on an excerpt from assistant message 3:
+> quoted excerpt
+Comment: Why is this unsafe?
 
-### Two users start from empty
+Amber Otter:
+Investigate the crash.
 
-1. Alice and Bob join an empty shared thread.
-2. Both cursors appear at the same empty position.
-3. Alice types `Investigate the crash`.
-4. Alice remains in her block.
-5. Bob sees Alice's text and cursor live.
-6. Bob's draft cursor appears in an empty position below Alice's block.
+Brisk Heron:
+Also check the attached log.
+<attachment name="crash.log">...</attachment>
+```
 
-### Independent prompts
+The host titles a new thread from the first prompt block, as today.
 
-1. Alice owns block A.
-2. Bob types in the lower draft position and creates block B.
-3. Alice and Bob can continue editing their own blocks without changing focus for the other participant.
-4. Both replicas show A followed by B.
+Submitting while the agent is generating is rejected. Participants can keep
+editing the draft during generation.
 
-### Multiple blocks from one participant
+### Stopping
 
-1. Alice creates block A.
-2. Bob creates block B below it.
-3. Alice moves to the draft position below B and types.
-4. A new block C is created with Alice as creator.
-5. Blocks A and C remain separate and are submitted in their visual order.
+Everyone sees the Stop button while the agent is generating. `Stop` names
+the running agent message. The host cancels that run if it is still active
+and ignores the request otherwise. The message ends as it does today.
 
-### Co-editing one block
+### Model selection
 
-1. Alice creates block A.
-2. Bob clicks text in A, or navigates upward into it.
-3. Bob's avatar layers with Alice's avatar beside A.
-4. Alice and Bob edit A concurrently.
-5. Both replicas converge without losing either participant's valid edits.
-6. Each participant's cursor and selection remain anchored through remote edits.
+- Model selection is per thread. New local threads start with the last model
+  selected locally.
+- Anyone can pick a model. The client sends `SelectModel` with the catalog
+  ID. The host applies it in arrival order, ignores unknown IDs, and
+  broadcasts `ModelSelected`. Every picker updates live.
+- A run uses the model selected when its submission is accepted. Changing
+  the model during a run affects the next run.
 
-### Shared submission
+This is independent of the draft document and is the first feature to build.
 
-1. Several nonempty blocks exist.
-2. Bob presses Ctrl-Enter.
-3. Every participant sees one immutable submitted user message containing the blocks in order.
-4. Exactly one agent generation starts.
-5. The response streams identically to every participant.
-6. Simultaneous Ctrl-Enter presses do not duplicate the request.
+## Sharing lifecycle
 
-### Disconnect and reconnect
+- **Starting**: the host's existing draft becomes the shared draft
+  unchanged. Its items keep the host as creator.
+- **Joining**: the collaborator sends `Join` with its protocol version. The
+  host rejects mismatched versions. Otherwise it replies with `Welcome`
+  (see [Protocol](#protocol)), then streams the bytes of every attachment
+  in the thread.
+- **Falling behind**: a collaborator that lags the host's event buffer
+  receives a new `Welcome`. It **merges** the draft state into its existing
+  replica instead of replacing it, so its unsent local edits survive.
+- **Collaborator disconnects**: its presence disappears. The host applies the
+  empty-item and incomplete-upload cleanup described above.
+- **Host disconnects**: the session ends and collaborators' copies of the
+  thread are removed, as today. Host migration is out of scope.
 
-1. Alice edits while Bob is temporarily disconnected.
-2. Bob reconnects and synchronizes through state vectors and CRDT diffs.
-3. Both replicas converge.
-4. Bob's stale presence is removed while disconnected and recreated after reconnecting.
-5. No stale cursor offset is applied directly to the reconciled text.
+Nothing is persisted. A draft lives as long as its thread exists in the
+host's app.
 
-## Non-goals for the first collaboration increment
+## Document layout
 
-- Access control or user accounts
-- Durable server-side persistence
-- Collaborative undo/redo semantics
-- Rich-text prompt blocks
-- Tool execution controlled independently by multiple peers
-- Host migration after the sharing participant disconnects
-- Comments inserted into prior timeline content
-- A polished invitation/link format beyond the endpoint identity
+One Yrs document per thread holds the draft. It holds collaborative content
+only.
 
-These may be added later, but the initial architecture should avoid making them impossible.
+```text
+Draft document
+├── order: Array<ItemId>
+└── items: Map<ItemId, Item>
 
-## Open questions
+Prompt item (Map)
+├── kind: "prompt"
+├── creator: ParticipantId          write-once
+├── body: Text
+└── attachments: Array<AttachmentRecord>
 
-The following decisions must be made before considering the behavior complete:
+Comment item (Map)
+├── kind: "comment"
+├── creator: ParticipantId          write-once
+├── target: CommentTarget           atomic, write-once
+└── body: Text
 
-1. **Participant identity:** Is identity ephemeral per connection, stable per installation, or tied to a future user account?
-2. **Empty drafts:** Does each participant have an explicit empty CRDT block, or is the empty draft position represented only by presence until typing begins?
-3. **First-writer races:** If two participants type into the shared empty position concurrently, do they create two independent blocks or co-edit one newly claimed block?
-4. **Vertical navigation:** At what exact cursor positions does Up leave the draft or cross from one block into another? How should wrapped visual lines behave?
-5. **Returning to independent mode:** What command or pointer target moves a participant from a co-edited block back to their empty draft position?
-6. **Block deletion:** Is an empty block removed automatically, retained with its creator, or removed only through an explicit action?
-7. **Submission format:** How are blocks separated, and should creator names be included in the prompt sent to the agent?
-8. **Submission snapshot:** How does the host ensure it has incorporated a remote participant's latest update before accepting Ctrl-Enter?
-9. **Post-submit lifecycle:** Are submitted blocks cleared, archived as a grouped timeline item, or retained while a fresh collaborative draft set is created?
-10. **Edits during generation:** Are newly typed blocks always reserved for the next submission, and can participants edit the just-submitted snapshot?
-11. **Host failure:** What happens to collaboration and an in-flight generation when the endpoint-owning participant disconnects?
-12. **Avatar overflow:** How many editor avatars are shown before collapsing into a count?
-13. **Awareness transport:** Should presence use a dedicated protocol message stream, a Yrs awareness implementation, or another ephemeral channel?
-14. **Permissions:** Can every connected participant submit, edit every block, and unshare the thread?
-15. **Invitation data:** Is an endpoint public key sufficient, or will peers require an endpoint address, relay information, thread identifier, and protocol version in a share link?
+AttachmentRecord (atomic value)
+├── id
+├── name
+├── kind: text | png | jpeg
+├── size
+└── creator: ParticipantId
 
-## Requirement summary
+CommentTarget (atomic value)
+├── message_id                      agent message or comment reply
+├── range                           byte range in the message's markdown source
+└── quote                           display text captured at creation
+```
 
-The core invariant is that the collaborative composer is an ordered collection of independently created CRDT prompt blocks, not one shared string and not one permanent field per user. Independence is the default, co-editing is deliberate, participant presence remains ephemeral, and Ctrl/Cmd-Enter creates one ordered, exactly-once agent submission visible to everyone.
+Design decisions:
+
+- **Order separate from content.** Items have stable UUIDs independent of
+  position, so carets, presence, and creator records survive concurrent
+  inserts and removals. Creating or removing an item changes `order` and
+  `items` in one transaction.
+- **One document per thread.** Accepting a submission removes the submitted
+  items rather than replacing the document. Unsubmitted items (and the carets
+  in them) keep their identity. Late updates need no routing, since they land
+  in removed items. The submission sequence, not the document, prevents
+  duplicate submissions.
+- **Creator in the item.** It arrives atomically with the item, so no item is
+  ever shown without a creator. Clients never write it after creation. The
+  host enforces this. Future authentication is enforced at the host, not in
+  the document.
+- **Atomic targets and attachment records.** Their fields describe one
+  coherent value and must never merge field by field.
+- **Bodies are Yrs `Text`.** Version 1 writes plain unformatted text. The
+  composer does not render markdown, so typed markdown is literal text.
+  Planned additions fit `Text` without changing the layout:
+  - mentions as inline embeds `{ "mention": <participant UUID> }`, so the
+    participant reference is one unit instead of editable characters; and
+  - inline formatting as Yrs formatting attributes.
+
+  Clients must never flatten embeds or attributes into plain text.
+
+### State outside the document
+
+| State                               | Where it lives                                           |
+| ----------------------------------- | -------------------------------------------------------- |
+| Participants, names, colors         | Host session; names derived from UUIDs                   |
+| Presence                            | Host-relayed protocol messages                           |
+| Selected model                      | Thread state at the host, synced by protocol             |
+| Submission sequence                 | Thread state at the host                                 |
+| Attachment bytes and stored status  | Host byte store keyed by attachment ID, relayed to peers |
+| Published timeline, agent runs      | Thread state, synced by the existing host events         |
+| Folding, scroll, local errors, etc. | Local UI state                                           |
+
+## Protocol
+
+All traffic goes through the host. Collaborators never talk to each other.
+The messages below are conceptual. Names and shapes will follow the existing
+`protocol.rs` style.
+
+**Collaborator to host**
+
+| Message            | Purpose                                                         |
+| ------------------ | --------------------------------------------------------------- |
+| `Join`             | First message; carries the protocol version                     |
+| `DraftUpdate`      | Encoded Yrs update from a local transaction                     |
+| `Presence`         | Replaces this participant's presence state                      |
+| `AttachmentData`   | Bytes of an attachment this participant added                   |
+| `Submit`           | Requests a submission at the given sequence                     |
+| `Stop`             | Stops the named agent run                                       |
+| `SelectModel`      | Selects a model by catalog ID                                   |
+
+**Host to collaborators**
+
+| Message                      | Purpose                                                                                                                                  |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| `Welcome`                    | Participant UUID, timeline snapshot, draft state, participants and their presence, model, submission sequence, stored attachment IDs |
+| `Rejected`                   | Join refused (e.g. protocol version) or a request refused; peer-specific                                                                 |
+| `DraftUpdate`                | Yrs update from another participant or the host                                                                                          |
+| `ParticipantJoined` / `Left` | Membership changes                                                                                                                       |
+| `Presence`                   | A participant's latest presence                                                                                                          |
+| `AttachmentData`             | Relayed attachment bytes                                                                                                                 |
+| `AttachmentStored`           | The host holds every byte of an attachment                                                                                               |
+| `ModelSelected`              | The thread's model changed                                                                                                               |
+| `UserMessage`                | An accepted submission, now carrying its sequence, creators, and attachment references instead of bytes                                  |
+| existing agent events        | Unchanged: title, agent start, streamed text, comment replies, end                                                                       |
+
+The host is itself a participant. Its local edits, submissions, stops, and
+model changes go through the same logic as a collaborator's.
+
+Attachment bytes travel in bounded chunks, or on their own stream, so a
+large file never delays draft updates or presence.
+
+## Validation
+
+After applying a collaborator's `DraftUpdate`, the host checks:
+
+- the document has only the `order` and `items` roots;
+- every `order` entry is unique and has an item, and every item is in
+  `order`;
+- every item has a supported kind and exactly the fields listed for it;
+- `creator` and `target` never change, and a new item's creator is the
+  sending participant;
+- bodies contain only version-1 content;
+- attachment records are well-formed, unique by ID, and within size limits.
+
+Any violation is a protocol error, and the host disconnects the peer. The
+update has already been applied by then. With no authentication this is a
+defensive check, not a security boundary. If authentication makes this
+insufficient, the host can validate each update against a scratch copy
+before applying it.
+
+Protocol versions must match exactly and nothing is persisted, so the
+document needs no schema version or compatibility with older clients.
+
+## Implementation notes
+
+- **One code path.** Local and shared threads both back their draft with
+  Yrs. A local thread simply has no peers.
+- **Threading.** Each client's replica lives in its GPUI `Thread` entity.
+  Transactions are synchronous and never cross an `await`. The Tokio side
+  moves only encoded bytes. The host's replica is authoritative.
+- **Optimistic local edits.** Local edits never wait for the network. Queued
+  outgoing updates may be merged while the channel is busy.
+- **Offsets.** Application-facing text offsets are UTF-8 bytes, converted to
+  Yrs offsets at the boundary. Carets and selections that must survive
+  concurrent edits use sticky indices.
+- **Remote edits in focused editors.** Remote edits must preserve the local
+  caret and selection, and are deferred while IME composition is active.
+- **Comment editors.** The inline and composer editors of a comment bind to
+  the same `Text`. The current copy-on-change sync goes away.
+- **Undo.** Undo must never revert another participant's edits. Scope it to
+  local-origin changes, for example with a Yrs `UndoManager`.
+- **Client IDs.** Each replica uses a fresh random Yrs client ID. A rejoin
+  creates a new replica.
+
+## Implementation order
+
+1. **Shared thread controls, no Yrs**: participant UUIDs and derived names,
+   protocol version in `Join`, per-thread model selection with
+   `SelectModel`, and `Stop` from any participant.
+2. **Local Yrs drafts**: move drafts onto Yrs for all threads. Add
+   multi-block composing, comments as items, per-block attachments,
+   navigation, empty-item removal, and the new prompt format.
+3. **Draft sync**: sync the draft through the host, make collaborators
+   writable, and submit through the host with sequence numbers.
+4. **Presence**: remote carets and selections, avatar gutters, and
+   presence-aware removal.
+5. **Attachment transfer**: send bytes separately with progress and stored
+   status, and reference attachments by ID in published messages and
+   `Welcome`.
+
+## Future work
+
+These fit the design without changing the document layout:
+
+- **Queued messages**: accepting a submission (snapshot and remove) is
+  already separate from starting a run. Queueing means accepting while
+  generating, showing the accepted message as pending, and running it after
+  the current run.
+- **Permissions**: binary edit/view. The host drops draft updates, presence
+  edits, `Submit`, `Stop`, and `SelectModel` from viewers. Viewers get the
+  current read-only rendering. Nothing changes in the document.
+- **Authentication**: the host maps authenticated identities to participant
+  UUIDs and enforces `creator`.
+- **Contributor history**: the host can derive which items each participant's
+  updates touched from Yrs events, without changing the document.
+- **Mentions and inline formatting**: see
+  [Document layout](#document-layout).
+- **Reordering blocks**: possible because order is separate from content. No
+  UI is planned.
+
+Out of scope: host migration, persistence, keeping identity across
+reconnects, collaborative undo semantics beyond undoing local changes, and an
+invitation format beyond today's endpoint ID.
+
+## Acceptance scenarios
+
+**Two participants start from empty**
+
+1. Alice and Bob join an empty shared thread. Both carets and avatars share
+   one draft row.
+2. Alice types. A block is created with Alice as creator, and she stays in
+   it.
+3. Bob sees Alice's text and caret live. His caret is at the draft position
+   below her block.
+
+**Independent and multiple blocks**
+
+1. Alice creates block A, and Bob types at the draft position, creating B.
+2. Alice moves to the draft position and types, creating C.
+3. Every replica shows A, B, C, and the agent prompt lists them in that
+   order under their creators' names.
+
+**Co-editing**
+
+1. Bob presses Up from the draft position into A.
+2. Bob's avatar layers beside Alice's on A.
+3. Both edit concurrently. Replicas converge, and each caret stays anchored
+   through the other's edits.
+
+**Empty block removal**
+
+1. Bob clears A while Alice's caret is still in A. A stays.
+2. Alice clicks away. A is removed for everyone.
+
+**Submission while typing**
+
+1. Alice and Bob each have a non-empty block. Bob is mid-sentence.
+2. Alice presses Ctrl-Enter. One user message with both blocks appears for
+   everyone, and exactly one agent run starts.
+3. Bob's characters typed after the host's snapshot are discarded, and his
+   caret moves to the draft position.
+4. Bob pressing Ctrl-Enter at the same moment starts no second run.
+
+**Comments**
+
+1. While the agent is still streaming, Bob selects part of its answer and
+   types, creating a comment.
+2. Alice sees the highlight, the inline editor, and the composer card with
+   Bob's avatar, and can edit the comment.
+3. After submission, the agent replies to the comment, and the reply shows
+   under the comment in the response.
+
+**Attachments**
+
+1. Bob pastes an image into his block. Everyone sees a loading chip, and
+   Send is disabled.
+2. Once the host has stored the image, Alice can send even though Carol is
+   still downloading it.
+3. The published message shows the image in Bob's block. Carol's chip
+   finishes loading.
+
+**Thread controls**
+
+1. Carol, a collaborator, changes the model. Every picker updates, and the
+   next run uses it.
+2. During the run, Bob presses Stop. The host cancels the run for everyone.
+
+**Late join**
+
+1. Dave joins mid-generation. He receives the timeline, the draft with
+   everyone's items, presence, the model, and then attachment bytes.
+2. His replica converges with the host, and his first edit is visible to
+   everyone.
