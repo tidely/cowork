@@ -28,14 +28,22 @@
 //!
 //! Text positions throughout the API are UTF-8 byte offsets on char boundaries, matching Rust
 //! strings; the document is configured to count text in bytes so no conversion is needed.
+//!
+//! Changes made through a [`Draft`]'s own methods are recorded as they commit and handed out by
+//! [`Draft::take_local_update`]; changes merged in with [`Draft::apply_update`] never are, so a
+//! replica never echoes other participants' content back as its own.
 
 mod item;
 mod text_edit;
+mod validate;
 
 #[cfg(test)]
 mod tests;
 
-use std::collections::{BTreeSet, HashSet};
+use std::{
+    collections::{BTreeSet, HashSet},
+    sync::{Arc, Mutex, MutexGuard, PoisonError},
+};
 
 use anyhow::{Context as _, Result};
 use uuid::Uuid;
@@ -49,6 +57,7 @@ pub use item::{
     AttachmentId, AttachmentKind, AttachmentRecord, CommentTarget, DraftItem, DraftItemKind, ItemId,
 };
 pub use text_edit::TextEdit;
+pub use validate::verify_change;
 
 const ORDER: &str = "order";
 const ITEMS: &str = "items";
@@ -62,6 +71,11 @@ const TARGET: &str = "target";
 const KIND_PROMPT: &str = "prompt";
 const KIND_COMMENT: &str = "comment";
 
+/// Transaction origin of [`Draft::apply_update`], which the local update recorder skips.
+const REMOTE_ORIGIN: &str = "draft:remote";
+/// Key of the document's update observer that records local updates.
+const LOCAL_UPDATE_OBSERVER: &str = "draft:local-updates";
+
 /// One replica of a thread's draft.
 ///
 /// All methods take `&self`; each call runs in its own Yrs transaction.
@@ -69,6 +83,10 @@ pub struct Draft {
     doc: Doc,
     order: ArrayRef,
     items: MapRef,
+    /// The v1 update of every local transaction since the last [`Self::take_local_update`],
+    /// pushed by the document's update observer. The observer lives in `doc`, which this struct
+    /// owns exclusively, so it is dropped along with it.
+    local_updates: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
 impl Default for Draft {
@@ -85,7 +103,48 @@ impl Draft {
         });
         let order = doc.get_or_insert_array(ORDER);
         let items = doc.get_or_insert_map(ITEMS);
-        Self { doc, order, items }
+
+        let local_updates = Arc::new(Mutex::new(Vec::new()));
+        let recorder = local_updates.clone();
+        // Yrs only invokes update observers for transactions that inserted or deleted something,
+        // so no-op transactions record nothing.
+        doc.observe_update_v1(LOCAL_UPDATE_OBSERVER, move |txn, event| {
+            let remote = txn
+                .origin()
+                .is_some_and(|origin| origin.as_ref() == REMOTE_ORIGIN.as_bytes());
+            if !remote {
+                lock(&recorder).push(event.update.clone());
+            }
+        })
+        .expect("a new document has no active transaction");
+
+        Self {
+            doc,
+            order,
+            items,
+            local_updates,
+        }
+    }
+
+    /// The v1 update of every local change since the previous call, merged into one update, or
+    /// `None` when nothing changed locally.
+    ///
+    /// Local changes are those made through this `Draft`'s own mutating methods
+    /// ([`Self::create_prompt`], [`Self::create_comment`], [`Self::remove_items`],
+    /// [`Self::set_body`], [`Self::edit_body`], [`Self::add_attachment`],
+    /// [`Self::remove_attachment`]). Changes merged in with [`Self::apply_update`] are never
+    /// reported, though local changes made afterwards may depend on them.
+    pub fn take_local_update(&self) -> Option<Vec<u8>> {
+        let updates = std::mem::take(&mut *lock(&self.local_updates));
+        if updates.is_empty() {
+            return None;
+        }
+        let updates = updates.iter().map(|update| {
+            // These bytes were just encoded by Yrs itself; failing to decode them is a Yrs bug.
+            Update::decode_v1(update).expect("yrs produced an undecodable update")
+        });
+        let merged = Update::merge_updates(updates);
+        (!merged.is_empty()).then(|| merged.encode_v1())
     }
 
     /// Appends a prompt block. `body` may be empty.
@@ -282,11 +341,12 @@ impl Draft {
     /// Merges a v1 update (idempotent, commutative).
     ///
     /// Parts of the update whose causal dependencies haven't arrived yet are kept pending inside
-    /// the document and integrated once they do.
+    /// the document and integrated once they do. Nothing merged here is reported by
+    /// [`Self::take_local_update`].
     pub fn apply_update(&self, update: &[u8]) -> Result<()> {
         let update = Update::decode_v1(update).context("invalid draft update")?;
         self.doc
-            .transact_mut()
+            .transact_mut_with(REMOTE_ORIGIN)
             .apply_update(update)
             .context("failed to apply draft update")
     }
@@ -383,6 +443,11 @@ fn get_string<T: ReadTxn>(txn: &T, map: &MapRef, key: &str) -> Option<String> {
         Out::Any(Any::String(s)) => Some(s.to_string()),
         _ => None,
     }
+}
+
+/// Locks `mutex`, ignoring poisoning: the guarded list of updates is valid after any panic.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn parse_order_entry(entry: &Out) -> Option<ItemId> {

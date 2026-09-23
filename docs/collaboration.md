@@ -6,11 +6,16 @@ Yrs document, and the protocol between host and collaborators.
 
 ## Status
 
-Steps 1 and 2 of the [implementation order](#implementation-order) are done:
+Steps 1 to 3 of the [implementation order](#implementation-order) are done:
 participant identity, the protocol version handshake, shared model selection,
-stopping from any participant, and local Yrs drafts with prompt blocks,
-comments as items, per-block attachments, navigation, and empty-item removal.
-Collaborators are still read-only, and the draft is not yet synced.
+stopping from any participant, Yrs drafts with prompt blocks, comments as
+items, per-block attachments, navigation, and empty-item removal, and the
+draft synced through the host with host-coordinated submission.
+
+Two interim rules apply until later steps replace them; see
+[Implementation order](#implementation-order). Not yet implemented: telling a
+collaborator why the host rejected their submission (generating, attachments
+loading); the request is currently dropped silently.
 
 ## Summary
 
@@ -510,9 +515,21 @@ document needs no schema version or compatibility with older clients.
    writable, and submit through the host with sequence numbers.
 4. **Presence**: remote carets and selections, avatar gutters, and
    presence-aware removal.
+
+   **Replace the interim removal rule.** Without presence, nobody can tell
+   whether someone else is typing in an item. Until this step, an empty item
+   is removed automatically (on blur, or when its last attachment is
+   removed) only by its creator. Escape and Backspace still remove any empty
+   item. This step replaces the creator check with "nobody else is focused in
+   it" (`ThreadDraft::remove_if_abandoned`), and adds the host's cleanup of
+   empty items a disconnecting participant was focused in.
 5. **Attachment transfer**: send bytes separately with progress and stored
    status, and reference attachments by ID in published messages and
    `Welcome`.
+
+   **Enable attaching in joined threads.** Until this step, collaborators
+   cannot attach files: the attach button is disabled, and pasting or
+   dropping files does nothing (`Cowork::draft_accepts_attachments`).
 
 ## Future work
 

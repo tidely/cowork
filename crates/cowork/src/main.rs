@@ -17,8 +17,8 @@ use agent::{Agent as StreamingAgent, AgentEvent};
 use anyhow::Context as _;
 use base64::Engine as _;
 use draft::{
-    AttachmentId, AttachmentKind, AttachmentRecord, CommentTarget, Draft, DraftItemKind, ItemId,
-    TextEdit,
+    AttachmentId, AttachmentKind, AttachmentRecord, CommentTarget, Draft, DraftItem, DraftItemKind,
+    ItemId, TextEdit,
 };
 use gpui::{
     Animation, AnimationExt, App, AppContext, AssetSource, AsyncApp, Bounds, ClipboardEntry,
@@ -850,6 +850,11 @@ struct ThreadDraft {
     doc: Draft,
     attachment_bytes: HashMap<AttachmentId, FileAttachment>,
     editors: HashMap<ItemId, ItemEditors>,
+    /// The text each item editor last agreed on with the document. An editor
+    /// catches up with others' edits only when it is next drawn, so a
+    /// keystroke can arrive first; the change it makes is then its difference
+    /// from this text, not from the document, which would revert those edits.
+    synced_text: HashMap<EntityId, String>,
     /// The empty spot below the prompt blocks; typing there creates a block.
     draft_position: Option<Entity<TextareaState>>,
 
@@ -902,6 +907,7 @@ impl ThreadDraft {
             doc: Draft::new(),
             attachment_bytes: HashMap::new(),
             editors: HashMap::new(),
+            synced_text: HashMap::new(),
             draft_position: None,
             attachment_batches: HashMap::new(),
             comments_folded: false,
@@ -979,6 +985,29 @@ impl ThreadDraft {
         chain
     }
 
+    /// Applies what the user typed into an item's editor to the document.
+    ///
+    /// The editor may not show others' latest edits yet, so its change is
+    /// taken relative to the text it last synced and moved past those edits
+    /// before it is applied. Returns the item's resulting text.
+    fn apply_typing(&mut self, id: ItemId, editor: EntityId, typed: &str) -> Option<String> {
+        let body = self.doc.body(id)?;
+        let synced = self
+            .synced_text
+            .get(&editor)
+            .cloned()
+            .unwrap_or_else(|| body.clone());
+        if let Some(mut edit) = TextEdit::diff(&synced, typed) {
+            if let Some(remote) = TextEdit::diff(&synced, &body) {
+                edit.range = remote.map_offset(edit.range.start)..remote.map_offset(edit.range.end);
+            }
+            self.doc.edit_body(id, &edit);
+        }
+        // Everything the editor shows is in the document now.
+        self.synced_text.insert(editor, typed.to_owned());
+        self.doc.body(id)
+    }
+
     /// Removes items together with their editors and file bytes.
     fn remove_items(&mut self, ids: &[ItemId]) {
         let attachments = self
@@ -994,7 +1023,11 @@ impl ThreadDraft {
             .collect::<Vec<_>>();
         self.doc.remove_items(ids);
         for id in ids {
-            self.editors.remove(id);
+            if let Some(editors) = self.editors.remove(id) {
+                for editor in editors.all() {
+                    self.synced_text.remove(&editor.entity_id());
+                }
+            }
         }
         self.attachment_batches
             .retain(|_, block| !ids.contains(block));
@@ -1010,6 +1043,24 @@ impl ThreadDraft {
         }
         self.remove_items(&[id]);
         true
+    }
+
+    /// Removes an empty item the local user has left, if they created it.
+    ///
+    /// Interim rule until presence (step 4 of the collaboration spec): the
+    /// spec removes an empty item once nobody is focused in it, but without
+    /// presence nobody knows whether someone else just started typing there,
+    /// so only the item's creator removes it. Step 4 replaces this with the
+    /// presence check.
+    fn remove_if_abandoned(&mut self, id: ItemId) -> bool {
+        if !self
+            .doc
+            .item(id)
+            .is_some_and(|item| item.creator == self.author.as_uuid())
+        {
+            return false;
+        }
+        self.remove_if_empty(id)
     }
 
     /// The block to attach a finished file to, creating it when needed.
@@ -1162,17 +1213,22 @@ enum ThreadSharing {
     },
     /// Mirroring someone else's thread.
     ///
-    /// `endpoint` and `connection` are held rather than read: together with
-    /// `host` they keep the QUIC connection and its protocol stream open, so
-    /// replacing this state is what disconnects. Requests to the host, such as
-    /// selecting a model, are sent on `host`.
-    #[allow(dead_code, reason = "fields are held open for their lifetime")]
+    /// Requests to the host, such as draft updates, are sent on `host`. It is
+    /// unbounded so that no request is ever dropped: a lost draft update
+    /// would leave every later one waiting on it forever. Replacing this state
+    /// closes `host` and drops `link`, which is what disconnects.
     Connected {
-        endpoint: Endpoint,
-        connection: Connection,
         host: async_channel::Sender<protocol::CollaboratorMessage>,
+        /// `None` when the peer is not reached over the network, as in tests.
+        link: Option<PeerLink>,
     },
     Failed,
+}
+
+/// Keeps a collaborator's QUIC connection to the host open.
+struct PeerLink {
+    endpoint: Endpoint,
+    _connection: Connection,
 }
 
 impl ThreadSharing {
@@ -1213,8 +1269,10 @@ enum ThreadOwnership {
 }
 
 impl ThreadOwnership {
+    /// Every participant edits the draft. Read-only viewers will come with
+    /// sharing permissions, which the read-only rendering is kept for.
     fn can_write(self) -> bool {
-        matches!(self, Self::Local)
+        true
     }
 
     fn remove_on_disconnect(self) -> bool {
@@ -1464,13 +1522,20 @@ impl Thread {
     }
 
     /// Replaces everything the host is authoritative for with its snapshot.
+    ///
+    /// The draft is merged rather than replaced: local edits the host has
+    /// not received yet are still on their way to it and must survive.
     fn rebase(&mut self, welcome: protocol::Welcome, cx: &mut impl AppContext) {
         let protocol::Welcome {
             participant_id,
             thread,
+            draft,
         } = welcome;
         self.participant_id = ParticipantId::from_bytes(participant_id);
         self.draft.author = self.participant_id;
+        if let Err(error) = self.draft.doc.apply_update(&draft) {
+            eprintln!("failed to merge the host's draft: {error:#}");
+        }
         self.participants = thread
             .participants
             .iter()
@@ -1505,8 +1570,52 @@ impl Thread {
         }
     }
 
+    /// Sends the draft's local changes to whoever else has a copy: every
+    /// collaborator when hosting, the host when mirroring.
+    fn flush_draft(&mut self) {
+        let Some(update) = self.draft.doc.take_local_update() else {
+            return;
+        };
+        match &self.sharing {
+            ThreadSharing::Shared { .. } => {
+                self.publish(protocol::HostMessage::DraftUpdate(update));
+            }
+            ThreadSharing::Connected { .. } => {
+                self.request(protocol::CollaboratorMessage::DraftUpdate(update));
+            }
+            // Whoever joins later receives the whole draft with their welcome.
+            ThreadSharing::NotShared | ThreadSharing::Sharing | ThreadSharing::Failed => {}
+        }
+    }
+
+    /// Applies a collaborator's draft update and forwards it to everyone.
+    ///
+    /// Fails when the update breaks the draft's invariants or changes what
+    /// `author` may not change, such as attributing an item to someone else.
+    /// It has been applied by then; failing only tells the caller to
+    /// disconnect the collaborator.
+    fn apply_collaborator_update(
+        &mut self,
+        author: ParticipantId,
+        update: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        let before = self.draft.doc.items();
+        self.draft.doc.apply_update(&update)?;
+        self.publish(protocol::HostMessage::DraftUpdate(update));
+        self.draft.doc.validate()?;
+        draft::verify_change(&before, &self.draft.doc.items(), author.as_uuid())
+    }
+
+    /// How many submissions this thread has accepted.
+    fn submission_count(&self) -> u64 {
+        self.timeline
+            .iter()
+            .filter(|message| matches!(message, TimelineMessage::User(_)))
+            .count() as u64
+    }
+
     /// Sends a request to the host of a mirrored thread. Returns `false` when
-    /// this thread is not mirrored or the host is unreachable.
+    /// this thread is not mirrored or its connection has closed.
     fn request(&self, request: protocol::CollaboratorMessage) -> bool {
         let ThreadSharing::Connected { host, .. } = &self.sharing else {
             return false;
@@ -1617,6 +1726,11 @@ impl Thread {
             protocol::HostMessage::ModelSelected { catalog_id } => {
                 if let Some(model) = ModelSelection::from_catalog_id(&catalog_id) {
                     self.model = model;
+                }
+            }
+            protocol::HostMessage::DraftUpdate(update) => {
+                if let Err(error) = self.draft.doc.apply_update(&update) {
+                    eprintln!("failed to apply a draft update: {error:#}");
                 }
             }
             protocol::HostMessage::ThreadTitled(title) => self.summary.title = title,
@@ -1910,6 +2024,10 @@ struct Cowork {
     active_generations: HashMap<Uuid, ActiveGeneration>,
     /// Who the local user is in the threads this app creates and hosts.
     local_participant_id: ParticipantId,
+    /// The draft editor the user is typing in, so that when its item is
+    /// removed, by a submission or by someone else, the caret can move to
+    /// the draft position instead of vanishing.
+    typing_in: Option<(Uuid, EntityId, gpui::FocusHandle)>,
     /// The model new threads start with: the last one selected locally.
     new_thread_model: ModelSelection,
     /// Always shows the active thread's model; see [`Cowork::sync_model_picker`].
@@ -2022,12 +2140,25 @@ impl Cowork {
     /// for new items and the draft position, drops those of removed items,
     /// and shows text changed by anything other than the editor itself.
     fn prepare_draft(&mut self, draft_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((missing, needs_draft_position, shown)) =
+        // Only when the removed editor still has focus: anything else the
+        // user has moved to since keeps it.
+        let focused = self
+            .typing_in
+            .as_ref()
+            .filter(|(typing_draft, _, focus)| {
+                *typing_draft == draft_id
+                    && window.focused(cx).is_none_or(|focused| focused == *focus)
+            })
+            .map(|(_, editor, _)| *editor);
+        let Some((missing, needs_draft_position, shown, lost_focus)) =
             self.update_draft(draft_id, cx, |draft| {
                 let items = draft.doc.items();
                 draft
                     .editors
                     .retain(|id, _| items.iter().any(|item| item.id == *id));
+                // The item being typed in is gone: submitted, or removed by
+                // someone else.
+                let lost_focus = focused.is_some_and(|editor| draft.slot_of(editor).is_none());
                 let mut missing = Vec::new();
                 let mut shown = Vec::new();
                 for item in items {
@@ -2041,15 +2172,20 @@ impl Cowork {
                         None => missing.push(item),
                     }
                 }
-                (missing, draft.draft_position.is_none(), shown)
+                (missing, draft.draft_position.is_none(), shown, lost_focus)
             })
         else {
             return;
         };
-
-        for (editor, body) in shown {
-            Self::show_text(&editor, &body, window, cx);
+        if lost_focus {
+            self.typing_in = None;
         }
+
+        let synced = shown
+            .into_iter()
+            .filter(|(editor, body)| Self::show_text(editor, body, window, cx))
+            .map(|(editor, body)| (editor.entity_id(), body))
+            .collect::<Vec<_>>();
         let created = missing
             .into_iter()
             .map(|item| {
@@ -2068,17 +2204,23 @@ impl Cowork {
             .collect::<Vec<_>>();
         let draft_position =
             needs_draft_position.then(|| Self::new_routed_draft_editor(draft_id, "", window, cx));
-        if created.is_empty() && draft_position.is_none() {
-            return;
-        }
         self.update_draft(draft_id, cx, |draft| {
+            draft.synced_text.extend(synced);
             for (id, editors) in created {
+                if let Some(body) = draft.doc.body(id) {
+                    for editor in editors.all() {
+                        draft.synced_text.insert(editor.entity_id(), body.clone());
+                    }
+                }
                 draft.editors.entry(id).or_insert(editors);
             }
             if let Some(draft_position) = draft_position {
                 draft.draft_position.get_or_insert(draft_position);
             }
         });
+        if lost_focus {
+            self.focus_draft_editor(draft_id, EditorSlot::DraftPosition, None, window, cx);
+        }
     }
 
     /// Replaces an editor's text, keeping its selection on the same text.
@@ -2086,25 +2228,35 @@ impl Cowork {
     /// Waits while an IME composition is in progress: its marked text is in
     /// the editor but not yet in the document, and replacing it would cancel
     /// the composition. The text catches up once the composition commits.
-    fn show_text(editor: &Entity<TextareaState>, text: &str, window: &mut Window, cx: &mut App) {
+    ///
+    /// Returns whether the editor shows `text` afterwards.
+    fn show_text(
+        editor: &Entity<TextareaState>,
+        text: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> bool {
         let (value, selection) = {
             let editor = editor.read(cx);
             (editor.value(), editor.selected_range())
         };
         let Some(edit) = TextEdit::diff(&value, text) else {
-            return;
+            return true;
         };
         if editor
             .update(cx, |editor, cx| editor.marked_text_range(window, cx))
             .is_some()
         {
-            return;
+            return false;
         }
         let selection = edit.map_offset(selection.start)..edit.map_offset(selection.end);
+        // Replacing the value also clears the editor's undo history, which
+        // keeps undo from reverting anyone else's edits.
         editor.update(cx, |editor, cx| {
             editor.set_value(SharedString::from(text.to_owned()), window, cx);
             editor.set_selected_range(selection, cx);
         });
+        true
     }
 
     fn draft_editor_event(
@@ -2116,26 +2268,52 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) {
         let editor_id = editor.entity_id();
+        // Switching to another window blurs too, but the user will be back.
+        if matches!(event, InputEvent::Blur)
+            && window.is_window_active()
+            && self
+                .typing_in
+                .as_ref()
+                .is_some_and(|(typing_draft, typing_editor, _)| {
+                    (*typing_draft, *typing_editor) == (draft_id, editor_id)
+                })
+        {
+            self.typing_in = None;
+        }
         match event {
             InputEvent::Change => {
                 let value = editor.read(cx).value().to_string();
                 let editor = editor.clone();
-                self.update_draft(draft_id, cx, move |draft| match draft.slot_of(editor_id) {
-                    // Typing at the draft position creates a block, and the
-                    // editor typed into becomes that block's, so focus, caret
-                    // and any IME composition carry on uninterrupted.
-                    Some(EditorSlot::DraftPosition) if !value.is_empty() => {
-                        let id = draft.doc.create_prompt(draft.author.as_uuid(), &value);
-                        draft.editors.insert(id, ItemEditors::Prompt(editor));
-                        draft.draft_position = None;
-                    }
-                    Some(slot) => {
-                        if let Some(id) = slot.item() {
-                            draft.doc.set_body(id, &value);
+                let merged = self
+                    .update_draft(draft_id, cx, {
+                        let editor = editor.clone();
+                        move |draft| match draft.slot_of(editor_id) {
+                            // Typing at the draft position creates a block, and
+                            // the editor typed into becomes that block's, so
+                            // focus, caret and any IME composition carry on
+                            // uninterrupted.
+                            Some(EditorSlot::DraftPosition) if !value.is_empty() => {
+                                let id = draft.doc.create_prompt(draft.author.as_uuid(), &value);
+                                draft.editors.insert(id, ItemEditors::Prompt(editor));
+                                draft.synced_text.insert(editor_id, value);
+                                draft.draft_position = None;
+                                None
+                            }
+                            Some(slot) => slot
+                                .item()
+                                .and_then(|id| draft.apply_typing(id, editor_id, &value)),
+                            None => None,
                         }
-                    }
-                    None => {}
-                });
+                    })
+                    .flatten();
+                // Show others' edits the keystroke was merged with right away.
+                if let Some(body) = merged
+                    && Self::show_text(&editor, &body, window, cx)
+                {
+                    self.update_draft(draft_id, cx, |draft| {
+                        draft.synced_text.insert(editor_id, body);
+                    });
+                }
                 cx.notify();
             }
             // Empty items disappear once nobody is in them anymore. Switching
@@ -2163,10 +2341,13 @@ impl Cowork {
                 if still_in_item || self.has_pending_reads(draft_id, id, cx) {
                     return;
                 }
-                self.update_draft(draft_id, cx, |draft| draft.remove_if_empty(id));
+                self.update_draft(draft_id, cx, |draft| draft.remove_if_abandoned(id));
                 cx.notify();
             }
-            InputEvent::Focus | InputEvent::Blur | InputEvent::PressEnter { .. } => {}
+            InputEvent::Focus => {
+                self.typing_in = Some((draft_id, editor_id, editor.focus_handle(cx)));
+            }
+            InputEvent::Blur | InputEvent::PressEnter { .. } => {}
         }
     }
 
@@ -2241,6 +2422,9 @@ impl Cowork {
             editor.update(cx, |editor, cx| editor.set_selected_range(caret..caret, cx));
         }
         editor.focus_handle(cx).focus(window, cx);
+        // Recorded right away; the focus event only arrives with the next
+        // frame, after the editor it replaces may already be gone.
+        self.typing_in = Some((draft_id, editor.entity_id(), editor.focus_handle(cx)));
         cx.notify();
         true
     }
@@ -2705,8 +2889,8 @@ impl Cowork {
                         return Ok(());
                     };
                     cowork.update(cx, |cowork, cx| {
-                        cowork.collaborator_request(&thread, request, cx);
-                    })?;
+                        cowork.collaborator_request(&thread, participant_id, request, cx)
+                    })??;
                 }
             }
         }
@@ -2720,14 +2904,19 @@ impl Cowork {
         peer: &HostPeer,
         cx: &mut AsyncApp,
     ) -> anyhow::Result<broadcast::Receiver<protocol::HostMessage>> {
-        let (snapshot, events) = thread
+        let (snapshot, draft, events) = thread
             .update(cx, |thread, _| {
-                Some((thread.to_protocol(), thread.subscribe()?))
+                Some((
+                    thread.to_protocol(),
+                    thread.draft.doc.encode_state(),
+                    thread.subscribe()?,
+                ))
             })?
             .context("Thread is no longer shared.")?;
         peer.send(protocol::HostMessage::Welcome(protocol::Welcome {
             participant_id: participant_id.into_bytes(),
             thread: snapshot,
+            draft,
         }))
         .await
         .context("Peer disconnected before receiving the thread snapshot.")?;
@@ -2735,18 +2924,47 @@ impl Cowork {
     }
 
     /// Applies a request a collaborator sent to a thread this app hosts.
+    ///
+    /// Fails when the collaborator broke the protocol and must be
+    /// disconnected.
     fn collaborator_request(
         &mut self,
         thread: &Entity<Thread>,
+        participant: ParticipantId,
         request: protocol::CollaboratorMessage,
         cx: &mut Context<Self>,
-    ) {
+    ) -> anyhow::Result<()> {
         match request {
             // Only valid as the first message, which `serve_peer` consumes.
             protocol::CollaboratorMessage::Join { .. } => {}
+            protocol::CollaboratorMessage::DraftUpdate(update) => {
+                thread
+                    .update(cx, |thread, _| {
+                        thread.apply_collaborator_update(participant, update)
+                    })
+                    .with_context(|| format!("Invalid draft update from {participant:?}."))?;
+                cx.notify();
+            }
+            protocol::CollaboratorMessage::Submit { sequence } => {
+                let (draft_id, stale) = {
+                    let thread = thread.read(cx);
+                    (
+                        thread.draft.id,
+                        thread.generating || thread.submission_count() != sequence,
+                    )
+                };
+                // A stale sequence means another submission won the race;
+                // everyone sees that one.
+                // TODO: tell the submitter why a submission was not accepted.
+                if !stale && !self.draft_is_loading_attachments(draft_id) {
+                    self.accept_submission(draft_id, Some(thread.clone()), cx);
+                    let thread_id = thread.read(cx).instance_id;
+                    self.thread_updated(thread_id, cx);
+                }
+            }
             protocol::CollaboratorMessage::SelectModel { catalog_id } => {
                 let Some(model) = ModelSelection::from_catalog_id(&catalog_id) else {
-                    return;
+                    return Ok(());
                 };
                 thread.update(cx, |thread, cx| {
                     thread.emit(
@@ -2763,6 +2981,7 @@ impl Cowork {
                 self.cancel_generation(thread_id, Some(Uuid::from_bytes(message_id)), cx);
             }
         }
+        Ok(())
     }
 
     fn copy_endpoint_id(&mut self, cx: &mut Context<Self>) {
@@ -2971,8 +3190,6 @@ impl Cowork {
         dialog.update(cx, |dialog, _| {
             dialog.status = JoinStatus::Joining;
         });
-        // Re-authored with the id the host assigns once the thread is joined.
-        let draft = ThreadDraft::new(self.local_participant_id);
         let window_handle = window.window_handle();
         cx.notify();
 
@@ -3020,37 +3237,69 @@ impl Cowork {
                 }
             };
 
-            let (requests, events) = host.split();
-            let Ok((thread, thread_id)) = this.update(cx, move |this, cx| {
-                let thread = cx.new(|cx| {
-                    Thread::from_welcome(
-                        welcome,
-                        draft,
-                        ThreadSharing::Connected {
-                            endpoint,
-                            connection,
-                            host: requests,
-                        },
-                        cx,
-                    )
-                });
-                let thread_id = thread.read(cx).instance_id;
-                this.thread_store.update(cx, |store, _| {
-                    store.threads.push_front(thread.clone());
-                });
-                this.active_thread_id = Some(thread_id);
-                this.selection_message_id = None;
-                this.join_dialog = None;
-                cx.notify();
-                (thread, thread_id)
-            }) else {
-                return;
+            let link = PeerLink {
+                endpoint,
+                _connection: connection,
             };
+            if this
+                .update(cx, move |this, cx| {
+                    this.mirror_thread(welcome, host, Some(link), cx);
+                    this.join_dialog = None;
+                })
+                .is_err()
+            {
+                return;
+            }
             _ = cx.update_window(window_handle, |_, window, cx| {
                 window.close_dialog(cx);
             });
+        })
+        .detach();
+    }
 
-            // Replay the host's changes onto the local mirror of the thread.
+    /// Opens a joined thread: builds its mirror from the host's welcome,
+    /// replays the host's events onto it, and forwards its requests to the
+    /// host in order. Returns the new thread's id.
+    fn mirror_thread(
+        &mut self,
+        welcome: protocol::Welcome,
+        host: ThreadHost,
+        link: Option<PeerLink>,
+        cx: &mut Context<Self>,
+    ) -> Uuid {
+        let (host_requests, events) = host.split();
+        let (requests, queued_requests) = async_channel::unbounded();
+        cx.background_spawn(async move {
+            while let Ok(request) = queued_requests.recv().await {
+                if host_requests.send(request).await.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
+
+        // Re-authored with the id the host assigned by `from_welcome`.
+        let draft = ThreadDraft::new(self.local_participant_id);
+        let thread = cx.new(|cx| {
+            Thread::from_welcome(
+                welcome,
+                draft,
+                ThreadSharing::Connected {
+                    host: requests,
+                    link,
+                },
+                cx,
+            )
+        });
+        let thread_id = thread.read(cx).instance_id;
+        self.thread_store.update(cx, |store, _| {
+            store.threads.push_front(thread.clone());
+        });
+        self.active_thread_id = Some(thread_id);
+        self.selection_message_id = None;
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
             while let Ok(event) = events.recv().await {
                 thread.update(cx, |thread, cx| thread.apply(event, cx));
                 if this
@@ -3060,8 +3309,32 @@ impl Cowork {
                     return;
                 }
             }
+            // The host stopped sharing, went away, or dropped us.
+            _ = this.update(cx, |this, cx| this.remove_mirrored_thread(thread_id, cx));
         })
         .detach();
+        thread_id
+    }
+
+    /// Closes a joined thread, which has nothing left to show once it is no
+    /// longer connected to its host.
+    fn remove_mirrored_thread(&mut self, thread_id: Uuid, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+            return;
+        };
+        if !thread.read(cx).ownership.remove_on_disconnect() {
+            return;
+        }
+        self.thread_store.update(cx, |store, cx| {
+            store
+                .threads
+                .retain(|thread| thread.read(cx).instance_id != thread_id);
+        });
+        if self.active_thread_id == Some(thread_id) {
+            self.active_thread_id = None;
+            self.selection_message_id = None;
+        }
+        cx.notify();
     }
 
     fn toggle_sharing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -3094,21 +3367,15 @@ impl Cowork {
                 // Replacing the state drops the channel to the host, closing
                 // the protocol stream that kept the connection alive.
                 let endpoint = thread.update(cx, |thread, _| {
-                    let ThreadSharing::Connected { endpoint, .. } =
+                    let ThreadSharing::Connected { link, .. } =
                         std::mem::replace(&mut thread.sharing, ThreadSharing::NotShared)
                     else {
                         return None;
                     };
-                    Some(endpoint)
+                    link.map(|link| link.endpoint)
                 });
                 if thread.read(cx).ownership.remove_on_disconnect() {
-                    self.thread_store.update(cx, |store, cx| {
-                        store
-                            .threads
-                            .retain(|thread| thread.read(cx).instance_id != thread_id);
-                    });
-                    self.active_thread_id = None;
-                    self.selection_message_id = None;
+                    self.remove_mirrored_thread(thread_id, cx);
                     self.new_thread_draft = ThreadDraft::new(self.local_participant_id);
                     self.focus_composer(window, cx);
                 }
@@ -3744,7 +4011,9 @@ impl Cowork {
                 .doc
                 .create_comment(draft.author.as_uuid(), target, initial_text);
             draft.comments_folded = false;
-            (draft.id, comment_id)
+            let draft_id = draft.id;
+            thread.flush_draft();
+            (draft_id, comment_id)
         });
         TextSelection::clear(window, cx);
         self.focus_draft_editor(
@@ -4757,7 +5026,8 @@ impl Cowork {
     }
 
     /// Finds a writable draft wherever it lives, so work started on one thread
-    /// still lands there after the user switches to another.
+    /// still lands there after the user switches to another. Local changes
+    /// made by `update` are sent to the thread's other participants.
     fn update_draft<R>(
         &mut self,
         draft_id: Uuid,
@@ -4765,7 +5035,11 @@ impl Cowork {
         update: impl FnOnce(&mut ThreadDraft) -> R,
     ) -> Option<R> {
         if self.new_thread_draft.id == draft_id {
-            return Some(update(&mut self.new_thread_draft));
+            let result = update(&mut self.new_thread_draft);
+            // Nobody else has this draft yet; whoever joins once it has a
+            // thread receives all of it with their welcome.
+            self.new_thread_draft.doc.take_local_update();
+            return Some(result);
         }
         let thread = self
             .thread_store
@@ -4777,7 +5051,11 @@ impl Cowork {
                 thread.ownership.can_write() && thread.draft.id == draft_id
             })
             .cloned()?;
-        Some(thread.update(cx, |thread, _| update(&mut thread.draft)))
+        Some(thread.update(cx, |thread, _| {
+            let result = update(&mut thread.draft);
+            thread.flush_draft();
+            result
+        }))
     }
 
     fn draft_is_loading_attachments(&self, draft_id: Uuid) -> bool {
@@ -4796,6 +5074,18 @@ impl Cowork {
         }
     }
 
+    /// Whether files can be attached to the draft. Not yet in joined
+    /// threads: attachment bytes only reach the host once attachment
+    /// transfer (step 5 of the collaboration spec) exists.
+    fn draft_accepts_attachments(&self, draft_id: Uuid, cx: &App) -> bool {
+        self.new_thread_draft.id == draft_id
+            || self.thread_store.read(cx).threads.iter().any(|thread| {
+                let thread = thread.read(cx);
+                thread.draft.id == draft_id
+                    && !matches!(thread.sharing, ThreadSharing::Connected { .. })
+            })
+    }
+
     fn add_attachments(
         &mut self,
         draft_id: Uuid,
@@ -4803,7 +5093,7 @@ impl Cowork {
         sources: Vec<AttachmentSource>,
         cx: &mut Context<Self>,
     ) {
-        if sources.is_empty() {
+        if sources.is_empty() || !self.draft_accepts_attachments(draft_id, cx) {
             return;
         }
         self.attachment_errors
@@ -4936,7 +5226,7 @@ impl Cowork {
             draft.doc.remove_attachment(attachment);
             draft.attachment_bytes.remove(&attachment);
             if !block_focused {
-                draft.remove_if_empty(block);
+                draft.remove_if_abandoned(block);
             }
         });
         self.attachment_errors
@@ -5040,6 +5330,7 @@ impl Cowork {
         if sources.is_empty() {
             return;
         }
+        // Files are not pasted as text even where they cannot be attached.
         cx.stop_propagation();
         self.add_attachments(draft_id, target, sources, cx);
     }
@@ -5183,39 +5474,65 @@ impl Cowork {
     }
 
     fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let active_thread = self
-            .active_thread_id
-            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx));
-        if active_thread.as_ref().is_some_and(|thread| {
-            let thread = thread.read(cx);
-            !thread.ownership.can_write() || thread.generating
-        }) {
+        let active_thread = self.active_thread(cx);
+        if active_thread
+            .as_ref()
+            .is_some_and(|thread| thread.read(cx).generating)
+        {
             return;
         }
-
         let Some(draft_id) = self.writable_draft_id(cx) else {
             return;
         };
         if self.draft_is_loading_attachments(draft_id) {
             return;
         }
-        let focused = self
-            .focused_draft_editor(window, cx)
-            .map(|(_, slot, _)| slot);
+
+        // The host of a mirrored thread accepts submissions, so that exactly
+        // one happens however many participants press Ctrl-Enter at once.
+        if let Some(thread) = active_thread
+            .as_ref()
+            .filter(|thread| matches!(thread.read(cx).sharing, ThreadSharing::Connected { .. }))
+        {
+            let thread = thread.read(cx);
+            if !thread.draft.doc.items().iter().all(DraftItem::is_empty) {
+                thread.request(protocol::CollaboratorMessage::Submit {
+                    sequence: thread.submission_count(),
+                });
+                self.selection_message_id = None;
+                self.follow_generation = true;
+            }
+            return;
+        }
+
+        if self.accept_submission(draft_id, active_thread, cx) {
+            self.selection_message_id = None;
+            self.follow_generation = true;
+            self.timeline_scroll_handle.scroll_to_bottom();
+            // Whoever was typing in a submitted item continues at the draft
+            // position; see `prepare_draft`.
+            if self.focused_draft_editor(window, cx).is_none() {
+                self.focus_draft_editor(draft_id, EditorSlot::DraftPosition, None, window, cx);
+            }
+        }
+    }
+
+    /// Submits a local or hosted thread's draft: publishes its non-empty
+    /// items as one user message and starts the agent on it. Without a
+    /// thread, the draft starts a new one. Returns whether anything was
+    /// submitted.
+    fn accept_submission(
+        &mut self,
+        draft_id: Uuid,
+        active_thread: Option<Entity<Thread>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         let Some((comments, blocks, comments_folded)) = self
             .update_draft(draft_id, cx, Self::take_submission)
             .flatten()
         else {
-            return;
+            return false;
         };
-        // Only those whose item was just submitted move on.
-        let refocus = focused.is_none_or(|slot| {
-            slot.item().is_some_and(|id| {
-                !self
-                    .read_draft(draft_id, cx, |draft| draft.doc.contains(id))
-                    .unwrap_or(false)
-            })
-        });
         self.attachment_errors
             .retain(|error| error.draft_id != draft_id);
 
@@ -5277,11 +5594,6 @@ impl Cowork {
             thread_id
         };
 
-        self.selection_message_id = None;
-        self.follow_generation = true;
-        if refocus {
-            self.focus_draft_editor(draft_id, EditorSlot::DraftPosition, None, window, cx);
-        }
         self.start_generation(
             thread_id,
             prompt,
@@ -5291,7 +5603,7 @@ impl Cowork {
             turn_comments,
             cx,
         );
-        self.timeline_scroll_handle.scroll_to_bottom();
+        true
     }
 
     /// Takes every non-empty item out of the draft, in draft order, as the
@@ -5370,12 +5682,15 @@ impl Cowork {
         let timeline_scroll_handle = self.timeline_scroll_handle.clone();
         let can_write = composer.is_some();
         let active_thread = self.active_thread(cx);
-        // Collaborators cannot write to the draft yet, but they can still pick
-        // the model and stop the agent, like every participant.
+        // Picking the model and stopping the agent stay available to
+        // participants who cannot write to the draft.
         let can_control = can_write
             || active_thread
                 .as_ref()
                 .is_some_and(|thread| thread.read(cx).sharing.is_collaborating());
+        let can_attach = self
+            .writable_draft_id(cx)
+            .is_some_and(|draft_id| self.draft_accepts_attachments(draft_id, cx));
         let loading_attachments = self
             .writable_draft_id(cx)
             .is_some_and(|draft_id| self.draft_is_loading_attachments(draft_id));
@@ -5560,6 +5875,10 @@ impl Cowork {
                         .ghost()
                         .small()
                         .accessibility_label("Attach files")
+                        .disabled(!can_attach)
+                        .when(!can_attach, |this| {
+                            this.tooltip("Attaching files in joined threads is not available yet")
+                        })
                         .on_click(cx.listener(Self::pick_attachments)),
                 )
             })
@@ -6139,6 +6458,7 @@ fn main() -> anyhow::Result<()> {
                         tokio_handle,
                         active_generations: HashMap::new(),
                         local_participant_id,
+                        typing_in: None,
                         new_thread_model: DEFAULT_MODEL,
                         model_picker,
                         model_picker_hovered: false,
@@ -6164,7 +6484,7 @@ fn main() -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use draft::DraftItem;
+
     use gpui_base::TextSelectionLayer;
 
     fn annotate_markdown(markdown: &str, ranges: impl IntoIterator<Item = Range<usize>>) -> String {
@@ -6399,6 +6719,7 @@ mod tests {
             tokio_handle,
             active_generations: HashMap::new(),
             local_participant_id,
+            typing_in: None,
             new_thread_model: DEFAULT_MODEL,
             model_picker,
             model_picker_hovered: false,
@@ -7070,8 +7391,8 @@ mod tests {
     }
 
     #[test]
-    fn collaborator_threads_are_read_only_and_removed_on_disconnect() {
-        assert!(!ThreadOwnership::Remote.can_write());
+    fn collaborator_threads_are_writable_and_removed_on_disconnect() {
+        assert!(ThreadOwnership::Remote.can_write());
         assert!(ThreadOwnership::Remote.remove_on_disconnect());
         assert!(ThreadOwnership::Local.can_write());
         assert!(!ThreadOwnership::Local.remove_on_disconnect());
@@ -7278,6 +7599,7 @@ mod tests {
                 let welcome = protocol::Welcome {
                     participant_id: collaborator_participant.into_bytes(),
                     thread: view.host.read(cx).to_protocol(),
+                    draft: view.host.read(cx).draft.doc.encode_state(),
                 };
                 let draft = ThreadDraft::new(ParticipantId::new());
                 let collaborator =
@@ -7525,7 +7847,9 @@ mod tests {
                     message_id: Uuid::new_v4().into_bytes(),
                 },
             ] {
-                cowork.collaborator_request(&thread, request, cx);
+                cowork
+                    .collaborator_request(&thread, ParticipantId::new(), request, cx)
+                    .expect("valid request");
             }
             assert_eq!(thread.read(cx).model, DEFAULT_MODEL);
             assert!(!cancelled.load(Ordering::Acquire));
@@ -7538,7 +7862,9 @@ mod tests {
                     message_id: running_message_id.into_bytes(),
                 },
             ] {
-                cowork.collaborator_request(&thread, request, cx);
+                cowork
+                    .collaborator_request(&thread, ParticipantId::new(), request, cx)
+                    .expect("valid request");
             }
             assert_eq!(thread.read(cx).model, OLLAMA_QWEN);
             assert!(cancelled.load(Ordering::Acquire));
@@ -8071,6 +8397,591 @@ mod tests {
         assert!(preface.contains("comment_1 — Mossy Crane, on an excerpt"));
         assert!(preface.contains("> quote\nComment: why?"));
         assert_eq!(Cowork::comments_preface(&[], &[], &[]), None);
+    }
+
+    /// A host and a collaborator side by side in one window, connected over
+    /// an in-memory stream through the real protocol code.
+    struct Collaboration<'a> {
+        host: Entity<Cowork>,
+        collaborator: Entity<Cowork>,
+        host_thread: Entity<Thread>,
+        cx: &'a mut gpui::VisualTestContext,
+        _runtime: tokio::runtime::Runtime,
+    }
+
+    struct PairRoot {
+        host: Entity<Cowork>,
+        collaborator: Entity<Cowork>,
+    }
+
+    /// A connected host and collaborator end, relayed on the test's own
+    /// executor, with every message encoded and decoded like on the wire.
+    fn in_memory_peers(cx: &mut App) -> (HostPeer, ThreadHost) {
+        fn relay<Message: serde::Serialize + serde::de::DeserializeOwned + 'static>(
+            from: async_channel::Receiver<Message>,
+            to: async_channel::Sender<Message>,
+            cx: &mut App,
+        ) {
+            cx.spawn(async move |_| {
+                while let Ok(message) = from.recv().await {
+                    let bytes = postcard::to_stdvec(&message).expect("encode message");
+                    let message = postcard::from_bytes(&bytes).expect("decode message");
+                    if to.send(message).await.is_err() {
+                        break;
+                    }
+                }
+            })
+            .detach();
+        }
+
+        let (host_out, host_out_relay) = async_channel::unbounded();
+        let (host_in_relay, host_in) = async_channel::unbounded();
+        let (collaborator_out, collaborator_out_relay) = async_channel::unbounded();
+        let (collaborator_in_relay, collaborator_in) = async_channel::unbounded();
+        relay::<protocol::HostMessage>(host_out_relay, collaborator_in_relay, cx);
+        relay::<protocol::CollaboratorMessage>(collaborator_out_relay, host_in_relay, cx);
+        (
+            protocol::Peer {
+                outgoing: host_out,
+                incoming: host_in,
+            },
+            protocol::Peer {
+                outgoing: collaborator_out,
+                incoming: collaborator_in,
+            },
+        )
+    }
+
+    impl Render for PairRoot {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .size_full()
+                .flex()
+                .child(div().w_1_2().h_full().child(self.host.clone()))
+                .child(div().w_1_2().h_full().child(self.collaborator.clone()))
+        }
+    }
+
+    impl<'a> Collaboration<'a> {
+        /// Starts with the host sharing a thread whose draft has one block,
+        /// and the collaborator joined to it.
+        fn start(cx: &'a mut gpui::TestAppContext) -> Self {
+            cx.update(gpui_component::init);
+            // Never driven, so nothing ever runs on it: the test scheduler
+            // rejects wake-ups from other threads. The agent never answers.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            let endpoint = runtime
+                .block_on(Endpoint::builder(presets::Minimal).bind())
+                .expect("bind endpoint");
+            let tokio_handle = runtime.handle().clone();
+            let thread_id = Uuid::new_v4();
+            let (root, cx) = cx.add_window_view(|window, cx| {
+                let draft = ThreadDraft::new(ParticipantId::new());
+                draft
+                    .doc
+                    .create_prompt(draft.author.as_uuid(), "from the host");
+                let mut thread = test_thread(thread_id, Vec::new(), draft);
+                thread.participant_id = thread.draft.author;
+                thread.participants = vec![thread.participant_id];
+                thread.sharing = ThreadSharing::Shared {
+                    endpoint,
+                    events: broadcast::channel(THREAD_EVENT_CAPACITY).0,
+                };
+                let thread = cx.new(|_| thread);
+                let host_store = cx.new(|_| ThreadStore {
+                    threads: VecDeque::from([thread]),
+                });
+                let host = cx.new(|cx| {
+                    test_cowork(
+                        host_store,
+                        Some(thread_id),
+                        tokio_handle.clone(),
+                        window,
+                        cx,
+                    )
+                });
+                let collaborator_store = cx.new(|_| ThreadStore::default());
+                let collaborator = cx.new(|cx| {
+                    test_cowork(collaborator_store, None, tokio_handle.clone(), window, cx)
+                });
+                let pair = cx.new(|_| PairRoot { host, collaborator });
+                Root::new(pair, window, cx)
+            });
+            cx.update(|window, _| window.activate_window());
+            let pair = root.read_with(cx, |root, _| {
+                root.view()
+                    .clone()
+                    .downcast::<PairRoot>()
+                    .expect("root shows the pair")
+            });
+            let (host, collaborator) =
+                pair.read_with(cx, |pair, _| (pair.host.clone(), pair.collaborator.clone()));
+            let host_thread =
+                host.read_with(cx, |host, cx| host.active_thread(cx).expect("thread"));
+
+            let (host_end, collaborator_end) = cx.update(|_, cx| in_memory_peers(cx));
+            cx.update(|_, cx| {
+                let host_weak = host.downgrade();
+                let thread_weak = host_thread.downgrade();
+                cx.spawn(async move |cx| {
+                    if let Err(error) =
+                        Cowork::serve_peer(host_weak, thread_weak, host_end, cx).await
+                    {
+                        eprintln!("stopped serving collaborator: {error:#}");
+                    }
+                })
+                .detach();
+                let collaborator = collaborator.clone();
+                cx.spawn(async move |cx| {
+                    collaborator_end
+                        .send(protocol::CollaboratorMessage::Join {
+                            protocol_version: protocol::PROTOCOL_VERSION,
+                        })
+                        .await
+                        .expect("send join");
+                    let Some(protocol::HostMessage::Welcome(welcome)) =
+                        collaborator_end.receive().await
+                    else {
+                        panic!("expected a welcome");
+                    };
+                    collaborator.update(cx, |collaborator, cx| {
+                        collaborator.mirror_thread(welcome, collaborator_end, None, cx);
+                    });
+                })
+                .detach();
+            });
+
+            let mut collaboration = Self {
+                host,
+                collaborator,
+                host_thread,
+                cx,
+                _runtime: runtime,
+            };
+            collaboration.wait_until("the collaborator joins", |this| {
+                this.collaborator_thread().is_some()
+            });
+            collaboration
+        }
+
+        /// Pumps both sides, drawing frames so editors catch up, until `done`.
+        fn wait_until(&mut self, what: &str, mut done: impl FnMut(&mut Self) -> bool) {
+            for _ in 0..20 {
+                self.cx.run_until_parked();
+                self.cx.update(|window, cx| window.draw(cx).clear(cx));
+                self.cx.run_until_parked();
+                if done(self) {
+                    return;
+                }
+            }
+            panic!("gave up waiting until {what}");
+        }
+
+        /// Lets everything in flight settle.
+        fn settle(&mut self) {
+            for _ in 0..5 {
+                self.cx.run_until_parked();
+                self.cx.update(|window, cx| window.draw(cx).clear(cx));
+            }
+            self.cx.run_until_parked();
+        }
+
+        fn collaborator_thread(&mut self) -> Option<Entity<Thread>> {
+            self.collaborator
+                .read_with(self.cx, |collaborator, cx| collaborator.active_thread(cx))
+        }
+
+        fn items(&mut self, thread: &Entity<Thread>) -> Vec<DraftItem> {
+            thread.read_with(self.cx, |thread, _| thread.draft.doc.items())
+        }
+
+        fn bodies(&mut self, thread: &Entity<Thread>) -> Vec<String> {
+            self.items(thread)
+                .into_iter()
+                .map(|item| item.body)
+                .collect()
+        }
+
+        fn focus(&mut self, cowork: &Entity<Cowork>) {
+            self.cx.update(|window, cx| {
+                cowork.update(cx, |cowork, cx| cowork.focus_composer(window, cx));
+            });
+        }
+    }
+
+    #[gpui::test]
+    fn collaborators_receive_the_draft_and_edit_it_live(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let host_thread = session.host_thread.clone();
+        assert_eq!(session.bodies(&collaborator_thread), ["from the host"]);
+        let collaborator_id =
+            collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id);
+
+        // The collaborator continues the host's block.
+        let collaborator = session.collaborator.clone();
+        session.focus(&collaborator);
+        session.cx.simulate_input("!");
+        session.wait_until("the host sees the collaborator's edit", |this| {
+            this.bodies(&host_thread) == ["from the host!"]
+        });
+
+        // A block the collaborator creates is theirs.
+        session.cx.simulate_keystrokes("down");
+        session.cx.simulate_input("mine");
+        session.wait_until("the host sees the collaborator's block", |this| {
+            this.bodies(&host_thread).len() == 2
+        });
+        let items = session.items(&host_thread);
+        assert_eq!(items[1].body, "mine");
+        assert_eq!(items[1].creator, collaborator_id.as_uuid());
+
+        // The host's edits appear in the collaborator's editors.
+        let host = session.host.clone();
+        let block = items[1].id;
+        host.update(session.cx, |host, cx| {
+            let draft_id = host_thread.read(cx).draft.id;
+            host.update_draft(draft_id, cx, |draft| {
+                draft.doc.set_body(block, "mine, and the host's");
+            });
+        });
+        session.wait_until("the collaborator's editor shows the host's edit", |this| {
+            this.collaborator.read_with(this.cx, |collaborator, cx| {
+                let thread = collaborator.active_thread(cx).expect("joined");
+                thread
+                    .read(cx)
+                    .draft
+                    .editor(EditorSlot::Prompt(block))
+                    .is_some_and(|editor| editor.read(cx).value() == "mine, and the host's")
+            })
+        });
+        assert_eq!(
+            session.bodies(&collaborator_thread),
+            session.bodies(&host_thread)
+        );
+    }
+
+    #[gpui::test]
+    fn the_host_accepts_one_submission_per_sequence(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let host_thread = session.host_thread.clone();
+
+        let collaborator = session.collaborator.clone();
+        session.cx.update(|window, cx| {
+            collaborator.update(cx, |collaborator, cx| {
+                collaborator.submit_composer(window, cx)
+            });
+        });
+        session.wait_until("the collaborator sees the submission", |this| {
+            collaborator_thread.read_with(this.cx, |thread, _| thread.submission_count() == 1)
+        });
+        assert!(session.items(&host_thread).is_empty());
+        assert!(session.items(&collaborator_thread).is_empty());
+        host_thread.read_with(session.cx, |thread, _| {
+            let [TimelineMessage::User(message), ..] = thread.timeline.as_slice() else {
+                panic!("expected the submitted message first");
+            };
+            assert_eq!(message.blocks[0].text, "from the host");
+        });
+
+        // The test's agent never answers, so end its run by hand.
+        host_thread.update(session.cx, |thread, cx| {
+            let id = thread.running_agent_message_id().expect("a running agent");
+            thread.emit(
+                protocol::HostMessage::AgentEnded {
+                    id: id.into_bytes(),
+                    failure: None,
+                },
+                cx,
+            );
+        });
+
+        // A submission that raced the one just accepted is ignored, even
+        // though the draft has new content by now.
+        let host = session.host.clone();
+        host.update(session.cx, |host, cx| {
+            let draft_id = host_thread.read(cx).draft.id;
+            host.update_draft(draft_id, cx, |draft| {
+                draft.doc.create_prompt(draft.author.as_uuid(), "later");
+            });
+        });
+        session.wait_until("the collaborator sees the new block", |this| {
+            this.bodies(&collaborator_thread) == ["later"]
+        });
+        collaborator_thread.read_with(session.cx, |thread, _| {
+            thread.request(protocol::CollaboratorMessage::Submit { sequence: 0 });
+        });
+        session.settle();
+        assert_eq!(
+            host_thread.read_with(session.cx, |thread, _| thread.submission_count()),
+            1
+        );
+        assert_eq!(session.bodies(&host_thread), ["later"]);
+
+        // With the current sequence it goes through.
+        collaborator_thread.read_with(session.cx, |thread, _| {
+            thread.request(protocol::CollaboratorMessage::Submit { sequence: 1 });
+        });
+        session.wait_until("the second submission is accepted", |this| {
+            collaborator_thread.read_with(this.cx, |thread, _| thread.submission_count() == 2)
+        });
+        assert!(session.items(&host_thread).is_empty());
+    }
+
+    #[gpui::test]
+    fn concurrent_blocks_converge_to_one_order(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let host_thread = session.host_thread.clone();
+
+        // Both append before either hears of the other's block.
+        let host = session.host.clone();
+        host.update(session.cx, |host, cx| {
+            let draft_id = host_thread.read(cx).draft.id;
+            host.update_draft(draft_id, cx, |draft| {
+                draft.doc.create_prompt(draft.author.as_uuid(), "host");
+            });
+        });
+        let collaborator = session.collaborator.clone();
+        collaborator.update(session.cx, |collaborator, cx| {
+            let draft_id = collaborator_thread.read(cx).draft.id;
+            collaborator.update_draft(draft_id, cx, |draft| {
+                draft
+                    .doc
+                    .create_prompt(draft.author.as_uuid(), "collaborator");
+            });
+        });
+
+        session.wait_until("both have both blocks", |this| {
+            this.items(&host_thread).len() == 3 && this.items(&collaborator_thread).len() == 3
+        });
+        assert_eq!(
+            session.bodies(&host_thread),
+            session.bodies(&collaborator_thread)
+        );
+    }
+
+    #[gpui::test]
+    fn a_submitted_block_moves_its_typist_to_the_draft_position(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let collaborator = session.collaborator.clone();
+        session.focus(&collaborator);
+        let focused = |session: &mut Collaboration| {
+            session.cx.update(|window, cx| {
+                collaborator
+                    .read(cx)
+                    .focused_draft_editor(window, cx)
+                    .map(|(_, slot, _)| slot)
+            })
+        };
+        assert!(matches!(focused(&mut session), Some(EditorSlot::Prompt(_))));
+
+        collaborator_thread.read_with(session.cx, |thread, _| {
+            thread.request(protocol::CollaboratorMessage::Submit { sequence: 0 });
+        });
+        session.wait_until("the submission arrives", |this| {
+            collaborator_thread.read_with(this.cx, |thread, _| thread.submission_count() == 1)
+        });
+        session.settle();
+        assert_eq!(focused(&mut session), Some(EditorSlot::DraftPosition));
+    }
+
+    #[test]
+    fn only_the_creator_removes_an_item_it_left_empty() {
+        let mut draft = ThreadDraft::new(ParticipantId::new());
+        let own = draft.doc.create_prompt(draft.author.as_uuid(), "");
+        let others = draft.doc.create_prompt(Uuid::new_v4(), "");
+
+        assert!(!draft.remove_if_abandoned(others));
+        assert!(draft.remove_if_abandoned(own));
+        assert_eq!(
+            draft
+                .doc
+                .items()
+                .into_iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>(),
+            [others]
+        );
+    }
+
+    #[gpui::test]
+    fn rebasing_keeps_local_edits_the_host_has_not_seen(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let host_draft = Draft::new();
+        host_draft.create_prompt(Uuid::new_v4(), "host");
+        let welcome = |host_draft: &Draft| protocol::Welcome {
+            participant_id: [3; 16],
+            thread: protocol::ThreadSnapshot {
+                id: [1; 16],
+                title: "Shared".into(),
+                participants: Vec::new(),
+                model: DEFAULT_MODEL.catalog_id.into(),
+                messages: Vec::new(),
+            },
+            draft: host_draft.encode_state(),
+        };
+
+        let thread = cx.new(|cx| {
+            Thread::from_welcome(
+                welcome(&host_draft),
+                ThreadDraft::new(ParticipantId::new()),
+                ThreadSharing::NotShared,
+                cx,
+            )
+        });
+        thread.update(cx, |thread, cx| {
+            let author = thread.draft.author.as_uuid();
+            thread.draft.doc.create_prompt(author, "unsent");
+            thread.apply(protocol::HostMessage::Welcome(welcome(&host_draft)), cx);
+            let bodies = thread
+                .draft
+                .doc
+                .items()
+                .into_iter()
+                .map(|item| item.body)
+                .collect::<Vec<_>>();
+            assert_eq!(bodies, ["host", "unsent"]);
+        });
+    }
+
+    /// Typing into an editor that has not been drawn since someone else's
+    /// edit arrived must not revert that edit.
+    #[gpui::test]
+    fn keystrokes_merge_with_edits_the_editor_does_not_show_yet(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let host_thread = session.host_thread.clone();
+        let host = session.host.clone();
+        session.focus(&host);
+        session.settle();
+        let block = session.items(&host_thread)[0].id;
+
+        // The collaborator's edit, as the host receives it.
+        let collaborator_id =
+            collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id);
+        let remote = Draft::new();
+        remote
+            .apply_update(
+                &host_thread.read_with(session.cx, |thread, _| thread.draft.doc.encode_state()),
+            )
+            .expect("copy the draft");
+        remote.edit_body(
+            block,
+            &TextEdit {
+                range: 0..0,
+                insert: "X".into(),
+            },
+        );
+        let update = remote.take_local_update().expect("an update");
+        let editor = host.read_with(session.cx, |_, cx| {
+            host_thread
+                .read(cx)
+                .draft
+                .editor(EditorSlot::Prompt(block))
+                .expect("host editor")
+        });
+
+        // Applied and typed over within one update, so no frame is drawn in
+        // between that would let the editor catch up. Typing goes through
+        // the input handler, as simulated input would draw first.
+        session.cx.update(|window, cx| {
+            host.update(cx, |host, cx| {
+                host.collaborator_request(
+                    &host_thread,
+                    collaborator_id,
+                    protocol::CollaboratorMessage::DraftUpdate(update),
+                    cx,
+                )
+                .expect("a valid update");
+            });
+            assert_eq!(editor.read(cx).value(), "from the host");
+            editor.update(cx, |editor, cx| {
+                editor.replace_text_in_range(None, "!", window, cx);
+            });
+        });
+        session.wait_until("both edits reach both sides", |this| {
+            this.bodies(&host_thread) == ["Xfrom the host!"]
+                && this.bodies(&collaborator_thread) == ["Xfrom the host!"]
+        });
+        host.read_with(session.cx, |host, cx| {
+            let editor = host_thread
+                .read(cx)
+                .draft
+                .editor(EditorSlot::Prompt(block))
+                .expect("host editor");
+            assert_eq!(editor.read(cx).value(), "Xfrom the host!");
+            let _ = host;
+        });
+    }
+
+    /// Draft updates and the submission travel on one ordered stream, so the
+    /// last keystroke before Ctrl-Enter is part of the submission.
+    #[gpui::test]
+    fn a_submission_includes_the_last_keystroke(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let host_thread = session.host_thread.clone();
+        let collaborator = session.collaborator.clone();
+        session.focus(&collaborator);
+        session.settle();
+
+        session.cx.simulate_input("?");
+        session.cx.update(|window, cx| {
+            collaborator.update(cx, |collaborator, cx| {
+                collaborator.submit_composer(window, cx)
+            });
+        });
+        session.wait_until("the host accepts the submission", |this| {
+            host_thread.read_with(this.cx, |thread, _| thread.submission_count() == 1)
+        });
+        host_thread.read_with(session.cx, |thread, _| {
+            let [TimelineMessage::User(message), ..] = thread.timeline.as_slice() else {
+                panic!("expected the submitted message first");
+            };
+            assert_eq!(message.blocks[0].text, "from the host?");
+        });
+    }
+
+    #[gpui::test]
+    fn a_joined_thread_closes_when_the_host_stops_sharing(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let host_thread = session.host_thread.clone();
+        host_thread.update(session.cx, |thread, _| {
+            thread.sharing = ThreadSharing::NotShared;
+            thread.participants.clear();
+        });
+        session.wait_until("the collaborator's thread closes", |this| {
+            this.collaborator.read_with(this.cx, |collaborator, cx| {
+                collaborator.active_thread_id.is_none()
+                    && collaborator.thread_store.read(cx).threads.is_empty()
+            })
+        });
+    }
+
+    #[gpui::test]
+    fn misattributed_draft_updates_disconnect_the_collaborator(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let host_thread = session.host_thread.clone();
+        assert_eq!(
+            host_thread.read_with(session.cx, |thread, _| thread.participants.len()),
+            2
+        );
+
+        let forged = Draft::new();
+        forged.create_prompt(Uuid::new_v4(), "not mine");
+        let update = forged.take_local_update().expect("an update");
+        collaborator_thread.read_with(session.cx, |thread, _| {
+            thread.request(protocol::CollaboratorMessage::DraftUpdate(update));
+        });
+        session.wait_until("the host drops the collaborator", |this| {
+            host_thread.read_with(this.cx, |thread, _| thread.participants.len() == 1)
+        });
     }
 
     #[gpui::test]

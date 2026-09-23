@@ -1,4 +1,8 @@
-use yrs::{Array, ArrayPrelim, Map, MapPrelim, Text, TextPrelim, Transact};
+use yrs::{
+    Array, ArrayPrelim, ClientID, Map, MapPrelim, Text, TextPrelim, Transact,
+    branch::{Branch, BranchPtr},
+    types::Attrs,
+};
 
 use super::*;
 
@@ -570,4 +574,748 @@ fn body_with_embed_refuses_edits() {
     assert_eq!(draft.body(id).as_deref(), Some("ab"));
     assert_eq!(draft.set_body(id, "abc"), None);
     assert_eq!(draft.body(id).as_deref(), Some("ab"));
+}
+
+// 7. Local updates
+
+fn take(draft: &Draft) -> Vec<u8> {
+    draft.take_local_update().expect("expected a local update")
+}
+
+/// The clients whose inserts `update` carries.
+fn update_clients(update: &[u8]) -> Vec<ClientID> {
+    // Unlike `state_vector`, this includes clients whose blocks don't start at clock 0.
+    let mut clients: Vec<ClientID> = Update::decode_v1(update)
+        .unwrap()
+        .state_vector_lower()
+        .iter()
+        .map(|(client, _)| *client)
+        .collect();
+    clients.sort();
+    clients
+}
+
+fn assert_converged(drafts: &[&Draft]) {
+    let (first, rest) = drafts.split_first().unwrap();
+    // The state vector encoding's client order isn't stable, so compare decoded.
+    let state = |draft: &Draft| StateVector::decode_v1(&draft.state_vector()).unwrap();
+    for draft in rest {
+        assert_eq!(draft.items(), first.items());
+        assert_eq!(draft.attachment_ids(), first.attachment_ids());
+        assert_eq!(state(draft), state(first));
+    }
+}
+
+#[test]
+fn draft_is_send() {
+    fn assert_send<T: Send>() {}
+    assert_send::<Draft>();
+}
+
+#[test]
+fn every_local_mutation_is_reported_once() {
+    let draft = Draft::new();
+    let replica = Draft::new();
+    let me = participant();
+    assert_eq!(draft.take_local_update(), None);
+
+    let forward = || {
+        let update = take(&draft);
+        assert_eq!(draft.take_local_update(), None);
+        assert!(
+            update_clients(&update)
+                .iter()
+                .all(|client| *client == draft.doc.client_id())
+        );
+        replica.apply_update(&update).unwrap();
+        assert_eq!(replica.take_local_update(), None);
+        assert_converged(&[&draft, &replica]);
+    };
+
+    let prompt = draft.create_prompt(me, "hello");
+    forward();
+    draft.create_comment(me, target("q"), "note");
+    forward();
+    assert!(draft.set_body(prompt, "hello world").is_some());
+    forward();
+    assert!(draft.edit_body(
+        prompt,
+        &TextEdit {
+            range: 0..5,
+            insert: "bye".into()
+        }
+    ));
+    forward();
+    let record = attachment("a.png", me);
+    assert!(draft.add_attachment(prompt, record.clone()));
+    forward();
+    assert!(draft.remove_attachment(record.id));
+    forward();
+    assert_eq!(draft.remove_items(&[prompt]), 1);
+    forward();
+
+    assert_eq!(replica.items().len(), 1);
+    replica.validate().unwrap();
+}
+
+#[test]
+fn applied_updates_are_not_reported() {
+    let a = Draft::new();
+    let b = Draft::new();
+    let alice = participant();
+    let bob = participant();
+
+    let id = a.create_prompt(alice, "from a");
+    let created = take(&a);
+    b.apply_update(&created).unwrap();
+    b.apply_update(&created).unwrap();
+    b.apply_update(&a.encode_state()).unwrap();
+    assert_eq!(b.take_local_update(), None);
+
+    // Out of order: `later` stays pending until `edit` arrives, and neither is reported.
+    a.set_body(id, "from a, edited").unwrap();
+    let edit = take(&a);
+    a.create_prompt(alice, "later");
+    let later = take(&a);
+    b.apply_update(&later).unwrap();
+    assert_eq!(b.take_local_update(), None);
+    b.apply_update(&edit).unwrap();
+    assert_eq!(b.take_local_update(), None);
+    assert_converged(&[&a, &b]);
+
+    // Local changes made on top of remote ones carry only local inserts.
+    b.set_body(id, "from b").unwrap();
+    b.create_prompt(bob, "b's block");
+    let from_b = take(&b);
+    assert_eq!(update_clients(&from_b), vec![b.doc.client_id()]);
+    a.apply_update(&from_b).unwrap();
+    assert_eq!(a.take_local_update(), None);
+    assert_converged(&[&a, &b]);
+}
+
+#[test]
+fn no_op_mutations_report_nothing() {
+    let draft = Draft::new();
+    let me = participant();
+    let prompt = draft.create_prompt(me, "same");
+    let _ = take(&draft);
+
+    assert_eq!(draft.set_body(prompt, "same"), None);
+    assert_eq!(draft.set_body(ItemId::new(), "x"), None);
+    assert_eq!(draft.remove_items(&[ItemId::new()]), 0);
+    assert_eq!(draft.remove_items(&[]), 0);
+    // Valid but empty.
+    assert!(draft.edit_body(
+        prompt,
+        &TextEdit {
+            range: 2..2,
+            insert: String::new()
+        }
+    ));
+    assert!(!draft.edit_body(
+        prompt,
+        &TextEdit {
+            range: 3..99,
+            insert: "x".into()
+        }
+    ));
+    assert!(!draft.add_attachment(ItemId::new(), attachment("x.png", me)));
+    assert!(!draft.remove_attachment(AttachmentId::new()));
+    draft.items();
+    draft.encode_state();
+    draft.validate().unwrap();
+
+    assert_eq!(draft.take_local_update(), None);
+}
+
+#[test]
+fn local_edits_between_takes_are_merged() {
+    let a = Draft::new();
+    let b = Draft::new();
+    let me = participant();
+
+    let first = a.create_prompt(me, "first");
+    let comment = a.create_comment(me, target("q"), "comment");
+    a.set_body(first, "first!").unwrap();
+    assert!(a.edit_body(
+        comment,
+        &TextEdit {
+            range: 0..0,
+            insert: "a ".into()
+        }
+    ));
+    let record = attachment("a.png", me);
+    assert!(a.add_attachment(first, record.clone()));
+    let doomed = a.create_prompt(me, "doomed");
+    assert_eq!(a.remove_items(&[doomed]), 1);
+
+    let update = take(&a);
+    assert_eq!(a.take_local_update(), None);
+    b.apply_update(&update).unwrap();
+    assert_converged(&[&a, &b]);
+    assert_eq!(ids(&b), vec![first, comment]);
+
+    // A second batch building on the first.
+    a.set_body(first, "first!!").unwrap();
+    assert!(a.remove_attachment(record.id));
+    let second = a.create_prompt(me, "second");
+    a.set_body(second, "second, edited").unwrap();
+    b.apply_update(&take(&a)).unwrap();
+    assert_converged(&[&a, &b]);
+    assert_eq!(b.body(second).as_deref(), Some("second, edited"));
+    assert_eq!(b.take_local_update(), None);
+    b.validate().unwrap();
+}
+
+/// One sync round through the host, the way the app relays updates: each collaborator sends only
+/// its `take_local_update` output to the host, which checks it and forwards it to the other
+/// collaborators; then the host sends its own local update to everyone.
+///
+/// Returns the host's update.
+fn relay_round(host: &Draft, collaborators: &[(Uuid, &Draft)]) -> Option<Vec<u8>> {
+    for (author, replica) in collaborators {
+        let Some(update) = replica.take_local_update() else {
+            continue;
+        };
+        let before = host.items();
+        host.apply_update(&update).unwrap();
+        verify_change(&before, &host.items(), *author).unwrap();
+        host.validate().unwrap();
+        for (other, peer) in collaborators {
+            if other != author {
+                peer.apply_update(&update).unwrap();
+            }
+        }
+    }
+
+    let host_update = host.take_local_update();
+    if let Some(update) = &host_update {
+        assert_eq!(update_clients(update), vec![host.doc.client_id()]);
+        for (_, peer) in collaborators {
+            peer.apply_update(update).unwrap();
+        }
+    }
+    for (_, peer) in collaborators {
+        assert_eq!(peer.take_local_update(), None);
+        peer.validate().unwrap();
+    }
+    host_update
+}
+
+#[test]
+fn host_relays_between_collaborators() {
+    let host = Draft::new();
+    let host_id = participant();
+    let alice = participant();
+    let bob = participant();
+
+    let shared = host.create_prompt(host_id, "hello");
+    // Joining collaborators get the full state, which delivers the host's pending change too.
+    let a = replica_of(&host);
+    let b = replica_of(&host);
+    let _ = take(&host);
+    let before_round = replica_of(&host);
+    let collaborators = [(alice, &a), (bob, &b)];
+
+    // Concurrent typing in the same block and concurrent block creation.
+    let insert = |draft: &Draft, at: usize, text: &str| {
+        assert!(draft.edit_body(
+            shared,
+            &TextEdit {
+                range: at..at,
+                insert: text.into()
+            }
+        ));
+    };
+    insert(&a, 5, " from alice");
+    insert(&b, 0, "bob: ");
+    insert(&host, 5, "!");
+    let a_block = a.create_prompt(alice, "alice's block");
+    let b_comment = b.create_comment(bob, target("q"), "bob's comment");
+    let h_block = host.create_prompt(host_id, "host's block");
+
+    let host_update = relay_round(&host, &collaborators).unwrap();
+    assert_converged(&[&host, &a, &b]);
+    let body = host.body(shared).unwrap();
+    for part in ["bob: ", "hello", " from alice", "!"] {
+        assert!(body.contains(part), "{body:?} lacks {part:?}");
+    }
+    let mut expected = vec![shared, a_block, b_comment, h_block];
+    let mut actual = ids(&host);
+    expected.sort();
+    actual.sort();
+    assert_eq!(actual, expected);
+
+    // The host's update holds only the host's own changes.
+    before_round.apply_update(&host_update).unwrap();
+    assert_eq!(ids(&before_round), vec![shared, h_block]);
+    assert_eq!(before_round.body(shared).as_deref(), Some("hello!"));
+
+    // Keystroke-by-keystroke typing at the same spot, with rounds in between.
+    let end = host.body(shared).unwrap().len();
+    for (index, key) in ["a", "b", "c"].iter().enumerate() {
+        insert(&a, end, &key.to_uppercase());
+        insert(&b, end, key);
+        insert(&host, end, "_");
+        if index % 2 == 1 {
+            relay_round(&host, &collaborators);
+            assert_converged(&[&host, &a, &b]);
+        }
+    }
+    relay_round(&host, &collaborators);
+    assert_converged(&[&host, &a, &b]);
+    let body = host.body(shared).unwrap();
+    assert_eq!(body.len(), end + 9);
+    for key in ["A", "b", "C", "_"] {
+        assert!(body[end..].contains(key), "{body:?}");
+    }
+    host.validate().unwrap();
+}
+
+// 8. Validation
+
+#[test]
+fn validate_accepts_api_documents() {
+    let draft = Draft::new();
+    draft.validate().unwrap();
+
+    let me = participant();
+    let other = participant();
+    let prompt = draft.create_prompt(me, "prompt 👋");
+    let comment = draft.create_comment(me, target("q"), "");
+    let empty = draft.create_prompt(me, "");
+    let first = attachment("a.png", me);
+    let large = AttachmentRecord {
+        size: 5_000_000_000,
+        ..attachment("b.txt", other)
+    };
+    assert!(draft.add_attachment(prompt, first.clone()));
+    assert!(draft.add_attachment(empty, large));
+    draft.set_body(prompt, "prompt, edited 👋").unwrap();
+    draft.set_body(comment, "now with text").unwrap();
+    draft.validate().unwrap();
+
+    let replica = replica_of(&draft);
+    replica.validate().unwrap();
+    replica.create_prompt(other, "from the replica");
+    replica.set_body(prompt, "edited remotely").unwrap();
+    sync(&draft, &replica);
+    draft.validate().unwrap();
+    replica.validate().unwrap();
+
+    assert!(draft.remove_attachment(first.id));
+    draft.remove_items(&[prompt, comment]);
+    sync(&draft, &replica);
+    draft.validate().unwrap();
+    replica.validate().unwrap();
+
+    replica.remove_items(&ids(&replica));
+    sync(&draft, &replica);
+    assert!(draft.items().is_empty());
+    draft.validate().unwrap();
+    replica.validate().unwrap();
+}
+
+struct Fixture {
+    prompt: ItemId,
+    prompt_map: MapRef,
+    other_prompt_map: MapRef,
+    comment_map: MapRef,
+    record: AttachmentRecord,
+}
+
+fn item_map<T: ReadTxn>(draft: &Draft, txn: &T, id: ItemId) -> MapRef {
+    match draft.items.get(txn, &id.to_string()) {
+        Some(Out::YMap(map)) => map,
+        other => panic!("item {id} is {other:?}"),
+    }
+}
+
+fn body_of<T: ReadTxn>(txn: &T, item: &MapRef) -> TextRef {
+    match item.get(txn, BODY) {
+        Some(Out::YText(text)) => text,
+        other => panic!("body is {other:?}"),
+    }
+}
+
+fn attachments_of<T: ReadTxn>(txn: &T, item: &MapRef) -> ArrayRef {
+    match item.get(txn, ATTACHMENTS) {
+        Some(Out::YArray(array)) => array,
+        other => panic!("attachments is {other:?}"),
+    }
+}
+
+/// The map half of any shared type, to write entries its typed API hides.
+fn map_view(branch: &Branch) -> MapRef {
+    MapRef::from(BranchPtr::from(branch))
+}
+
+/// The sequence half of any shared type, to write content its typed API hides.
+fn array_view(branch: &Branch) -> ArrayRef {
+    ArrayRef::from(BranchPtr::from(branch))
+}
+
+fn with_field(any: Any, key: &str, value: impl Into<Any>) -> Any {
+    let Any::Map(mut map) = any else {
+        panic!("not a map");
+    };
+    std::sync::Arc::make_mut(&mut map).insert(key.into(), value.into());
+    Any::Map(map)
+}
+
+/// Builds a valid draft, breaks it with `corrupt` and checks that `validate` reports an error
+/// mentioning `expected`.
+fn assert_rejected(expected: &str, corrupt: impl FnOnce(&Draft, &mut TransactionMut, &Fixture)) {
+    let draft = Draft::new();
+    let me = participant();
+    let prompt = draft.create_prompt(me, "prompt");
+    let other_prompt = draft.create_prompt(me, "other");
+    let comment = draft.create_comment(me, target("q"), "comment");
+    let record = attachment("a.png", me);
+    assert!(draft.add_attachment(prompt, record.clone()));
+    draft.validate().unwrap();
+
+    {
+        let mut txn = draft.doc.transact_mut();
+        let fixture = Fixture {
+            prompt,
+            prompt_map: item_map(&draft, &txn, prompt),
+            other_prompt_map: item_map(&draft, &txn, other_prompt),
+            comment_map: item_map(&draft, &txn, comment),
+            record,
+        };
+        corrupt(&draft, &mut txn, &fixture);
+    }
+
+    let error = format!("{:#}", draft.validate().unwrap_err());
+    assert!(
+        error.contains(expected),
+        "expected {expected:?} in {error:?}"
+    );
+    // The violation replicates, and so does its detection.
+    let replica = replica_of(&draft);
+    assert!(replica.validate().is_err());
+}
+
+#[test]
+fn validate_rejects_bad_structure() {
+    assert_rejected("not an item id", |d, txn, _| {
+        d.order.push_back(txn, 42);
+    });
+    assert_rejected("not an item id", |d, txn, _| {
+        d.order.push_back(txn, "not a uuid");
+    });
+    assert_rejected("not an item id", |d, txn, _| {
+        d.order.push_back(txn, ArrayPrelim::default());
+    });
+    assert_rejected("more than once", |d, txn, f| {
+        d.order.push_back(txn, f.prompt.to_string());
+    });
+    assert_rejected("has no item", |d, txn, _| {
+        d.order.push_back(txn, ItemId::new().to_string());
+    });
+    assert_rejected("not in order", |d, txn, _| {
+        let item = d
+            .items
+            .insert(txn, ItemId::new().to_string(), MapPrelim::default());
+        item.insert(txn, KIND, KIND_COMMENT);
+    });
+    // Only the canonical id string can be looked up from `order`.
+    assert_rejected("not in order", |d, txn, f| {
+        let key = f.prompt.as_uuid().simple().to_string();
+        d.items.insert(txn, key, MapPrelim::default());
+    });
+    assert_rejected("not a map", |d, txn, _| {
+        let id = ItemId::new().to_string();
+        d.items.insert(txn, id.as_str(), "item");
+        d.order.push_back(txn, id);
+    });
+    assert_rejected("`order` root has map entries", |d, txn, _| {
+        map_view(d.order.as_ref()).insert(txn, "hidden", 1);
+    });
+    assert_rejected("`items` root has sequence content", |d, txn, _| {
+        array_view(d.items.as_ref()).push_back(txn, 1);
+    });
+}
+
+#[test]
+fn validate_rejects_bad_items() {
+    assert_rejected("unsupported kind", |_, txn, f| {
+        f.prompt_map.insert(txn, KIND, "poll");
+    });
+    assert_rejected("kind is missing or not a string", |_, txn, f| {
+        f.prompt_map.insert(txn, KIND, 1);
+    });
+    assert_rejected("kind is missing or not a string", |_, txn, f| {
+        f.comment_map.remove(txn, KIND);
+    });
+    assert_rejected("has fields", |_, txn, f| {
+        f.prompt_map.remove(txn, BODY);
+    });
+    assert_rejected("has fields", |_, txn, f| {
+        f.prompt_map.insert(txn, "extra", true);
+    });
+    assert_rejected("has fields", |_, txn, f| {
+        f.prompt_map.insert(txn, TARGET, target("q").to_any());
+    });
+    assert_rejected("has fields", |_, txn, f| {
+        f.comment_map
+            .insert(txn, ATTACHMENTS, ArrayPrelim::default());
+    });
+    assert_rejected("has sequence content", |_, txn, f| {
+        array_view(f.comment_map.as_ref()).push_back(txn, 1);
+    });
+    assert_rejected("is not a UUID", |_, txn, f| {
+        f.prompt_map.insert(txn, CREATOR, "someone");
+    });
+    assert_rejected("creator is not a string", |_, txn, f| {
+        f.comment_map.insert(txn, CREATOR, 7);
+    });
+}
+
+#[test]
+fn validate_rejects_bad_bodies() {
+    assert_rejected("body is not a text", |_, txn, f| {
+        f.prompt_map.insert(txn, BODY, "plain string");
+    });
+    assert_rejected("body is not a text", |_, txn, f| {
+        f.comment_map.insert(txn, BODY, ArrayPrelim::default());
+    });
+    assert_rejected("body contains embeds", |_, txn, f| {
+        body_of(txn, &f.prompt_map).insert_embed(txn, 1, Any::from("embed"));
+    });
+    assert_rejected("body contains embeds", |_, txn, f| {
+        body_of(txn, &f.comment_map).insert_embed(txn, 0, MapPrelim::default());
+    });
+    assert_rejected("body has formatting attributes", |_, txn, f| {
+        let bold = Attrs::from([("bold".into(), true.into())]);
+        body_of(txn, &f.prompt_map).format(txn, 0, 3, bold);
+    });
+    assert_rejected("body has formatting attributes", |_, txn, f| {
+        let italic = Attrs::from([("italic".into(), true.into())]);
+        body_of(txn, &f.comment_map).insert_with_attributes(txn, 0, "x", italic);
+    });
+    assert_rejected("body has map entries", |_, txn, f| {
+        let body = body_of(txn, &f.prompt_map);
+        map_view(body.as_ref()).insert(txn, "hidden", 1);
+    });
+}
+
+#[test]
+fn validate_rejects_bad_attachments_and_targets() {
+    assert_rejected("attachments is not an array", |_, txn, f| {
+        f.prompt_map.insert(txn, ATTACHMENTS, "none");
+    });
+    assert_rejected("attachments has map entries", |_, txn, f| {
+        let attachments = attachments_of(txn, &f.prompt_map);
+        map_view(attachments.as_ref()).insert(txn, "hidden", 1);
+    });
+    assert_rejected("not an atomic value", |_, txn, f| {
+        attachments_of(txn, &f.prompt_map).push_back(txn, MapPrelim::default());
+    });
+    assert_rejected("exactly the fields", |_, txn, f| {
+        attachments_of(txn, &f.prompt_map).push_back(txn, "junk");
+    });
+    assert_rejected("exactly the fields", |_, txn, f| {
+        let record = with_field(attachment("x.png", participant()).to_any(), "extra", 1);
+        attachments_of(txn, &f.other_prompt_map).push_back(txn, record);
+    });
+    assert_rejected("is malformed", |_, txn, f| {
+        let record = with_field(attachment("x.gif", participant()).to_any(), "kind", "gif");
+        attachments_of(txn, &f.prompt_map).push_back(txn, record);
+    });
+    assert_rejected("is malformed", |_, txn, f| {
+        let record = with_field(attachment("x.png", participant()).to_any(), "size", -1);
+        attachments_of(txn, &f.prompt_map).push_back(txn, record);
+    });
+    assert_rejected("more than once", |_, txn, f| {
+        attachments_of(txn, &f.prompt_map).push_back(txn, f.record.to_any());
+    });
+    assert_rejected("more than once", |_, txn, f| {
+        let copy = AttachmentRecord {
+            name: "copy.png".into(),
+            ..f.record.clone()
+        };
+        attachments_of(txn, &f.other_prompt_map).push_back(txn, copy.to_any());
+    });
+
+    assert_rejected("target is not an atomic value", |_, txn, f| {
+        f.comment_map.insert(txn, TARGET, TextPrelim::new("target"));
+    });
+    assert_rejected("target does not have exactly the fields", |_, txn, f| {
+        f.comment_map
+            .insert(txn, TARGET, with_field(target("q").to_any(), "extra", 1));
+    });
+    assert_rejected("target is malformed", |_, txn, f| {
+        let reversed = with_field(target("q").to_any(), "start", 100);
+        f.comment_map.insert(txn, TARGET, reversed);
+    });
+    assert_rejected("target is malformed", |_, txn, f| {
+        let bad = with_field(target("q").to_any(), "message_id", "not a uuid");
+        f.comment_map.insert(txn, TARGET, bad);
+    });
+}
+
+#[test]
+fn validate_rejects_extra_roots() {
+    let draft = Draft::new();
+    draft.create_prompt(participant(), "fine");
+
+    let foreign = Doc::new();
+    let extra = foreign.get_or_insert_map("extra");
+    extra.insert(&mut foreign.transact_mut(), "key", "value");
+    let update = foreign
+        .transact()
+        .encode_state_as_update_v1(&StateVector::default());
+    draft.apply_update(&update).unwrap();
+
+    assert_eq!(draft.items().len(), 1);
+    let error = draft.validate().unwrap_err().to_string();
+    assert!(error.contains("unexpected root \"extra\""), "{error}");
+}
+
+// 9. Change verification
+
+/// Runs `change` on `draft` and verifies it as made by `author`.
+fn change_by(draft: &Draft, author: Uuid, change: impl FnOnce()) -> Result<()> {
+    let before = draft.items();
+    change();
+    verify_change(&before, &draft.items(), author)
+}
+
+#[test]
+fn verify_change_accepts_allowed_changes() {
+    let draft = Draft::new();
+    let alice = participant();
+    let bob = participant();
+    let prompt = draft.create_prompt(alice, "alice's");
+    let comment = draft.create_comment(alice, target("q"), "alice's comment");
+    let record = attachment("a.png", alice);
+    assert!(draft.add_attachment(prompt, record.clone()));
+
+    let unchanged = draft.items();
+    verify_change(&unchanged, &unchanged, bob).unwrap();
+
+    change_by(&draft, bob, || {
+        let own = draft.create_prompt(bob, "bob's");
+        assert!(draft.add_attachment(own, attachment("b.png", bob)));
+        draft.create_comment(bob, target("r"), "bob's comment");
+    })
+    .unwrap();
+    change_by(&draft, bob, || {
+        assert!(draft.add_attachment(prompt, attachment("c.png", bob)));
+    })
+    .unwrap();
+    change_by(&draft, bob, || {
+        draft.set_body(prompt, "edited by bob").unwrap();
+        draft.set_body(comment, "also edited by bob").unwrap();
+    })
+    .unwrap();
+    change_by(&draft, bob, || {
+        assert!(draft.remove_attachment(record.id));
+    })
+    .unwrap();
+    change_by(&draft, bob, || {
+        assert_eq!(draft.remove_items(&[prompt, comment]), 2);
+    })
+    .unwrap();
+}
+
+#[test]
+fn verify_change_rejects_forbidden_changes() {
+    let draft = Draft::new();
+    let alice = participant();
+    let bob = participant();
+    let prompt = draft.create_prompt(alice, "alice's");
+    draft.create_comment(alice, target("q"), "alice's comment");
+    assert!(draft.add_attachment(prompt, attachment("a.png", alice)));
+    let before = draft.items();
+
+    let rejected = |after: &[DraftItem], expected: &str| {
+        let error = verify_change(&before, after, bob).unwrap_err().to_string();
+        assert!(
+            error.contains(expected),
+            "expected {expected:?} in {error:?}"
+        );
+    };
+
+    // Through the API, as the host would see a forged update.
+    let replica = replica_of(&draft);
+    let error = change_by(&replica, bob, || {
+        replica.create_prompt(alice, "forged");
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("new item"), "{error}");
+    let error = change_by(&replica, bob, || {
+        let own = replica.create_prompt(bob, "own");
+        assert!(replica.add_attachment(own, attachment("forged.png", alice)));
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("new attachment"), "{error}");
+
+    let mut after = before.clone();
+    after.push(DraftItem {
+        id: ItemId::new(),
+        creator: alice,
+        body: String::new(),
+        kind: DraftItemKind::Comment {
+            target: target("x"),
+        },
+    });
+    rejected(&after, "new item");
+
+    let mut after = before.clone();
+    after[0].creator = bob;
+    rejected(&after, "changed creator");
+
+    let mut after = before.clone();
+    after[0].kind = DraftItemKind::Comment {
+        target: target("q"),
+    };
+    rejected(&after, "changed kind");
+
+    let mut after = before.clone();
+    after[1].kind = DraftItemKind::Prompt {
+        attachments: Vec::new(),
+    };
+    rejected(&after, "changed kind");
+
+    let mut after = before.clone();
+    after[1].kind = DraftItemKind::Comment {
+        target: target("another quote"),
+    };
+    rejected(&after, "changed target");
+
+    fn attachments_of(items: &mut [DraftItem]) -> &mut Vec<AttachmentRecord> {
+        match &mut items[0].kind {
+            DraftItemKind::Prompt { attachments } => attachments,
+            DraftItemKind::Comment { .. } => panic!("not a prompt"),
+        }
+    }
+
+    let mut after = before.clone();
+    attachments_of(&mut after).push(attachment("forged.png", alice));
+    rejected(&after, "new attachment");
+
+    let mut after = before.clone();
+    attachments_of(&mut after)[0].name = "renamed.png".into();
+    rejected(&after, "was modified");
+
+    let mut after = before.clone();
+    attachments_of(&mut after)[0].creator = bob;
+    rejected(&after, "was modified");
+
+    // Records are matched by id across blocks, so one changed while moving is caught.
+    let mut after = before.clone();
+    let mut moved = attachments_of(&mut after).remove(0);
+    moved.size += 1;
+    after.push(DraftItem {
+        id: ItemId::new(),
+        creator: bob,
+        body: String::new(),
+        kind: DraftItemKind::Prompt {
+            attachments: vec![moved],
+        },
+    });
+    rejected(&after, "was modified");
 }

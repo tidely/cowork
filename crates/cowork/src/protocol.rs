@@ -19,7 +19,7 @@ pub(crate) const PEER_CHANNEL_CAPACITY: usize = 128;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 2;
+pub(crate) const PROTOCOL_VERSION: u32 = 3;
 
 /// A request from a collaborator to the host.
 ///
@@ -37,6 +37,12 @@ pub(crate) enum CollaboratorMessage {
     /// Stops the agent run producing message `message_id`, if it is still
     /// running.
     Stop { message_id: uuid::Bytes },
+    /// A Yrs update of the collaborator's own changes to the draft.
+    DraftUpdate(Vec<u8>),
+    /// Submits the draft. `sequence` is the number of user messages the
+    /// collaborator has seen, so a submission that raced another one is
+    /// ignored instead of submitting whatever was typed in between.
+    Submit { sequence: u64 },
 }
 
 /// A change to a shared thread, authored by the host.
@@ -61,6 +67,8 @@ pub(crate) enum HostMessage {
     ParticipantLeft(uuid::Bytes),
     /// The thread's model changed.
     ModelSelected { catalog_id: String },
+    /// A Yrs update to the draft, made by the host or a collaborator.
+    DraftUpdate(Vec<u8>),
     /// The thread was named, which happens on its first user message.
     ThreadTitled(String),
     /// A user message was appended to the timeline.
@@ -107,6 +115,8 @@ pub(crate) struct Welcome {
     /// The id the host assigned to the receiving collaborator.
     pub(crate) participant_id: uuid::Bytes,
     pub(crate) thread: ThreadSnapshot,
+    /// The full state of the draft as a Yrs update.
+    pub(crate) draft: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -341,6 +351,7 @@ mod tests {
         let message = HostMessage::Welcome(Welcome {
             participant_id: [12; 16],
             thread: snapshot,
+            draft: vec![1, 2, 3],
         });
 
         assert_eq!(round_trip(&message), message);
@@ -371,6 +382,7 @@ mod tests {
             HostMessage::ModelSelected {
                 catalog_id: "catalog-model".into(),
             },
+            HostMessage::DraftUpdate(vec![4, 5, 6]),
         ] {
             assert_eq!(round_trip(&message), message);
         }
@@ -385,6 +397,8 @@ mod tests {
             CollaboratorMessage::Stop {
                 message_id: [2; 16],
             },
+            CollaboratorMessage::DraftUpdate(vec![7, 8]),
+            CollaboratorMessage::Submit { sequence: 3 },
         ] {
             let encoded = postcard::to_stdvec(&message).expect("encode protocol message");
             let decoded: CollaboratorMessage =

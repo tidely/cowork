@@ -79,6 +79,9 @@ pub struct AttachmentRecord {
 }
 
 impl AttachmentRecord {
+    /// The exact keys of a stored record.
+    pub(crate) const FIELDS: [&'static str; 5] = ["id", "name", "kind", "size", "creator"];
+
     pub(crate) fn to_any(&self) -> Any {
         any_map([
             ("id", Any::from(self.id.to_string())),
@@ -118,6 +121,9 @@ pub struct CommentTarget {
 }
 
 impl CommentTarget {
+    /// The exact keys of a stored target.
+    pub(crate) const FIELDS: [&'static str; 4] = ["message_id", "start", "end", "quote"];
+
     pub(crate) fn to_any(&self) -> Any {
         any_map([
             ("message_id", Any::from(self.message_id.to_string())),
@@ -174,6 +180,12 @@ impl DraftItem {
     pub fn is_comment(&self) -> bool {
         matches!(self.kind, DraftItemKind::Comment { .. })
     }
+}
+
+/// Whether `any` is a map with exactly the keys in `fields`.
+pub(crate) fn has_exact_fields(any: &Any, fields: &[&str]) -> bool {
+    let Any::Map(map) = any else { return false };
+    map.len() == fields.len() && fields.iter().all(|field| map.contains_key(*field))
 }
 
 fn any_map<const N: usize>(fields: [(&str, Any); N]) -> Any {
