@@ -26,7 +26,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 6;
+pub(crate) const PROTOCOL_VERSION: u32 = 7;
 
 /// A request from a collaborator to the host.
 ///
@@ -163,8 +163,9 @@ pub(crate) enum HostMessage {
         participant: uuid::Bytes,
         profile: Profile,
     },
-    /// The thread's model changed.
-    ModelSelected { catalog_id: String },
+    /// The thread's model changed. `max_tokens` is the size of the context
+    /// window the host runs it with.
+    ModelSelected { catalog_id: String, max_tokens: u64 },
     /// A Yrs update to the draft, made by the host or a collaborator.
     DraftUpdate(Vec<u8>),
     /// A participant's presence changed.
@@ -207,6 +208,10 @@ pub(crate) enum HostMessage {
         comment_id: uuid::Bytes,
         response: String,
     },
+    /// An agent request finished, and the provider reported how many tokens
+    /// of the context window the thread fills with its reply. Replaces the
+    /// estimate for the output streamed since the last count.
+    ContextMeasured(u64),
     /// The agent finished. `failure` carries a message to display when the
     /// agent produced no output of its own.
     AgentEnded {
@@ -246,6 +251,12 @@ pub(crate) struct ThreadSnapshot {
     pub(crate) profiles: Vec<(uuid::Bytes, Profile)>,
     /// Catalog id of the thread's model.
     pub(crate) model: String,
+    /// See [`HostMessage::ModelSelected`].
+    pub(crate) max_tokens: u64,
+    /// The latest count of [`HostMessage::ContextMeasured`], if any.
+    pub(crate) context_tokens: Option<u64>,
+    /// Bytes of agent output streamed since `context_tokens` was measured.
+    pub(crate) streamed_bytes: u64,
     pub(crate) messages: Vec<TimelineMessage>,
 }
 
@@ -578,6 +589,9 @@ mod tests {
             participants: vec![[11; 16], [12; 16]],
             profiles: vec![([11; 16], sample_profile()), ([13; 16], Profile::default())],
             model: "catalog-model".into(),
+            max_tokens: 131_072,
+            context_tokens: Some(4_096),
+            streamed_bytes: 120,
             messages: vec![
                 TimelineMessage::User(UserMessage {
                     id: [2; 16],
@@ -662,6 +676,7 @@ mod tests {
             },
             HostMessage::ModelSelected {
                 catalog_id: "catalog-model".into(),
+                max_tokens: 131_072,
             },
             HostMessage::DraftUpdate(vec![4, 5, 6]),
             HostMessage::Presence {
@@ -728,6 +743,7 @@ mod tests {
                 id: [7; 16],
                 failure: Some("Unable to generate a response".into()),
             },
+            HostMessage::ContextMeasured(4_096),
         ] {
             assert_eq!(round_trip(&message), message);
         }

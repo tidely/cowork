@@ -48,7 +48,7 @@ use gpui_component::{
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     combobox::{Combobox, ComboboxEvent, ComboboxState},
     dialog::{DialogDescription, DialogFooter, DialogHeader, DialogTitle},
-    progress::Progress,
+    progress::{Progress, ProgressCircle},
     searchable_list::{SearchableGroup, SearchableListItem, SearchableVec},
     shimmer::ShimmerText,
     sidebar::{
@@ -65,7 +65,7 @@ use itertools::Itertools;
 use participant::ParticipantId;
 use rig::{
     completion::{
-        Message as RigMessage,
+        Message as RigMessage, Usage,
         message::{ImageMediaType, UserContent},
     },
     prelude::*,
@@ -123,6 +123,9 @@ static SYNTAX_THEME: OnceLock<Option<Theme>> = OnceLock::new();
 const MAX_ATTACHMENT_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 /// Largest encoded image sent to the model, in line with common provider limits.
 const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
+/// A rough average for estimating the tokens in streamed text before the
+/// provider reports the exact count.
+const BYTES_PER_TOKEN: u64 = 4;
 /// Text is inlined into the prompt, so keep it well within `OLLAMA_CONTEXT_TOKENS`.
 const MAX_TEXT_ATTACHMENT_BYTES: u64 = 256 * 1024;
 /// Largest total of the attachments submitted together.
@@ -986,17 +989,21 @@ struct ModelSelection {
     catalog_id: &'static str,
     provider: ModelProvider,
     model: &'static str,
+    /// The size of the context window the model is run with.
+    max_tokens: u64,
 }
 
 const RECOMMENDED_QWEN: ModelSelection = ModelSelection {
     catalog_id: "recommended-qwen-3.8-27b",
     provider: ModelProvider::Ollama,
     model: OLLAMA_MODEL,
+    max_tokens: OLLAMA_CONTEXT_TOKENS,
 };
 const OLLAMA_QWEN: ModelSelection = ModelSelection {
     catalog_id: "ollama-qwen-3.8-27b",
     provider: ModelProvider::Ollama,
     model: OLLAMA_MODEL,
+    max_tokens: OLLAMA_CONTEXT_TOKENS,
 };
 /// Every model the picker offers. Collaborators select models by catalog id,
 /// so changing this catalog also requires bumping
@@ -1955,6 +1962,77 @@ impl ThreadOwnership {
     }
 }
 
+/// The tokens `usage` counts: the provider's total, or the sum of its input
+/// and output counts when it reports no total.
+fn usage_tokens(usage: Usage) -> u64 {
+    usage
+        .total_tokens
+        .unwrap_or_else(|| usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0))
+}
+
+/// How much of a thread's context window is in use.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ContextUsage {
+    tokens: u64,
+    max_tokens: u64,
+}
+
+impl ContextUsage {
+    /// `thread`'s usage, or an empty window of `model` for a thread not
+    /// created yet.
+    fn of(thread: Option<&Thread>, model: ModelSelection) -> Self {
+        match thread {
+            Some(thread) => Self {
+                tokens: thread.live_context_tokens().unwrap_or(0),
+                max_tokens: thread.max_tokens,
+            },
+            None => Self {
+                tokens: 0,
+                max_tokens: model.max_tokens,
+            },
+        }
+    }
+
+    /// How full the window is. May exceed 100 while an estimate overshoots.
+    fn percent(self) -> f32 {
+        if self.max_tokens == 0 {
+            return 0.;
+        }
+        self.tokens as f32 * 100. / self.max_tokens as f32
+    }
+
+    /// Grey until the window is nearly full, then amber, then red.
+    fn color(self) -> gpui::Rgba {
+        match self.percent() {
+            percent if percent >= 95. => rgb(0xf87171),
+            percent if percent >= 80. => rgb(0xfbbf24),
+            _ => rgb(0xa1a1aa),
+        }
+    }
+}
+
+/// A token count shortened to at most a few digits, such as `950`, `4.1k`,
+/// `128k`, or `1M`.
+fn format_token_count(tokens: u64) -> String {
+    fn scaled(tokens: u64, unit: u64, suffix: &str) -> String {
+        let value = tokens as f64 / unit as f64;
+        if value < 9.95 {
+            let text = format!("{value:.1}");
+            format!("{}{suffix}", text.strip_suffix(".0").unwrap_or(&text))
+        } else {
+            format!("{value:.0}{suffix}")
+        }
+    }
+
+    if tokens < 1_000 {
+        tokens.to_string()
+    } else if tokens < 999_500 {
+        scaled(tokens, 1_000, "k")
+    } else {
+        scaled(tokens, 1_000_000, "M")
+    }
+}
+
 struct Thread {
     /// Identifies this local view. Multiple views may mirror the same shared
     /// thread, so this must remain distinct from `summary.id`.
@@ -1978,7 +2056,21 @@ struct Thread {
     /// item is submitted so that renaming never changes the transcript and
     /// the agent knows everyone by one name. Only the host fills it.
     prompt_names: HashMap<ParticipantId, SharedString>,
+    /// Tokens the agent has used in this thread, counted at the end of each
+    /// turn; see [`Cowork::record_turn_usage`]. Only the host, which runs
+    /// the agent, fills it.
+    tokens_used: u64,
     model: ModelSelection,
+    /// The size of the model's context window, as the host last reported it.
+    max_tokens: u64,
+    /// How much of the context window the thread fills, as the provider
+    /// reported at the end of the last agent request that reported usage.
+    /// `None` until one has; see [`Thread::live_context_tokens`].
+    context_tokens: Option<u64>,
+    /// Bytes of agent output streamed since `context_tokens` was measured.
+    /// Every participant counts them from the same events, so their
+    /// estimates agree.
+    streamed_bytes: u64,
     timeline: Vec<TimelineMessage>,
     draft: ThreadDraft,
     generating: bool,
@@ -2196,7 +2288,11 @@ impl Thread {
             profiles: HashMap::new(),
             transcript: Vec::new(),
             prompt_names: HashMap::new(),
+            tokens_used: 0,
             model: DEFAULT_MODEL,
+            max_tokens: DEFAULT_MODEL.max_tokens,
+            context_tokens: None,
+            streamed_bytes: 0,
             timeline: Vec::new(),
             draft,
             generating: false,
@@ -2256,7 +2352,10 @@ impl Thread {
         // the protocol version check rules that out between matching apps.
         if let Some(model) = ModelSelection::from_catalog_id(&thread.model) {
             self.model = model;
+            self.max_tokens = thread.max_tokens;
         }
+        self.context_tokens = thread.context_tokens;
+        self.streamed_bytes = thread.streamed_bytes;
         let (summary, timeline) = thread.into_native(cx);
         self.summary = summary;
         self.set_timeline(timeline);
@@ -2279,6 +2378,9 @@ impl Thread {
                 .sorted_by_key(|(participant, _)| *participant)
                 .collect(),
             model: self.model.catalog_id.into(),
+            max_tokens: self.max_tokens,
+            context_tokens: self.context_tokens,
+            streamed_bytes: self.streamed_bytes,
             messages: self
                 .timeline
                 .iter()
@@ -2548,11 +2650,13 @@ impl Thread {
             // the agent with a different one.
             if sent {
                 self.model = model;
+                self.max_tokens = model.max_tokens;
             }
         } else {
             self.emit(
                 protocol::HostMessage::ModelSelected {
                     catalog_id: model.catalog_id.into(),
+                    max_tokens: model.max_tokens,
                 },
                 cx,
             );
@@ -2664,9 +2768,13 @@ impl Thread {
                     Err(error) => eprintln!("ignored attachment data: {error:#}"),
                 }
             }
-            protocol::HostMessage::ModelSelected { catalog_id } => {
+            protocol::HostMessage::ModelSelected {
+                catalog_id,
+                max_tokens,
+            } => {
                 if let Some(model) = ModelSelection::from_catalog_id(&catalog_id) {
                     self.model = model;
+                    self.max_tokens = max_tokens;
                 }
             }
             protocol::HostMessage::DraftUpdate(update) => {
@@ -2690,6 +2798,7 @@ impl Thread {
                 self.generating = true;
             }
             protocol::HostMessage::AgentTextAppended { id, target, text } => {
+                self.streamed_bytes += text.len() as u64;
                 let Some(message) = self.agent_message_mut(id) else {
                     return;
                 };
@@ -2734,8 +2843,15 @@ impl Thread {
                     response,
                 });
             }
+            protocol::HostMessage::ContextMeasured(tokens) => {
+                self.context_tokens = Some(tokens);
+                self.streamed_bytes = 0;
+            }
             protocol::HostMessage::AgentEnded { id, failure } => {
                 self.generating = false;
+                // A request that was stopped or failed before it reported
+                // usage never adds its partial output to the transcript.
+                self.streamed_bytes = 0;
                 let Some(message) = self.agent_message_mut(id) else {
                     return;
                 };
@@ -2753,6 +2869,16 @@ impl Thread {
                 }
             }
         }
+    }
+
+    /// How much of the context window the thread fills right now: the last
+    /// measured count, plus an estimate for the output streamed since. `None`
+    /// until there is either.
+    fn live_context_tokens(&self) -> Option<u64> {
+        if self.context_tokens.is_none() && self.streamed_bytes == 0 {
+            return None;
+        }
+        Some(self.context_tokens.unwrap_or(0) + self.streamed_bytes.div_ceil(BYTES_PER_TOKEN))
     }
 
     fn set_timeline(&mut self, timeline: Vec<TimelineMessage>) {
@@ -3032,6 +3158,9 @@ struct Cowork {
     profile_name_subscription: Option<Subscription>,
     tokio_handle: tokio::runtime::Handle,
     active_generations: HashMap<Uuid, ActiveGeneration>,
+    /// Tokens used across local threads, excluding ones joined from someone
+    /// else; see [`Cowork::record_turn_usage`].
+    tokens_used: u64,
     /// Who the local user is in the threads this app creates and hosts.
     local_participant_id: ParticipantId,
     /// The draft editor the user is typing in, so that when its item is
@@ -3718,7 +3847,11 @@ impl Cowork {
             profiles: HashMap::new(),
             transcript: Vec::new(),
             prompt_names: HashMap::new(),
+            tokens_used: 0,
             model,
+            max_tokens: model.max_tokens,
+            context_tokens: None,
+            streamed_bytes: 0,
             timeline,
             draft,
             generating: false,
@@ -4229,6 +4362,7 @@ impl Cowork {
                     thread.emit(
                         protocol::HostMessage::ModelSelected {
                             catalog_id: model.catalog_id.into(),
+                            max_tokens: model.max_tokens,
                         },
                         cx,
                     );
@@ -6650,7 +6784,7 @@ impl Cowork {
             tools.add_tool(RespondToComment::new(tool_comments));
             StreamingAgent::new(model, tools)
                 .additional_params(json!({
-                    "num_ctx": OLLAMA_CONTEXT_TOKENS,
+                    "num_ctx": selected_model.max_tokens,
                     "think": "medium"
                 }))
                 .run(prompt, &mut history, move |event| {
@@ -6671,9 +6805,25 @@ impl Cowork {
         cx.spawn(async move |this, cx| {
             let mut stream_completed = true;
             let mut published_comment_responses = HashSet::new();
+            let mut turn_usage = Usage::default();
             while let Some(item) = receiver.recv().await {
                 if let AgentEvent::HistoryAppended(message) = item {
                     thread.update(cx, |thread, _| thread.transcript.push(message));
+                    continue;
+                }
+                if let AgentEvent::Usage(usage) = item {
+                    turn_usage += usage;
+                    // Each request sends the whole transcript, so its usage
+                    // is how full the context is.
+                    if usage.is_reported() {
+                        thread.update(cx, |thread, cx| {
+                            thread.emit(
+                                protocol::HostMessage::ContextMeasured(usage_tokens(usage)),
+                                cx,
+                            );
+                        });
+                        _ = this.update(cx, |_, cx| cx.notify());
+                    }
                     continue;
                 }
                 if let AgentEvent::ToolCall(call) = &item
@@ -6741,6 +6891,7 @@ impl Cowork {
                     );
                 });
                 _ = this.update(cx, |this, cx| {
+                    this.record_turn_usage(&thread, turn_usage, cx);
                     if let Entry::Occupied(entry) = this.active_generations.entry(thread_id) {
                         if entry.get().message_id == message_id {
                             entry.remove();
@@ -6781,7 +6932,21 @@ impl Cowork {
             AgentEvent::Model(_)
             | AgentEvent::ToolCall(_)
             | AgentEvent::ToolResult { .. }
-            | AgentEvent::HistoryAppended(_) => None,
+            | AgentEvent::HistoryAppended(_)
+            | AgentEvent::Usage(_) => None,
+        }
+    }
+
+    /// Adds a finished turn's usage to its thread and, unless the thread was
+    /// joined from someone else, to the global count.
+    fn record_turn_usage(&mut self, thread: &Entity<Thread>, usage: Usage, cx: &mut App) {
+        let tokens = usage_tokens(usage);
+        let ownership = thread.update(cx, |thread, _| {
+            thread.tokens_used += tokens;
+            thread.ownership
+        });
+        if ownership == ThreadOwnership::Local {
+            self.tokens_used += tokens;
         }
     }
 
@@ -7724,7 +7889,10 @@ impl Cowork {
         let loading_attachments = self
             .writable_draft_id(cx)
             .is_some_and(|draft_id| self.draft_is_loading_attachments(draft_id, cx));
-        let generating = active_thread.is_some_and(|thread| thread.read(cx).generating);
+        let generating = active_thread
+            .as_ref()
+            .is_some_and(|thread| thread.read(cx).generating);
+        let context_indicator = self.render_context_indicator(active_thread.as_ref(), cx);
         let selected_model_title = self
             .model_picker
             .read(cx)
@@ -7749,6 +7917,7 @@ impl Cowork {
         let model_picker_hovered = self.model_picker_hovered;
         let model_picker = div()
             .id("model-picker-container")
+            .debug_selector(|| "model-picker".to_owned())
             .w(model_picker_width)
             .min_w_0()
             .h(px(28.))
@@ -7910,9 +8079,75 @@ impl Cowork {
             })
             .when(can_control, |this| {
                 this.child(div().flex_1())
+                    .child(context_indicator)
                     .child(model_picker)
                     .children(button)
             })
+    }
+
+    /// A ring that fills as the active thread nears the end of its model's
+    /// context window. Hovering it shows the numbers.
+    fn render_context_indicator(
+        &self,
+        thread: Option<&Entity<Thread>>,
+        cx: &App,
+    ) -> impl IntoElement + use<> {
+        let model = self.new_thread_model;
+        let usage = ContextUsage::of(thread.map(|thread| thread.read(cx)), model);
+        let thread = thread.map(Entity::downgrade);
+        div()
+            .id("context-indicator")
+            .debug_selector(|| "context-indicator".to_owned())
+            .size(px(28.))
+            .flex_none()
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                ProgressCircle::new("context-ring")
+                    .value(usage.percent())
+                    .color(usage.color())
+                    .accessibility_label(format!("Context window {:.0}% full", usage.percent()))
+                    .size(px(16.)),
+            )
+            .tooltip(move |window, cx| {
+                let thread = thread.clone();
+                // Reads the thread on every render, so the numbers keep up
+                // with a streaming reply while the tooltip is open.
+                Tooltip::element(move |_, cx| {
+                    let thread = thread.as_ref().and_then(WeakEntity::upgrade);
+                    let usage =
+                        ContextUsage::of(thread.as_ref().map(|thread| thread.read(cx)), model);
+                    Self::render_context_details(usage)
+                })
+                .py_2()
+                .px_3()
+                .build(window, cx)
+            })
+    }
+
+    fn render_context_details(usage: ContextUsage) -> impl IntoElement {
+        let muted = rgb(0x71717a);
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().text_color(rgb(0xa1a1aa)).child("Context"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .text_color(rgb(0xe4e4e7))
+                    .child(format!("{:.0}%", usage.percent()))
+                    .child(div().text_color(muted).child("·"))
+                    .child(format_token_count(usage.tokens))
+                    .child(
+                        div()
+                            .text_color(muted)
+                            .child(format!("/ {}", format_token_count(usage.max_tokens))),
+                    ),
+            )
     }
 
     fn submit_composer_action(
@@ -8609,6 +8844,7 @@ fn main() -> anyhow::Result<()> {
                         profile_name_subscription: None,
                         tokio_handle,
                         active_generations: HashMap::new(),
+                        tokens_used: 0,
                         local_participant_id,
                         typing_in: None,
                         published_presence: HashMap::new(),
@@ -8902,6 +9138,7 @@ mod tests {
             profile_name_subscription: None,
             tokio_handle,
             active_generations: HashMap::new(),
+            tokens_used: 0,
             local_participant_id,
             typing_in: None,
             published_presence: HashMap::new(),
@@ -8934,7 +9171,11 @@ mod tests {
             profiles: HashMap::new(),
             transcript: Vec::new(),
             prompt_names: HashMap::new(),
+            tokens_used: 0,
             model: DEFAULT_MODEL,
+            max_tokens: DEFAULT_MODEL.max_tokens,
+            context_tokens: None,
+            streamed_bytes: 0,
             timeline,
             draft,
             generating: false,
@@ -9743,10 +9984,12 @@ mod tests {
                 target: protocol::AgentText::Response,
                 text: "the answer.".into(),
             },
+            protocol::HostMessage::ContextMeasured(2_048),
             protocol::HostMessage::AgentEnded { id, failure: None },
             joined(ParticipantId::new()),
             protocol::HostMessage::ModelSelected {
                 catalog_id: OLLAMA_QWEN.catalog_id.into(),
+                max_tokens: 65_536,
             },
         ]
     }
@@ -9827,6 +10070,8 @@ mod tests {
                 [host_participant, collaborator_participant]
             );
             assert_eq!(collaborator.model, OLLAMA_QWEN);
+            assert_eq!(collaborator.max_tokens, 65_536);
+            assert_eq!(collaborator.context_tokens, Some(2_048));
             assert!(!host.generating);
             assert!(!collaborator.generating);
 
@@ -9870,12 +10115,14 @@ mod tests {
                     joined(first),
                     protocol::HostMessage::ModelSelected {
                         catalog_id: "no-such-model".into(),
+                        max_tokens: 1,
                     },
                 ] {
                     thread.apply(event, cx);
                 }
                 assert_eq!(thread.participants, [first, second]);
                 assert_eq!(thread.model, DEFAULT_MODEL);
+                assert_eq!(thread.max_tokens, DEFAULT_MODEL.max_tokens);
 
                 thread.apply(
                     protocol::HostMessage::ParticipantLeft(first.into_bytes()),
@@ -9911,6 +10158,7 @@ mod tests {
                 thread.apply(
                     protocol::HostMessage::ModelSelected {
                         catalog_id: RECOMMENDED_QWEN.catalog_id.into(),
+                        max_tokens: RECOMMENDED_QWEN.max_tokens,
                     },
                     cx,
                 );
@@ -9930,6 +10178,91 @@ mod tests {
                 Some(OLLAMA_QWEN)
             );
             cowork.active_thread_id = Some(thread_id);
+        });
+    }
+
+    #[test]
+    fn token_counts_are_shortened() {
+        for (tokens, text) in [
+            (0, "0"),
+            (950, "950"),
+            (1_000, "1k"),
+            (4_096, "4.1k"),
+            (9_949, "9.9k"),
+            (9_950, "10k"),
+            (128_000, "128k"),
+            (131_072, "131k"),
+            (999_499, "999k"),
+            (999_500, "1M"),
+            (1_000_000, "1M"),
+            (1_500_000, "1.5M"),
+            (20_000_000, "20M"),
+        ] {
+            assert_eq!(format_token_count(tokens), text, "{tokens} tokens");
+        }
+    }
+
+    #[test]
+    fn context_usage_percent_and_color() {
+        let usage = |tokens| ContextUsage {
+            tokens,
+            max_tokens: 1_000,
+        };
+        assert_eq!(usage(130).percent(), 13.);
+        assert_eq!(usage(130).color(), rgb(0xa1a1aa));
+        assert_eq!(usage(800).color(), rgb(0xfbbf24));
+        assert_eq!(usage(1_200).color(), rgb(0xf87171));
+        let unknown = ContextUsage {
+            tokens: 5,
+            max_tokens: 0,
+        };
+        assert_eq!(unknown.percent(), 0.);
+    }
+
+    #[test]
+    fn usage_tokens_falls_back_to_input_and_output() {
+        let usage = |input, output, total| Usage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: total,
+            ..Default::default()
+        };
+        assert_eq!(usage_tokens(usage(Some(10), Some(5), Some(20))), 20);
+        assert_eq!(usage_tokens(usage(Some(10), Some(5), None)), 15);
+        assert_eq!(usage_tokens(usage(Some(10), None, None)), 10);
+        assert_eq!(usage_tokens(Usage::default()), 0);
+    }
+
+    #[gpui::test]
+    fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppContext) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime");
+        let (cowork, _, cx) = attachment_test_cowork(cx, runtime.handle().clone());
+        let turn = |total| Usage {
+            total_tokens: Some(total),
+            ..Default::default()
+        };
+
+        cowork.update(cx, |cowork, cx| {
+            let local = cowork.active_thread(cx).expect("active thread");
+            let joined = cx.new(|_| {
+                let mut thread = test_thread(
+                    Uuid::new_v4(),
+                    Vec::new(),
+                    ThreadDraft::new(ParticipantId::new()),
+                );
+                thread.ownership = ThreadOwnership::Remote;
+                thread
+            });
+
+            cowork.record_turn_usage(&local, turn(100), cx);
+            cowork.record_turn_usage(&local, turn(50), cx);
+            cowork.record_turn_usage(&joined, turn(30), cx);
+
+            assert_eq!(local.read(cx).tokens_used, 150);
+            assert_eq!(joined.read(cx).tokens_used, 30);
+            assert_eq!(cowork.tokens_used, 150);
         });
     }
 
@@ -9953,6 +10286,72 @@ mod tests {
                     Some(model)
                 );
             }
+        });
+    }
+
+    #[gpui::test]
+    fn context_tokens_are_estimated_while_streaming(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let draft = ThreadDraft::new(ParticipantId::new());
+            EmptyThreadTestView {
+                thread: Cowork::new_empty_local_thread(
+                    draft,
+                    ParticipantId::new(),
+                    DEFAULT_MODEL,
+                    cx,
+                ),
+                draft_id: Uuid::nil(),
+            }
+        });
+        let id = Uuid::new_v4().into_bytes();
+        let text = |text: &str| protocol::HostMessage::AgentTextAppended {
+            id,
+            target: protocol::AgentText::Response,
+            text: text.into(),
+        };
+
+        cx.update(|_, cx| {
+            let thread = view.read(cx).thread.clone();
+            thread.update(cx, |thread, cx| {
+                assert_eq!(thread.live_context_tokens(), None);
+                thread.apply(
+                    protocol::HostMessage::AgentStarted {
+                        id,
+                        comment_group_id: None,
+                    },
+                    cx,
+                );
+
+                // Before any count, streamed output is all there is.
+                thread.apply(text("12345"), cx);
+                assert_eq!(thread.live_context_tokens(), Some(2));
+
+                // A measurement replaces the estimate, which then grows on.
+                thread.apply(protocol::HostMessage::ContextMeasured(100), cx);
+                assert_eq!(thread.live_context_tokens(), Some(100));
+                thread.apply(text("12345678"), cx);
+                assert_eq!(thread.live_context_tokens(), Some(102));
+            });
+
+            // Someone joining mid-stream sees the same count.
+            let welcome = protocol::Welcome {
+                participant_id: ParticipantId::new().into_bytes(),
+                thread: thread.read(cx).to_protocol(),
+                draft: thread.read(cx).draft.doc.encode_state(),
+                presence: Vec::new(),
+                stored_attachments: Vec::new(),
+            };
+            let draft = ThreadDraft::new(ParticipantId::new());
+            let mirror =
+                cx.new(|cx| Thread::from_welcome(welcome, draft, ThreadSharing::NotShared, cx));
+            assert_eq!(mirror.read(cx).live_context_tokens(), Some(102));
+
+            // Output of a stopped request never reaches the transcript.
+            thread.update(cx, |thread, cx| {
+                thread.apply(protocol::HostMessage::AgentEnded { id, failure: None }, cx);
+                assert_eq!(thread.live_context_tokens(), Some(100));
+            });
         });
     }
 
@@ -10271,6 +10670,21 @@ mod tests {
         assert!(display_name_error("   ").is_some());
         assert!(display_name_error(&"a".repeat(MAX_DISPLAY_NAME_CHARS)).is_none());
         assert!(display_name_error(&"a".repeat(MAX_DISPLAY_NAME_CHARS + 1)).is_some());
+    }
+
+    #[gpui::test]
+    fn context_indicator_sits_left_of_the_model_picker(cx: &mut gpui::TestAppContext) {
+        let (_cowork, _runtime, cx) = composer_test_cowork(cx);
+
+        let indicator = cx
+            .debug_bounds("context-indicator")
+            .expect("context indicator should be rendered");
+        let picker = cx
+            .debug_bounds("model-picker")
+            .expect("model picker should be rendered");
+
+        assert!(indicator.right() <= picker.left());
+        assert!(indicator.top() < picker.bottom() && picker.top() < indicator.bottom());
     }
 
     #[gpui::test]
@@ -11299,6 +11713,9 @@ mod tests {
                 participants: Vec::new(),
                 profiles: Vec::new(),
                 model: DEFAULT_MODEL.catalog_id.into(),
+                max_tokens: DEFAULT_MODEL.max_tokens,
+                context_tokens: None,
+                streamed_bytes: 0,
                 messages: Vec::new(),
             },
             draft: host_draft.encode_state(),

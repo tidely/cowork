@@ -8,7 +8,7 @@
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
 use rig::{
-    completion::{AssistantContent, CompletionModel, CompletionResponse, Message},
+    completion::{AssistantContent, CompletionModel, CompletionResponse, Message, Usage},
     message::{ToolCall, UserContent},
     streaming::{StreamEvent, StreamingCompletionResponse},
     tool::{ToolContext, ToolResult, ToolSet},
@@ -29,6 +29,10 @@ pub enum AgentEvent {
     /// request streams, so an interrupted run's history still ends with what
     /// the model was last asked. The initial prompt is not repeated here.
     HistoryAppended(Message),
+    /// The tokens a completed model request used, as the provider reported
+    /// them. A run makes one request per model turn, so summing these gives
+    /// the run's usage even when a later request fails or is cancelled.
+    Usage(Usage),
 }
 
 /// The completed response and the history assembled by the loop.
@@ -110,6 +114,7 @@ where
                 .context("failed to start model stream")?;
             let tool_calls = consume_turn(&mut stream, &mut emit).await?;
             let response = stream.finish();
+            emit(AgentEvent::Usage(response.usage));
 
             let reply = Message::Assistant {
                 id: response.message_id.clone(),
