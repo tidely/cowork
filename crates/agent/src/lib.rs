@@ -24,6 +24,11 @@ pub enum AgentEvent {
     ToolCall(ToolCall),
     /// The result of executing a tool after its model turn completed.
     ToolResult { call: ToolCall, result: ToolResult },
+    /// A message was added to the history, exactly as later requests send
+    /// it: each completed model turn, and each tool-result prompt before its
+    /// request streams, so an interrupted run's history still ends with what
+    /// the model was last asked. The initial prompt is not repeated here.
+    HistoryAppended(Message),
 }
 
 /// The completed response and the history assembled by the loop.
@@ -70,12 +75,17 @@ where
     ///
     /// `emit` is called synchronously as stream events arrive. It should do
     /// little work itself; forwarding events to a channel is a good default.
+    ///
+    /// Every message this adds to `history` after `prompt` is also emitted
+    /// as [`AgentEvent::HistoryAppended`]. On failure, `history` ends with
+    /// the prompt of the request that failed.
     pub async fn run(
         &self,
         mut prompt: Message,
         history: &mut Vec<Message>,
         mut emit: impl FnMut(AgentEvent),
     ) -> Result<CompletionResponse> {
+        let mut initial = true;
         loop {
             let mut request = self
                 .model
@@ -89,6 +99,10 @@ where
             if let Some(params) = &self.additional_params {
                 request = request.additional_params(params.clone());
             }
+            history.push(prompt.clone());
+            if !std::mem::take(&mut initial) {
+                emit(AgentEvent::HistoryAppended(prompt));
+            }
 
             let mut stream = request
                 .stream()
@@ -97,11 +111,12 @@ where
             let tool_calls = consume_turn(&mut stream, &mut emit).await?;
             let response = stream.finish();
 
-            history.push(prompt);
-            history.push(Message::Assistant {
+            let reply = Message::Assistant {
                 id: response.message_id.clone(),
                 content: response.choice.clone(),
-            });
+            };
+            history.push(reply.clone());
+            emit(AgentEvent::HistoryAppended(reply));
 
             if tool_calls.is_empty() {
                 return Ok(response);

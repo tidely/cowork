@@ -92,10 +92,18 @@ Implementation notes on attachment transfer:
   launch and uses it for its local threads too.
 - Reconnecting is a fresh join with a new participant UUID. Items created
   earlier keep their original creator.
-- Display names are two filler words (e.g. "Amber Otter") and a color, both
-  derived deterministically from the UUID. Every client computes the same
-  result, so names are never transmitted. Names are not authoritative and
-  may collide.
+- Each participant has a **profile**: a display name and a profile picture,
+  both optional and chosen by the participant. Without them, a participant
+  shows as two filler words (e.g. "Amber Otter") and initials, derived
+  deterministically from the UUID. Colors are always derived from the UUID,
+  so carets stay distinct. Profiles are cosmetic, never authoritative, and
+  may collide; they are not disambiguated.
+- A collaborator sends its profile right after `Join`, and again whenever it
+  changes. The host validates it (a trimmed name of at most 40 characters; a
+  JPEG of exactly 256×256 pixels and at most 128 KiB) and disconnects peers
+  that send an invalid one. Profiles travel in `ParticipantJoined`,
+  `ProfileChanged`, and every snapshot, and are kept after a participant
+  leaves, so their messages still name them.
 - Identity will later be tied to real accounts or keys by mapping an
   authenticated identity to a participant UUID at the host. Nothing in the
   document depends on how identity is established.
@@ -319,9 +327,20 @@ A single-block submission looks like the current user message.
 
 **Agent prompt**: the same format for shared and local threads.
 
-- Comments come first, as today, each labeled with its creator's name. The
-  agent must still call `respond_to_comment` once per comment.
-- Each prompt block follows, in order, preceded by its creator's name.
+- Comments come first, as today, each labeled with its creator's prompt
+  name. The agent must still call `respond_to_comment` once per comment.
+- Each prompt block follows, in order, preceded by its creator's prompt
+  name.
+- A participant's **prompt name** is their display name when their first
+  item is submitted in the thread, and never changes afterwards. Renaming
+  shows everywhere in the UI, but the agent keeps knowing them by one name,
+  and nothing it was already sent changes.
+- The host keeps a **transcript** of everything the agent was sent and
+  replied, including reasoning, tool calls, and tool results, and sends it
+  verbatim as the history of the next run. Each request therefore extends
+  the previous one exactly, keeping the provider's prompt cache valid. A
+  run that is stopped or fails keeps its prompt and every turn it
+  completed.
 - Each block's attachments stay with that block, using today's encoding.
 - Mentions (once supported) render as `@Name`.
 
@@ -370,8 +389,9 @@ This is independent of the draft document and is the first feature to build.
 
 - **Starting**: the host's existing draft becomes the shared draft
   unchanged. Its items keep the host as creator.
-- **Joining**: the collaborator sends `Join` with its protocol version. The
-  host rejects mismatched versions. Otherwise it replies with `Welcome`
+- **Joining**: the collaborator sends `Join` with its protocol version,
+  then its `Profile`. The host rejects mismatched versions. Otherwise it
+  replies with `Welcome`
   (see [Protocol](#protocol)), then streams the bytes of every attachment
   in the thread.
 - **Falling behind**: a collaborator that lags the host's event buffer
@@ -450,7 +470,8 @@ Design decisions:
 
 | State                               | Where it lives                                           |
 | ----------------------------------- | -------------------------------------------------------- |
-| Participants, names, colors         | Host session; names derived from UUIDs                   |
+| Participants and profiles           | Host session, synced by protocol; colors from UUIDs      |
+| Prompt names and agent transcript   | Thread state at the host                                 |
 | Presence                            | Host-relayed protocol messages                           |
 | Selected model                      | Thread state at the host, synced by protocol             |
 | Submission sequence                 | Thread state at the host                                 |
@@ -469,6 +490,7 @@ The messages below are conceptual. Names and shapes will follow the existing
 | Message            | Purpose                                                         |
 | ------------------ | --------------------------------------------------------------- |
 | `Join`             | First message; carries the protocol version                     |
+| `Profile`          | Second message, and again whenever the profile changes          |
 | `DraftUpdate`      | Encoded Yrs update from a local transaction                     |
 | `Presence`         | Replaces this participant's presence state                      |
 | `AttachmentData`   | Bytes of an attachment this participant added                   |
@@ -480,10 +502,11 @@ The messages below are conceptual. Names and shapes will follow the existing
 
 | Message                      | Purpose                                                                                                                                  |
 | ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `Welcome`                    | Participant UUID, timeline snapshot, draft state, participants and their presence, model, submission sequence, stored attachment IDs |
+| `Welcome`                    | Participant UUID, timeline snapshot, draft state, participants, their profiles and presence, model, submission sequence, stored attachment IDs |
 | `Rejected`                   | Join refused (e.g. protocol version) or a request refused; peer-specific                                                                 |
 | `DraftUpdate`                | Yrs update from another participant or the host                                                                                          |
-| `ParticipantJoined` / `Left` | Membership changes                                                                                                                       |
+| `ParticipantJoined` / `Left` | Membership changes; joining carries the participant's profile                                                                            |
+| `ProfileChanged`             | A participant's new profile                                                                                                              |
 | `Presence`                   | A participant's latest presence                                                                                                          |
 | `AttachmentData`             | Relayed attachment bytes                                                                                                                 |
 | `AttachmentStored`           | The host holds every byte of an attachment                                                                                               |

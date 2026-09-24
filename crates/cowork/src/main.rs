@@ -449,6 +449,14 @@ fn image_content(bytes: Vec<u8>) -> Result<FileAttachmentContent, Vec<u8>> {
 /// Profile pictures are cropped to a square of this many pixels, so they stay
 /// small and cheap to draw however large the chosen file is.
 const PROFILE_PICTURE_PIXELS: u32 = 256;
+/// Pictures travel to every participant, so they are sent as JPEG, which
+/// keeps a photo this size around 20 KB.
+const PROFILE_PICTURE_QUALITY: u8 = 85;
+/// Far above what `PROFILE_PICTURE_PIXELS` at `PROFILE_PICTURE_QUALITY`
+/// produces; only bounds what a peer can make everyone store.
+const MAX_PROFILE_PICTURE_BYTES: usize = 128 * 1024;
+/// Shows through where a picture was transparent, since JPEG has no alpha.
+const PROFILE_PICTURE_BACKGROUND: [u8; 3] = [0x27, 0x27, 0x2a];
 const MAX_DISPLAY_NAME_CHARS: usize = 40;
 
 fn load_profile_picture(path: &Path) -> anyhow::Result<gpui::Image> {
@@ -469,16 +477,68 @@ fn load_profile_picture(path: &Path) -> anyhow::Result<gpui::Image> {
     profile_picture(&bytes).with_context(|| format!("{name} is not a supported image"))
 }
 
-/// Center-crops an image to a square and re-encodes it as a PNG.
+/// Center-crops an image to a square and re-encodes it as a JPEG.
 fn profile_picture(bytes: &[u8]) -> anyhow::Result<gpui::Image> {
-    let square = image::load_from_memory(bytes)?.resize_to_fill(
-        PROFILE_PICTURE_PIXELS,
-        PROFILE_PICTURE_PIXELS,
-        image::imageops::FilterType::Lanczos3,
-    );
-    let mut png = Vec::new();
-    square.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
-    Ok(gpui::Image::from_bytes(gpui::ImageFormat::Png, png))
+    let square = image::load_from_memory(bytes)?
+        .resize_to_fill(
+            PROFILE_PICTURE_PIXELS,
+            PROFILE_PICTURE_PIXELS,
+            image::imageops::FilterType::Lanczos3,
+        )
+        .into_rgba8();
+    let opaque = image::RgbImage::from_fn(square.width(), square.height(), |x, y| {
+        let [red, green, blue, alpha] = square.get_pixel(x, y).0;
+        let blend = |channel: u8, background: u8| {
+            let alpha = u16::from(alpha);
+            ((u16::from(channel) * alpha + u16::from(background) * (255 - alpha)) / 255) as u8
+        };
+        image::Rgb([
+            blend(red, PROFILE_PICTURE_BACKGROUND[0]),
+            blend(green, PROFILE_PICTURE_BACKGROUND[1]),
+            blend(blue, PROFILE_PICTURE_BACKGROUND[2]),
+        ])
+    });
+    let mut jpeg = Vec::new();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, PROFILE_PICTURE_QUALITY)
+        .encode_image(&opaque)?;
+    Ok(gpui::Image::from_bytes(gpui::ImageFormat::Jpeg, jpeg))
+}
+
+/// Checks a profile a collaborator sent, as [`profile_picture`] and
+/// [`display_name_error`] would have made it.
+fn validate_profile(profile: &protocol::Profile) -> anyhow::Result<()> {
+    if let Some(name) = &profile.name {
+        anyhow::ensure!(name.trim() == name, "The profile name is not trimmed.");
+        if let Some(error) = display_name_error(name) {
+            anyhow::bail!(error);
+        }
+    }
+    if let Some(picture) = &profile.picture {
+        anyhow::ensure!(
+            picture.len() <= MAX_PROFILE_PICTURE_BYTES,
+            "The profile picture is {}; it can be at most {}.",
+            format_bytes(picture.len() as u64),
+            format_bytes(MAX_PROFILE_PICTURE_BYTES as u64)
+        );
+        // Limited up front, so a picture claiming to be huge is never
+        // decoded.
+        let mut limits = image::Limits::default();
+        limits.max_image_width = Some(PROFILE_PICTURE_PIXELS);
+        limits.max_image_height = Some(PROFILE_PICTURE_PIXELS);
+        let mut reader = image::ImageReader::with_format(
+            std::io::Cursor::new(picture),
+            image::ImageFormat::Jpeg,
+        );
+        reader.limits(limits);
+        let decoded = reader
+            .decode()
+            .context("The profile picture is not a valid JPEG.")?;
+        anyhow::ensure!(
+            decoded.width() == PROFILE_PICTURE_PIXELS && decoded.height() == PROFILE_PICTURE_PIXELS,
+            "The profile picture is not {PROFILE_PICTURE_PIXELS} pixels square."
+        );
+    }
+    Ok(())
 }
 
 /// Why `name` cannot be a display name, if it cannot.
@@ -543,6 +603,7 @@ fn agent_message(
     preface: Option<&str>,
     blocks: &[PromptBlock],
     files: &HashMap<AttachmentId, FileAttachment>,
+    names: &HashMap<ParticipantId, SharedString>,
 ) -> RigMessage {
     let mut content = preface
         .map(UserContent::text)
@@ -551,7 +612,7 @@ fn agent_message(
     for block in blocks {
         content.push(UserContent::text(format!(
             "{}:\n{}",
-            block.author.display_name(),
+            prompt_name(names, block.author),
             block.text
         )));
         content.extend(
@@ -563,6 +624,19 @@ fn agent_message(
         );
     }
     RigMessage::User { content }
+}
+
+/// `participant`'s name in prompts; see [`Thread::prompt_names`].
+fn prompt_name(
+    names: &HashMap<ParticipantId, SharedString>,
+    participant: ParticipantId,
+) -> SharedString {
+    names
+        .get(&participant)
+        .cloned()
+        // Everyone is named before their items are sent, so this is only a
+        // fallback that is stable as well.
+        .unwrap_or_else(|| participant.display_name().into())
 }
 
 fn attachment_content(attachment: &FileAttachment) -> UserContent {
@@ -702,6 +776,7 @@ fn selection_rects(
 /// A participant's name in their color, just above their caret at `origin`.
 fn paint_caret_label(
     participant: ParticipantId,
+    name: SharedString,
     origin: gpui::Point<gpui::Pixels>,
     window: &mut Window,
     cx: &mut App,
@@ -709,7 +784,6 @@ fn paint_caret_label(
     const FONT_SIZE: gpui::Pixels = px(10.);
     const HEIGHT: gpui::Pixels = px(14.);
 
-    let name = SharedString::from(participant.display_name());
     let run = TextRun {
         len: name.len(),
         font: window.text_style().font(),
@@ -1041,10 +1115,6 @@ struct UserMessageGroup {
     id: Uuid,
     comments: Vec<UserComment>,
     blocks: Vec<PromptBlock>,
-    /// The comment instructions the agent was given with this message, so
-    /// history replays exactly what was sent. Only the host that ran the
-    /// agent has them.
-    history_preface: Option<String>,
     comments_folded: bool,
 }
 
@@ -1830,13 +1900,41 @@ struct JoinDialog {
     _input_subscription: Option<Subscription>,
 }
 
-/// How the local user presents themselves. Only shown locally for now.
-#[derive(Default)]
-struct LocalProfile {
+/// How a participant presents themselves; see [`protocol::Profile`].
+#[derive(Clone, Default)]
+struct Profile {
     /// Replaces the name derived from the participant id when set.
     name: Option<SharedString>,
     /// Replaces the initials avatar when set.
     picture: Option<Arc<gpui::Image>>,
+}
+
+impl Profile {
+    fn to_protocol(&self) -> protocol::Profile {
+        protocol::Profile {
+            name: self.name.as_ref().map(ToString::to_string),
+            picture: self
+                .picture
+                .as_ref()
+                .map(|picture| picture.bytes().to_vec()),
+        }
+    }
+
+    fn from_protocol(profile: protocol::Profile) -> Self {
+        Self {
+            name: profile.name.map(Into::into),
+            picture: profile
+                .picture
+                .map(|bytes| Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Jpeg, bytes))),
+        }
+    }
+}
+
+/// The name `participant` chose, or the one derived from their id.
+fn participant_name(participant: ParticipantId, profile: Option<&Profile>) -> SharedString {
+    profile
+        .and_then(|profile| profile.name.clone())
+        .unwrap_or_else(|| participant.display_name().into())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1868,6 +1966,18 @@ struct Thread {
     /// Connected participants in join order, starting with the host. Empty
     /// while the thread is not shared.
     participants: Vec<ParticipantId>,
+    /// The profile of everyone who has joined while shared, kept after they
+    /// leave so their messages still name them. Includes the local user's,
+    /// although [`Cowork::profile`] is what shows for them.
+    profiles: HashMap<ParticipantId, Profile>,
+    /// Everything the agent has been sent and has replied, exactly as sent,
+    /// so each request extends the previous one and the provider's prompt
+    /// cache stays valid. Only the host, which runs the agent, fills it.
+    transcript: Vec<RigMessage>,
+    /// The name each author is given in prompts, fixed when their first
+    /// item is submitted so that renaming never changes the transcript and
+    /// the agent knows everyone by one name. Only the host fills it.
+    prompt_names: HashMap<ParticipantId, SharedString>,
     model: ModelSelection,
     timeline: Vec<TimelineMessage>,
     draft: ThreadDraft,
@@ -1975,7 +2085,6 @@ impl protocol::UserMessage {
                         .collect(),
                 })
                 .collect(),
-            history_preface: None,
             comments_folded: false,
         }
     }
@@ -2084,6 +2193,9 @@ impl Thread {
             },
             participant_id: ParticipantId::from_bytes(welcome.participant_id),
             participants: Vec::new(),
+            profiles: HashMap::new(),
+            transcript: Vec::new(),
+            prompt_names: HashMap::new(),
             model: DEFAULT_MODEL,
             timeline: Vec::new(),
             draft,
@@ -2130,6 +2242,16 @@ impl Thread {
             .copied()
             .map(ParticipantId::from_bytes)
             .collect();
+        self.profiles = thread
+            .profiles
+            .iter()
+            .map(|(participant, profile)| {
+                (
+                    ParticipantId::from_bytes(*participant),
+                    Profile::from_protocol(profile.clone()),
+                )
+            })
+            .collect();
         // Only a model this app does not know about can fail to resolve, and
         // the protocol version check rules that out between matching apps.
         if let Some(model) = ModelSelection::from_catalog_id(&thread.model) {
@@ -2148,6 +2270,13 @@ impl Thread {
                 .participants
                 .iter()
                 .map(|participant| participant.into_bytes())
+                .collect(),
+            // Sorted, so the same thread always makes the same snapshot.
+            profiles: self
+                .profiles
+                .iter()
+                .map(|(participant, profile)| (participant.into_bytes(), profile.to_protocol()))
+                .sorted_by_key(|(participant, _)| *participant)
                 .collect(),
             model: self.model.catalog_id.into(),
             messages: self
@@ -2485,11 +2614,25 @@ impl Thread {
             // Only ever sent in place of the first `Welcome`, which the join
             // handshake consumes.
             protocol::HostMessage::Rejected(_) => {}
-            protocol::HostMessage::ParticipantJoined(participant) => {
+            protocol::HostMessage::ParticipantJoined {
+                participant,
+                profile,
+            } => {
                 let participant = ParticipantId::from_bytes(participant);
                 if !self.participants.contains(&participant) {
                     self.participants.push(participant);
                 }
+                self.profiles
+                    .insert(participant, Profile::from_protocol(profile));
+            }
+            protocol::HostMessage::ProfileChanged {
+                participant,
+                profile,
+            } => {
+                self.profiles.insert(
+                    ParticipantId::from_bytes(participant),
+                    Profile::from_protocol(profile),
+                );
             }
             protocol::HostMessage::ParticipantLeft(participant) => {
                 let participant = ParticipantId::from_bytes(participant);
@@ -2880,7 +3023,10 @@ struct Cowork {
     join_dialog: Option<Entity<JoinDialog>>,
     /// Whether the main stage shows the profile page instead of a thread.
     profile_open: bool,
-    profile: LocalProfile,
+    profile: Profile,
+    /// Everyone's profile as the active thread shows them, refreshed at the
+    /// start of every render; see [`Cowork::profiles_for`].
+    shown_profiles: HashMap<ParticipantId, Profile>,
     profile_error: Option<SharedString>,
     /// Watches the open profile name dialog's input.
     profile_name_subscription: Option<Subscription>,
@@ -3569,6 +3715,9 @@ impl Cowork {
             },
             participant_id,
             participants: Vec::new(),
+            profiles: HashMap::new(),
+            transcript: Vec::new(),
+            prompt_names: HashMap::new(),
             model,
             timeline,
             draft,
@@ -3678,8 +3827,10 @@ impl Cowork {
     }
 
     fn start_sharing(&mut self, thread: Entity<Thread>, cx: &mut Context<Self>) {
+        let profile = self.profile.clone();
         thread.update(cx, |thread, _| {
             thread.sharing = ThreadSharing::Sharing;
+            thread.profiles.insert(thread.participant_id, profile);
         });
         cx.notify();
 
@@ -3817,11 +3968,23 @@ impl Cowork {
             {}
             anyhow::bail!("Rejected a peer using protocol version {protocol_version}.");
         }
+        let profile = peer
+            .receive()
+            .with_timeout(PEER_TIMEOUT, cx.background_executor())
+            .await?
+            .context("Peer closed before sending its profile.")?;
+        let protocol::CollaboratorMessage::Profile(profile) = profile else {
+            anyhow::bail!("Expected a profile message, got {profile:?}.");
+        };
+        validate_profile(&profile).context("Invalid profile from a joining peer.")?;
 
         let participant_id = ParticipantId::new();
         thread.update(cx, |thread, cx| {
             thread.emit(
-                protocol::HostMessage::ParticipantJoined(participant_id.into_bytes()),
+                protocol::HostMessage::ParticipantJoined {
+                    participant: participant_id.into_bytes(),
+                    profile,
+                },
                 cx,
             );
         })?;
@@ -3993,6 +4156,20 @@ impl Cowork {
         match request {
             // Only valid as the first message, which `serve_peer` consumes.
             protocol::CollaboratorMessage::Join { .. } => {}
+            protocol::CollaboratorMessage::Profile(profile) => {
+                validate_profile(&profile)
+                    .with_context(|| format!("Invalid profile from {participant:?}."))?;
+                thread.update(cx, |thread, cx| {
+                    thread.emit(
+                        protocol::HostMessage::ProfileChanged {
+                            participant: participant.into_bytes(),
+                            profile,
+                        },
+                        cx,
+                    );
+                });
+                cx.notify();
+            }
             protocol::CollaboratorMessage::DraftUpdate(update) => {
                 thread
                     .update(cx, |thread, _| {
@@ -4275,6 +4452,7 @@ impl Cowork {
         let window_handle = window.window_handle();
         cx.notify();
 
+        let profile = self.profile.to_protocol();
         let join_task = self.tokio_handle.spawn(async move {
             let endpoint = Endpoint::builder(presets::N0).bind().await?;
             let connection =
@@ -4290,6 +4468,9 @@ impl Cowork {
             })
             .await
             .context("Peer connection is no longer available.")?;
+            host.send(protocol::CollaboratorMessage::Profile(profile))
+                .await
+                .context("Peer connection is no longer available.")?;
             let welcome = tokio::time::timeout(PEER_TIMEOUT, host.receive())
                 .await
                 .context("Timed out waiting for the thread snapshot.")?
@@ -4591,7 +4772,7 @@ impl Cowork {
                     .children(
                         active_thread
                             .as_ref()
-                            .and_then(|thread| Self::render_participants(thread.read(cx))),
+                            .and_then(|thread| self.render_participants(thread.read(cx))),
                     )
                     .when(sharing_status == SharingStatus::Shared, |this| {
                         this.child(copy_endpoint_button)
@@ -4666,7 +4847,7 @@ impl Cowork {
 
     /// The connected participants of a shared thread as overlapping avatars,
     /// in join order, each naming its participant on hover.
-    fn render_participants(thread: &Thread) -> Option<gpui::AnyElement> {
+    fn render_participants(&self, thread: &Thread) -> Option<gpui::AnyElement> {
         const MAX_VISIBLE: usize = 5;
         const AVATAR_SIZE: f32 = 24.;
         const AVATAR_OVERLAP: f32 = 6.;
@@ -4682,12 +4863,12 @@ impl Cowork {
             .take(MAX_VISIBLE)
             .enumerate()
             .map(|(index, &participant)| {
-                let name = if participant == thread.participant_id {
-                    format!("{} (you)", participant.display_name())
+                let name: SharedString = if participant == thread.participant_id {
+                    format!("{} (you)", self.name_of(participant)).into()
                 } else {
-                    participant.display_name()
+                    self.name_of(participant)
                 };
-                Self::render_participant_avatar(participant, px(AVATAR_SIZE))
+                self.render_participant_avatar(participant, px(AVATAR_SIZE))
                     // Separates overlapping avatars from each other.
                     .border_2()
                     .border_color(rgb(0x1c1c1f))
@@ -4730,9 +4911,46 @@ impl Cowork {
         )
     }
 
-    /// A participant's avatar, identical wherever they appear: their color
-    /// behind their initials.
-    fn render_participant_avatar(participant: ParticipantId, size: gpui::Pixels) -> gpui::Div {
+    /// Everyone's profile in `thread`, with the local user's current one
+    /// under each id they have there.
+    fn profiles_for(&self, thread: Option<&Thread>) -> HashMap<ParticipantId, Profile> {
+        let mut profiles = thread
+            .map(|thread| thread.profiles.clone())
+            .unwrap_or_default();
+        profiles.insert(self.local_participant_id, self.profile.clone());
+        if let Some(thread) = thread {
+            profiles.insert(thread.participant_id, self.profile.clone());
+        }
+        profiles
+    }
+
+    fn name_of(&self, participant: ParticipantId) -> SharedString {
+        participant_name(participant, self.shown_profiles.get(&participant))
+    }
+
+    /// A participant's avatar, identical wherever they appear.
+    fn render_participant_avatar(
+        &self,
+        participant: ParticipantId,
+        size: gpui::Pixels,
+    ) -> gpui::Div {
+        Self::render_avatar_for(participant, self.shown_profiles.get(&participant), size)
+    }
+
+    /// The picture a participant chose, or their initials in their color.
+    fn render_avatar_for(
+        participant: ParticipantId,
+        profile: Option<&Profile>,
+        size: gpui::Pixels,
+    ) -> gpui::Div {
+        if let Some(picture) = profile.and_then(|profile| profile.picture.clone()) {
+            return div()
+                .size(size)
+                .flex_none()
+                .overflow_hidden()
+                .rounded_full()
+                .child(img(picture).size_full().rounded_full());
+        }
         div()
             .size(size)
             .flex()
@@ -4937,23 +5155,12 @@ impl Cowork {
     }
 
     fn profile_name(&self) -> SharedString {
-        self.profile
-            .name
-            .clone()
-            .unwrap_or_else(|| self.local_participant_id.display_name().into())
+        participant_name(self.local_participant_id, Some(&self.profile))
     }
 
     /// The local user's picture if they chose one, their initials otherwise.
     fn render_profile_avatar(&self, size: gpui::Pixels) -> gpui::Div {
-        match &self.profile.picture {
-            Some(picture) => div()
-                .size(size)
-                .flex_none()
-                .overflow_hidden()
-                .rounded_full()
-                .child(img(picture.clone()).size_full().rounded_full()),
-            None => Self::render_participant_avatar(self.local_participant_id, size),
-        }
+        Self::render_avatar_for(self.local_participant_id, Some(&self.profile), size)
     }
 
     fn open_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -5087,7 +5294,13 @@ impl Cowork {
             _ = this.update(cx, |this, cx| {
                 match result {
                     Ok(picture) => {
-                        this.profile.picture = Some(Arc::new(picture));
+                        this.set_profile(
+                            Profile {
+                                picture: Some(Arc::new(picture)),
+                                ..this.profile.clone()
+                            },
+                            cx,
+                        );
                         this.profile_error = None;
                     }
                     Err(error) => this.profile_error = Some(error.to_string().into()),
@@ -5212,10 +5425,44 @@ impl Cowork {
         if display_name_error(&value).is_some() {
             return false;
         }
-        self.profile.name = Some(value.trim().to_owned().into());
+        self.set_profile(
+            Profile {
+                name: Some(value.trim().to_owned().into()),
+                ..self.profile.clone()
+            },
+            cx,
+        );
         self.profile_name_subscription = None;
-        cx.notify();
         true
+    }
+
+    /// Replaces the local user's profile and tells everyone they share a
+    /// thread with.
+    fn set_profile(&mut self, profile: Profile, cx: &mut Context<Self>) {
+        self.profile = profile;
+        let threads = self.thread_store.read(cx).threads.clone();
+        for thread in threads {
+            thread.update(cx, |thread, cx| match thread.sharing {
+                ThreadSharing::Shared { .. } => thread.emit(
+                    protocol::HostMessage::ProfileChanged {
+                        participant: thread.participant_id.into_bytes(),
+                        profile: self.profile.to_protocol(),
+                    },
+                    cx,
+                ),
+                ThreadSharing::Connected { .. } => {
+                    thread.request(protocol::CollaboratorMessage::Profile(
+                        self.profile.to_protocol(),
+                    ));
+                }
+                ThreadSharing::NotShared | ThreadSharing::Sharing | ThreadSharing::Failed => {
+                    thread
+                        .profiles
+                        .insert(thread.participant_id, self.profile.clone());
+                }
+            });
+        }
+        cx.notify();
     }
 
     fn dismiss_profile_name_dialog(cowork: &WeakEntity<Self>, cx: &mut App) -> bool {
@@ -5530,7 +5777,7 @@ impl Cowork {
             .child(if collapsed { "›" } else { "⌄" })
     }
 
-    fn render_inline_comment(comment: &UserComment) -> gpui::AnyElement {
+    fn render_inline_comment(&self, comment: &UserComment) -> gpui::AnyElement {
         let body = match &comment.body {
             UserCommentBody::Submitted(body) => div()
                 .w_full()
@@ -5543,10 +5790,7 @@ impl Cowork {
                 .flex_1()
                 .min_w_0()
                 .child(Textarea::new(inline))
-                .child(Self::render_remote_carets(
-                    inline,
-                    comment.presence.carets.clone(),
-                ))
+                .child(self.render_remote_carets(inline, comment.presence.carets.clone()))
                 .into_any_element(),
         };
 
@@ -5568,16 +5812,13 @@ impl Cowork {
                     .py_2()
                     .border_l_2()
                     .border_color(rgb(comment.author.color()))
-                    .child(Self::render_layered_avatars(
-                        comment.author,
-                        &comment.presence.editors,
-                    ))
+                    .child(self.render_layered_avatars(comment.author, &comment.presence.editors))
                     .child(body),
             )
             .into_any_element()
     }
 
-    fn render_composer_comment(comment: &UserComment) -> gpui::AnyElement {
+    fn render_composer_comment(&self, comment: &UserComment) -> gpui::AnyElement {
         let body = match &comment.body {
             UserCommentBody::Submitted(body) => div()
                 .w_full()
@@ -5590,10 +5831,7 @@ impl Cowork {
                 .flex_1()
                 .min_w_0()
                 .child(Textarea::new(composer))
-                .child(Self::render_remote_carets(
-                    composer,
-                    comment.presence.carets.clone(),
-                ))
+                .child(self.render_remote_carets(composer, comment.presence.carets.clone()))
                 .into_any_element(),
         };
 
@@ -5636,7 +5874,7 @@ impl Cowork {
                                 .py_2()
                                 .border_l_2()
                                 .border_color(rgb(comment.author.color()))
-                                .child(Self::render_layered_avatars(
+                                .child(self.render_layered_avatars(
                                     comment.author,
                                     &comment.presence.editors,
                                 ))
@@ -5647,11 +5885,11 @@ impl Cowork {
             .into_any_element()
     }
 
-    fn render_avatar(author: MessageAuthor) -> gpui::Div {
+    fn render_avatar(&self, author: MessageAuthor) -> gpui::Div {
         const SIZE: gpui::Pixels = px(22.);
 
         match author {
-            MessageAuthor::User(participant) => Self::render_participant_avatar(participant, SIZE),
+            MessageAuthor::User(participant) => self.render_participant_avatar(participant, SIZE),
             MessageAuthor::Agent => div()
                 .size(SIZE)
                 .flex_none()
@@ -5801,9 +6039,14 @@ impl Cowork {
                 .into_any_element(),
             ];
             if !group.comments_folded {
-                content.extend(group.comments.iter().map(Self::render_composer_comment));
+                content.extend(
+                    group
+                        .comments
+                        .iter()
+                        .map(|comment| self.render_composer_comment(comment)),
+                );
             }
-            rows.push(Self::render_comment_group_row(&group.comments, content));
+            rows.push(self.render_comment_group_row(&group.comments, content));
         }
         for (block_index, (block, cards)) in group.blocks.iter().zip(cards).enumerate() {
             let mut content = Vec::new();
@@ -5832,10 +6075,7 @@ impl Cowork {
                     .into_any_element(),
                 );
             }
-            rows.push(Self::render_message_row(
-                Some(MessageAuthor::User(block.author)),
-                content,
-            ));
+            rows.push(self.render_message_row(Some(MessageAuthor::User(block.author)), content));
         }
 
         div()
@@ -5857,13 +6097,14 @@ impl Cowork {
     /// The row of a group of comments. Its gutter shows who wrote them, so
     /// that a folded group is still recognizably someone's message.
     fn render_comment_group_row(
+        &self,
         comments: &[UserComment],
         content: impl IntoIterator<Item = gpui::AnyElement>,
     ) -> gpui::Div {
         let authors = Self::comment_authors(comments);
         match authors.split_first() {
-            Some((first, rest)) => Self::render_presence_row(*first, rest, content),
-            None => Self::render_message_row(None, content),
+            Some((first, rest)) => self.render_presence_row(*first, rest, content),
+            None => self.render_message_row(None, content),
         }
     }
 
@@ -5880,11 +6121,12 @@ impl Cowork {
     /// A composer row whose gutter shows `primary` with everyone else in the
     /// row layered below it.
     fn render_presence_row(
+        &self,
         primary: ParticipantId,
         others: &[ParticipantId],
         content: impl IntoIterator<Item = gpui::AnyElement>,
     ) -> gpui::Div {
-        Self::render_message_row(None, content)
+        self.render_message_row(None, content)
             .child(
                 div()
                     .absolute()
@@ -5893,7 +6135,7 @@ impl Cowork {
                     .w(px(40.))
                     .flex()
                     .justify_center()
-                    .child(Self::render_layered_avatars(primary, others)),
+                    .child(self.render_layered_avatars(primary, others)),
             )
             .relative()
     }
@@ -5901,7 +6143,11 @@ impl Cowork {
     /// A participant's avatar with smaller avatars of `others` overlapping
     /// its lower edge. Positioned absolutely so that people coming and going
     /// never move the row's text.
-    fn render_layered_avatars(primary: ParticipantId, others: &[ParticipantId]) -> gpui::Div {
+    fn render_layered_avatars(
+        &self,
+        primary: ParticipantId,
+        others: &[ParticipantId],
+    ) -> gpui::Div {
         const MAX_OTHERS: usize = 2;
         const SMALL: gpui::Pixels = px(14.);
         const STEP: f32 = 10.;
@@ -5911,7 +6157,7 @@ impl Cowork {
             .iter()
             .take(MAX_OTHERS)
             .map(|&participant| {
-                Self::render_participant_avatar(participant, SMALL)
+                self.render_participant_avatar(participant, SMALL)
                     .text_size(px(6.))
                     .border_1()
                     .border_color(rgb(0x18181b))
@@ -5937,7 +6183,7 @@ impl Cowork {
         let count = layered.len();
         div()
             .relative()
-            .child(Self::render_avatar(MessageAuthor::User(primary)))
+            .child(self.render_avatar(MessageAuthor::User(primary)))
             .children(layered.into_iter().enumerate().map(|(index, avatar)| {
                 // Centered under the primary avatar, fanned out sideways.
                 let offset = (index as f32 - (count as f32 - 1.) / 2.) * STEP;
@@ -5947,10 +6193,15 @@ impl Cowork {
 
     /// Paints other participants' carets and selections over `editor`.
     fn render_remote_carets(
+        &self,
         editor: &Entity<TextareaState>,
         carets: Vec<RemoteCaret>,
     ) -> impl IntoElement {
         let editor = editor.clone();
+        let names = carets
+            .iter()
+            .map(|caret| self.name_of(caret.participant))
+            .collect::<Vec<_>>();
         canvas(
             |_, _, _| (),
             move |_, _, window, cx| {
@@ -5977,7 +6228,7 @@ impl Cowork {
                         })
                         .collect::<Vec<_>>()
                 };
-                for (caret, selection, head) in layout {
+                for ((caret, selection, head), name) in layout.into_iter().zip(&names) {
                     let color = caret.participant.color();
                     for rect in selection {
                         window.paint_quad(gpui::fill(rect, rgba((color << 8) | 0x40)));
@@ -5990,7 +6241,7 @@ impl Cowork {
                         rgb(color),
                     ));
                     if caret.moved_at.elapsed() < CARET_LABEL_DURATION {
-                        paint_caret_label(caret.participant, head.origin, window, cx);
+                        paint_caret_label(caret.participant, name.clone(), head.origin, window, cx);
                     }
                 }
             },
@@ -6004,6 +6255,7 @@ impl Cowork {
     /// One row of the timeline or composer: an avatar gutter, the content, and
     /// a matching gap on the right.
     fn render_message_row(
+        &self,
         author: Option<MessageAuthor>,
         content: impl IntoIterator<Item = gpui::AnyElement>,
     ) -> gpui::Div {
@@ -6017,7 +6269,7 @@ impl Cowork {
                     .flex_none()
                     .flex()
                     .justify_center()
-                    .children(author.map(Self::render_avatar)),
+                    .children(author.map(|author| self.render_avatar(author))),
             )
             .child(
                 div()
@@ -6138,7 +6390,7 @@ impl Cowork {
             content.extend(
                 group
                     .iter()
-                    .map(|comment| Self::render_inline_comment(comment)),
+                    .map(|comment| self.render_inline_comment(comment)),
             );
             cursor = line_end;
         }
@@ -6170,7 +6422,7 @@ impl Cowork {
         let waiting = !message.complete && message.thinking.is_empty() && message.text.is_empty();
         let mut submitted_comment_content = Vec::new();
         for comment in submitted_comments {
-            submitted_comment_content.push(Self::render_composer_comment(comment));
+            submitted_comment_content.push(self.render_composer_comment(comment));
             if let Some(response) = message
                 .comment_responses
                 .iter()
@@ -6287,7 +6539,7 @@ impl Cowork {
                     .flex_none()
                     .flex()
                     .justify_center()
-                    .child(Self::render_avatar(MessageAuthor::Agent)),
+                    .child(self.render_avatar(MessageAuthor::Agent)),
             )
             .child(
                 div()
@@ -6359,57 +6611,6 @@ impl Cowork {
         }
     }
 
-    fn rig_history(
-        messages: &[TimelineMessage],
-        files: &HashMap<AttachmentId, FileAttachment>,
-    ) -> Vec<RigMessage> {
-        messages
-            .iter()
-            .filter_map(|message| match message {
-                TimelineMessage::User(group) => Some(agent_message(
-                    group.history_preface.as_deref(),
-                    &group.blocks,
-                    files,
-                )),
-                TimelineMessage::Agent(message) if message.complete && !message.failed => {
-                    let submitted_comments = message
-                        .comment_group_id
-                        .and_then(|group_id| {
-                            messages.iter().find_map(|entry| match entry {
-                                TimelineMessage::User(group) if group.id == group_id => {
-                                    Some(group.comments.as_slice())
-                                }
-                                _ => None,
-                            })
-                        })
-                        .unwrap_or_default();
-                    let mut history_text = submitted_comments
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(index, comment)| {
-                            message
-                                .comment_responses
-                                .iter()
-                                .find(|response| response.comment_id == comment.id)
-                                .map(|response| (index, response))
-                        })
-                        .map(|(index, response)| {
-                            format!("Reply to comment {}: {}", index + 1, response.response)
-                        })
-                        .join("\n\n");
-                    if !message.text.is_empty() {
-                        if !history_text.is_empty() {
-                            history_text.push_str("\n\n");
-                        }
-                        history_text.push_str(&message.text);
-                    }
-                    Some(RigMessage::assistant(history_text))
-                }
-                TimelineMessage::Agent(_) => None,
-            })
-            .collect()
-    }
-
     fn start_generation(
         &mut self,
         thread_id: Uuid,
@@ -6426,6 +6627,9 @@ impl Cowork {
         let message_id = Uuid::new_v4();
         let selected_model = thread.read(cx).model;
         thread.update(cx, |thread, cx| {
+            // Recorded before the run starts, so a prompt stays in the
+            // transcript even when the run is stopped before sending it.
+            thread.transcript.push(prompt.clone());
             thread.emit(
                 protocol::HostMessage::AgentStarted {
                     id: message_id.into_bytes(),
@@ -6468,6 +6672,10 @@ impl Cowork {
             let mut stream_completed = true;
             let mut published_comment_responses = HashSet::new();
             while let Some(item) = receiver.recv().await {
+                if let AgentEvent::HistoryAppended(message) = item {
+                    thread.update(cx, |thread, _| thread.transcript.push(message));
+                    continue;
+                }
                 if let AgentEvent::ToolCall(call) = &item
                     && call.function.name == "respond_to_comment"
                     && let Ok(response) = serde_json::from_value::<RespondToCommentArgs>(
@@ -6570,7 +6778,10 @@ impl Cowork {
                 target: protocol::AgentText::Response,
                 text,
             }),
-            AgentEvent::Model(_) | AgentEvent::ToolCall(_) | AgentEvent::ToolResult { .. } => None,
+            AgentEvent::Model(_)
+            | AgentEvent::ToolCall(_)
+            | AgentEvent::ToolResult { .. }
+            | AgentEvent::HistoryAppended(_) => None,
         }
     }
 
@@ -6610,6 +6821,7 @@ impl Cowork {
         comments: &[UserComment],
         comment_ids: &[tools::CommentId],
         timeline: &[TimelineMessage],
+        names: &HashMap<ParticipantId, SharedString>,
     ) -> Option<String> {
         if comments.is_empty() {
             return None;
@@ -6640,7 +6852,7 @@ impl Cowork {
                 "\n{}. {} — {}, on an excerpt from assistant message {}:\n> {}\nComment: {}\n",
                 index + 1,
                 comment_id,
-                comment.author.display_name(),
+                prompt_name(names, comment.author),
                 message_number,
                 comment.reference.quote.replace('\n', "\n> "),
                 body.trim(),
@@ -7329,17 +7541,41 @@ impl Cowork {
         self.attachment_errors
             .retain(|error| error.draft_id != draft_id);
 
-        let (timeline, files) = match &active_thread {
+        let (timeline, files, history, mut prompt_names) = match &active_thread {
             Some(thread) => {
                 let thread = thread.read(cx);
-                (thread.timeline.clone(), thread.draft.files.clone())
+                (
+                    thread.timeline.clone(),
+                    thread.draft.files.clone(),
+                    thread.transcript.clone(),
+                    thread.prompt_names.clone(),
+                )
             }
-            None => (Vec::new(), self.new_thread_draft.files.clone()),
+            None => (
+                Vec::new(),
+                self.new_thread_draft.files.clone(),
+                Vec::new(),
+                HashMap::new(),
+            ),
         };
-        let history = Self::rig_history(&timeline, &files);
+        let profiles = self.profiles_for(active_thread.as_ref().map(|thread| thread.read(cx)));
+        let authors = comments
+            .iter()
+            .map(|comment| comment.author)
+            .chain(blocks.iter().map(|block| block.author));
+        for author in authors {
+            prompt_names
+                .entry(author)
+                .or_insert_with(|| participant_name(author, profiles.get(&author)));
+        }
         let turn_comments = Arc::new(TurnComments::new(comments.len()));
-        let preface = Self::comments_preface(&comments, turn_comments.comment_ids(), &timeline);
-        let prompt = agent_message(preface.as_deref(), &blocks, &files);
+        let preface = Self::comments_preface(
+            &comments,
+            turn_comments.comment_ids(),
+            &timeline,
+            &prompt_names,
+        );
+        let prompt = agent_message(preface.as_deref(), &blocks, &files, &prompt_names);
         let comment_ids = comments
             .iter()
             .map(|comment| comment.id)
@@ -7349,7 +7585,6 @@ impl Cowork {
             id: Uuid::new_v4(),
             comments,
             blocks,
-            history_preface: preface,
             comments_folded: has_comments || comments_folded,
         };
         let comment_group_id = has_comments.then_some(submitted_group.id);
@@ -7365,6 +7600,7 @@ impl Cowork {
                     submitted_group.to_protocol(),
                 ));
                 thread.timeline.push(TimelineMessage::User(submitted_group));
+                thread.prompt_names = prompt_names;
             });
             thread_id
         } else {
@@ -7382,6 +7618,7 @@ impl Cowork {
                 self.new_thread_model,
                 cx,
             );
+            thread.update(cx, |thread, _| thread.prompt_names = prompt_names);
             let thread_id = thread.read(cx).instance_id;
             self.thread_store.update(cx, |store, _| {
                 store.threads.push_front(thread.clone());
@@ -7912,9 +8149,16 @@ impl Cowork {
                     .into_any_element(),
             ];
             if !comments_folded {
-                content.extend(comments.iter().map(Self::render_composer_comment));
+                content.extend(
+                    comments
+                        .iter()
+                        .map(|comment| self.render_composer_comment(comment)),
+                );
             }
-            rows.push(Self::render_comment_group_row(&comments, content).into_any_element());
+            rows.push(
+                self.render_comment_group_row(&comments, content)
+                    .into_any_element(),
+            );
         }
 
         let block_count = blocks.len();
@@ -7946,15 +8190,12 @@ impl Cowork {
             }
             content.push(
                 Self::render_composer_editor(&block.editor, last, cx)
-                    .child(Self::render_remote_carets(
-                        &block.editor,
-                        block.presence.carets,
-                    ))
+                    .child(self.render_remote_carets(&block.editor, block.presence.carets))
                     .into_any_element(),
             );
             let block_id = block.id;
             rows.push(
-                Self::render_presence_row(block.creator, &block.presence.editors, content)
+                self.render_presence_row(block.creator, &block.presence.editors, content)
                     .can_drop(|value, _, _| {
                         value
                             .downcast_ref::<ExternalPaths>()
@@ -8003,16 +8244,16 @@ impl Cowork {
             content.extend(errors);
             content.extend(draft_position.as_ref().map(|editor| {
                 Self::render_composer_editor(editor, true, cx)
-                    .child(Self::render_remote_carets(
-                        editor,
-                        draft_position_presence.carets,
-                    ))
+                    .child(self.render_remote_carets(editor, draft_position_presence.carets))
                     .into_any_element()
             }));
             let (primary, others) = draft_position_people;
-            rows.push(Self::render_presence_row(primary, &others, content).into_any_element());
+            rows.push(
+                self.render_presence_row(primary, &others, content)
+                    .into_any_element(),
+            );
         } else if !errors.is_empty() {
-            rows.push(Self::render_message_row(None, errors).into_any_element());
+            rows.push(self.render_message_row(None, errors).into_any_element());
         }
 
         div()
@@ -8186,6 +8427,9 @@ impl Cowork {
 impl Render for Cowork {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_model_picker(window, cx);
+        let active_thread = self.active_thread(cx);
+        self.shown_profiles =
+            self.profiles_for(active_thread.as_ref().map(|thread| thread.read(cx)));
         if let Some(draft_id) = self.writable_draft_id(cx) {
             self.prepare_draft(draft_id, window, cx);
         }
@@ -8359,7 +8603,8 @@ fn main() -> anyhow::Result<()> {
                         copied_endpoint_id: None,
                         join_dialog: None,
                         profile_open: false,
-                        profile: LocalProfile::default(),
+                        profile: Profile::default(),
+                        shown_profiles: HashMap::new(),
                         profile_error: None,
                         profile_name_subscription: None,
                         tokio_handle,
@@ -8453,7 +8698,8 @@ mod tests {
             text: "Question".into(),
             attachments: records,
         };
-        let RigMessage::User { content } = agent_message(None, &[block], &files) else {
+        let RigMessage::User { content } = agent_message(None, &[block], &files, &HashMap::new())
+        else {
             panic!("expected user message");
         };
         assert_eq!(content.len(), 3);
@@ -8489,7 +8735,9 @@ mod tests {
                 attachments: Vec::new(),
             },
         ];
-        let RigMessage::User { content } = agent_message(Some("Comments first."), &blocks, &files)
+        let names = HashMap::from([(bob, SharedString::from("Bob"))]);
+        let RigMessage::User { content } =
+            agent_message(Some("Comments first."), &blocks, &files, &names)
         else {
             panic!("expected user message");
         };
@@ -8506,7 +8754,7 @@ mod tests {
                 "Comments first.".to_owned(),
                 "Mossy Crane:\nInvestigate the crash.".to_owned(),
                 "<file name=\"crash.log\">\nboom\n</file>".to_owned(),
-                format!("{}:\nAlso check the logs.", bob.display_name()),
+                "Bob:\nAlso check the logs.".to_owned(),
             ]
         );
     }
@@ -8648,7 +8896,8 @@ mod tests {
             copied_endpoint_id: None,
             join_dialog: None,
             profile_open: false,
-            profile: LocalProfile::default(),
+            profile: Profile::default(),
+            shown_profiles: HashMap::new(),
             profile_error: None,
             profile_name_subscription: None,
             tokio_handle,
@@ -8665,6 +8914,14 @@ mod tests {
         }
     }
 
+    /// `participant` joining with the profile derived from their id.
+    fn joined(participant: ParticipantId) -> protocol::HostMessage {
+        protocol::HostMessage::ParticipantJoined {
+            participant: participant.into_bytes(),
+            profile: protocol::Profile::default(),
+        }
+    }
+
     fn test_thread(thread_id: Uuid, timeline: Vec<TimelineMessage>, draft: ThreadDraft) -> Thread {
         Thread {
             instance_id: thread_id,
@@ -8674,6 +8931,9 @@ mod tests {
             },
             participant_id: ParticipantId::new(),
             participants: Vec::new(),
+            profiles: HashMap::new(),
+            transcript: Vec::new(),
+            prompt_names: HashMap::new(),
             model: DEFAULT_MODEL,
             timeline,
             draft,
@@ -9371,7 +9631,6 @@ mod tests {
                 text: "Existing message".into(),
                 attachments: Vec::new(),
             }],
-            history_preface: None,
             comments_folded: false,
         })];
         assert_eq!(
@@ -9485,7 +9744,7 @@ mod tests {
                 text: "the answer.".into(),
             },
             protocol::HostMessage::AgentEnded { id, failure: None },
-            protocol::HostMessage::ParticipantJoined(ParticipantId::new().into_bytes()),
+            joined(ParticipantId::new()),
             protocol::HostMessage::ModelSelected {
                 catalog_id: OLLAMA_QWEN.catalog_id.into(),
             },
@@ -9521,12 +9780,7 @@ mod tests {
             view.update(cx, |view, cx| {
                 view.host.update(cx, |thread, cx| {
                     thread.participants = vec![thread.participant_id];
-                    thread.apply(
-                        protocol::HostMessage::ParticipantJoined(
-                            collaborator_participant.into_bytes(),
-                        ),
-                        cx,
-                    );
+                    thread.apply(joined(collaborator_participant), cx);
                 });
                 for event in events.iter().take(joined_after) {
                     view.host
@@ -9611,9 +9865,9 @@ mod tests {
             let thread = view.read(cx).thread.clone();
             thread.update(cx, |thread, cx| {
                 for event in [
-                    protocol::HostMessage::ParticipantJoined(first.into_bytes()),
-                    protocol::HostMessage::ParticipantJoined(second.into_bytes()),
-                    protocol::HostMessage::ParticipantJoined(first.into_bytes()),
+                    joined(first),
+                    joined(second),
+                    joined(first),
                     protocol::HostMessage::ModelSelected {
                         catalog_id: "no-such-model".into(),
                     },
@@ -9925,17 +10179,90 @@ mod tests {
     }
 
     #[test]
-    fn profile_pictures_are_cropped_to_a_square_png() {
+    fn profile_pictures_are_cropped_to_a_square_jpeg_peers_accept() {
         let picture = profile_picture(&encoded_image(7, image::ImageFormat::Bmp))
             .expect("a bmp is a supported image");
 
-        assert_eq!(picture.format(), gpui::ImageFormat::Png);
+        assert_eq!(picture.format(), gpui::ImageFormat::Jpeg);
         let decoded = image::load_from_memory(picture.bytes()).expect("decodes");
         assert_eq!(
             (decoded.width(), decoded.height()),
             (PROFILE_PICTURE_PIXELS, PROFILE_PICTURE_PIXELS)
         );
+        let profile = protocol::Profile {
+            name: Some("Ada".into()),
+            picture: Some(picture.bytes().to_vec()),
+        };
+        validate_profile(&profile).expect("peers accept the pictures this app makes");
         assert!(profile_picture(b"not an image").is_err());
+    }
+
+    #[test]
+    fn transparent_profile_pictures_get_a_background() {
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(image::RgbaImage::new(4, 4))
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .expect("encode test image");
+        let picture = profile_picture(&png).expect("a png is a supported image");
+
+        let decoded = image::load_from_memory(picture.bytes())
+            .expect("decodes")
+            .into_rgb8();
+        let [red, green, blue] = decoded.get_pixel(128, 128).0;
+        for (channel, expected) in [red, green, blue]
+            .into_iter()
+            .zip(PROFILE_PICTURE_BACKGROUND)
+        {
+            assert!(
+                channel.abs_diff(expected) <= 4,
+                "{channel} is not near {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn peers_profiles_are_validated() {
+        let valid_picture = profile_picture(&encoded_image(3, image::ImageFormat::Bmp))
+            .expect("a bmp is a supported image")
+            .bytes()
+            .to_vec();
+        let small_jpeg = {
+            let mut jpeg = Vec::new();
+            image::DynamicImage::ImageRgb8(image::RgbImage::new(16, 16))
+                .write_to(
+                    &mut std::io::Cursor::new(&mut jpeg),
+                    image::ImageFormat::Jpeg,
+                )
+                .expect("encode test image");
+            jpeg
+        };
+        let profile = |name: Option<&str>, picture: Option<Vec<u8>>| protocol::Profile {
+            name: name.map(Into::into),
+            picture,
+        };
+
+        assert!(validate_profile(&protocol::Profile::default()).is_ok());
+        assert!(validate_profile(&profile(Some("Ada"), Some(valid_picture))).is_ok());
+        assert!(validate_profile(&profile(Some(" Ada"), None)).is_err());
+        assert!(validate_profile(&profile(Some(""), None)).is_err());
+        assert!(
+            validate_profile(&profile(
+                Some(&"a".repeat(MAX_DISPLAY_NAME_CHARS + 1)),
+                None
+            ))
+            .is_err()
+        );
+        assert!(validate_profile(&profile(None, Some(small_jpeg))).is_err());
+        assert!(
+            validate_profile(&profile(
+                None,
+                Some(encoded_image(3, image::ImageFormat::Png))
+            ))
+            .is_err()
+        );
+        assert!(
+            validate_profile(&profile(None, Some(vec![0; MAX_PROFILE_PICTURE_BYTES + 1]))).is_err()
+        );
     }
 
     #[test]
@@ -10390,6 +10717,86 @@ mod tests {
         });
     }
 
+    /// The text parts of a user message sent to the agent.
+    fn prompt_texts(message: &RigMessage) -> Vec<String> {
+        let RigMessage::User { content } = message else {
+            panic!("expected a user message, got {message:?}");
+        };
+        content
+            .iter()
+            .filter_map(|part| match part {
+                UserContent::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[gpui::test]
+    fn renaming_never_changes_what_the_agent_was_sent(cx: &mut gpui::TestAppContext) {
+        let (cowork, _runtime, cx) = composer_test_cowork(cx);
+        let derived_name =
+            cowork.read_with(cx, |cowork, _| cowork.local_participant_id.display_name());
+        cx.simulate_input("first");
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            cowork.update(cx, |cowork, cx| cowork.submit_composer(window, cx));
+        });
+        cx.run_until_parked();
+        let thread = cowork.read_with(cx, |cowork, cx| {
+            cowork
+                .active_thread(cx)
+                .expect("the submission started a thread")
+        });
+        // The prompt is recorded before the run starts, and this test's run
+        // never does.
+        let first_prompt = thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.transcript.len(), 1);
+            thread.transcript[0].clone()
+        });
+        assert_eq!(
+            prompt_texts(&first_prompt),
+            [format!("{derived_name}:\nfirst")]
+        );
+
+        cowork.update(cx, |cowork, cx| {
+            cowork.set_profile(
+                Profile {
+                    name: Some("Grace".into()),
+                    picture: None,
+                },
+                cx,
+            );
+        });
+        thread.update(cx, |thread, _| {
+            thread.generating = false;
+            thread
+                .draft
+                .doc
+                .create_prompt(thread.draft.author.as_uuid(), "second");
+        });
+        cx.update(|window, cx| {
+            cowork.update(cx, |cowork, cx| cowork.submit_composer(window, cx));
+        });
+        cx.run_until_parked();
+
+        thread.read_with(cx, |thread, _| {
+            assert_eq!(thread.transcript.len(), 2);
+            assert_eq!(
+                prompt_texts(&thread.transcript[0]),
+                prompt_texts(&first_prompt)
+            );
+            assert_eq!(
+                prompt_texts(&thread.transcript[1]),
+                [format!("{derived_name}:\nsecond")]
+            );
+        });
+        // The rename still shows everywhere else.
+        assert_eq!(
+            cowork.read_with(cx, |cowork, _| cowork.profile_name()),
+            "Grace"
+        );
+    }
+
     #[test]
     fn comment_instructions_name_each_comment_author() {
         let author = ParticipantId::from_bytes([7; 16]);
@@ -10408,12 +10815,16 @@ mod tests {
             }],
             turn_comments.comment_ids(),
             &[],
+            &HashMap::new(),
         )
         .expect("comments need instructions");
 
         assert!(preface.contains("comment_1 — Mossy Crane, on an excerpt"));
         assert!(preface.contains("> quote\nComment: why?"));
-        assert_eq!(Cowork::comments_preface(&[], &[], &[]), None);
+        assert_eq!(
+            Cowork::comments_preface(&[], &[], &[], &HashMap::new()),
+            None
+        );
     }
 
     /// A host and a collaborator side by side in one window, connected over
@@ -10567,6 +10978,12 @@ mod tests {
                         })
                         .await
                         .expect("send join");
+                    let profile = collaborator
+                        .read_with(cx, |collaborator, _| collaborator.profile.to_protocol());
+                    collaborator_end
+                        .send(protocol::CollaboratorMessage::Profile(profile))
+                        .await
+                        .expect("send profile");
                     let Some(protocol::HostMessage::Welcome(welcome)) =
                         collaborator_end.receive().await
                     else {
@@ -10880,6 +11297,7 @@ mod tests {
                 id: [1; 16],
                 title: "Shared".into(),
                 participants: Vec::new(),
+                profiles: Vec::new(),
                 model: DEFAULT_MODEL.catalog_id.into(),
                 messages: Vec::new(),
             },
@@ -11414,7 +11832,9 @@ mod tests {
             let [TimelineMessage::User(message), ..] = thread.timeline.as_slice() else {
                 panic!("expected the submitted message first");
             };
-            let RigMessage::User { content } = agent_message(None, &message.blocks, files) else {
+            let RigMessage::User { content } =
+                agent_message(None, &message.blocks, files, &HashMap::new())
+            else {
                 panic!("expected a user message");
             };
             assert!(content.iter().any(
@@ -11603,7 +12023,6 @@ mod tests {
                 text: "earlier".into(),
                 attachments: timeline_records.clone(),
             }],
-            history_preface: None,
             comments_folded: false,
         })];
         let thread = cx.new(|_| {
@@ -11676,6 +12095,100 @@ mod tests {
         oversized.id = [8; 16];
         oversized.total = MAX_TEXT_ATTACHMENT_BYTES + 1;
         assert!(receiver.receive_chunk(oversized, None).is_err());
+    }
+
+    #[gpui::test]
+    fn profiles_reach_everyone_in_the_thread(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let host_thread = session.host_thread.clone();
+        let (collaborator_id, host_id) = collaborator_thread.read_with(session.cx, |thread, _| {
+            (thread.participant_id, thread.participants[0])
+        });
+        let shown_name = |thread: &Thread, participant| {
+            participant_name(participant, thread.profiles.get(&participant)).to_string()
+        };
+        // Joined with the profile it had, which names nobody yet.
+        assert_eq!(
+            host_thread.read_with(session.cx, |thread, _| shown_name(thread, collaborator_id)),
+            collaborator_id.display_name()
+        );
+
+        let picture = Arc::new(
+            profile_picture(&encoded_image(5, image::ImageFormat::Bmp)).expect("a picture"),
+        );
+        let collaborator = session.collaborator.clone();
+        session.cx.update(|_, cx| {
+            collaborator.update(cx, |collaborator, cx| {
+                collaborator.set_profile(
+                    Profile {
+                        name: Some("Ada".into()),
+                        picture: Some(picture.clone()),
+                    },
+                    cx,
+                );
+            });
+        });
+        session.wait_until("the host sees the collaborator's profile", |this| {
+            host_thread.read_with(this.cx, |thread, _| {
+                thread
+                    .profiles
+                    .get(&collaborator_id)
+                    .is_some_and(|profile| {
+                        profile.name.as_deref() == Some("Ada")
+                            && profile
+                                .picture
+                                .as_ref()
+                                .is_some_and(|shown| shown.bytes() == picture.bytes())
+                    })
+            })
+        });
+
+        let host = session.host.clone();
+        session.cx.update(|_, cx| {
+            host.update(cx, |host, cx| {
+                host.set_profile(
+                    Profile {
+                        name: Some("Grace".into()),
+                        picture: None,
+                    },
+                    cx,
+                );
+            });
+        });
+        session.wait_until("the collaborator sees the host's profile", |this| {
+            collaborator_thread.read_with(this.cx, |thread, _| {
+                shown_name(thread, host_id) == "Grace"
+                    && shown_name(thread, collaborator_id) == "Ada"
+            })
+        });
+
+        // The agent is told the names people chose.
+        let prompt_names = host.read_with(session.cx, |host, cx| {
+            let profiles = host.profiles_for(Some(host_thread.read(cx)));
+            (
+                participant_name(host_id, profiles.get(&host_id)),
+                participant_name(collaborator_id, profiles.get(&collaborator_id)),
+            )
+        });
+        assert_eq!(prompt_names, ("Grace".into(), "Ada".into()));
+    }
+
+    #[gpui::test]
+    fn invalid_profiles_disconnect_the_collaborator(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let host_thread = session.host_thread.clone();
+
+        collaborator_thread.read_with(session.cx, |thread, _| {
+            thread.request(protocol::CollaboratorMessage::Profile(protocol::Profile {
+                name: None,
+                picture: Some(b"not a picture".to_vec()),
+            }));
+        });
+        session.wait_until("the host drops the collaborator", |this| {
+            host_thread.read_with(this.cx, |thread, _| thread.participants.len() == 1)
+        });
     }
 
     #[gpui::test]

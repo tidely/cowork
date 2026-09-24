@@ -26,7 +26,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 5;
+pub(crate) const PROTOCOL_VERSION: u32 = 6;
 
 /// A request from a collaborator to the host.
 ///
@@ -39,6 +39,10 @@ pub(crate) enum CollaboratorMessage {
     /// [`HostMessage::Welcome`], or [`HostMessage::Rejected`] when it cannot
     /// serve this collaborator. Must remain the first variant.
     Join { protocol_version: u32 },
+    /// The collaborator's profile. Always the second frame, which the host
+    /// waits for before admitting the collaborator, and sent again whenever
+    /// the collaborator changes it.
+    Profile(Profile),
     /// Selects the thread's model by its catalog id. Unknown ids are ignored.
     SelectModel { catalog_id: String },
     /// Stops the agent run producing message `message_id`, if it is still
@@ -59,6 +63,17 @@ pub(crate) enum CollaboratorMessage {
     /// Part of a file the collaborator attached to the draft. Sent on the
     /// bulk queue; see [`Peer::bulk`].
     AttachmentData(AttachmentChunk),
+}
+
+/// How a participant presents themselves. Chosen by the participant and
+/// purely cosmetic: names can collide, and identity is always the participant
+/// id.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Profile {
+    /// `None` shows the name derived from the participant id.
+    pub(crate) name: Option<String>,
+    /// A square JPEG. `None` shows the participant's initials.
+    pub(crate) picture: Option<Vec<u8>>,
 }
 
 /// One piece of an attachment's bytes, in order. Every piece names the file,
@@ -136,9 +151,18 @@ pub(crate) enum HostMessage {
     /// second variant.
     Rejected(String),
     /// A participant connected. Participants are listed in join order.
-    ParticipantJoined(uuid::Bytes),
-    /// A participant disconnected.
+    ParticipantJoined {
+        participant: uuid::Bytes,
+        profile: Profile,
+    },
+    /// A participant disconnected. Their profile is kept, since their
+    /// messages still name them.
     ParticipantLeft(uuid::Bytes),
+    /// A participant changed their profile.
+    ProfileChanged {
+        participant: uuid::Bytes,
+        profile: Profile,
+    },
     /// The thread's model changed.
     ModelSelected { catalog_id: String },
     /// A Yrs update to the draft, made by the host or a collaborator.
@@ -218,6 +242,8 @@ pub(crate) struct ThreadSnapshot {
     pub(crate) title: String,
     /// Connected participants in join order, starting with the host.
     pub(crate) participants: Vec<uuid::Bytes>,
+    /// The profile of everyone who has joined, including those who left.
+    pub(crate) profiles: Vec<(uuid::Bytes, Profile)>,
     /// Catalog id of the thread's model.
     pub(crate) model: String,
     pub(crate) messages: Vec<TimelineMessage>,
@@ -418,6 +444,13 @@ where
 mod tests {
     use super::*;
 
+    fn sample_profile() -> Profile {
+        Profile {
+            name: Some("Ada".into()),
+            picture: Some(vec![0xff, 0xd8, 0xff]),
+        }
+    }
+
     fn sample_presence() -> Presence {
         Presence {
             focus: Some(PresenceFocus::Item([5; 16])),
@@ -477,7 +510,7 @@ mod tests {
                 .is_ok()
             {}
         });
-        host.send(HostMessage::ParticipantJoined([1; 16]))
+        host.send(HostMessage::ParticipantLeft([1; 16]))
             .await
             .expect("send control");
         collaborator
@@ -495,7 +528,7 @@ mod tests {
             };
             let collaborator_got = async {
                 loop {
-                    if let Some(HostMessage::ParticipantJoined(_)) = collaborator.receive().await {
+                    if let Some(HostMessage::ParticipantLeft(_)) = collaborator.receive().await {
                         return;
                     }
                 }
@@ -519,12 +552,12 @@ mod tests {
             .expect("queue bulk");
         sender
             .outgoing
-            .try_send(HostMessage::ParticipantJoined([1; 16]))
+            .try_send(HostMessage::ParticipantLeft([1; 16]))
             .expect("queue control");
 
         assert_eq!(
             receiver.receive().await,
-            Some(HostMessage::ParticipantJoined([1; 16]))
+            Some(HostMessage::ParticipantLeft([1; 16]))
         );
         assert_eq!(
             receiver.receive().await,
@@ -543,6 +576,7 @@ mod tests {
             id: [1; 16],
             title: "Shared thread".into(),
             participants: vec![[11; 16], [12; 16]],
+            profiles: vec![([11; 16], sample_profile()), ([13; 16], Profile::default())],
             model: "catalog-model".into(),
             messages: vec![
                 TimelineMessage::User(UserMessage {
@@ -617,8 +651,15 @@ mod tests {
     fn membership_and_control_messages_round_trip_through_postcard() {
         for message in [
             HostMessage::Rejected("Version mismatch".into()),
-            HostMessage::ParticipantJoined([1; 16]),
+            HostMessage::ParticipantJoined {
+                participant: [1; 16],
+                profile: sample_profile(),
+            },
             HostMessage::ParticipantLeft([1; 16]),
+            HostMessage::ProfileChanged {
+                participant: [1; 16],
+                profile: Profile::default(),
+            },
             HostMessage::ModelSelected {
                 catalog_id: "catalog-model".into(),
             },
@@ -640,6 +681,7 @@ mod tests {
             CollaboratorMessage::Join {
                 protocol_version: PROTOCOL_VERSION,
             },
+            CollaboratorMessage::Profile(sample_profile()),
             CollaboratorMessage::SelectModel {
                 catalog_id: "catalog-model".into(),
             },
