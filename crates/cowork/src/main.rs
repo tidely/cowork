@@ -1827,9 +1827,42 @@ struct ThreadMessageId {
 struct SegmentTextView {
     state: Entity<TextViewState>,
     text: String,
-    source_offsets: Option<Vec<usize>>,
     rendered_at: u64,
 }
+
+/// Identifies a segment's text view within its message. Plain segments are
+/// identified by where they start alone, so one that grows keeps its view.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+struct SegmentKey {
+    start: usize,
+    annotated: bool,
+}
+
+/// A piece of a message split around its comments, followed by the inline
+/// comments anchored in it.
+#[derive(Clone)]
+struct MessageSegment {
+    source_range: Range<usize>,
+    state: Entity<TextViewState>,
+    annotated: bool,
+    source_offsets: Option<Vec<usize>>,
+    /// Lays out empty, so there is nothing to wait for.
+    blank: bool,
+    comments: Vec<Uuid>,
+}
+
+/// The segments a message is shown split into.
+struct ShownSegments {
+    /// `None` while the message is still shown whole.
+    segments: Option<Vec<MessageSegment>>,
+    /// Since when newer segments have been waiting to be laid out.
+    pending_since: Option<Instant>,
+    rendered_at: u64,
+}
+
+/// How long newly split segments may stay unparsed before they are shown
+/// anyway.
+const SEGMENT_LAYOUT_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct ThreadSummary {
@@ -3572,7 +3605,8 @@ struct Cowork {
     thread_store: Entity<ThreadStore>,
     active_thread_id: Option<Uuid>,
     selection_message_id: Option<Uuid>,
-    segment_text_views: HashMap<(ThreadMessageId, Range<usize>), SegmentTextView>,
+    segment_text_views: HashMap<(ThreadMessageId, SegmentKey), SegmentTextView>,
+    shown_segments: HashMap<ThreadMessageId, ShownSegments>,
     render_generation: u64,
     titlebar_click_armed: bool,
     copied_endpoint_id: Option<Uuid>,
@@ -6344,26 +6378,22 @@ impl Cowork {
         text_view: &Entity<TextViewState>,
         cx: &App,
     ) -> Option<Range<usize>> {
-        let mut selected_ranges = self
-            .segment_text_views
-            .iter()
-            .filter(|((segment_id, _), _)| *segment_id == thread_message_id)
-            .filter_map(|((_, source_range), text_view)| {
-                text_view
-                    .state
-                    .read(cx)
-                    .selected_source_range()
-                    .map(|range| {
-                        let range = text_view
-                            .source_offsets
-                            .as_ref()
-                            .and_then(|offsets| {
-                                Some(*offsets.get(range.start)?..*offsets.get(range.end)?)
-                            })
-                            .unwrap_or(range);
-                        (range.start + source_range.start)..(range.end + source_range.start)
-                    })
-            });
+        let segments = self
+            .shown_segments
+            .get(&thread_message_id)
+            .and_then(|shown| shown.segments.as_deref())
+            .unwrap_or_default();
+        let mut selected_ranges = segments.iter().filter_map(|segment| {
+            segment.state.read(cx).selected_source_range().map(|range| {
+                let range = segment
+                    .source_offsets
+                    .as_ref()
+                    .and_then(|offsets| Some(*offsets.get(range.start)?..*offsets.get(range.end)?))
+                    .unwrap_or(range);
+                let start = segment.source_range.start;
+                (range.start + start)..(range.end + start)
+            })
+        });
         let first = selected_ranges.next();
         let segmented = selected_ranges.fold(first, |combined, range| {
             Some(match combined {
@@ -6763,27 +6793,28 @@ impl Cowork {
         Self::markdown_style().with_link(rgb(USER_ACCENT).into())
     }
 
-    fn render_message_segment(
+    fn message_segment(
         &mut self,
         thread_message_id: ThreadMessageId,
-        _segment_index: usize,
         source_range: Range<usize>,
         text: &str,
         annotated: bool,
         source_offsets: Option<Vec<usize>>,
         cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    ) -> MessageSegment {
+        let key = SegmentKey {
+            start: source_range.start,
+            annotated,
+        };
         let text_view = self
             .segment_text_views
-            .entry((thread_message_id, source_range))
+            .entry((thread_message_id, key))
             .or_insert_with(|| SegmentTextView {
                 state: cx.new(|cx| TextViewState::markdown(text, cx)),
                 text: text.to_owned(),
-                source_offsets: source_offsets.clone(),
                 rendered_at: self.render_generation,
             });
         text_view.rendered_at = self.render_generation;
-        text_view.source_offsets = source_offsets;
         if text_view.text != text {
             text_view.text.clear();
             text_view.text.push_str(text);
@@ -6798,15 +6829,61 @@ impl Cowork {
                     .update(cx, |view, cx| view.set_text(text, cx));
             }
         }
-        TextView::new(&text_view.state)
+        MessageSegment {
+            source_range,
+            state: text_view.state.clone(),
+            annotated,
+            source_offsets,
+            blank: text.trim().is_empty(),
+            comments: Vec::new(),
+        }
+    }
+
+    fn render_message_segment(segment: &MessageSegment) -> gpui::AnyElement {
+        TextView::new(&segment.state)
             .selection_format(SelectionFormat::Plain)
-            .style(if annotated {
+            .style(if segment.annotated {
                 Self::annotated_markdown_style()
             } else {
                 Self::markdown_style()
             })
             .w_full()
             .into_any_element()
+    }
+
+    /// Whether `segment` has been laid out with its content. gpui-kit parses
+    /// large Markdown in the background, and until then a new text view lays
+    /// out empty.
+    fn segment_laid_out(segment: &MessageSegment, cx: &App) -> bool {
+        segment.blank || segment.state.read(cx).bounds().size.height > px(0.)
+    }
+
+    /// `segments` with their inline comments, followed by those of
+    /// `required` they do not place.
+    fn render_segments(
+        &self,
+        segments: &[MessageSegment],
+        comments: &[&UserComment],
+        required: &[Uuid],
+    ) -> Vec<gpui::AnyElement> {
+        let mut content = Vec::new();
+        let mut placed = HashSet::new();
+        for segment in segments {
+            content.push(Self::render_message_segment(segment));
+            for id in &segment.comments {
+                if let Some(comment) = comments.iter().find(|comment| comment.id == *id) {
+                    placed.insert(*id);
+                    content.push(self.render_inline_comment(comment));
+                }
+            }
+        }
+        content.extend(
+            comments
+                .iter()
+                .filter(|comment| required.contains(&comment.id) && !placed.contains(&comment.id))
+                .map(|comment| self.render_inline_comment(comment)),
+        );
+        content
     }
 
     fn hard_line_start(text: &str, offset: usize) -> usize {
@@ -7141,7 +7218,6 @@ impl Cowork {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
-        let mut content = Vec::new();
         let mut cursor = 0;
         let mut anchored_comments = comments
             .iter()
@@ -7155,17 +7231,21 @@ impl Cowork {
             .collect::<Vec<_>>();
         anchored_comments.sort_by_key(|comment| comment.reference.range.start);
 
-        if anchored_comments.is_empty() && !text.is_empty() {
-            content.push(
+        let whole = || {
+            (!text.is_empty()).then(|| {
                 TextView::new(text_view)
                     .selection_format(SelectionFormat::Plain)
                     .style(Self::markdown_style())
                     .w_full()
-                    .into_any_element(),
-            );
-            return content;
+                    .into_any_element()
+            })
+        };
+        if anchored_comments.is_empty() {
+            self.shown_segments.remove(&thread_message_id);
+            return whole().into_iter().collect();
         }
 
+        let mut segments = Vec::new();
         let mut comment_index = 0;
         while comment_index < anchored_comments.len() {
             let first = anchored_comments[comment_index];
@@ -7176,9 +7256,8 @@ impl Cowork {
             let annotated_start =
                 Self::hard_line_start(text, first.reference.range.start).max(cursor);
             if cursor < annotated_start {
-                content.push(self.render_message_segment(
+                segments.push(self.message_segment(
                     thread_message_id,
-                    content.len(),
                     cursor..annotated_start,
                     &text[cursor..annotated_start],
                     false,
@@ -7207,26 +7286,21 @@ impl Cowork {
                 &text[cursor..line_end],
                 annotation_ranges,
             );
-            content.push(self.render_message_segment(
+            let mut segment = self.message_segment(
                 thread_message_id,
-                content.len(),
                 cursor..line_end,
                 &annotated,
                 true,
                 Some(source_offsets),
                 cx,
-            ));
-            content.extend(
-                group
-                    .iter()
-                    .map(|comment| self.render_inline_comment(comment)),
             );
+            segment.comments = group.iter().map(|comment| comment.id).collect();
+            segments.push(segment);
             cursor = line_end;
         }
         if cursor < text.len() {
-            content.push(self.render_message_segment(
+            segments.push(self.message_segment(
                 thread_message_id,
-                content.len(),
                 cursor..text.len(),
                 &text[cursor..],
                 false,
@@ -7234,6 +7308,65 @@ impl Cowork {
                 cx,
             ));
         }
+
+        // Until the new segments have been laid out, keep showing what they
+        // replace. Swapping in text views that are still empty would collapse
+        // the timeline and clamp its scroll offset, jumping the view elsewhere.
+        let generation = self.render_generation;
+        let shown = self
+            .shown_segments
+            .entry(thread_message_id)
+            .or_insert_with(|| ShownSegments {
+                segments: None,
+                pending_since: None,
+                rendered_at: generation,
+            });
+        shown.rendered_at = generation;
+        let placed_comments = segments
+            .iter()
+            .flat_map(|segment| segment.comments.iter().copied())
+            .collect::<Vec<_>>();
+        let pending = segments
+            .iter()
+            .filter(|segment| !Self::segment_laid_out(segment, cx))
+            .collect::<Vec<_>>();
+        let timed_out = shown
+            .pending_since
+            .is_some_and(|since| since.elapsed() >= SEGMENT_LAYOUT_TIMEOUT);
+        if pending.is_empty() || timed_out {
+            let content = self.render_segments(&segments, &anchored_comments, &placed_comments);
+            let shown = self
+                .shown_segments
+                .get_mut(&thread_message_id)
+                .expect("shown segments were just inserted");
+            shown.segments = Some(segments);
+            shown.pending_since = None;
+            return content;
+        }
+
+        shown.pending_since.get_or_insert_with(Instant::now);
+        let previous = shown.segments.clone();
+        // Laid out out of sight so that they are measured once parsed, which
+        // is what is waited for.
+        let measuring = div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .w_full()
+            .h(px(0.))
+            .overflow_hidden()
+            .children(pending.into_iter().map(Self::render_message_segment))
+            .into_any_element();
+        window.request_animation_frame();
+        let mut content = match previous {
+            Some(previous) => self.render_segments(&previous, &anchored_comments, &placed_comments),
+            None => {
+                let mut content = whole().into_iter().collect::<Vec<_>>();
+                content.extend(self.render_segments(&[], &anchored_comments, &placed_comments));
+                content
+            }
+        };
+        content.push(measuring);
         content
     }
 
@@ -9310,6 +9443,8 @@ impl Cowork {
 
         self.segment_text_views
             .retain(|_, text_view| text_view.rendered_at == self.render_generation);
+        self.shown_segments
+            .retain(|_, shown| shown.rendered_at == self.render_generation);
 
         let can_write = composer.is_some();
         let composer = composer.map(|composer| self.render_composer(composer, cx));
@@ -9552,6 +9687,7 @@ fn main() -> anyhow::Result<()> {
                         active_thread_id: None,
                         selection_message_id: None,
                         segment_text_views: HashMap::new(),
+                        shown_segments: HashMap::new(),
                         render_generation: 0,
                         titlebar_click_armed: false,
                         copied_endpoint_id: None,
@@ -9848,6 +9984,7 @@ mod tests {
             active_thread_id,
             selection_message_id: None,
             segment_text_views: HashMap::new(),
+            shown_segments: HashMap::new(),
             render_generation: 0,
             titlebar_click_armed: false,
             copied_endpoint_id: None,
@@ -10309,6 +10446,13 @@ mod tests {
         });
         let cx: &mut gpui::VisualTestContext = cx;
         cx.run_until_parked();
+        // An existing comment splits the message, whose segments replace it
+        // once they have been laid out.
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+        }
         cx.simulate_mouse_down(
             point(px(selection_start_x), px(8.)),
             MouseButton::Left,
@@ -13764,6 +13908,148 @@ mod tests {
             participants.right() <= copy_button.left(),
             "participants {participants:?} overlap the copy link button {copy_button:?}"
         );
+    }
+
+    /// Commenting on a long response splits it into freshly parsed segments.
+    /// gpui-kit parses large Markdown in the background, so until then those
+    /// segments are empty; the timeline must not collapse (and clamp its
+    /// scroll offset) while they are.
+    #[gpui::test]
+    fn commenting_on_a_long_response_keeps_the_timeline_scroll_position(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        cx.update(gpui_component::init);
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let tokio_handle = runtime.handle().clone();
+        let markdown = (1..=80)
+            .map(|index| {
+                format!(
+                    "Paragraph {index}. The quick brown fox jumps over the lazy dog, \
+                     then circles back to see whether the dog noticed anything.\n\n"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let quote = "Paragraph 79.";
+        let quote_start = markdown.find(quote).expect("quoted paragraph");
+        assert!(
+            quote_start > 4 * 1024,
+            "the text before the comment must be parsed in the background"
+        );
+
+        let thread_id = Uuid::new_v4();
+        let message_id = Uuid::new_v4();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let timeline = vec![TimelineMessage::Agent(AgentMessage {
+                id: message_id,
+                comment_group_id: None,
+                started_at: SystemTime::UNIX_EPOCH,
+                comment_responses: Vec::new(),
+                thinking: String::new(),
+                thinking_view: cx.new(|cx| TextViewState::markdown("", cx)),
+                thinking_complete: true,
+                thinking_expanded: false,
+                text: markdown.clone(),
+                text_view: cx.new(|cx| TextViewState::markdown(&markdown, cx)),
+                duration: None,
+                complete: true,
+                failed: false,
+            })];
+            let draft = ThreadDraft::new(ParticipantId::new());
+            let thread = cx.new(|_| test_thread(thread_id, timeline, draft));
+            let thread_store = cx.new(|_| ThreadStore {
+                threads: VecDeque::from([thread]),
+            });
+            let cowork =
+                cx.new(|cx| test_cowork(thread_store, Some(thread_id), tokio_handle, window, cx));
+            Root::new(cowork, window, cx)
+        });
+        let cowork = root.read_with(cx, |root, _| {
+            root.view()
+                .clone()
+                .downcast::<Cowork>()
+                .expect("cowork root")
+        });
+        let settle = |cx: &mut gpui::VisualTestContext| {
+            for _ in 0..4 {
+                cx.run_until_parked();
+                cx.update(|window, cx| window.draw(cx).clear(cx));
+            }
+        };
+        let scroll = |cx: &mut gpui::VisualTestContext| {
+            cowork.read_with(cx, |cowork, _| {
+                (
+                    cowork.timeline_scroll_handle.offset().y,
+                    cowork.timeline_scroll_handle.max_offset().y,
+                )
+            })
+        };
+
+        settle(cx);
+        cowork.update(cx, |cowork, cx| {
+            cowork.timeline_scroll_handle.scroll_to_bottom();
+            cx.notify();
+        });
+        settle(cx);
+        let (offset_before, max_before) = scroll(cx);
+        assert!(
+            max_before > px(500.),
+            "the response must overflow the window, max offset {max_before:?}"
+        );
+        assert_eq!(offset_before, -max_before);
+
+        cowork.update(cx, |cowork, cx| {
+            let thread = cowork
+                .thread_store
+                .read(cx)
+                .thread(thread_id, cx)
+                .expect("thread");
+            thread.update(cx, |thread, _| {
+                let draft = &mut thread.draft;
+                draft.doc.create_comment(
+                    draft.author.as_uuid(),
+                    CommentTarget {
+                        message_id,
+                        range: quote_start..quote_start + quote.len(),
+                        quote: quote.into(),
+                    },
+                    "x",
+                );
+            });
+            cx.notify();
+        });
+        // The frame right after the comment appears, before any background
+        // parse has had a chance to finish.
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let (offset_first_frame, max_first_frame) = scroll(cx);
+        assert!(
+            max_first_frame >= max_before,
+            "the timeline collapsed from {max_before:?} to {max_first_frame:?} \
+             while the new segments were parsed"
+        );
+        assert_eq!(offset_first_frame, offset_before);
+
+        settle(cx);
+        let (offset_after, _) = scroll(cx);
+        assert!(
+            (offset_after - offset_before).abs() < px(1.),
+            "the timeline scrolled from {offset_before:?} to {offset_after:?}"
+        );
+        cowork.read_with(cx, |cowork, _| {
+            let shown = cowork
+                .shown_segments
+                .get(&ThreadMessageId {
+                    thread_id,
+                    message_id,
+                })
+                .expect("the commented response is split");
+            assert!(shown.pending_since.is_none());
+            let segments = shown.segments.as_ref().expect("segments are shown");
+            assert!(segments.iter().any(|segment| segment.annotated));
+        });
     }
 
     #[gpui::test]
