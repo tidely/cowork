@@ -19,17 +19,17 @@ anyhow = "1"
 base64 = "0.22"
 async-channel = "2"
 chrono = "0.4"
-gpui = { package = "gpui-pre", version = "0.3.5" }
-# https://github.com/longbridge/gpui-kit/pull/3136
-gpui-base = { git = "https://github.com/tidely/gpui-kit", branch = "selected-source-range" }
-gpui-component = { git = "https://github.com/tidely/gpui-kit", branch = "selected-source-range" }
-gpui-kit-assets = { git = "https://github.com/tidely/gpui-kit", branch = "selected-source-range" }
+# Must match the GPUI snapshot gpui-kit pins.
+gpui = { package = "gpui-pre", version = "=0.3.6" }
+# Upstream main plus `RenderedText::source` and `RenderedText::range_for_source`.
+gpui-base = { git = "https://github.com/tidely/gpui-kit", branch = "text-view-source-range-highlights" }
+gpui-component = { git = "https://github.com/tidely/gpui-kit", branch = "text-view-source-range-highlights" }
+gpui-kit-assets = { git = "https://github.com/tidely/gpui-kit", branch = "text-view-source-range-highlights" }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
-gpui_platform = { package = "gpui-pre-platform", version = "0.3.5", features = ["font-kit", "wayland", "x11", "runtime_shaders"] }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.6", features = ["font-kit", "wayland", "x11", "runtime_shaders"] }
 futures = "0.3"
 iroh = "1.2.0"
 itertools = "0.14"
-markdown = "1.0.0"
 postcard = { version = "1.1.3", features = ["use-std"] }
 rig = { git = "https://github.com/0xPlaygrounds/rig", rev = "2d16c1b25f6749b3a2cd841beddf767106495069" }
 serde = { version = "1", features = ["derive"] }

@@ -22,7 +22,6 @@ gpui_platform.workspace = true
 image.workspace = true
 iroh.workspace = true
 itertools.workspace = true
-markdown.workspace = true
 postcard.workspace = true
 rig.workspace = true
 serde.workspace = true

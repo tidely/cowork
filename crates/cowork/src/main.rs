@@ -31,8 +31,8 @@ use gpui::{
     canvas, div, img, point, prelude::*, px, rems, rgb, rgba, size,
 };
 use gpui_base::{
-    GlobalState, SelectableText, TextSelection, TextView, TextViewDefaults, TextViewState,
-    TextViewStyle, Textarea,
+    GlobalState, RangeHighlight, RenderedText, SelectableText, TextSelection, TextView,
+    TextViewDefaults, TextViewState, TextViewStyle, Textarea,
     input::{
         Backspace, Escape, Input, InputEditorStyle, InputEvent, InputState, MoveDown, MoveUp,
         Paste, TextareaState,
@@ -106,7 +106,7 @@ const MACOS_TRAFFIC_LIGHT_TRAILING_GAP: gpui::Pixels = px(12.);
 const OLLAMA_MODEL: &str = "qwen3.8:27b";
 const OLLAMA_CONTEXT_TOKENS: u64 = 16 * 8_192;
 const OLLAMA_AVATAR_PATH: &str = "providers/ollama.png";
-const USER_ACCENT: u32 = 0xe26d5a;
+
 const COWORK_ALPN: &[u8] = b"cowork/0";
 const ENDPOINT_ID_TEXT_LENGTH: usize = EndpointId::LENGTH * 2;
 /// How long any single step of the collaboration handshake may take.
@@ -1812,42 +1812,34 @@ enum UserCommentBody {
     Submitted(SharedString),
 }
 
-struct MarkdownTextLeaf {
-    source_range: Range<usize>,
-    annotation_range: Range<usize>,
-    atomic: bool,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct ThreadMessageId {
     thread_id: Uuid,
     message_id: Uuid,
 }
 
+/// The text view of a segment, identified by where the segment starts in its
+/// message so that one that grows or shrinks keeps its view.
 struct SegmentTextView {
     state: Entity<TextViewState>,
     text: String,
+    /// The highlights last set on `state`, and the text they were resolved
+    /// against. Setting highlights redraws the view, so they are only set
+    /// again when either changes.
+    highlights: Option<(RenderedText, Vec<RangeHighlight>)>,
     rendered_at: u64,
 }
 
-/// Identifies a segment's text view within its message. Plain segments are
-/// identified by where they start alone, so one that grows keeps its view.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct SegmentKey {
-    start: usize,
-    annotated: bool,
-}
-
-/// A piece of a message split around its comments, followed by the inline
-/// comments anchored in it.
+/// A piece of a message split after the lines its comments are on, followed
+/// by the inline comments anchored in it.
 #[derive(Clone)]
 struct MessageSegment {
     source_range: Range<usize>,
     state: Entity<TextViewState>,
-    annotated: bool,
-    source_offsets: Option<Vec<usize>>,
-    /// Lays out empty, so there is nothing to wait for.
-    blank: bool,
+    /// Whether the view renders the segment's text yet. gpui-kit parses large
+    /// Markdown in the background, and until then a new view renders nothing
+    /// and a changed one its previous text.
+    parsed: bool,
     comments: Vec<Uuid>,
 }
 
@@ -1855,14 +1847,14 @@ struct MessageSegment {
 struct ShownSegments {
     /// `None` while the message is still shown whole.
     segments: Option<Vec<MessageSegment>>,
-    /// Since when newer segments have been waiting to be laid out.
+    /// Since when newer segments have been waiting to be parsed.
     pending_since: Option<Instant>,
     rendered_at: u64,
 }
 
 /// How long newly split segments may stay unparsed before they are shown
 /// anyway.
-const SEGMENT_LAYOUT_TIMEOUT: Duration = Duration::from_secs(1);
+const SEGMENT_PARSE_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct ThreadSummary {
@@ -3605,7 +3597,7 @@ struct Cowork {
     thread_store: Entity<ThreadStore>,
     active_thread_id: Option<Uuid>,
     selection_message_id: Option<Uuid>,
-    segment_text_views: HashMap<(ThreadMessageId, SegmentKey), SegmentTextView>,
+    segment_text_views: HashMap<(ThreadMessageId, usize), SegmentTextView>,
     shown_segments: HashMap<ThreadMessageId, ShownSegments>,
     render_generation: u64,
     titlebar_click_armed: bool,
@@ -6332,46 +6324,6 @@ impl Cowork {
             .is_ok()
     }
 
-    fn markdown_text_leaves(markdown: &str) -> Vec<MarkdownTextLeaf> {
-        fn collect(node: &markdown::mdast::Node, source: &str, leaves: &mut Vec<MarkdownTextLeaf>) {
-            let atomic = matches!(node, markdown::mdast::Node::InlineCode(_));
-            if (matches!(node, markdown::mdast::Node::Text(_)) || atomic)
-                && let Some(position) = node.position()
-                && position.start.offset < position.end.offset
-                && source
-                    .get(position.start.offset..position.end.offset)
-                    .is_some()
-            {
-                let mut source_start = position.start.offset;
-                if !atomic
-                    && let Some(previous) = source_start.checked_sub(1)
-                    && source.as_bytes().get(previous) == Some(&b'\\')
-                {
-                    source_start = previous;
-                }
-                let source_range = source_start..position.end.offset;
-                leaves.push(MarkdownTextLeaf {
-                    source_range: source_range.clone(),
-                    annotation_range: position.start.offset..position.end.offset,
-                    atomic,
-                });
-                return;
-            }
-            if let Some(children) = node.children() {
-                for child in children {
-                    collect(child, source, leaves);
-                }
-            }
-        }
-
-        let Ok(tree) = markdown::to_mdast(markdown, &markdown::ParseOptions::gfm()) else {
-            return Vec::new();
-        };
-        let mut leaves = Vec::new();
-        collect(&tree, markdown, &mut leaves);
-        leaves
-    }
-
     fn selected_message_source_range(
         &self,
         thread_message_id: ThreadMessageId,
@@ -6383,16 +6335,11 @@ impl Cowork {
             .get(&thread_message_id)
             .and_then(|shown| shown.segments.as_deref())
             .unwrap_or_default();
+        // Each segment's view renders a slice of the message's Markdown.
         let mut selected_ranges = segments.iter().filter_map(|segment| {
-            segment.state.read(cx).selected_source_range().map(|range| {
-                let range = segment
-                    .source_offsets
-                    .as_ref()
-                    .and_then(|offsets| Some(*offsets.get(range.start)?..*offsets.get(range.end)?))
-                    .unwrap_or(range);
-                let start = segment.source_range.start;
-                (range.start + start)..(range.end + start)
-            })
+            let range = segment.state.read(cx).selected_source_range()?;
+            let start = segment.source_range.start;
+            Some((range.start + start)..(range.end + start))
         });
         let first = selected_ranges.next();
         let segmented = selected_ranges.fold(first, |combined, range| {
@@ -6403,81 +6350,6 @@ impl Cowork {
         });
 
         segmented.or_else(|| text_view.read(cx).selected_source_range())
-    }
-
-    fn annotation_ranges(markdown: &str, selection: Range<usize>) -> Vec<Range<usize>> {
-        let mut ranges = Vec::<Range<usize>>::new();
-        for leaf in Self::markdown_text_leaves(markdown) {
-            let start = leaf.source_range.start.max(selection.start);
-            let end = leaf.source_range.end.min(selection.end);
-            if start >= end {
-                continue;
-            }
-            let range = if leaf.atomic {
-                leaf.annotation_range
-            } else {
-                start..end
-            };
-            if let Some(previous) = ranges.last_mut()
-                && previous.end == range.start
-            {
-                previous.end = range.end;
-            } else {
-                ranges.push(range);
-            }
-        }
-        ranges
-    }
-
-    fn annotate_markdown_with_source_offsets(
-        markdown: &str,
-        ranges: impl IntoIterator<Item = Range<usize>>,
-    ) -> (String, Vec<usize>) {
-        let mut ranges = ranges
-            .into_iter()
-            .filter(|range| {
-                range.start < range.end
-                    && range.end <= markdown.len()
-                    && markdown.is_char_boundary(range.start)
-                    && markdown.is_char_boundary(range.end)
-            })
-            .collect::<Vec<_>>();
-        ranges.sort_by_key(|range| range.start);
-
-        let mut merged_ranges = Vec::<Range<usize>>::new();
-        for range in ranges {
-            if let Some(previous) = merged_ranges.last_mut()
-                && range.start <= previous.end
-            {
-                previous.end = previous.end.max(range.end);
-            } else {
-                merged_ranges.push(range);
-            }
-        }
-
-        let mut annotated = String::new();
-        let mut source_offsets = vec![0];
-        let mut cursor = 0;
-        for range in merged_ranges {
-            annotated.push_str(&markdown[cursor..range.start]);
-            source_offsets.extend((cursor + 1)..=range.start);
-
-            annotated.push('[');
-            source_offsets.push(range.start);
-
-            annotated.push_str(&markdown[range.clone()]);
-            source_offsets.extend((range.start + 1)..=range.end);
-
-            const LINK_SUFFIX: &str = "](#inline-comment)";
-            annotated.push_str(LINK_SUFFIX);
-            source_offsets.extend(std::iter::repeat_n(range.end, LINK_SUFFIX.len()));
-            cursor = range.end;
-        }
-        annotated.push_str(&markdown[cursor..]);
-        source_offsets.extend((cursor + 1)..=markdown.len());
-
-        debug_assert_eq!(source_offsets.len(), annotated.len() + 1);
-        (annotated, source_offsets)
     }
 
     fn begin_inline_comment(
@@ -6764,7 +6636,6 @@ impl Cowork {
             .with_code_background(code_background.into())
             .with_border(rgb(0x3f3f46).into())
             .with_paragraph_gap(rems(0.75))
-            .with_heading_base_font_size(px(14.))
             .with_code_block(
                 gpui::StyleRefinement::default()
                     .bg(code_background)
@@ -6789,52 +6660,65 @@ impl Cowork {
             .with_dark(true)
     }
 
-    fn annotated_markdown_style() -> TextViewStyle {
-        Self::markdown_style().with_link(rgb(USER_ACCENT).into())
+    /// The background of the text a comment by `author` is on.
+    fn comment_highlight(&self, author: ParticipantId) -> gpui::Hsla {
+        gpui::Hsla::from(rgb(self.color_of(author))).opacity(0.2)
     }
 
+    /// The segment of a message rendering `source_range` of its Markdown, which
+    /// is `text`, with `highlights` given as ranges of `text`.
     fn message_segment(
         &mut self,
         thread_message_id: ThreadMessageId,
         source_range: Range<usize>,
         text: &str,
-        annotated: bool,
-        source_offsets: Option<Vec<usize>>,
+        highlights: &[(Range<usize>, gpui::Hsla)],
         cx: &mut Context<Self>,
     ) -> MessageSegment {
-        let key = SegmentKey {
-            start: source_range.start,
-            annotated,
-        };
         let text_view = self
             .segment_text_views
-            .entry((thread_message_id, key))
+            .entry((thread_message_id, source_range.start))
             .or_insert_with(|| SegmentTextView {
                 state: cx.new(|cx| TextViewState::markdown(text, cx)),
                 text: text.to_owned(),
+                highlights: None,
                 rendered_at: self.render_generation,
             });
         text_view.rendered_at = self.render_generation;
         if text_view.text != text {
             text_view.text.clear();
             text_view.text.push_str(text);
-            if annotated {
-                // Reparse the whole annotated segment. Incrementally replacing
-                // Markdown can retain stale link-render caches and drop an
-                // existing highlight when a neighboring annotation is added.
-                text_view.state = cx.new(|cx| TextViewState::markdown(text, cx));
-            } else {
-                text_view
-                    .state
-                    .update(cx, |view, cx| view.set_text(text, cx));
+            text_view
+                .state
+                .update(cx, |view, cx| view.set_text(text, cx));
+        }
+
+        // The highlights address `text`, so they wait for the view to render
+        // it; until then it keeps those it had, following its old text.
+        let rendered = text_view.state.read(cx).rendered_text();
+        let parsed = rendered.source() == text;
+        if parsed {
+            let highlights = highlights
+                .iter()
+                .filter_map(|(range, background)| {
+                    let range = rendered.range_for_source(range.clone())?;
+                    Some(RangeHighlight::new(range, *background))
+                })
+                .collect::<Vec<_>>();
+            let applied = (rendered, highlights);
+            if text_view.highlights.as_ref() != Some(&applied) {
+                text_view.state.update(cx, |view, cx| {
+                    let set = view.set_range_highlights(applied.1.clone(), cx);
+                    debug_assert!(set.is_ok(), "highlights of its own text: {set:?}");
+                });
+                text_view.highlights = Some(applied);
             }
         }
+
         MessageSegment {
             source_range,
             state: text_view.state.clone(),
-            annotated,
-            source_offsets,
-            blank: text.trim().is_empty(),
+            parsed,
             comments: Vec::new(),
         }
     }
@@ -6842,20 +6726,9 @@ impl Cowork {
     fn render_message_segment(segment: &MessageSegment) -> gpui::AnyElement {
         TextView::new(&segment.state)
             .selection_format(SelectionFormat::Plain)
-            .style(if segment.annotated {
-                Self::annotated_markdown_style()
-            } else {
-                Self::markdown_style()
-            })
+            .style(Self::markdown_style())
             .w_full()
             .into_any_element()
-    }
-
-    /// Whether `segment` has been laid out with its content. gpui-kit parses
-    /// large Markdown in the background, and until then a new text view lays
-    /// out empty.
-    fn segment_laid_out(segment: &MessageSegment, cx: &App) -> bool {
-        segment.blank || segment.state.read(cx).bounds().size.height > px(0.)
     }
 
     /// `segments` with their inline comments, followed by those of
@@ -7245,27 +7118,35 @@ impl Cowork {
             return whole().into_iter().collect();
         }
 
+        // Each comment's range, in the segments it falls in, with its
+        // author's color.
+        let comment_ranges = anchored_comments
+            .iter()
+            .map(|comment| {
+                (
+                    comment.reference.range.clone(),
+                    self.comment_highlight(comment.author),
+                )
+            })
+            .collect::<Vec<_>>();
+        let highlights_in = |segment: &Range<usize>| {
+            comment_ranges
+                .iter()
+                .filter_map(|(range, background)| {
+                    let start = range.start.max(segment.start);
+                    let end = range.end.min(segment.end);
+                    (start < end)
+                        .then(|| ((start - segment.start)..(end - segment.start), *background))
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // The message is split after the (wrapped) line each group of
+        // comments ends on, so that their editors sit right below it.
         let mut segments = Vec::new();
         let mut comment_index = 0;
         while comment_index < anchored_comments.len() {
             let first = anchored_comments[comment_index];
-            if first.reference.range.start < cursor {
-                comment_index += 1;
-                continue;
-            }
-            let annotated_start =
-                Self::hard_line_start(text, first.reference.range.start).max(cursor);
-            if cursor < annotated_start {
-                segments.push(self.message_segment(
-                    thread_message_id,
-                    cursor..annotated_start,
-                    &text[cursor..annotated_start],
-                    false,
-                    None,
-                    cx,
-                ));
-                cursor = annotated_start;
-            }
             let line_end =
                 Self::wrapped_line_end(text, first.reference.range.end, wrap_width, window);
             let group_start = comment_index;
@@ -7274,44 +7155,35 @@ impl Cowork {
             {
                 comment_index += 1;
             }
-            let group = &anchored_comments[group_start..comment_index];
-            let annotation_ranges = group
-                .iter()
-                .flat_map(|comment| Self::annotation_ranges(text, comment.reference.range.clone()))
-                .filter_map(|range| {
-                    (range.start >= cursor && range.end <= line_end)
-                        .then_some((range.start - cursor)..(range.end - cursor))
-                });
-            let (annotated, source_offsets) = Self::annotate_markdown_with_source_offsets(
-                &text[cursor..line_end],
-                annotation_ranges,
-            );
+            let range = cursor..line_end;
             let mut segment = self.message_segment(
                 thread_message_id,
-                cursor..line_end,
-                &annotated,
-                true,
-                Some(source_offsets),
+                range.clone(),
+                &text[range.clone()],
+                &highlights_in(&range),
                 cx,
             );
-            segment.comments = group.iter().map(|comment| comment.id).collect();
+            segment.comments = anchored_comments[group_start..comment_index]
+                .iter()
+                .map(|comment| comment.id)
+                .collect();
             segments.push(segment);
             cursor = line_end;
         }
         if cursor < text.len() {
+            let range = cursor..text.len();
             segments.push(self.message_segment(
                 thread_message_id,
-                cursor..text.len(),
-                &text[cursor..],
-                false,
-                None,
+                range.clone(),
+                &text[range.clone()],
+                &highlights_in(&range),
                 cx,
             ));
         }
 
-        // Until the new segments have been laid out, keep showing what they
-        // replace. Swapping in text views that are still empty would collapse
-        // the timeline and clamp its scroll offset, jumping the view elsewhere.
+        // Until the new segments render their text, keep showing what they
+        // replace. Swapping in views that are still empty would collapse the
+        // timeline and clamp its scroll offset, jumping the view elsewhere.
         let generation = self.render_generation;
         let shown = self
             .shown_segments
@@ -7326,14 +7198,11 @@ impl Cowork {
             .iter()
             .flat_map(|segment| segment.comments.iter().copied())
             .collect::<Vec<_>>();
-        let pending = segments
-            .iter()
-            .filter(|segment| !Self::segment_laid_out(segment, cx))
-            .collect::<Vec<_>>();
+        let parsed = segments.iter().all(|segment| segment.parsed);
         let timed_out = shown
             .pending_since
-            .is_some_and(|since| since.elapsed() >= SEGMENT_LAYOUT_TIMEOUT);
-        if pending.is_empty() || timed_out {
+            .is_some_and(|since| since.elapsed() >= SEGMENT_PARSE_TIMEOUT);
+        if parsed || timed_out {
             let content = self.render_segments(&segments, &anchored_comments, &placed_comments);
             let shown = self
                 .shown_segments
@@ -7346,28 +7215,17 @@ impl Cowork {
 
         shown.pending_since.get_or_insert_with(Instant::now);
         let previous = shown.segments.clone();
-        // Laid out out of sight so that they are measured once parsed, which
-        // is what is waited for.
-        let measuring = div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .w_full()
-            .h(px(0.))
-            .overflow_hidden()
-            .children(pending.into_iter().map(Self::render_message_segment))
-            .into_any_element();
+        // The views parse in the background whether or not they are drawn;
+        // look again next frame.
         window.request_animation_frame();
-        let mut content = match previous {
+        match previous {
             Some(previous) => self.render_segments(&previous, &anchored_comments, &placed_comments),
             None => {
                 let mut content = whole().into_iter().collect::<Vec<_>>();
                 content.extend(self.render_segments(&[], &anchored_comments, &placed_comments));
                 content
             }
-        };
-        content.push(measuring);
-        content
+        }
     }
 
     fn render_agent_message(
@@ -9606,7 +9464,6 @@ impl Render for Cowork {
                             }),
                     ),
             )
-            .children(Root::render_dialog_layer(window, cx))
     }
 }
 
@@ -9733,10 +9590,6 @@ mod tests {
     use super::*;
 
     use gpui_base::TextSelectionLayer;
-
-    fn annotate_markdown(markdown: &str, ranges: impl IntoIterator<Item = Range<usize>>) -> String {
-        Cowork::annotate_markdown_with_source_offsets(markdown, ranges).0
-    }
 
     fn encoded_image(width: u32, format: image::ImageFormat) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -10170,140 +10023,264 @@ mod tests {
         assert_eq!(copied_text.parse::<EndpointId>().unwrap(), endpoint_id);
     }
 
-    #[test]
-    fn annotated_markdown_uses_native_markdown_link() {
-        let annotated = annotate_markdown("Before selected text after", [7..20]);
+    /// A segment of a rendered agent message: its Markdown, and each
+    /// highlight as the range and text of the rendered text it paints.
+    type HighlightedSegment = (String, Vec<(Range<usize>, String)>);
 
-        assert_eq!(annotated, "Before [selected text](#inline-comment) after");
-    }
-
-    #[test]
-    fn annotated_markdown_merges_intersecting_comments() {
-        let annotated = annotate_markdown("overlapping", [0..7, 4..11]);
-
-        assert_eq!(annotated, "[overlapping](#inline-comment)");
-    }
-
-    #[test]
-    fn annotated_markdown_preserves_heading_around_partial_selection() {
-        let annotated = annotate_markdown("### A Heading", [6..13]);
-
-        assert_eq!(annotated, "### A [Heading](#inline-comment)");
-    }
-
-    #[test]
-    fn annotated_markdown_preserves_bold_around_partial_selection() {
-        let annotated = annotate_markdown("**Hi**", [3..4]);
-
-        assert_eq!(annotated, "**H[i](#inline-comment)**");
-    }
-
-    #[test]
-    fn comments_follow_gpui_source_ranges_across_markdown_boundaries() {
-        fn through(markdown: &str, start: &str, end: &str) -> Range<usize> {
-            let start_offset = markdown.find(start).expect("selection start");
-            let end_offset = markdown[start_offset..]
-                .find(end)
-                .map(|offset| start_offset + offset + end.len())
-                .expect("selection end");
-            start_offset..end_offset
+    /// Renders `markdown` as an agent message `wrap_width` wide, with a comment
+    /// on each of `ranges`, and returns its segments.
+    fn highlighted_segments(
+        cx: &mut gpui::TestAppContext,
+        markdown: &'static str,
+        ranges: &[Range<usize>],
+        wrap_width: f32,
+    ) -> Vec<HighlightedSegment> {
+        struct HighlightRoot {
+            cowork: Entity<Cowork>,
+            text_view: Entity<TextViewState>,
+            id: ThreadMessageId,
+            markdown: &'static str,
+            comments: Vec<UserComment>,
+            wrap_width: gpui::Pixels,
         }
 
-        let cases = [
+        impl Render for HighlightRoot {
+            fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let content = self.cowork.update(cx, |cowork, cx| {
+                    cowork.render_agent_text(
+                        self.id,
+                        self.markdown,
+                        &self.text_view,
+                        &self.comments,
+                        self.wrap_width,
+                        window,
+                        cx,
+                    )
+                });
+                div().w(self.wrap_width).flex().flex_col().children(content)
+            }
+        }
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let tokio_handle = runtime.handle().clone();
+        let (root, cx) = cx.add_window_view(|window, cx| {
+            let id = ThreadMessageId {
+                thread_id: Uuid::new_v4(),
+                message_id: Uuid::new_v4(),
+            };
+            let draft = ThreadDraft::new(ParticipantId::new());
+            for range in ranges {
+                draft.doc.create_comment(
+                    draft.author.as_uuid(),
+                    CommentTarget {
+                        message_id: id.message_id,
+                        quote: markdown[range.clone()].into(),
+                        range: range.clone(),
+                    },
+                    "comment",
+                );
+            }
+            let thread_store = cx.new(|_| ThreadStore::default());
+            HighlightRoot {
+                cowork: cx.new(|cx| test_cowork(thread_store, None, tokio_handle, window, cx)),
+                text_view: cx.new(|cx| TextViewState::markdown(markdown, cx)),
+                id,
+                markdown,
+                comments: draft.comment_views(&[]),
+                wrap_width: px(wrap_width),
+            }
+        });
+        for _ in 0..3 {
+            cx.run_until_parked();
+            cx.update(|window, cx| window.draw(cx).clear(cx));
+        }
+        root.read_with(cx, |root, cx| {
+            let cowork = root.cowork.read(cx);
+            let segments = cowork
+                .shown_segments
+                .get(&root.id)
+                .and_then(|shown| shown.segments.as_ref())
+                .expect("a commented message is split");
+            segments
+                .iter()
+                .map(|segment| {
+                    let view = &cowork.segment_text_views[&(root.id, segment.source_range.start)];
+                    assert_eq!(view.text, root.markdown[segment.source_range.clone()]);
+                    let (text, highlights) = view.highlights.as_ref().expect("highlights are set");
+                    let highlights = highlights
+                        .iter()
+                        .map(|highlight| {
+                            let range = highlight.range();
+                            (range.clone(), text.as_str()[range].to_string())
+                        })
+                        .collect();
+                    (view.text.clone(), highlights)
+                })
+                .collect()
+        })
+    }
+
+    /// The text each highlight of a one-segment message paints.
+    fn highlighted_texts(
+        cx: &mut gpui::TestAppContext,
+        markdown: &'static str,
+        ranges: &[Range<usize>],
+    ) -> Vec<String> {
+        let segments = highlighted_segments(cx, markdown, ranges, 600.);
+        let [(_, highlights)] = segments.as_slice() else {
+            panic!("{markdown:?} is one segment, got {segments:?}");
+        };
+        highlights.iter().map(|(_, text)| text.clone()).collect()
+    }
+
+    /// The range of `markdown` from `start` through the next `end`.
+    fn through(markdown: &str, start: &str, end: &str) -> Range<usize> {
+        let start_offset = markdown.find(start).expect("selection start");
+        let end_offset = markdown[start_offset..]
+            .find(end)
+            .map(|offset| start_offset + offset + end.len())
+            .expect("selection end");
+        start_offset..end_offset
+    }
+
+    #[gpui::test]
+    fn comments_highlight_the_text_rendered_from_their_source(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let cases: [(&str, &'static str, Range<usize>, &str); 12] = [
             (
-                "inside bold",
-                "Before **bold text** after",
-                through("Before **bold text** after", "old", "old"),
-                "Before **b[old](#inline-comment) text** after",
+                "plain",
+                "Before selected text after",
+                7..20,
+                "selected text",
             ),
+            ("heading", "### A Heading", 6..13, "Heading"),
+            ("inside bold", "**Hi**", 3..4, "i"),
             (
                 "across opening bold edge",
                 "Before **bold text** after",
                 through("Before **bold text** after", "re ", "bold"),
-                "Befo[re ](#inline-comment)**[bold](#inline-comment) text** after",
+                "re bold",
             ),
             (
                 "across closing bold edge",
                 "Before **bold text** after",
                 through("Before **bold text** after", "text", " af"),
-                "Before **bold [text](#inline-comment)**[ af](#inline-comment)ter",
+                "text af",
             ),
             (
                 "whole bold section",
                 "Before **bold text** after",
-                through("Before **bold text** after", "bold", "text"),
-                "Before **[bold text](#inline-comment)** after",
+                through("Before **bold text** after", "**bold", "text**"),
+                "bold text",
             ),
             (
                 "across several styled sections",
                 "A **bold** and *italic* tail",
                 through("A **bold** and *italic* tail", "bold", " ta"),
-                "A **[bold](#inline-comment)**[ and ](#inline-comment)*[italic](#inline-comment)*[ ta](#inline-comment)il",
+                "bold and italic ta",
             ),
             (
                 "nested styles",
                 "Start **bold and *italic*** end",
                 through("Start **bold and *italic*** end", "and ", "italic"),
-                "Start **bold [and ](#inline-comment)*[italic](#inline-comment)*** end",
+                "and italic",
             ),
-            (
-                "whole inline code",
-                "Use `value` now",
-                5..10,
-                "Use [`value`](#inline-comment) now",
-            ),
-            (
-                "partial inline code is atomic",
-                "Use `value` now",
-                6..9,
-                "Use [`value`](#inline-comment) now",
-            ),
+            ("whole inline code", "Use `value` now", 4..11, "value"),
+            ("part of inline code", "Use `value` now", 6..9, "alu"),
             (
                 "heading and emphasis",
                 "### A **styled heading** here",
                 through("### A **styled heading** here", "A ", "** h"),
-                "### [A ](#inline-comment)**[styled heading](#inline-comment)**[ h](#inline-comment)ere",
+                "A styled heading h",
+            ),
+            (
+                "across inline code",
+                "In Rust, we use `u128` to handle larger numbers",
+                0.."In Rust, we use `u128` to handle larger numbers".len(),
+                "In Rust, we use u128 to handle larger numbers",
             ),
         ];
-
-        for (name, markdown, source_range, expected) in cases {
-            let ranges = Cowork::annotation_ranges(markdown, source_range);
-            let annotated = annotate_markdown(markdown, ranges);
-
-            assert_eq!(annotated, expected, "{name}");
-            let html = markdown::to_html_with_options(&annotated, &markdown::Options::gfm())
-                .expect("annotated Markdown should compile");
-            assert!(
-                html.contains("href=\"#inline-comment\""),
-                "{name}: annotation should survive Markdown rendering: {html}"
+        for (name, markdown, range, expected) in cases {
+            assert_eq!(
+                highlighted_texts(cx, markdown, std::slice::from_ref(&range)),
+                [expected],
+                "{name}"
             );
         }
     }
 
-    #[test]
-    fn can_comment_on_selection_across_inline_code() {
-        let markdown = "In Rust, we use `u128` to handle larger numbers";
-        let ranges = Cowork::annotation_ranges(markdown, 0..markdown.len());
-        let annotated = annotate_markdown(markdown, ranges);
-        let html = markdown::to_html_with_options(&annotated, &markdown::Options::gfm())
-            .expect("annotated Markdown should compile");
-
+    #[gpui::test]
+    fn intersecting_comments_each_highlight_their_text(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
         assert_eq!(
-            annotated,
-            "[In Rust, we use `u128` to handle larger numbers](#inline-comment)"
+            highlighted_texts(cx, "overlapping", &[0..7, 4..11]),
+            ["overlap", "lapping"]
         );
-        assert!(html.contains(
-            "<a href=\"#inline-comment\">In Rust, we use <code>u128</code> to handle larger numbers</a>"
-        ));
     }
 
-    #[test]
-    fn comments_use_gpui_range_to_target_identical_styled_text() {
-        let markdown = "**same** then **same**";
-        let ranges = Cowork::annotation_ranges(markdown, 16..20);
-        let annotated = annotate_markdown(markdown, ranges);
+    #[gpui::test]
+    fn comments_highlight_the_occurrence_they_are_on(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let second = 16..20;
+        let segments = highlighted_segments(
+            cx,
+            "**same** then **same**",
+            std::slice::from_ref(&second),
+            600.,
+        );
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].1, [(10..14, "same".to_string())]);
+    }
 
-        assert_eq!(annotated, "**same** then **[same](#inline-comment)**");
+    #[gpui::test]
+    fn messages_split_after_the_line_a_comment_ends_on(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let markdown = "First paragraph.\n\nSecond has a comment here.\n\nThird paragraph.";
+        let comment = through(markdown, "comment", "comment");
+        assert_eq!(
+            highlighted_segments(cx, markdown, &[comment], 600.),
+            [
+                (
+                    "First paragraph.\n\nSecond has a comment here.\n".to_string(),
+                    vec![(30..37, "comment".to_string())],
+                ),
+                ("\nThird paragraph.".to_string(), Vec::new()),
+            ]
+        );
+    }
+
+    #[gpui::test]
+    fn a_comment_past_its_line_highlights_into_the_next_segment(cx: &mut gpui::TestAppContext) {
+        cx.update(gpui_component::init);
+        let markdown = "one two\n\nthree four\n\nfive";
+        // The first comment ends the line its group is placed after; the
+        // second starts on it and runs into the next paragraph.
+        let segments = highlighted_segments(
+            cx,
+            markdown,
+            &[4..7, through(markdown, "two", "three")],
+            600.,
+        );
+        let texts = segments
+            .iter()
+            .map(|(text, highlights)| {
+                let highlights = highlights
+                    .iter()
+                    .map(|(_, text)| text.as_str())
+                    .collect::<Vec<_>>();
+                (text.as_str(), highlights)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            [
+                ("one two\n", vec!["two", "two"]),
+                ("\nthree four\n\nfive", vec!["three"]),
+            ]
+        );
     }
 
     fn assert_backslash_selection_creates_comment(
@@ -10478,19 +10455,18 @@ mod tests {
             let _ = window.draw(cx);
         });
 
-        let annotated_state_before = expected_highlights_after_comment.map(|_| {
-            view.read_with(cx, |view, cx| {
-                view.cowork
-                    .read(cx)
-                    .segment_text_views
-                    .iter()
-                    .find(|((segment, _), _)| segment.message_id == view.message_id)
-                    .expect("annotated segment")
-                    .1
-                    .state
-                    .entity_id()
-            })
-        });
+        // The view of the segment holding the existing comment's line.
+        let segment_view = |view: &SelectionRoot, cx: &App| {
+            view.cowork
+                .read(cx)
+                .segment_text_views
+                .iter()
+                .find(|((segment, start), _)| segment.message_id == view.message_id && *start == 0)
+                .map(|(_, segment)| segment.state.entity_id())
+                .expect("commented segment")
+        };
+        let segment_view_before = expected_highlights_after_comment
+            .map(|_| view.read_with(cx, |view, cx| segment_view(view, cx)));
         cx.simulate_keystrokes("x");
 
         view.read_with(cx, |view, cx| {
@@ -10554,20 +10530,12 @@ mod tests {
                     .segment_text_views
                     .iter()
                     .filter(|((segment, _), _)| segment.message_id == view.message_id)
-                    .map(|(_, segment)| segment.text.match_indices("#inline-comment").count())
+                    .filter_map(|(_, segment)| segment.highlights.as_ref())
+                    .map(|(_, highlights)| highlights.len())
                     .sum::<usize>();
                 assert_eq!(highlight_count, expected_highlights);
-                let annotated_state_after = view
-                    .cowork
-                    .read(cx)
-                    .segment_text_views
-                    .iter()
-                    .find(|((segment, _), _)| segment.message_id == view.message_id)
-                    .expect("annotated segment")
-                    .1
-                    .state
-                    .entity_id();
-                assert_ne!(Some(annotated_state_after), annotated_state_before);
+                // Highlighting another comment on the same line keeps its view.
+                assert_eq!(Some(segment_view(view, cx)), segment_view_before);
             });
         }
     }
@@ -10664,22 +10632,6 @@ mod tests {
             104.,
             155.,
             Some(2),
-        );
-    }
-
-    #[test]
-    fn annotation_segment_excludes_preceding_code_block() {
-        let markdown = "Before\n\n```rust\nfn main() {}\n```\n\nParagraph with selected text";
-        let selection_start = markdown.find("selected").unwrap();
-        let annotation_start = Cowork::hard_line_start(markdown, selection_start);
-
-        assert_eq!(
-            &markdown[..annotation_start],
-            "Before\n\n```rust\nfn main() {}\n```\n\n"
-        );
-        assert_eq!(
-            &markdown[annotation_start..],
-            "Paragraph with selected text"
         );
     }
 
@@ -14039,16 +13991,31 @@ mod tests {
             "the timeline scrolled from {offset_before:?} to {offset_after:?}"
         );
         cowork.read_with(cx, |cowork, _| {
+            let id = ThreadMessageId {
+                thread_id,
+                message_id,
+            };
             let shown = cowork
                 .shown_segments
-                .get(&ThreadMessageId {
-                    thread_id,
-                    message_id,
-                })
+                .get(&id)
                 .expect("the commented response is split");
             assert!(shown.pending_since.is_none());
             let segments = shown.segments.as_ref().expect("segments are shown");
-            assert!(segments.iter().any(|segment| segment.annotated));
+            // The quote is highlighted once the segment holding it has parsed.
+            let highlighted = segments
+                .iter()
+                .filter_map(|segment| {
+                    cowork.segment_text_views[&(id, segment.source_range.start)]
+                        .highlights
+                        .as_ref()
+                })
+                .flat_map(|(text, highlights)| {
+                    highlights
+                        .iter()
+                        .map(|highlight| text.as_str()[highlight.range()].to_string())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(highlighted, [quote]);
         });
     }
 
