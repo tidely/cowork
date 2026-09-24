@@ -4799,6 +4799,7 @@ impl Cowork {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("Cowork"),
             )
+            .footer(self.render_sidebar_bottom_bar())
             .child(actions);
         let sidebar = if collaborating_threads.is_empty() {
             sidebar
@@ -4807,6 +4808,61 @@ impl Cowork {
         };
 
         sidebar.child(recents)
+    }
+
+    /// Mirrors the main stage's bottom bar, but with its divider always shown.
+    fn render_sidebar_bottom_bar(&self) -> impl IntoElement {
+        // `Sidebar` pads its footer slot by `px_3` and `pb_3`; bleeding over
+        // that padding lets the bar span the sidebar's full width and line up
+        // with the main stage's bottom bar.
+        const FOOTER_INSET: gpui::Rems = rems(-0.75);
+        let identity = self.local_participant_id;
+
+        div()
+            .id("sidebar-bottom-bar")
+            .debug_selector(|| "sidebar-bottom-bar".to_owned())
+            .relative()
+            .flex_1()
+            .mx(FOOTER_INSET)
+            .mb(FOOTER_INSET)
+            .h(TOP_BAR_HEIGHT)
+            .flex()
+            .items_center()
+            .px_1()
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(1.))
+                    .bg(rgb(0x2d2d30)),
+            )
+            .child(
+                Button::new("identity")
+                    .ghost()
+                    .debug_selector(|| "identity-button".to_owned())
+                    .flex_1()
+                    .px_1p5()
+                    // `Button` centers its content, so fill it with a single
+                    // left-aligned row.
+                    .child(
+                        div()
+                            .debug_selector(|| "identity-button-content".to_owned())
+                            .flex_1()
+                            .min_w_0()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(Self::render_participant_avatar(identity, px(22.)))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .text_ellipsis()
+                                    .child(identity.display_name()),
+                            ),
+                    ),
+            )
     }
 
     fn markdown_text_leaves(markdown: &str) -> Vec<MarkdownTextLeaf> {
@@ -9461,6 +9517,33 @@ mod tests {
         cx.update(|window, cx| cowork.update(cx, |cowork, cx| cowork.focus_composer(window, cx)));
         cx.run_until_parked();
         (cowork, runtime, cx)
+    }
+
+    #[gpui::test]
+    fn sidebar_bottom_bar_lines_up_with_the_main_bottom_bar(cx: &mut gpui::TestAppContext) {
+        let (_cowork, _runtime, cx) = composer_test_cowork(cx);
+
+        let sidebar_bar = cx
+            .debug_bounds("sidebar-bottom-bar")
+            .expect("sidebar bottom bar should be rendered");
+        let main_bar = cx
+            .debug_bounds("bottom-bar")
+            .expect("main bottom bar should be rendered");
+
+        assert_eq!(sidebar_bar.origin.y, main_bar.origin.y);
+        assert_eq!(sidebar_bar.size.height, main_bar.size.height);
+        assert_eq!(sidebar_bar.origin.x, px(0.));
+        assert_eq!(sidebar_bar.size.width, SIDEBAR_WIDTH);
+
+        let button = cx
+            .debug_bounds("identity-button")
+            .expect("identity button should be rendered");
+        let content = cx
+            .debug_bounds("identity-button-content")
+            .expect("identity button content should be rendered");
+        assert_eq!(button.left(), sidebar_bar.left() + px(4.));
+        assert_eq!(button.right(), sidebar_bar.right() - px(4.));
+        assert_eq!(content.left(), button.left() + px(6.));
     }
 
     fn new_thread_items(
