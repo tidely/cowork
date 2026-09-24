@@ -6520,8 +6520,10 @@ impl Cowork {
                 .into_any_element(),
         };
 
+        let comment_id = comment.id;
         div()
-            .id(format!("inline-comment-{}", comment.id))
+            .id(format!("inline-comment-{comment_id}"))
+            .debug_selector(move || format!("inline-comment-{comment_id}"))
             .w_full()
             .overflow_hidden()
             .rounded_md()
@@ -7218,13 +7220,12 @@ impl Cowork {
         // The views parse in the background whether or not they are drawn;
         // look again next frame.
         window.request_animation_frame();
+        // A newly created comment has no place in the old layout yet. Do not
+        // append its focused editor after the whole response while parsing:
+        // that would scroll the timeline away from the quoted text.
         match previous {
-            Some(previous) => self.render_segments(&previous, &anchored_comments, &placed_comments),
-            None => {
-                let mut content = whole().into_iter().collect::<Vec<_>>();
-                content.extend(self.render_segments(&[], &anchored_comments, &placed_comments));
-                content
-            }
+            Some(previous) => self.render_segments(&previous, &anchored_comments, &[]),
+            None => whole().into_iter().collect(),
         }
     }
 
@@ -13953,25 +13954,35 @@ mod tests {
         );
         assert_eq!(offset_before, -max_before);
 
-        cowork.update(cx, |cowork, cx| {
-            let thread = cowork
-                .thread_store
-                .read(cx)
-                .thread(thread_id, cx)
-                .expect("thread");
-            thread.update(cx, |thread, _| {
-                let draft = &mut thread.draft;
-                draft.doc.create_comment(
-                    draft.author.as_uuid(),
-                    CommentTarget {
-                        message_id,
-                        range: quote_start..quote_start + quote.len(),
-                        quote: quote.into(),
-                    },
-                    "x",
+        let comment_id = cx.update(|window, cx| {
+            cowork.update(cx, |cowork, cx| {
+                let thread = cowork
+                    .thread_store
+                    .read(cx)
+                    .thread(thread_id, cx)
+                    .expect("thread");
+                let comment_id = thread.update(cx, |thread, _| {
+                    let draft = &mut thread.draft;
+                    draft.doc.create_comment(
+                        draft.author.as_uuid(),
+                        CommentTarget {
+                            message_id,
+                            range: quote_start..quote_start + quote.len(),
+                            quote: quote.into(),
+                        },
+                        "x",
+                    )
+                });
+                cowork.focus_draft_editor(
+                    thread.read(cx).draft.id,
+                    EditorSlot::CommentInline(comment_id),
+                    None,
+                    window,
+                    cx,
                 );
-            });
-            cx.notify();
+                cx.notify();
+                comment_id
+            })
         });
         // The frame right after the comment appears, before any background
         // parse has had a chance to finish.
@@ -13983,8 +13994,18 @@ mod tests {
              while the new segments were parsed"
         );
         assert_eq!(offset_first_frame, offset_before);
+        let inline_selector: &'static str =
+            Box::leak(format!("inline-comment-{comment_id}").into_boxed_str());
+        assert!(
+            cx.debug_bounds(inline_selector).is_none(),
+            "the new editor must not appear at the end of the unsplit response"
+        );
 
         settle(cx);
+        assert!(
+            cx.debug_bounds(inline_selector).is_some(),
+            "the editor should appear at its anchor after parsing"
+        );
         let (offset_after, _) = scroll(cx);
         assert!(
             (offset_after - offset_before).abs() < px(1.),
