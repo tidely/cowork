@@ -39,7 +39,8 @@ use gpui_base::{
     text::{CodeBlock, SelectionFormat},
 };
 use gpui_component::{
-    Collapsible, Disableable as _, Icon, Root, Sizable as _, ThemeMode, WindowExt as _,
+    Collapsible, Disableable as _, Icon, Root, Selectable as _, Sizable as _, ThemeMode,
+    WindowExt as _,
     attachment::{
         Attachment, AttachmentActions, AttachmentContent, AttachmentDescription, AttachmentMedia,
         AttachmentStatus, AttachmentTitle,
@@ -445,6 +446,55 @@ fn image_content(bytes: Vec<u8>) -> Result<FileAttachmentContent, Vec<u8>> {
     )))
 }
 
+/// Profile pictures are cropped to a square of this many pixels, so they stay
+/// small and cheap to draw however large the chosen file is.
+const PROFILE_PICTURE_PIXELS: u32 = 256;
+const MAX_DISPLAY_NAME_CHARS: usize = 40;
+
+fn load_profile_picture(path: &Path) -> anyhow::Result<gpui::Image> {
+    let name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string());
+    let len = std::fs::metadata(path)
+        .with_context(|| format!("Cannot read {name}"))?
+        .len();
+    anyhow::ensure!(
+        len <= MAX_IMAGE_ATTACHMENT_BYTES,
+        "{name} is {}; profile pictures can be at most {}",
+        format_bytes(len),
+        format_bytes(MAX_IMAGE_ATTACHMENT_BYTES)
+    );
+    let bytes = std::fs::read(path).with_context(|| format!("Cannot read {name}"))?;
+    profile_picture(&bytes).with_context(|| format!("{name} is not a supported image"))
+}
+
+/// Center-crops an image to a square and re-encodes it as a PNG.
+fn profile_picture(bytes: &[u8]) -> anyhow::Result<gpui::Image> {
+    let square = image::load_from_memory(bytes)?.resize_to_fill(
+        PROFILE_PICTURE_PIXELS,
+        PROFILE_PICTURE_PIXELS,
+        image::imageops::FilterType::Lanczos3,
+    );
+    let mut png = Vec::new();
+    square.write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)?;
+    Ok(gpui::Image::from_bytes(gpui::ImageFormat::Png, png))
+}
+
+/// Why `name` cannot be a display name, if it cannot.
+fn display_name_error(name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        Some("Enter a name.".into())
+    } else if name.chars().count() > MAX_DISPLAY_NAME_CHARS {
+        Some(format!(
+            "Names can be at most {MAX_DISPLAY_NAME_CHARS} characters."
+        ))
+    } else {
+        None
+    }
+}
+
 /// Files copied in a file manager are attached, as are images unless the
 /// clipboard also holds text (spreadsheets put a rendered image next to the
 /// cells, for example). Everything else is left to the regular text paste.
@@ -804,6 +854,7 @@ gpui_kit_assets::icon_assets!(
         Paperclip,
         FileText,
         Image,
+        Pen,
         X,
     ]
 );
@@ -1777,6 +1828,15 @@ struct JoinDialog {
     endpoint_token: Entity<InputState>,
     status: JoinStatus,
     _input_subscription: Option<Subscription>,
+}
+
+/// How the local user presents themselves. Only shown locally for now.
+#[derive(Default)]
+struct LocalProfile {
+    /// Replaces the name derived from the participant id when set.
+    name: Option<SharedString>,
+    /// Replaces the initials avatar when set.
+    picture: Option<Arc<gpui::Image>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2818,6 +2878,12 @@ struct Cowork {
     titlebar_click_armed: bool,
     copied_endpoint_id: Option<Uuid>,
     join_dialog: Option<Entity<JoinDialog>>,
+    /// Whether the main stage shows the profile page instead of a thread.
+    profile_open: bool,
+    profile: LocalProfile,
+    profile_error: Option<SharedString>,
+    /// Watches the open profile name dialog's input.
+    profile_name_subscription: Option<Subscription>,
     tokio_handle: tokio::runtime::Handle,
     active_generations: HashMap<Uuid, ActiveGeneration>,
     /// Who the local user is in the threads this app creates and hosts.
@@ -4314,6 +4380,7 @@ impl Cowork {
         });
         self.active_thread_id = Some(thread_id);
         self.selection_message_id = None;
+        self.profile_open = false;
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -4423,6 +4490,7 @@ impl Cowork {
     fn render_top_bar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let active_thread = self
             .active_thread_id
+            .filter(|_| !self.profile_open)
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx));
         let sharing_status = active_thread
             .as_ref()
@@ -4528,39 +4596,41 @@ impl Cowork {
                     .when(sharing_status == SharingStatus::Shared, |this| {
                         this.child(copy_endpoint_button)
                     })
-                    .child(
-                        div()
-                            .id("toggle-sharing")
-                            .h(px(28.))
-                            .px_3()
-                            .mr_2()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .rounded_md()
-                            .occlude()
-                            .text_sm()
-                            .text_color(rgb(0x71717a))
-                            .when(sharing_enabled, |this| {
-                                this.cursor_pointer()
-                                    .text_color(rgb(0xd4d4d8))
-                                    .hover(|this| this.bg(rgb(0x2d2d30)))
-                            })
-                            .when(sharing_status == SharingStatus::Failed, |this| {
-                                this.text_color(rgb(0xf87171))
-                            })
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _, _, cx| {
-                                    this.titlebar_click_armed = false;
-                                    cx.stop_propagation();
-                                }),
-                            )
-                            .on_click(cx.listener(|this, _, window, cx| {
-                                this.toggle_sharing(window, cx);
-                            }))
-                            .child(share_label),
-                    )
+                    .when(!self.profile_open, |this| {
+                        this.child(
+                            div()
+                                .id("toggle-sharing")
+                                .h(px(28.))
+                                .px_3()
+                                .mr_2()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_md()
+                                .occlude()
+                                .text_sm()
+                                .text_color(rgb(0x71717a))
+                                .when(sharing_enabled, |this| {
+                                    this.cursor_pointer()
+                                        .text_color(rgb(0xd4d4d8))
+                                        .hover(|this| this.bg(rgb(0x2d2d30)))
+                                })
+                                .when(sharing_status == SharingStatus::Failed, |this| {
+                                    this.text_color(rgb(0xf87171))
+                                })
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _, _, cx| {
+                                        this.titlebar_click_armed = false;
+                                        cx.stop_propagation();
+                                    }),
+                                )
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    this.toggle_sharing(window, cx);
+                                }))
+                                .child(share_label),
+                        )
+                    })
                     .when(!cfg!(target_os = "macos"), |this| {
                         this.child(
                             div()
@@ -4688,6 +4758,7 @@ impl Cowork {
         let can_write = thread.read(cx).ownership.can_write();
         self.active_thread_id = Some(thread_id);
         self.selection_message_id = None;
+        self.profile_open = false;
         self.follow_generation = true;
         self.timeline_scroll_handle.scroll_to_bottom();
         if can_write {
@@ -4704,7 +4775,7 @@ impl Cowork {
     ) -> SidebarMenuItem {
         SidebarMenuItem::new(thread.title.clone())
             .min_h(px(30.))
-            .active(self.active_thread_id == Some(thread_id))
+            .active(!self.profile_open && self.active_thread_id == Some(thread_id))
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.open_thread(thread_id, window, cx);
             }))
@@ -4737,11 +4808,12 @@ impl Cowork {
                                 .size_4()
                                 .text_color(rgb(0xe4e4e7)),
                         )
-                        .active(self.active_thread_id.is_none())
+                        .active(!self.profile_open && self.active_thread_id.is_none())
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.new_thread_draft = ThreadDraft::new(this.local_participant_id);
                             this.active_thread_id = None;
                             this.selection_message_id = None;
+                            this.profile_open = false;
                             this.focus_composer(window, cx);
                             cx.notify();
                         })),
@@ -4799,7 +4871,7 @@ impl Cowork {
                     .font_weight(FontWeight::SEMIBOLD)
                     .child("Cowork"),
             )
-            .footer(self.render_sidebar_bottom_bar())
+            .footer(self.render_sidebar_bottom_bar(cx))
             .child(actions);
         let sidebar = if collaborating_threads.is_empty() {
             sidebar
@@ -4811,12 +4883,11 @@ impl Cowork {
     }
 
     /// Mirrors the main stage's bottom bar, but with its divider always shown.
-    fn render_sidebar_bottom_bar(&self) -> impl IntoElement {
+    fn render_sidebar_bottom_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // `Sidebar` pads its footer slot by `px_3` and `pb_3`; bleeding over
         // that padding lets the bar span the sidebar's full width and line up
         // with the main stage's bottom bar.
         const FOOTER_INSET: gpui::Rems = rems(-0.75);
-        let identity = self.local_participant_id;
 
         div()
             .id("sidebar-bottom-bar")
@@ -4844,6 +4915,11 @@ impl Cowork {
                     .debug_selector(|| "identity-button".to_owned())
                     .flex_1()
                     .px_1p5()
+                    .selected(self.profile_open)
+                    .accessibility_label("Open profile")
+                    .on_click(cx.listener(|this, _, window, cx| {
+                        this.open_profile(window, cx);
+                    }))
                     // `Button` centers its content, so fill it with a single
                     // left-aligned row.
                     .child(
@@ -4854,15 +4930,301 @@ impl Cowork {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(Self::render_participant_avatar(identity, px(22.)))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .text_ellipsis()
-                                    .child(identity.display_name()),
-                            ),
+                            .child(self.render_profile_avatar(px(22.)))
+                            .child(div().min_w_0().text_ellipsis().child(self.profile_name())),
                     ),
             )
+    }
+
+    fn profile_name(&self) -> SharedString {
+        self.profile
+            .name
+            .clone()
+            .unwrap_or_else(|| self.local_participant_id.display_name().into())
+    }
+
+    /// The local user's picture if they chose one, their initials otherwise.
+    fn render_profile_avatar(&self, size: gpui::Pixels) -> gpui::Div {
+        match &self.profile.picture {
+            Some(picture) => div()
+                .size(size)
+                .flex_none()
+                .overflow_hidden()
+                .rounded_full()
+                .child(img(picture.clone()).size_full().rounded_full()),
+            None => Self::render_participant_avatar(self.local_participant_id, size),
+        }
+    }
+
+    fn open_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.profile_open = true;
+        self.profile_error = None;
+        // The composer is hidden, so it must not keep taking keystrokes.
+        window.blur(cx);
+        cx.notify();
+    }
+
+    fn render_profile_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        const PICTURE_SIZE: gpui::Pixels = px(96.);
+
+        let picture = div()
+            .id("profile-picture")
+            .debug_selector(|| "profile-picture".to_owned())
+            .group("profile-picture")
+            .relative()
+            .size(PICTURE_SIZE)
+            .flex_none()
+            .rounded_full()
+            .cursor_pointer()
+            .child(self.render_profile_avatar(PICTURE_SIZE).text_size(px(36.)))
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(rgba(0x00000080))
+                    .opacity(0.)
+                    .group_hover("profile-picture", |this| this.opacity(1.))
+                    .child(
+                        Icon::new(AssetIconName::Pen)
+                            .size_6()
+                            .text_color(rgb(0xffffff)),
+                    ),
+            )
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.pick_profile_picture(window, cx);
+            }));
+
+        div()
+            .id("profile-page")
+            .debug_selector(|| "profile-page".to_owned())
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .min_w_0()
+            .overflow_hidden()
+            .rounded_tl(px(12.))
+            .border_t_1()
+            .border_l_1()
+            .border_color(rgb(0x2d2d30))
+            .bg(rgb(0x18181b))
+            .child(
+                div()
+                    .id("profile-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .child(
+                        div()
+                            .w_full()
+                            .pt(px(72.))
+                            .pb_6()
+                            .px_6()
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap_3()
+                            .child(picture)
+                            .child(
+                                div()
+                                    .max_w_full()
+                                    .text_ellipsis()
+                                    .text_size(px(20.))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(rgb(0xe4e4e7))
+                                    .child(self.profile_name()),
+                            )
+                            .children(self.profile_error.clone().map(|error| {
+                                div().text_sm().text_color(rgb(0xf87171)).child(error)
+                            })),
+                    ),
+            )
+            .child(
+                div().absolute().top_3().right_3().child(
+                    Button::new("edit-profile")
+                        .ghost()
+                        .small()
+                        .icon(Icon::new(AssetIconName::Pen))
+                        .label("Edit")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_profile_name_dialog(window, cx);
+                        })),
+                ),
+            )
+    }
+
+    fn pick_profile_picture(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The native pickers have no file-type filter here, so the image is
+        // validated once chosen.
+        let selected = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Choose a profile picture".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let path = match selected.await {
+                Ok(Ok(Some(paths))) => match paths.into_iter().next() {
+                    Some(path) => path,
+                    None => return,
+                },
+                Ok(Ok(None)) | Err(_) => return,
+                Ok(Err(error)) => {
+                    _ = this.update(cx, |this, cx| {
+                        this.profile_error =
+                            Some(format!("Could not choose a file: {error}").into());
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
+            let result = cx
+                .background_executor()
+                .spawn(async move { load_profile_picture(&path) })
+                .await;
+            _ = this.update(cx, |this, cx| {
+                match result {
+                    Ok(picture) => {
+                        this.profile.picture = Some(Arc::new(picture));
+                        this.profile_error = None;
+                    }
+                    Err(error) => this.profile_error = Some(error.to_string().into()),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn open_profile_name_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current_name = self.profile_name();
+        let name = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder(current_name);
+            input.set_editor_style(InputEditorStyle {
+                caret: rgb(0xffffff).into(),
+                ..Default::default()
+            });
+            input
+        });
+        let input_subscription = cx.subscribe_in(
+            &name,
+            window,
+            |this, name, event: &InputEvent, window, cx| match event {
+                InputEvent::Change => cx.notify(),
+                InputEvent::PressEnter { .. } if this.save_profile_name(name, cx) => {
+                    window.close_dialog(cx);
+                }
+                _ => {}
+            },
+        );
+        self.profile_name_subscription = Some(input_subscription);
+
+        let cowork = cx.entity().downgrade();
+        let dialog_name = name.clone();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let name = dialog_name.clone();
+            let value = name.read(cx).value();
+            let error = display_name_error(&value);
+            // An empty field is obvious enough without a message.
+            let shown_error = error.clone().filter(|_| !value.trim().is_empty());
+            let dismiss_cowork = cowork.clone();
+            let cancel_cowork = cowork.clone();
+            let save_cowork = cowork.clone();
+            dialog
+                .w(px(440.))
+                .bg(rgb(0x1c1c1f))
+                .on_cancel(move |_, _, cx| Self::dismiss_profile_name_dialog(&dismiss_cowork, cx))
+                .content(move |content, _, _| {
+                    content
+                        .child(
+                            DialogHeader::new()
+                                .child(DialogTitle::new().child("Edit profile"))
+                                .child(DialogDescription::new().child("Change your display name.")),
+                        )
+                        .child(
+                            div()
+                                .id("profile-name-input")
+                                .h(px(38.))
+                                .px_3()
+                                .flex()
+                                .items_center()
+                                .rounded_md()
+                                .border_1()
+                                .border_color(rgb(0x52525b))
+                                .bg(rgb(0x18181b))
+                                .child(Input::new(&name)),
+                        )
+                        .children(
+                            shown_error
+                                .clone()
+                                .map(|error| div().text_color(rgb(0xf87171)).child(error)),
+                        )
+                        .child(
+                            DialogFooter::new()
+                                .child(
+                                    Button::new("cancel-profile-name")
+                                        .outline()
+                                        .label("Cancel")
+                                        .on_click({
+                                            let cancel_cowork = cancel_cowork.clone();
+                                            move |_, window, cx| {
+                                                if Self::dismiss_profile_name_dialog(
+                                                    &cancel_cowork,
+                                                    cx,
+                                                ) {
+                                                    window.close_dialog(cx);
+                                                }
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    Button::new("save-profile-name")
+                                        .primary()
+                                        .label("Save")
+                                        .disabled(error.is_some())
+                                        .on_click({
+                                            let save_cowork = save_cowork.clone();
+                                            let name = name.clone();
+                                            move |_, window, cx| {
+                                                let saved = save_cowork
+                                                    .update(cx, |cowork, cx| {
+                                                        cowork.save_profile_name(&name, cx)
+                                                    })
+                                                    .unwrap_or(false);
+                                                if saved {
+                                                    window.close_dialog(cx);
+                                                }
+                                            }
+                                        }),
+                                ),
+                        )
+                })
+        });
+        name.focus_handle(cx).focus(window, cx);
+        cx.notify();
+    }
+
+    /// Applies the name typed into the dialog, unless it is not a valid name.
+    fn save_profile_name(&mut self, name: &Entity<InputState>, cx: &mut Context<Self>) -> bool {
+        let value = name.read(cx).value();
+        if display_name_error(&value).is_some() {
+            return false;
+        }
+        self.profile.name = Some(value.trim().to_owned().into());
+        self.profile_name_subscription = None;
+        cx.notify();
+        true
+    }
+
+    fn dismiss_profile_name_dialog(cowork: &WeakEntity<Self>, cx: &mut App) -> bool {
+        cowork
+            .update(cx, |cowork, cx| {
+                cowork.profile_name_subscription = None;
+                cx.notify();
+            })
+            .is_ok()
     }
 
     fn markdown_text_leaves(markdown: &str) -> Vec<MarkdownTextLeaf> {
@@ -7882,7 +8244,7 @@ impl Render for Cowork {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .when(can_write, |this| {
+                            .when(can_write && !self.profile_open, |this| {
                                 this.can_drop(|value, _, _| {
                                     value
                                         .downcast_ref::<ExternalPaths>()
@@ -7890,17 +8252,25 @@ impl Render for Cowork {
                                 })
                                 .on_drop(cx.listener(Self::drop_attachments))
                             })
-                            .child(self.render_main_editor(
-                                read_only_line_bounds.clone(),
-                                window,
-                                cx,
-                            ))
-                            .child(self.render_bottom_bar(
-                                composer,
-                                read_only_line_bounds,
-                                window,
-                                cx,
-                            )),
+                            .map(|this| {
+                                if self.profile_open {
+                                    this.child(self.render_profile_page(cx))
+                                } else {
+                                    this.child(self.render_main_editor(
+                                        read_only_line_bounds.clone(),
+                                        window,
+                                        cx,
+                                    ))
+                                    .child(
+                                        self.render_bottom_bar(
+                                            composer,
+                                            read_only_line_bounds,
+                                            window,
+                                            cx,
+                                        ),
+                                    )
+                                }
+                            }),
                     ),
             )
             .children(Root::render_dialog_layer(window, cx))
@@ -7988,6 +8358,10 @@ fn main() -> anyhow::Result<()> {
                         titlebar_click_armed: false,
                         copied_endpoint_id: None,
                         join_dialog: None,
+                        profile_open: false,
+                        profile: LocalProfile::default(),
+                        profile_error: None,
+                        profile_name_subscription: None,
                         tokio_handle,
                         active_generations: HashMap::new(),
                         local_participant_id,
@@ -8273,6 +8647,10 @@ mod tests {
             titlebar_click_armed: false,
             copied_endpoint_id: None,
             join_dialog: None,
+            profile_open: false,
+            profile: LocalProfile::default(),
+            profile_error: None,
+            profile_name_subscription: None,
             tokio_handle,
             active_generations: HashMap::new(),
             local_participant_id,
@@ -9544,6 +9922,56 @@ mod tests {
         assert_eq!(button.left(), sidebar_bar.left() + px(4.));
         assert_eq!(button.right(), sidebar_bar.right() - px(4.));
         assert_eq!(content.left(), button.left() + px(6.));
+    }
+
+    #[test]
+    fn profile_pictures_are_cropped_to_a_square_png() {
+        let picture = profile_picture(&encoded_image(7, image::ImageFormat::Bmp))
+            .expect("a bmp is a supported image");
+
+        assert_eq!(picture.format(), gpui::ImageFormat::Png);
+        let decoded = image::load_from_memory(picture.bytes()).expect("decodes");
+        assert_eq!(
+            (decoded.width(), decoded.height()),
+            (PROFILE_PICTURE_PIXELS, PROFILE_PICTURE_PIXELS)
+        );
+        assert!(profile_picture(b"not an image").is_err());
+    }
+
+    #[test]
+    fn display_names_must_be_non_empty_and_short() {
+        assert!(display_name_error("  Ada  ").is_none());
+        assert!(display_name_error("   ").is_some());
+        assert!(display_name_error(&"a".repeat(MAX_DISPLAY_NAME_CHARS)).is_none());
+        assert!(display_name_error(&"a".repeat(MAX_DISPLAY_NAME_CHARS + 1)).is_some());
+    }
+
+    #[gpui::test]
+    fn the_profile_button_opens_the_profile_page(cx: &mut gpui::TestAppContext) {
+        let (cowork, _runtime, cx) = composer_test_cowork(cx);
+
+        let button = cx
+            .debug_bounds("identity-button")
+            .expect("identity button should be rendered");
+        cx.simulate_click(button.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+
+        assert!(cowork.read_with(cx, |cowork, _| cowork.profile_open));
+        assert!(cx.debug_bounds("profile-page").is_some());
+        assert!(cx.debug_bounds("profile-picture").is_some());
+        assert!(cx.debug_bounds("bottom-bar").is_none());
+
+        cx.update(|window, cx| {
+            cowork.update(cx, |cowork, cx| {
+                let name = cx.new(|cx| InputState::new(window, cx).default_value("  Ada  "));
+                assert!(cowork.save_profile_name(&name, cx));
+                assert_eq!(cowork.profile_name(), "Ada");
+
+                let blank = cx.new(|cx| InputState::new(window, cx).default_value("  "));
+                assert!(!cowork.save_profile_name(&blank, cx));
+                assert_eq!(cowork.profile_name(), "Ada");
+            });
+        });
     }
 
     fn new_thread_items(
