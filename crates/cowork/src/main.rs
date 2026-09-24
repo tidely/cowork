@@ -6662,7 +6662,7 @@ impl Cowork {
 
     /// The background of the text a comment by `author` is on.
     fn comment_highlight(&self, author: ParticipantId) -> gpui::Hsla {
-        gpui::Hsla::from(rgb(self.color_of(author))).opacity(0.2)
+        gpui::Hsla::from(rgb(self.color_of(author))).opacity(0.3)
     }
 
     /// The segment of a message rendering `source_range` of its Markdown, which
