@@ -1909,6 +1909,7 @@ dependencies = [
  "anyhow",
  "async-channel",
  "base64 0.22.1",
+ "chrono",
  "draft",
  "futures",
  "gpui-base",

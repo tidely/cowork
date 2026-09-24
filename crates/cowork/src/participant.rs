@@ -2,9 +2,10 @@ use uuid::Uuid;
 
 /// Identifies one participant of a thread.
 ///
-/// The host assigns collaborators a fresh id every time they join. The name
-/// and color are derived from the id, so every client renders a participant
-/// identically without either being sent over the wire. They are purely
+/// The host assigns collaborators a fresh id every time they join. The
+/// generated name and color are derived from an id deterministically, so every
+/// client renders a participant identically. Profiles name the id to derive
+/// them from, so a participant looks the same in every thread. They are purely
 /// cosmetic: names can collide and must never be used as identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ParticipantId(Uuid);

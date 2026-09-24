@@ -10,12 +10,13 @@ use std::{
         Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use agent::{Agent as StreamingAgent, AgentEvent};
 use anyhow::Context as _;
 use base64::Engine as _;
+use chrono::{DateTime, Datelike as _, Days, Local, Months, NaiveTime, TimeDelta, Timelike as _};
 use draft::{
     AttachmentId, AttachmentKind, AttachmentRecord, CommentTarget, Draft, DraftItem, DraftItemKind,
     ItemId, TextEdit,
@@ -46,6 +47,7 @@ use gpui_component::{
         AttachmentStatus, AttachmentTitle,
     },
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
+    chart::LineChart,
     combobox::{Combobox, ComboboxEvent, ComboboxState},
     dialog::{DialogDescription, DialogFooter, DialogHeader, DialogTitle},
     progress::{Progress, ProgressCircle},
@@ -778,7 +780,7 @@ fn selection_rects(
 
 /// A participant's name in their color, just above their caret at `origin`.
 fn paint_caret_label(
-    participant: ParticipantId,
+    color: u32,
     name: SharedString,
     origin: gpui::Point<gpui::Pixels>,
     window: &mut Window,
@@ -802,7 +804,7 @@ fn paint_caret_label(
         point(origin.x, origin.y - HEIGHT),
         size(line.width + px(8.), HEIGHT),
     );
-    window.paint_quad(gpui::fill(label, rgb(participant.color())).corner_radii(px(3.)));
+    window.paint_quad(gpui::fill(label, rgb(color)).corner_radii(px(3.)));
     _ = line.paint(
         point(label.left() + px(4.), label.top()),
         HEIGHT,
@@ -1096,6 +1098,8 @@ enum TimelineMessage {
 struct AgentMessage {
     id: Uuid,
     comment_group_id: Option<Uuid>,
+    /// When the host started generating this message.
+    started_at: SystemTime,
     comment_responses: Vec<AgentCommentResponse>,
     thinking: String,
     thinking_view: Entity<TextViewState>,
@@ -1105,6 +1109,9 @@ struct AgentMessage {
     text_view: Entity<TextViewState>,
     complete: bool,
     failed: bool,
+    /// How long the host spent generating this message, stopped and failed
+    /// runs included. `None` while generating.
+    duration: Option<Duration>,
 }
 
 #[derive(Clone)]
@@ -1914,9 +1921,21 @@ struct Profile {
     name: Option<SharedString>,
     /// Replaces the initials avatar when set.
     picture: Option<Arc<gpui::Image>>,
+    /// What the fallback name, initials, and color are derived from; see
+    /// [`protocol::Profile::appearance`].
+    appearance: Option<ParticipantId>,
 }
 
 impl Profile {
+    /// The local user's profile before they customize it, which looks the
+    /// same in every thread they join.
+    fn local(local_participant_id: ParticipantId) -> Self {
+        Self {
+            appearance: Some(local_participant_id),
+            ..Self::default()
+        }
+    }
+
     fn to_protocol(&self) -> protocol::Profile {
         protocol::Profile {
             name: self.name.as_ref().map(ToString::to_string),
@@ -1924,6 +1943,7 @@ impl Profile {
                 .picture
                 .as_ref()
                 .map(|picture| picture.bytes().to_vec()),
+            appearance: self.appearance.map(ParticipantId::into_bytes),
         }
     }
 
@@ -1933,15 +1953,23 @@ impl Profile {
             picture: profile
                 .picture
                 .map(|bytes| Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Jpeg, bytes))),
+            appearance: profile.appearance.map(ParticipantId::from_bytes),
         }
     }
 }
 
-/// The name `participant` chose, or the one derived from their id.
+/// The id `participant`'s fallback name, initials, and color come from.
+fn appearance(participant: ParticipantId, profile: Option<&Profile>) -> ParticipantId {
+    profile
+        .and_then(|profile| profile.appearance)
+        .unwrap_or(participant)
+}
+
+/// The name `participant` chose, or the one derived from their appearance.
 fn participant_name(participant: ParticipantId, profile: Option<&Profile>) -> SharedString {
     profile
         .and_then(|profile| profile.name.clone())
-        .unwrap_or_else(|| participant.display_name().into())
+        .unwrap_or_else(|| appearance(participant, profile).display_name().into())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2009,6 +2037,379 @@ impl ContextUsage {
             _ => rgb(0xa1a1aa),
         }
     }
+}
+
+/// A duration in its two largest units, such as `12s`, `35m 16s`, or
+/// `2h 5m`.
+fn format_stat_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}h {minutes}m")
+    } else if minutes > 0 {
+        format!("{minutes}m {seconds}s")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+/// A turn's tokens, dated when its response started generating.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TokenActivity {
+    at: SystemTime,
+    /// How long the response took, across which its tokens are spread.
+    duration: Duration,
+    tokens: u64,
+}
+
+impl TokenActivity {
+    /// The share of this turn's tokens used in each of the periods starting
+    /// at `starts`, in order. The last period is open-ended, so that a clock
+    /// that moved back keeps a turn in it. What was used before the first
+    /// period is left out.
+    fn spread(&self, starts: &[DateTime<Local>]) -> impl Iterator<Item = (usize, f64)> {
+        let start = DateTime::<Local>::from(self.at);
+        // A duration too long to date is treated as an instant.
+        let end = TimeDelta::from_std(self.duration)
+            .ok()
+            .and_then(|duration| start.checked_add_signed(duration))
+            .unwrap_or(start);
+        let tokens = self.tokens as f64;
+        let length = (end - start).num_microseconds().unwrap_or(i64::MAX) as f64;
+        let instant = length <= 0.;
+        // An instant falls wholly in the period it starts in.
+        let instant_index = starts
+            .partition_point(|period| *period <= start)
+            .checked_sub(1);
+        (0..starts.len()).filter_map(move |index| {
+            if instant {
+                return (Some(index) == instant_index).then_some((index, tokens));
+            }
+            let from = start.max(starts[index]);
+            let to = starts.get(index + 1).map_or(end, |next| end.min(*next));
+            let overlap = (to - from).num_microseconds().unwrap_or(i64::MAX) as f64;
+            (overlap > 0.).then(|| (index, tokens * overlap / length))
+        })
+    }
+}
+
+/// `values` rounded to whole numbers that add up to their rounded sum, by
+/// rounding up those with the largest fractions.
+fn round_preserving_total(values: &mut [f64]) {
+    let total = values.iter().sum::<f64>().round();
+    let mut fractions: Vec<_> = values
+        .iter_mut()
+        .enumerate()
+        .map(|(index, value)| {
+            let fraction = *value - value.floor();
+            *value = value.floor();
+            (index, fraction)
+        })
+        .collect();
+    let missing = (total - values.iter().sum::<f64>()).max(0.) as usize;
+    fractions.sort_by(|(a_index, a), (b_index, b)| b.total_cmp(a).then(a_index.cmp(b_index)));
+    for &(index, _) in fractions.iter().take(missing) {
+        values[index] += 1.;
+    }
+}
+
+/// The periods the token activity chart can show. Each rolls, ending now,
+/// so the chart never has periods still to come.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ActivityRange {
+    Lifetime,
+    Year,
+    Month,
+    Day,
+    #[default]
+    Hour,
+}
+
+impl ActivityRange {
+    const ALL: [Self; 5] = [
+        Self::Lifetime,
+        Self::Year,
+        Self::Month,
+        Self::Day,
+        Self::Hour,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Lifetime => "All time",
+            Self::Year => "Year",
+            Self::Month => "Month",
+            Self::Day => "Day",
+            Self::Hour => "Hour",
+        }
+    }
+}
+
+/// One point of the token activity chart: the tokens of the turns whose
+/// responses started in one period.
+#[derive(Clone, Debug, PartialEq)]
+struct ActivityBucket {
+    /// Names the period when hovered, uniquely within the chart.
+    label: SharedString,
+    tokens: f64,
+}
+
+/// A label under the token activity chart, centered on bucket `index`.
+#[derive(Clone, Debug, PartialEq)]
+struct AxisLabel {
+    index: usize,
+    text: SharedString,
+}
+
+/// What the token activity chart shows for one [`ActivityRange`].
+#[derive(Clone, Debug, PartialEq)]
+struct ActivityChart {
+    /// Oldest first.
+    buckets: Vec<ActivityBucket>,
+    axis: Vec<AxisLabel>,
+}
+
+impl ActivityChart {
+    /// The bucket with the most tokens, the latest of equals, unless no
+    /// bucket has any.
+    fn peak(&self) -> Option<(usize, &ActivityBucket)> {
+        self.buckets
+            .iter()
+            .enumerate()
+            .filter(|(_, bucket)| bucket.tokens > 0.)
+            .max_by(|(_, a), (_, b)| a.tokens.total_cmp(&b.tokens))
+    }
+}
+
+/// Which buckets [`ActivityChart::axis`] labels, counted back from the
+/// current one, which is on the right.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AxisLabels {
+    /// Every `every` units back, how long ago, such as `5m`. The current
+    /// bucket is left unlabeled; there, it is now.
+    Ago { every: u32, suffix: &'static str },
+    /// The current bucket and every `every` units back, the date in the
+    /// `strftime` pattern `format`.
+    Date { every: u32, format: &'static str },
+}
+
+/// The calendar unit one [`ActivityBucket`] spans, in local time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BucketUnit {
+    Minute,
+    Hour,
+    Day,
+    Month,
+}
+
+impl BucketUnit {
+    /// The start of the unit containing `time`.
+    fn floor(self, time: DateTime<Local>) -> DateTime<Local> {
+        let minute = time
+            .with_nanosecond(0)
+            .and_then(|time| time.with_second(0))
+            .unwrap_or(time);
+        match self {
+            Self::Minute => minute,
+            Self::Hour => minute.with_minute(0).unwrap_or(minute),
+            Self::Day => local_midnight(time.date_naive()).unwrap_or(time),
+            Self::Month => time
+                .date_naive()
+                .with_day(1)
+                .and_then(local_midnight)
+                .unwrap_or(time),
+        }
+    }
+
+    /// The start of the unit `count` units before the one starting at
+    /// `start`.
+    fn back(self, start: DateTime<Local>, count: u32) -> DateTime<Local> {
+        let date = start.date_naive();
+        let moved = match self {
+            Self::Minute => Some(start - TimeDelta::minutes(count.into())),
+            Self::Hour => Some(start - TimeDelta::hours(count.into())),
+            Self::Day => date
+                .checked_sub_days(Days::new(count.into()))
+                .and_then(local_midnight),
+            Self::Month => date
+                .checked_sub_months(Months::new(count))
+                .and_then(local_midnight),
+        };
+        moved.unwrap_or(start)
+    }
+}
+
+fn local_midnight(date: chrono::NaiveDate) -> Option<DateTime<Local>> {
+    date.and_time(NaiveTime::MIN)
+        .and_local_timezone(Local)
+        .earliest()
+}
+
+/// How [`token_activity_chart`] divides a range: `count` units ending with
+/// the current one, each named with the `strftime` pattern `title` when
+/// hovered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BucketLayout {
+    unit: BucketUnit,
+    count: u32,
+    title: &'static str,
+    axis: AxisLabels,
+}
+
+impl BucketLayout {
+    const HOUR: Self = Self {
+        unit: BucketUnit::Minute,
+        count: 60,
+        title: "%H:%M",
+        axis: AxisLabels::Ago {
+            every: 5,
+            suffix: "m",
+        },
+    };
+    const DAY: Self = Self {
+        unit: BucketUnit::Hour,
+        count: 24,
+        title: "%H:%M",
+        axis: AxisLabels::Ago {
+            every: 3,
+            suffix: "h",
+        },
+    };
+    const MONTH: Self = Self {
+        unit: BucketUnit::Day,
+        count: 30,
+        title: "%b %-d",
+        axis: AxisLabels::Date {
+            every: 5,
+            format: "%b %-d",
+        },
+    };
+    const YEAR: Self = Self {
+        unit: BucketUnit::Month,
+        count: 12,
+        title: "%b %Y",
+        axis: AxisLabels::Date {
+            every: 1,
+            format: "%b",
+        },
+    };
+
+    /// The layout for `range`. A lifetime takes the shortest fixed layout
+    /// that reaches back to the first activity, or else one month per point
+    /// since then.
+    fn of(range: ActivityRange, activity: &[TokenActivity], now: DateTime<Local>) -> Self {
+        match range {
+            ActivityRange::Hour => Self::HOUR,
+            ActivityRange::Day => Self::DAY,
+            ActivityRange::Month => Self::MONTH,
+            ActivityRange::Year => Self::YEAR,
+            ActivityRange::Lifetime => {
+                let Some(first) = activity
+                    .iter()
+                    .map(|activity| DateTime::<Local>::from(activity.at))
+                    .min()
+                else {
+                    return Self::HOUR;
+                };
+                [Self::HOUR, Self::DAY, Self::MONTH, Self::YEAR]
+                    .into_iter()
+                    .find(|layout| layout.start(now) <= first)
+                    .unwrap_or_else(|| {
+                        let months = (now.year() - first.year()) * 12 + now.month() as i32
+                            - first.month() as i32;
+                        let count = u32::try_from(months + 1).unwrap_or(1);
+                        Self {
+                            unit: BucketUnit::Month,
+                            count,
+                            title: "%b %Y",
+                            // About six labels.
+                            axis: AxisLabels::Date {
+                                every: count.div_ceil(6),
+                                format: "%b %Y",
+                            },
+                        }
+                    })
+            }
+        }
+    }
+
+    /// The start of the first bucket.
+    fn start(self, now: DateTime<Local>) -> DateTime<Local> {
+        self.unit
+            .back(self.unit.floor(now), self.count.saturating_sub(1))
+    }
+}
+
+/// The tokens used in each period of `range`, and how to label them.
+fn token_activity_chart(
+    activity: &[TokenActivity],
+    range: ActivityRange,
+    now: DateTime<Local>,
+) -> ActivityChart {
+    let layout = BucketLayout::of(range, activity, now);
+    let current = layout.unit.floor(now);
+    let starts: Vec<_> = (0..layout.count)
+        .rev()
+        .map(|back| layout.unit.back(current, back))
+        .collect();
+    let mut buckets: Vec<_> = starts
+        .iter()
+        .map(|start| ActivityBucket {
+            label: start.format(layout.title).to_string().into(),
+            tokens: 0.,
+        })
+        .collect();
+    let (every, first) = match layout.axis {
+        AxisLabels::Ago { every, .. } => (every, every),
+        AxisLabels::Date { every, .. } => (every, 0),
+    };
+    let axis = (first..layout.count)
+        .step_by(every.max(1) as usize)
+        .map(|back| {
+            let index = (layout.count - 1 - back) as usize;
+            let text = match layout.axis {
+                AxisLabels::Ago { suffix, .. } => format!("{back}{suffix}"),
+                AxisLabels::Date { format, .. } => starts[index].format(format).to_string(),
+            };
+            AxisLabel {
+                index,
+                text: text.into(),
+            }
+        })
+        .rev()
+        .collect();
+    let mut tokens = vec![0.; buckets.len()];
+    for activity in activity {
+        for (index, share) in activity.spread(&starts) {
+            tokens[index] += share;
+        }
+    }
+    // Whole tokens read better when hovered.
+    round_preserving_total(&mut tokens);
+    for (bucket, tokens) in buckets.iter_mut().zip(tokens) {
+        bucket.tokens = tokens;
+    }
+    ActivityChart { buckets, axis }
+}
+
+/// A statistic shortened to one decimal of its largest unit, such as `950`,
+/// `12.3K`, `100.8M`, or `2B`.
+fn format_stat_count(count: u64) -> String {
+    if count < 1_000 {
+        return count.to_string();
+    }
+    let units = [(1e3, "K"), (1e6, "M"), (1e9, "B"), (1e12, "T")];
+    let (value, suffix) = units
+        .iter()
+        .map(|&(unit, suffix)| ((count as f64 / unit * 10.).round() / 10., suffix))
+        // Rounding can carry into the next unit, as 999,960 does into 1M.
+        .find(|&(value, _)| value < 1_000.)
+        .unwrap_or_else(|| {
+            let (unit, suffix) = units[units.len() - 1];
+            ((count as f64 / unit * 10.).round() / 10., suffix)
+        });
+    let text = format!("{value:.1}");
+    format!("{}{suffix}", text.strip_suffix(".0").unwrap_or(&text))
 }
 
 /// A token count shortened to at most a few digits, such as `950`, `4.1k`,
@@ -2184,10 +2585,16 @@ impl protocol::UserMessage {
 
 impl AgentMessage {
     /// An empty message for an agent that has just started responding.
-    fn new(id: Uuid, comment_group_id: Option<Uuid>, cx: &mut impl AppContext) -> Self {
+    fn new(
+        id: Uuid,
+        comment_group_id: Option<Uuid>,
+        started_at: SystemTime,
+        cx: &mut impl AppContext,
+    ) -> Self {
         Self {
             id,
             comment_group_id,
+            started_at,
             comment_responses: Vec::new(),
             thinking: String::new(),
             thinking_view: cx.new(|cx| TextViewState::markdown("", cx)),
@@ -2197,6 +2604,7 @@ impl AgentMessage {
             text_view: cx.new(|cx| TextViewState::markdown("", cx)),
             complete: false,
             failed: false,
+            duration: None,
         }
     }
 
@@ -2204,6 +2612,7 @@ impl AgentMessage {
         protocol::AgentMessage {
             id: self.id.into_bytes(),
             comment_group_id: self.comment_group_id.map(Uuid::into_bytes),
+            started_at: self.started_at,
             comment_responses: self
                 .comment_responses
                 .iter()
@@ -2218,6 +2627,7 @@ impl AgentMessage {
             text: self.text.clone(),
             complete: self.complete,
             failed: self.failed,
+            duration: self.duration,
         }
     }
 }
@@ -2229,6 +2639,7 @@ impl protocol::AgentMessage {
         AgentMessage {
             id: Uuid::from_bytes(self.id),
             comment_group_id: self.comment_group_id.map(Uuid::from_bytes),
+            started_at: self.started_at,
             comment_responses: self
                 .comment_responses
                 .into_iter()
@@ -2247,6 +2658,7 @@ impl protocol::AgentMessage {
             text_view,
             complete: self.complete,
             failed: self.failed,
+            duration: self.duration,
         }
     }
 }
@@ -2789,10 +3201,12 @@ impl Thread {
             protocol::HostMessage::AgentStarted {
                 id,
                 comment_group_id,
+                started_at,
             } => {
                 self.timeline.push(TimelineMessage::Agent(AgentMessage::new(
                     Uuid::from_bytes(id),
                     comment_group_id.map(Uuid::from_bytes),
+                    started_at,
                     cx,
                 )));
                 self.generating = true;
@@ -2847,7 +3261,11 @@ impl Thread {
                 self.context_tokens = Some(tokens);
                 self.streamed_bytes = 0;
             }
-            protocol::HostMessage::AgentEnded { id, failure } => {
+            protocol::HostMessage::AgentEnded {
+                id,
+                failure,
+                duration,
+            } => {
                 self.generating = false;
                 // A request that was stopped or failed before it reported
                 // usage never adds its partial output to the transcript.
@@ -2859,6 +3277,7 @@ impl Thread {
                 message.thinking_complete = true;
                 message.thinking_expanded = false;
                 message.failed = failure.is_some();
+                message.duration = Some(duration);
                 // Only surface the failure when the agent said nothing itself.
                 if let Some(failure) = failure
                     && message.text.is_empty()
@@ -2869,6 +3288,17 @@ impl Thread {
                 }
             }
         }
+    }
+
+    /// How long the agent has spent generating in this thread.
+    fn generation_time(&self) -> Duration {
+        self.timeline
+            .iter()
+            .filter_map(|message| match message {
+                TimelineMessage::Agent(message) => message.duration,
+                TimelineMessage::User(_) => None,
+            })
+            .sum()
     }
 
     /// How much of the context window the thread fills right now: the last
@@ -3161,6 +3591,10 @@ struct Cowork {
     /// Tokens used across local threads, excluding ones joined from someone
     /// else; see [`Cowork::record_turn_usage`].
     tokens_used: u64,
+    /// When those tokens were used, turn by turn, in the order turns ended.
+    token_activity: Vec<TokenActivity>,
+    /// The period the profile page's token activity chart shows.
+    activity_range: ActivityRange,
     /// Who the local user is in the threads this app creates and hosts.
     local_participant_id: ParticipantId,
     /// The draft editor the user is typing in, so that when its item is
@@ -5062,6 +5496,10 @@ impl Cowork {
         participant_name(participant, self.shown_profiles.get(&participant))
     }
 
+    fn color_of(&self, participant: ParticipantId) -> u32 {
+        appearance(participant, self.shown_profiles.get(&participant)).color()
+    }
+
     /// A participant's avatar, identical wherever they appear.
     fn render_participant_avatar(
         &self,
@@ -5085,6 +5523,7 @@ impl Cowork {
                 .rounded_full()
                 .child(img(picture).size_full().rounded_full());
         }
+        let appearance = appearance(participant, profile);
         div()
             .size(size)
             .flex()
@@ -5092,11 +5531,11 @@ impl Cowork {
             .items_center()
             .justify_center()
             .rounded_full()
-            .bg(rgb(participant.color()))
+            .bg(rgb(appearance.color()))
             .text_size(px(9.))
             .font_weight(FontWeight::SEMIBOLD)
             .text_color(rgb(0xf4f4f5))
-            .child(participant.initials())
+            .child(appearance.initials())
     }
 
     fn open_thread(&mut self, thread_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
@@ -5134,20 +5573,20 @@ impl Cowork {
     }
 
     fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (collaborating_threads, recent_threads): (Vec<_>, Vec<_>) = self
-            .thread_store
-            .read(cx)
-            .threads
-            .iter()
-            .map(|thread| {
-                let thread = thread.read(cx);
-                (
-                    thread.instance_id,
-                    thread.summary.clone(),
-                    thread.sharing.is_collaborating(),
-                )
-            })
-            .partition(|(_, _, collaborating)| *collaborating);
+        let mut hosting_threads = Vec::new();
+        let mut collaborating_threads = Vec::new();
+        let mut recent_threads = Vec::new();
+        for thread in &self.thread_store.read(cx).threads {
+            let thread = thread.read(cx);
+            let entry = (thread.instance_id, thread.summary.clone());
+            match thread.sharing {
+                ThreadSharing::Sharing | ThreadSharing::Shared { .. } => {
+                    hosting_threads.push(entry)
+                }
+                ThreadSharing::Connected { .. } => collaborating_threads.push(entry),
+                ThreadSharing::NotShared | ThreadSharing::Failed => recent_threads.push(entry),
+            }
+        }
 
         let actions = CoworkSidebarSection::new(
             None::<SharedString>,
@@ -5184,28 +5623,39 @@ impl Cowork {
                 ),
         );
 
-        let collaborating =
-            CoworkSidebarSection::new(
-                Some("Collaborating"),
-                SidebarMenu::new().children(collaborating_threads.iter().map(
-                    |(thread_id, thread, _)| self.sidebar_thread_item(*thread_id, thread, cx),
-                )),
-            );
+        let hosting = CoworkSidebarSection::new(
+            Some("Shared by me"),
+            SidebarMenu::new().children(
+                hosting_threads
+                    .iter()
+                    .map(|(thread_id, thread)| self.sidebar_thread_item(*thread_id, thread, cx)),
+            ),
+        );
 
-        let recents =
-            CoworkSidebarSection::new(
-                Some("Recents"),
-                SidebarMenu::new().children(recent_threads.iter().map(|(thread_id, thread, _)| {
-                    self.sidebar_thread_item(*thread_id, thread, cx)
-                })),
-            )
-            .label_toggle(
-                self.recents_open,
-                cx.listener(|this, _, _, cx| {
-                    this.recents_open = !this.recents_open;
-                    cx.notify();
-                }),
-            );
+        let collaborating = CoworkSidebarSection::new(
+            Some("Collaborating"),
+            SidebarMenu::new().children(
+                collaborating_threads
+                    .iter()
+                    .map(|(thread_id, thread)| self.sidebar_thread_item(*thread_id, thread, cx)),
+            ),
+        );
+
+        let recents = CoworkSidebarSection::new(
+            Some("Recents"),
+            SidebarMenu::new().children(
+                recent_threads
+                    .iter()
+                    .map(|(thread_id, thread)| self.sidebar_thread_item(*thread_id, thread, cx)),
+            ),
+        )
+        .label_toggle(
+            self.recents_open,
+            cx.listener(|this, _, _, cx| {
+                this.recents_open = !this.recents_open;
+                cx.notify();
+            }),
+        );
 
         let sidebar = Sidebar::new("cowork-sidebar")
             .w(SIDEBAR_WIDTH)
@@ -5225,6 +5675,11 @@ impl Cowork {
             )
             .footer(self.render_sidebar_bottom_bar(cx))
             .child(actions);
+        let sidebar = if hosting_threads.is_empty() {
+            sidebar
+        } else {
+            sidebar.child(hosting)
+        };
         let sidebar = if collaborating_threads.is_empty() {
             sidebar
         } else {
@@ -5379,7 +5834,9 @@ impl Cowork {
                             )
                             .children(self.profile_error.clone().map(|error| {
                                 div().text_sm().text_color(rgb(0xf87171)).child(error)
-                            })),
+                            }))
+                            .child(self.render_usage_stats(cx))
+                            .child(self.render_token_activity(cx)),
                     ),
             )
             .child(
@@ -5393,6 +5850,239 @@ impl Cowork {
                             this.open_profile_name_dialog(window, cx);
                         })),
                 ),
+            )
+    }
+
+    /// The chats the user started here, excluding joined ones.
+    fn own_threads<'a>(&self, cx: &'a App) -> impl Iterator<Item = &'a Thread> {
+        self.thread_store
+            .read(cx)
+            .threads
+            .iter()
+            .map(|thread| thread.read(cx))
+            .filter(|thread| thread.ownership == ThreadOwnership::Local)
+    }
+
+    fn total_chats(&self, cx: &App) -> usize {
+        self.own_threads(cx).count()
+    }
+
+    /// The most time the agent has spent generating in one of the user's
+    /// own chats.
+    fn longest_chat(&self, cx: &App) -> Duration {
+        self.own_threads(cx)
+            .map(Thread::generation_time)
+            .max()
+            .unwrap_or_default()
+    }
+
+    /// A row of the user's usage statistics, each a value over its label.
+    fn render_usage_stats(&self, cx: &App) -> impl IntoElement {
+        let stats = [
+            (format_stat_count(self.tokens_used), "Lifetime tokens"),
+            (self.total_chats(cx).to_string(), "Total chats"),
+            (format_stat_duration(self.longest_chat(cx)), "Longest chat"),
+        ];
+        let divider = || div().flex_none().w(px(1.)).h(px(36.)).bg(rgb(0x27272a));
+        let stat = |(value, label): (String, &'static str)| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .text_sm()
+                .child(
+                    div()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(0xffffff))
+                        .child(value),
+                )
+                .child(div().text_color(rgba(0xffffff99)).child(label))
+        };
+
+        div()
+            .debug_selector(|| "usage-stats".to_owned())
+            .mt_5()
+            .w_full()
+            .max_w(px(444.))
+            .py(px(10.))
+            .flex()
+            .items_center()
+            .rounded(px(14.))
+            .border_1()
+            .border_color(rgb(0x27272a))
+            .bg(rgb(0x1b1b1e))
+            .children(Itertools::intersperse_with(
+                stats
+                    .into_iter()
+                    .map(|entry| stat(entry).into_any_element()),
+                || divider().into_any_element(),
+            ))
+    }
+
+    /// A line chart of the tokens the user used over the chosen period.
+    ///
+    /// The busiest period is marked by a faint line at the height of the
+    /// chart's top, labeled with its tokens, so the scale is readable
+    /// without hovering. The label sits at the end away from the peak, so
+    /// the two never collide.
+    fn render_token_activity(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        const PLOT_HEIGHT: f32 = 120.;
+        /// How far below the plot's top `LineChart` draws its highest value.
+        const PLOT_TOP_INSET: f32 = 10.;
+        const LABEL_LINE_HEIGHT: f32 = 16.;
+        /// The peak's line, just under its label, which tops the chart.
+        const PEAK_LINE_TOP: f32 = LABEL_LINE_HEIGHT + 2.;
+        /// Room above the plot, so that its highest value meets the line.
+        const PEAK_LABEL_ROOM: f32 = PEAK_LINE_TOP - PLOT_TOP_INSET;
+
+        let chart = token_activity_chart(&self.token_activity, self.activity_range, Local::now());
+        let last_index = chart.buckets.len().saturating_sub(1);
+        let peak = chart.peak().map(|(index, bucket)| {
+            let text = format!(
+                "Peak {} · {}",
+                format_stat_count(bucket.tokens as u64),
+                bucket.label
+            );
+            (index * 2 < chart.buckets.len(), text)
+        });
+        let empty = peak.is_none();
+
+        let axis = chart.axis.iter().map(|label| {
+            let text = div().whitespace_nowrap().child(label.text.clone());
+            let anchored = div().absolute().top_0();
+            if label.index == last_index && last_index > 0 {
+                anchored.right_0().child(text)
+            } else if label.index == 0 {
+                anchored.left_0().child(text)
+            } else {
+                // A zero-width anchor at the point, which the label overflows
+                // evenly on both sides.
+                anchored
+                    .left(gpui::relative(label.index as f32 / last_index as f32))
+                    .w(px(0.))
+                    .flex()
+                    .justify_center()
+                    .child(text)
+            }
+        });
+        let ranges = ActivityRange::ALL.into_iter().map(|range| {
+            let selected = range == self.activity_range;
+            div()
+                .id(range.label())
+                .debug_selector(move || format!("activity-range-{}", range.label()))
+                .cursor_pointer()
+                .text_color(if selected {
+                    rgb(0xffffff)
+                } else {
+                    rgba(0xffffff99)
+                })
+                .child(range.label())
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.activity_range = range;
+                    cx.notify();
+                }))
+        });
+
+        div()
+            .debug_selector(|| "token-activity".to_owned())
+            .mt_6()
+            .w_full()
+            .max_w(px(444.))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .text_sm()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .debug_selector(|| "token-activity-title".to_owned())
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(rgb(0xffffff))
+                            .child("Token activity"),
+                    )
+                    .child(div().flex().items_center().gap_3().children(ranges)),
+            )
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .pt(px(PEAK_LABEL_ROOM))
+                    .when_some(peak, |this, (label_on_right, text)| {
+                        this.child(
+                            div()
+                                .debug_selector(|| "token-activity-peak".to_owned())
+                                .absolute()
+                                .top(px(PEAK_LINE_TOP))
+                                .left_0()
+                                .right_0()
+                                .border_t_1()
+                                .border_dashed()
+                                .border_color(rgba(0xffffff1f)),
+                        )
+                        .child(
+                            div()
+                                .debug_selector(|| "token-activity-peak-label".to_owned())
+                                .absolute()
+                                .top_0()
+                                .map(|this| {
+                                    if label_on_right {
+                                        this.right_0()
+                                    } else {
+                                        this.left_0()
+                                    }
+                                })
+                                .text_xs()
+                                .line_height(px(LABEL_LINE_HEIGHT))
+                                .text_color(rgba(0xffffff80))
+                                .child(text),
+                        )
+                    })
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(PLOT_HEIGHT))
+                            .child(
+                                LineChart::new(chart.buckets)
+                                    .x(|bucket: &ActivityBucket| bucket.label.clone())
+                                    .y(|bucket: &ActivityBucket| bucket.tokens)
+                                    .stroke(rgb(0x3b82f6))
+                                    .linear()
+                                    .grid(false)
+                                    .x_axis(false)
+                                    .name("Tokens")
+                                    .id("token-activity-chart"),
+                            )
+                            .when(empty, |this| {
+                                this.child(
+                                    div()
+                                        .absolute()
+                                        .inset_0()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_color(rgba(0xffffff66))
+                                        .child("No tokens used in this period"),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .mt(px(6.))
+                            .w_full()
+                            .h(px(LABEL_LINE_HEIGHT))
+                            .text_xs()
+                            .line_height(px(LABEL_LINE_HEIGHT))
+                            .text_color(rgba(0xffffff80))
+                            .children(axis),
+                    ),
             )
     }
 
@@ -5945,7 +6635,7 @@ impl Cowork {
                     .px_3()
                     .py_2()
                     .border_l_2()
-                    .border_color(rgb(comment.author.color()))
+                    .border_color(rgb(self.color_of(comment.author)))
                     .child(self.render_layered_avatars(comment.author, &comment.presence.editors))
                     .child(body),
             )
@@ -6007,7 +6697,7 @@ impl Cowork {
                                 .px_3()
                                 .py_2()
                                 .border_l_2()
-                                .border_color(rgb(comment.author.color()))
+                                .border_color(rgb(self.color_of(comment.author)))
                                 .child(self.render_layered_avatars(
                                     comment.author,
                                     &comment.presence.editors,
@@ -6332,9 +7022,14 @@ impl Cowork {
         carets: Vec<RemoteCaret>,
     ) -> impl IntoElement {
         let editor = editor.clone();
-        let names = carets
+        let labels = carets
             .iter()
-            .map(|caret| self.name_of(caret.participant))
+            .map(|caret| {
+                (
+                    self.name_of(caret.participant),
+                    self.color_of(caret.participant),
+                )
+            })
             .collect::<Vec<_>>();
         canvas(
             |_, _, _| (),
@@ -6362,8 +7057,8 @@ impl Cowork {
                         })
                         .collect::<Vec<_>>()
                 };
-                for ((caret, selection, head), name) in layout.into_iter().zip(&names) {
-                    let color = caret.participant.color();
+                for ((caret, selection, head), (name, color)) in layout.into_iter().zip(&labels) {
+                    let color = *color;
                     for rect in selection {
                         window.paint_quad(gpui::fill(rect, rgba((color << 8) | 0x40)));
                     }
@@ -6375,7 +7070,7 @@ impl Cowork {
                         rgb(color),
                     ));
                     if caret.moved_at.elapsed() < CARET_LABEL_DURATION {
-                        paint_caret_label(caret.participant, name.clone(), head.origin, window, cx);
+                        paint_caret_label(color, name.clone(), head.origin, window, cx);
                     }
                 }
             },
@@ -6759,6 +7454,9 @@ impl Cowork {
             return;
         };
         let message_id = Uuid::new_v4();
+        let started_at = SystemTime::now();
+        // Monotonic, so the duration survives clock changes.
+        let started = Instant::now();
         let selected_model = thread.read(cx).model;
         thread.update(cx, |thread, cx| {
             // Recorded before the run starts, so a prompt stays in the
@@ -6768,6 +7466,7 @@ impl Cowork {
                 protocol::HostMessage::AgentStarted {
                     id: message_id.into_bytes(),
                     comment_group_id: comment_group_id.map(Uuid::into_bytes),
+                    started_at,
                 },
                 cx,
             );
@@ -6880,18 +7579,22 @@ impl Cowork {
                     Err(error) if error.is_cancelled() && cancelled.load(Ordering::Acquire) => None,
                     Err(error) => Some(error.into()),
                 };
+                let duration = started.elapsed();
                 thread.update(cx, |thread, cx| {
                     thread.emit(
                         protocol::HostMessage::AgentEnded {
                             id: message_id.into_bytes(),
                             failure: error
                                 .map(|error| format!("Unable to generate a response: {error}")),
+                            duration,
                         },
                         cx,
                     );
                 });
                 _ = this.update(cx, |this, cx| {
-                    this.record_turn_usage(&thread, turn_usage, cx);
+                    this.record_turn_usage(&thread, turn_usage, started_at, duration, cx);
+                    // The profile page's statistics may be showing.
+                    cx.notify();
                     if let Entry::Occupied(entry) = this.active_generations.entry(thread_id) {
                         if entry.get().message_id == message_id {
                             entry.remove();
@@ -6938,8 +7641,17 @@ impl Cowork {
     }
 
     /// Adds a finished turn's usage to its thread and, unless the thread was
-    /// joined from someone else, to the global count.
-    fn record_turn_usage(&mut self, thread: &Entity<Thread>, usage: Usage, cx: &mut App) {
+    /// joined from someone else, to the global count and the activity log,
+    /// spread across the `duration` of the response it started at
+    /// `started_at`.
+    fn record_turn_usage(
+        &mut self,
+        thread: &Entity<Thread>,
+        usage: Usage,
+        started_at: SystemTime,
+        duration: Duration,
+        cx: &mut App,
+    ) {
         let tokens = usage_tokens(usage);
         let ownership = thread.update(cx, |thread, _| {
             thread.tokens_used += tokens;
@@ -6947,6 +7659,13 @@ impl Cowork {
         });
         if ownership == ThreadOwnership::Local {
             self.tokens_used += tokens;
+            if tokens > 0 {
+                self.token_activity.push(TokenActivity {
+                    at: started_at,
+                    duration,
+                    tokens,
+                });
+            }
         }
     }
 
@@ -8838,13 +9557,15 @@ fn main() -> anyhow::Result<()> {
                         copied_endpoint_id: None,
                         join_dialog: None,
                         profile_open: false,
-                        profile: Profile::default(),
+                        profile: Profile::local(local_participant_id),
                         shown_profiles: HashMap::new(),
                         profile_error: None,
                         profile_name_subscription: None,
                         tokio_handle,
                         active_generations: HashMap::new(),
                         tokens_used: 0,
+                        token_activity: Vec::new(),
+                        activity_range: ActivityRange::default(),
                         local_participant_id,
                         typing_in: None,
                         published_presence: HashMap::new(),
@@ -9132,13 +9853,15 @@ mod tests {
             copied_endpoint_id: None,
             join_dialog: None,
             profile_open: false,
-            profile: Profile::default(),
+            profile: Profile::local(local_participant_id),
             shown_profiles: HashMap::new(),
             profile_error: None,
             profile_name_subscription: None,
             tokio_handle,
             active_generations: HashMap::new(),
             tokens_used: 0,
+            token_activity: Vec::new(),
+            activity_range: ActivityRange::default(),
             local_participant_id,
             typing_in: None,
             published_presence: HashMap::new(),
@@ -9547,6 +10270,7 @@ mod tests {
                     message_id
                 },
                 comment_group_id: None,
+                started_at: SystemTime::UNIX_EPOCH,
                 comment_responses: target_comment_reply
                     .then(|| AgentCommentResponse {
                         id: message_id,
@@ -9562,6 +10286,7 @@ mod tests {
                 thinking_expanded: false,
                 text: main_text.into(),
                 text_view: main_text_view,
+                duration: None,
                 complete: true,
                 failed: false,
             })];
@@ -9956,6 +10681,7 @@ mod tests {
             protocol::HostMessage::AgentStarted {
                 id,
                 comment_group_id: Some(user_message_id),
+                started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             },
             protocol::HostMessage::AgentCommentResponded {
                 id,
@@ -9985,7 +10711,11 @@ mod tests {
                 text: "the answer.".into(),
             },
             protocol::HostMessage::ContextMeasured(2_048),
-            protocol::HostMessage::AgentEnded { id, failure: None },
+            protocol::HostMessage::AgentEnded {
+                id,
+                failure: None,
+                duration: Duration::from_secs(5),
+            },
             joined(ParticipantId::new()),
             protocol::HostMessage::ModelSelected {
                 catalog_id: OLLAMA_QWEN.catalog_id.into(),
@@ -10203,6 +10933,216 @@ mod tests {
     }
 
     #[test]
+    fn stat_counts_are_shortened() {
+        for (count, text) in [
+            (0, "0"),
+            (950, "950"),
+            (1_000, "1K"),
+            (12_345, "12.3K"),
+            (999_949, "999.9K"),
+            (999_960, "1M"),
+            (100_800_000, "100.8M"),
+            (2_100_000_000, "2.1B"),
+            (5_000_000_000_000_000, "5000T"),
+        ] {
+            assert_eq!(format_stat_count(count), text, "{count}");
+        }
+    }
+
+    #[test]
+    fn token_activity_is_bucketed_by_local_time() {
+        use chrono::TimeZone as _;
+
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 20, 14, 37, 12)
+            .single()
+            .expect("unambiguous local time");
+        // Instants, which fall wholly in the period they start in.
+        let activity = |ago: TimeDelta, tokens| TokenActivity {
+            at: SystemTime::from(now - ago),
+            duration: Duration::ZERO,
+            tokens,
+        };
+        let recent = [
+            activity(TimeDelta::minutes(5), 10),
+            activity(TimeDelta::minutes(30), 20),
+            activity(TimeDelta::hours(2), 40),
+        ];
+        let chart = |activity: &[TokenActivity], range| token_activity_chart(activity, range, now);
+        let titles = |chart: &ActivityChart| -> Vec<String> {
+            chart
+                .buckets
+                .iter()
+                .map(|bucket| bucket.label.to_string())
+                .collect()
+        };
+        let tokens = |chart: &ActivityChart| -> Vec<f64> {
+            chart.buckets.iter().map(|bucket| bucket.tokens).collect()
+        };
+        let axis = |chart: &ActivityChart| -> Vec<(usize, String)> {
+            chart
+                .axis
+                .iter()
+                .map(|label| (label.index, label.text.to_string()))
+                .collect()
+        };
+
+        // A minute each, ending with the current one; older turns are left
+        // out. The axis counts back from now, on the right, every 5 minutes.
+        let hour = chart(&recent, ActivityRange::Hour);
+        let (titles_, tokens_) = (titles(&hour), tokens(&hour));
+        assert_eq!(
+            (titles_.len(), &*titles_[0], &*titles_[59]),
+            (60, "13:38", "14:37")
+        );
+        assert_eq!(
+            (tokens_[29], tokens_[54], tokens_.iter().sum()),
+            (20., 10., 30.)
+        );
+        let labels = axis(&hour);
+        assert_eq!(labels.len(), 11);
+        assert_eq!(labels[0], (4, "55m".to_owned()));
+        assert_eq!(labels[10], (54, "5m".to_owned()));
+        assert_eq!(
+            hour.peak().map(|(index, bucket)| (index, &*bucket.label)),
+            Some((29, "14:07"))
+        );
+
+        let day = chart(&recent, ActivityRange::Day);
+        let (titles_, tokens_) = (titles(&day), tokens(&day));
+        assert_eq!(
+            (titles_.len(), &*titles_[0], &*titles_[23]),
+            (24, "15:00", "14:00")
+        );
+        assert_eq!((tokens_[21], tokens_[23]), (40., 30.));
+        let labels = axis(&day);
+        assert_eq!(
+            (labels.len(), &labels[0], &labels[6]),
+            (7, &(2, "21h".to_owned()), &(20, "3h".to_owned()))
+        );
+
+        let month = chart(&recent, ActivityRange::Month);
+        let titles_ = titles(&month);
+        assert_eq!(
+            (titles_.len(), &*titles_[0], &*titles_[29]),
+            (30, "Apr 21", "May 20")
+        );
+        assert_eq!(
+            axis(&month)
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect::<Vec<_>>(),
+            ["Apr 25", "Apr 30", "May 5", "May 10", "May 15", "May 20"]
+        );
+
+        let year = chart(&recent, ActivityRange::Year);
+        let titles_ = titles(&year);
+        assert_eq!(
+            (titles_.len(), &*titles_[0], &*titles_[11]),
+            (12, "Jun 2025", "May 2026")
+        );
+        let labels = axis(&year);
+        assert_eq!(
+            (labels.len(), &labels[0], &labels[11]),
+            (12, &(0, "Jun".to_owned()), &(11, "May".to_owned()))
+        );
+
+        // All time takes the shortest layout that reaches the first turn.
+        assert_eq!(chart(&recent, ActivityRange::Lifetime), day);
+        let empty = chart(&[], ActivityRange::Lifetime);
+        assert_eq!((empty.buckets.len(), empty.peak()), (60, None));
+        let old = [activity(TimeDelta::days(400), 5), recent[0]];
+        let lifetime = chart(&old, ActivityRange::Lifetime);
+        let (titles_, tokens_) = (titles(&lifetime), tokens(&lifetime));
+        assert_eq!(
+            (titles_.len(), &*titles_[0], &*titles_[13]),
+            (14, "Apr 2025", "May 2026")
+        );
+        assert_eq!((tokens_[0], tokens_[13]), (5., 10.));
+        assert_eq!(
+            axis(&lifetime),
+            [
+                (1, "May 2025".to_owned()),
+                (4, "Aug 2025".to_owned()),
+                (7, "Nov 2025".to_owned()),
+                (10, "Feb 2026".to_owned()),
+                (13, "May 2026".to_owned()),
+            ]
+        );
+
+        // Of equal peaks, the latest is marked.
+        let tied = [
+            activity(TimeDelta::minutes(20), 7),
+            activity(TimeDelta::minutes(10), 7),
+        ];
+        let tied = chart(&tied, ActivityRange::Hour);
+        assert_eq!(tied.peak().map(|(index, _)| index), Some(49));
+    }
+
+    #[test]
+    fn token_activity_is_spread_across_each_response() {
+        use chrono::TimeZone as _;
+
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 20, 14, 37, 12)
+            .single()
+            .expect("unambiguous local time");
+        let response = |ago: TimeDelta, duration: TimeDelta, tokens| TokenActivity {
+            at: SystemTime::from(now - ago),
+            duration: duration.to_std().expect("positive duration"),
+            tokens,
+        };
+        let hour = |activity: &[TokenActivity]| -> Vec<f64> {
+            token_activity_chart(activity, ActivityRange::Hour, now)
+                .buckets
+                .iter()
+                .map(|bucket| bucket.tokens)
+                .collect()
+        };
+        let minutes = TimeDelta::minutes;
+        let seconds = TimeDelta::seconds;
+
+        // 14:30:30 to 14:33:30: half a minute, two whole ones, and a half.
+        let tokens = hour(&[response(minutes(6) + seconds(42), minutes(3), 600)]);
+        assert_eq!(tokens[52..56], [100., 200., 200., 100.]);
+        assert_eq!(tokens.iter().sum::<f64>(), 600.);
+
+        // 13:36:12 to 13:40:12, of which only what falls in the hour counts.
+        let tokens = hour(&[response(minutes(61), minutes(4), 240)]);
+        assert_eq!(tokens[0..3], [60., 60., 12.]);
+        assert_eq!(tokens.iter().sum::<f64>(), 132.);
+
+        // A response still running past now stays in the current minute.
+        let tokens = hour(&[response(seconds(12), minutes(2), 50)]);
+        assert_eq!(tokens[59], 50.);
+
+        // Shares are rounded to whole tokens without losing any: two
+        // tokens over three minutes go to the first two.
+        let tokens = hour(&[response(minutes(37) + seconds(12), minutes(3), 2)]);
+        assert_eq!(tokens[22..25], [1., 1., 0.]);
+        assert_eq!(tokens.iter().sum::<f64>(), 2.);
+    }
+
+    #[test]
+    fn stat_durations_show_their_two_largest_units() {
+        for (seconds, text) in [
+            (0, "0s"),
+            (59, "59s"),
+            (60, "1m 0s"),
+            (35 * 60 + 16, "35m 16s"),
+            (3_600, "1h 0m"),
+            (2 * 3_600 + 5 * 60 + 59, "2h 5m"),
+        ] {
+            assert_eq!(
+                format_stat_duration(Duration::from_secs(seconds)),
+                text,
+                "{seconds}s"
+            );
+        }
+        assert_eq!(format_stat_duration(Duration::from_millis(1_999)), "1s");
+    }
+
+    #[test]
     fn context_usage_percent_and_color() {
         let usage = |tokens| ContextUsage {
             tokens,
@@ -10256,13 +11196,61 @@ mod tests {
                 thread
             });
 
-            cowork.record_turn_usage(&local, turn(100), cx);
-            cowork.record_turn_usage(&local, turn(50), cx);
-            cowork.record_turn_usage(&joined, turn(30), cx);
+            let at = |seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+            let took = Duration::from_secs;
+            cowork.record_turn_usage(&local, turn(100), at(10), took(3), cx);
+            cowork.record_turn_usage(&local, turn(0), at(15), took(1), cx);
+            cowork.record_turn_usage(&local, turn(50), at(20), took(2), cx);
+            cowork.record_turn_usage(&joined, turn(30), at(30), took(4), cx);
 
             assert_eq!(local.read(cx).tokens_used, 150);
             assert_eq!(joined.read(cx).tokens_used, 30);
             assert_eq!(cowork.tokens_used, 150);
+            // Only the user's own turns that used tokens are charted.
+            assert_eq!(
+                cowork.token_activity,
+                [
+                    TokenActivity {
+                        at: at(10),
+                        duration: took(3),
+                        tokens: 100,
+                    },
+                    TokenActivity {
+                        at: at(20),
+                        duration: took(2),
+                        tokens: 50,
+                    },
+                ]
+            );
+
+            // Joined chats are not the user's own.
+            cowork
+                .thread_store
+                .update(cx, |store, _| store.threads.push_back(joined.clone()));
+            assert_eq!(cowork.total_chats(cx), 1);
+
+            for (thread, seconds) in [(&local, 20), (&joined, 90)] {
+                let id = Uuid::new_v4().into_bytes();
+                thread.update(cx, |thread, cx| {
+                    thread.apply(
+                        protocol::HostMessage::AgentStarted {
+                            id,
+                            comment_group_id: None,
+                            started_at: SystemTime::UNIX_EPOCH,
+                        },
+                        cx,
+                    );
+                    thread.apply(
+                        protocol::HostMessage::AgentEnded {
+                            id,
+                            failure: None,
+                            duration: Duration::from_secs(seconds),
+                        },
+                        cx,
+                    );
+                });
+            }
+            assert_eq!(cowork.longest_chat(cx), Duration::from_secs(20));
         });
     }
 
@@ -10319,6 +11307,7 @@ mod tests {
                     protocol::HostMessage::AgentStarted {
                         id,
                         comment_group_id: None,
+                        started_at: SystemTime::UNIX_EPOCH,
                     },
                     cx,
                 );
@@ -10349,7 +11338,14 @@ mod tests {
 
             // Output of a stopped request never reaches the transcript.
             thread.update(cx, |thread, cx| {
-                thread.apply(protocol::HostMessage::AgentEnded { id, failure: None }, cx);
+                thread.apply(
+                    protocol::HostMessage::AgentEnded {
+                        id,
+                        failure: None,
+                        duration: Duration::from_secs(1),
+                    },
+                    cx,
+                );
                 assert_eq!(thread.live_context_tokens(), Some(100));
             });
         });
@@ -10381,28 +11377,35 @@ mod tests {
                     protocol::HostMessage::AgentStarted {
                         id: finished.into_bytes(),
                         comment_group_id: None,
+                        started_at: SystemTime::UNIX_EPOCH,
                     },
                     protocol::HostMessage::AgentEnded {
                         id: finished.into_bytes(),
                         failure: None,
+                        duration: Duration::from_secs(3),
                     },
                     protocol::HostMessage::AgentStarted {
                         id: running.into_bytes(),
                         comment_group_id: None,
+                        started_at: SystemTime::UNIX_EPOCH,
                     },
                 ] {
                     thread.apply(event, cx);
                 }
                 assert_eq!(thread.running_agent_message_id(), Some(running));
+                // A running message has no duration yet.
+                assert_eq!(thread.generation_time(), Duration::from_secs(3));
 
                 thread.apply(
                     protocol::HostMessage::AgentEnded {
                         id: running.into_bytes(),
                         failure: None,
+                        duration: Duration::from_millis(4_500),
                     },
                     cx,
                 );
                 assert_eq!(thread.running_agent_message_id(), None);
+                assert_eq!(thread.generation_time(), Duration::from_millis(7_500));
             });
         });
     }
@@ -10591,6 +11594,7 @@ mod tests {
         let profile = protocol::Profile {
             name: Some("Ada".into()),
             picture: Some(picture.bytes().to_vec()),
+            appearance: None,
         };
         validate_profile(&profile).expect("peers accept the pictures this app makes");
         assert!(profile_picture(b"not an image").is_err());
@@ -10638,6 +11642,7 @@ mod tests {
         let profile = |name: Option<&str>, picture: Option<Vec<u8>>| protocol::Profile {
             name: name.map(Into::into),
             picture,
+            appearance: None,
         };
 
         assert!(validate_profile(&protocol::Profile::default()).is_ok());
@@ -10700,7 +11705,46 @@ mod tests {
         assert!(cowork.read_with(cx, |cowork, _| cowork.profile_open));
         assert!(cx.debug_bounds("profile-page").is_some());
         assert!(cx.debug_bounds("profile-picture").is_some());
+        assert!(cx.debug_bounds("usage-stats").is_some());
+        assert!(cx.debug_bounds("token-activity").is_some());
         assert!(cx.debug_bounds("bottom-bar").is_none());
+
+        // The chart starts on the last hour, and the options switch it.
+        assert_eq!(
+            cowork.read_with(cx, |cowork, _| cowork.activity_range),
+            ActivityRange::Hour
+        );
+        let one_day = cx
+            .debug_bounds("activity-range-Day")
+            .expect("Day option should be rendered");
+        cx.simulate_click(one_day.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        assert_eq!(
+            cowork.read_with(cx, |cowork, _| cowork.activity_range),
+            ActivityRange::Day
+        );
+
+        // The peak is marked once there is any activity.
+        assert!(cx.debug_bounds("token-activity-peak").is_none());
+        cowork.update(cx, |cowork, cx| {
+            cowork.token_activity.push(TokenActivity {
+                at: SystemTime::now(),
+                duration: Duration::ZERO,
+                tokens: 1_200,
+            });
+            cx.notify();
+        });
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("token-activity-peak").is_some());
+        let title = cx
+            .debug_bounds("token-activity-title")
+            .expect("title should be rendered");
+        let peak_label = cx
+            .debug_bounds("token-activity-peak-label")
+            .expect("peak label should be rendered");
+        // It reads as a caption to the title rather than a part of the plot.
+        let gap = peak_label.top() - title.bottom();
+        assert!(gap >= px(0.) && gap <= px(8.), "gap is {gap:?}");
 
         cx.update(|window, cx| {
             cowork.update(cx, |cowork, cx| {
@@ -11177,6 +12221,7 @@ mod tests {
                 Profile {
                     name: Some("Grace".into()),
                     picture: None,
+                    ..cowork.profile.clone()
                 },
                 cx,
             );
@@ -11551,6 +12596,7 @@ mod tests {
                 protocol::HostMessage::AgentEnded {
                     id: id.into_bytes(),
                     failure: None,
+                    duration: Duration::ZERO,
                 },
                 cx,
             );
@@ -12525,10 +13571,14 @@ mod tests {
         let shown_name = |thread: &Thread, participant| {
             participant_name(participant, thread.profiles.get(&participant)).to_string()
         };
-        // Joined with the profile it had, which names nobody yet.
+        // Joined with the profile it had, which only carries its generated
+        // name, the same one its own profile page shows.
+        let generated_name = session
+            .collaborator
+            .read_with(session.cx, |collaborator, _| collaborator.profile_name());
         assert_eq!(
             host_thread.read_with(session.cx, |thread, _| shown_name(thread, collaborator_id)),
-            collaborator_id.display_name()
+            generated_name.to_string()
         );
 
         let picture = Arc::new(
@@ -12541,6 +13591,7 @@ mod tests {
                     Profile {
                         name: Some("Ada".into()),
                         picture: Some(picture.clone()),
+                        ..collaborator.profile.clone()
                     },
                     cx,
                 );
@@ -12568,6 +13619,7 @@ mod tests {
                     Profile {
                         name: Some("Grace".into()),
                         picture: None,
+                        ..host.profile.clone()
                     },
                     cx,
                 );
@@ -12592,6 +13644,39 @@ mod tests {
     }
 
     #[gpui::test]
+    fn generated_profiles_look_the_same_in_every_thread(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let collaborator_id =
+            collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id);
+        let (host, collaborator) = (session.host.clone(), session.collaborator.clone());
+        session.settle();
+
+        let (local_id, own_name, own_view) =
+            collaborator.read_with(session.cx, |collaborator, _| {
+                (
+                    collaborator.local_participant_id,
+                    collaborator.profile_name(),
+                    (
+                        collaborator.name_of(collaborator_id),
+                        collaborator.color_of(collaborator_id),
+                    ),
+                )
+            });
+        let host_view = host.read_with(session.cx, |host, _| {
+            (
+                host.name_of(collaborator_id),
+                host.color_of(collaborator_id),
+            )
+        });
+
+        // Not derived from the id the host assigned for this join.
+        assert_eq!(own_name, SharedString::from(local_id.display_name()));
+        assert_eq!(own_view, (own_name.clone(), local_id.color()));
+        assert_eq!(host_view, own_view);
+    }
+
+    #[gpui::test]
     fn invalid_profiles_disconnect_the_collaborator(cx: &mut gpui::TestAppContext) {
         let mut session = Collaboration::start(cx);
         let collaborator_thread = session.collaborator_thread().expect("joined");
@@ -12601,6 +13686,7 @@ mod tests {
             thread.request(protocol::CollaboratorMessage::Profile(protocol::Profile {
                 name: None,
                 picture: Some(b"not a picture".to_vec()),
+                appearance: None,
             }));
         });
         session.wait_until("the host drops the collaborator", |this| {

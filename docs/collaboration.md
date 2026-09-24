@@ -93,11 +93,14 @@ Implementation notes on attachment transfer:
 - Reconnecting is a fresh join with a new participant UUID. Items created
   earlier keep their original creator.
 - Each participant has a **profile**: a display name and a profile picture,
-  both optional and chosen by the participant. Without them, a participant
-  shows as two filler words (e.g. "Amber Otter") and initials, derived
-  deterministically from the UUID. Colors are always derived from the UUID,
-  so carets stay distinct. Profiles are cosmetic, never authoritative, and
-  may collide; they are not disambiguated.
+  both optional and chosen by the participant, plus an **appearance** UUID.
+  Without a name or picture, a participant shows as two filler words (e.g.
+  "Amber Otter") and initials, derived deterministically from the
+  appearance; so is their color. Each app sends its own per-launch UUID as
+  the appearance, so a participant looks the same in every thread even though
+  the host assigns a new participant UUID on each join. Without an
+  appearance, the participant UUID is used. Profiles are cosmetic, never
+  authoritative, and may collide; they are not disambiguated.
 - A collaborator sends its profile right after `Join`, and again whenever it
   changes. The host validates it (a trimmed name of at most 40 characters; a
   JPEG of exactly 256×256 pixels and at most 128 KiB) and disconnects peers

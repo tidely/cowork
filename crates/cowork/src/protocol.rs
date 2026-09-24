@@ -1,3 +1,5 @@
+use std::time::{Duration, SystemTime};
+
 use anyhow::Context as _;
 use futures::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -26,7 +28,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 7;
+pub(crate) const PROTOCOL_VERSION: u32 = 8;
 
 /// A request from a collaborator to the host.
 ///
@@ -74,6 +76,11 @@ pub(crate) struct Profile {
     pub(crate) name: Option<String>,
     /// A square JPEG. `None` shows the participant's initials.
     pub(crate) picture: Option<Vec<u8>>,
+    /// The id the fallback name, the initials, and the color are derived
+    /// from instead of the participant id, which the host assigns anew on
+    /// every join. Lets a participant look the same in every thread. `None`
+    /// uses the participant id.
+    pub(crate) appearance: Option<uuid::Bytes>,
 }
 
 /// One piece of an attachment's bytes, in order. Every piece names the file,
@@ -189,9 +196,11 @@ pub(crate) enum HostMessage {
     /// The agent started responding; an empty message is appended and the
     /// thread is marked as generating. `comment_group_id` identifies the
     /// submitted user comments rendered at the top of this response.
+    /// `started_at` is when the host started generating it.
     AgentStarted {
         id: uuid::Bytes,
         comment_group_id: Option<uuid::Bytes>,
+        started_at: SystemTime,
     },
     /// A chunk of streamed agent output to append to an in-flight message.
     AgentTextAppended {
@@ -213,10 +222,12 @@ pub(crate) enum HostMessage {
     /// estimate for the output streamed since the last count.
     ContextMeasured(u64),
     /// The agent finished. `failure` carries a message to display when the
-    /// agent produced no output of its own.
+    /// agent produced no output of its own. `duration` is how long the host
+    /// spent generating the message, whether or not it completed.
     AgentEnded {
         id: uuid::Bytes,
         failure: Option<String>,
+        duration: Duration,
     },
 }
 
@@ -313,12 +324,16 @@ pub(crate) struct CommentReference {
 pub(crate) struct AgentMessage {
     pub(crate) id: uuid::Bytes,
     pub(crate) comment_group_id: Option<uuid::Bytes>,
+    /// See [`HostMessage::AgentStarted`].
+    pub(crate) started_at: SystemTime,
     pub(crate) comment_responses: Vec<AgentCommentResponse>,
     pub(crate) thinking: String,
     pub(crate) thinking_complete: bool,
     pub(crate) text: String,
     pub(crate) complete: bool,
     pub(crate) failed: bool,
+    /// See [`HostMessage::AgentEnded`]. `None` while generating.
+    pub(crate) duration: Option<Duration>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -459,6 +474,7 @@ mod tests {
         Profile {
             name: Some("Ada".into()),
             picture: Some(vec![0xff, 0xd8, 0xff]),
+            appearance: Some([15; 16]),
         }
     }
 
@@ -621,6 +637,7 @@ mod tests {
                 TimelineMessage::Agent(AgentMessage {
                     id: [4; 16],
                     comment_group_id: Some([2; 16]),
+                    started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
                     comment_responses: vec![AgentCommentResponse {
                         id: [5; 16],
                         comment_id: [3; 16],
@@ -631,6 +648,7 @@ mod tests {
                     text: "Answer".into(),
                     complete: true,
                     failed: false,
+                    duration: Some(Duration::from_millis(12_345)),
                 }),
             ],
         };
@@ -721,6 +739,7 @@ mod tests {
             HostMessage::AgentStarted {
                 id: [7; 16],
                 comment_group_id: Some([8; 16]),
+                started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
             },
             HostMessage::AgentTextAppended {
                 id: [7; 16],
@@ -742,6 +761,7 @@ mod tests {
             HostMessage::AgentEnded {
                 id: [7; 16],
                 failure: Some("Unable to generate a response".into()),
+                duration: Duration::from_millis(2_500),
             },
             HostMessage::ContextMeasured(4_096),
         ] {
