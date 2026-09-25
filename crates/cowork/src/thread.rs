@@ -7,9 +7,9 @@ use std::{
     time::Duration,
 };
 
+use agent::TurnFold;
 use draft::{AttachmentId, ItemId};
 use gpui::{App, AppContext, Entity, SharedString};
-use gpui_base::TextViewState;
 use iroh::{Endpoint, endpoint::Connection};
 use itertools::Itertools;
 use rig::completion::Message as RigMessage;
@@ -22,7 +22,7 @@ use crate::{
     profile::Profile,
     protocol,
     thread_draft::ThreadDraft,
-    timeline::{AgentCommentResponse, AgentMessage, TimelineMessage},
+    timeline::{AgentMessage, TimelineMessage},
 };
 
 /// How many thread events a collaborator may fall behind before the host
@@ -139,11 +139,17 @@ pub(crate) struct Thread {
     pub(crate) profiles: HashMap<ParticipantId, Profile>,
     /// Everything the agent has been sent and has replied, exactly as sent,
     /// so each request extends the previous one and the provider's prompt
-    /// cache stays valid. Only the host, which runs the agent, fills it.
+    /// cache stays valid. The host records it and everyone mirrors it; see
+    /// `transcript.rs`.
     pub(crate) transcript: Vec<RigMessage>,
+    /// Folds the running agent's events into the transcript's next message.
+    pub(crate) agent_turn: TurnFold,
+    /// The events `agent_turn` has folded since the transcript last grew,
+    /// which someone joining needs to fold the rest of the turn.
+    pub(crate) agent_events: Vec<protocol::AgentEventMessage>,
     /// The name each author is given in prompts, fixed when their first
     /// item is submitted so that renaming never changes the transcript and
-    /// the agent knows everyone by one name. Only the host fills it.
+    /// the agent knows everyone by one name. Mirrored like the transcript.
     pub(crate) prompt_names: HashMap<ParticipantId, SharedString>,
     /// Tokens the agent has used in this thread, counted at the end of each
     /// turn; see [`Cowork::record_turn_usage`]. Only the host, which runs
@@ -188,6 +194,8 @@ impl Thread {
             participants: Vec::new(),
             profiles: HashMap::new(),
             transcript: Vec::new(),
+            agent_turn: TurnFold::default(),
+            agent_events: Vec::new(),
             prompt_names: HashMap::new(),
             tokens_used: 0,
             model: None,
@@ -253,9 +261,25 @@ impl Thread {
         self.model = thread.model.take();
         self.context_tokens = thread.context_tokens;
         self.streamed_bytes = thread.streamed_bytes;
+        self.transcript = thread
+            .transcript
+            .iter()
+            .filter_map(|message| {
+                message
+                    .to_rig()
+                    .inspect_err(|error| eprintln!("{error:#}"))
+                    .ok()
+            })
+            .collect();
+        self.prompt_names = std::mem::take(&mut thread.prompt_names)
+            .into_iter()
+            .map(|(participant, name)| (ParticipantId::from_bytes(participant), name.into()))
+            .collect();
+        let agent_events = std::mem::take(&mut thread.agent_events);
         let (summary, timeline) = thread.into_native(cx);
         self.summary = summary;
         self.set_timeline(timeline);
+        self.resume_agent_turn(agent_events);
     }
 
     pub(crate) fn to_protocol(&self) -> protocol::ThreadSnapshot {
@@ -283,6 +307,42 @@ impl Thread {
                 .iter()
                 .map(TimelineMessage::to_protocol)
                 .collect(),
+            transcript: self
+                .transcript
+                .iter()
+                .map(protocol::TranscriptMessage::from_rig)
+                .collect(),
+            agent_events: self.agent_events.clone(),
+            prompt_names: self
+                .prompt_names
+                .iter()
+                .map(|(participant, name)| (participant.into_bytes(), name.to_string()))
+                .sorted()
+                .collect(),
+        }
+    }
+
+    /// Names `names`' participants in prompts, for those who have no name
+    /// there yet; see [`Thread::prompt_names`].
+    pub(crate) fn name_in_prompts(
+        &mut self,
+        names: HashMap<ParticipantId, SharedString>,
+        cx: &mut impl AppContext,
+    ) {
+        // In a stable order, so everyone applies the same events.
+        for (participant, name) in names
+            .into_iter()
+            .sorted_by_key(|(participant, _)| participant.into_bytes())
+        {
+            if !self.prompt_names.contains_key(&participant) {
+                self.emit(
+                    protocol::HostMessage::PromptNamed {
+                        participant: participant.into_bytes(),
+                        name: name.to_string(),
+                    },
+                    cx,
+                );
+            }
         }
     }
 
@@ -626,7 +686,7 @@ impl Thread {
     /// Folds a thread event into the timeline.
     pub(crate) fn apply(&mut self, event: protocol::HostMessage, cx: &mut impl AppContext) {
         match event {
-            protocol::HostMessage::Welcome(welcome) => self.rebase(welcome, cx),
+            protocol::HostMessage::Welcome(welcome) => self.rebase(*welcome, cx),
             // Only ever sent in place of the first `Welcome`, which the join
             // handshake consumes.
             protocol::HostMessage::Rejected(_) => {}
@@ -699,6 +759,7 @@ impl Thread {
                 id,
                 comment_group_id,
                 started_at,
+                prompt,
             } => {
                 self.timeline.push(TimelineMessage::Agent(AgentMessage::new(
                     Uuid::from_bytes(id),
@@ -707,56 +768,16 @@ impl Thread {
                     cx,
                 )));
                 self.generating = true;
+                self.push_transcript(&prompt);
+                self.agent_turn = TurnFold::default();
+                self.agent_events.clear();
             }
-            protocol::HostMessage::AgentTextAppended { id, target, text } => {
-                self.streamed_bytes += text.len() as u64;
-                let Some(message) = self.agent_message_mut(id) else {
-                    return;
-                };
-                let view = match target {
-                    protocol::AgentText::Thinking => {
-                        message.thinking.push_str(&text);
-                        message.thinking_view.clone()
-                    }
-                    protocol::AgentText::Response => {
-                        // Some models never close the reasoning block, so the
-                        // first answer token ends it instead.
-                        if !message.thinking.is_empty() && !message.thinking_complete {
-                            message.thinking_complete = true;
-                            message.thinking_expanded = false;
-                        }
-                        message.text.push_str(&text);
-                        message.text_view.clone()
-                    }
-                };
-                view.update(cx, |view, cx| view.push_str(&text, cx));
+            protocol::HostMessage::AgentEvent { id, event } => {
+                self.apply_agent_event(Uuid::from_bytes(id), event, cx);
             }
-            protocol::HostMessage::AgentThinkingEnded { id } => {
-                let Some(message) = self.agent_message_mut(id) else {
-                    return;
-                };
-                message.thinking_complete = true;
-                message.thinking_expanded = false;
-            }
-            protocol::HostMessage::AgentCommentResponded {
-                id,
-                response_id,
-                comment_id,
-                response,
-            } => {
-                let Some(message) = self.agent_message_mut(id) else {
-                    return;
-                };
-                message.comment_responses.push(AgentCommentResponse {
-                    id: Uuid::from_bytes(response_id),
-                    comment_id: Uuid::from_bytes(comment_id),
-                    response_view: cx.new(|cx| TextViewState::markdown(&response, cx)),
-                    response,
-                });
-            }
-            protocol::HostMessage::ContextMeasured(tokens) => {
-                self.context_tokens = Some(tokens);
-                self.streamed_bytes = 0;
+            protocol::HostMessage::PromptNamed { participant, name } => {
+                self.prompt_names
+                    .insert(ParticipantId::from_bytes(participant), name.into());
             }
             protocol::HostMessage::AgentEnded {
                 id,
@@ -767,6 +788,8 @@ impl Thread {
                 // A request that was stopped or failed before it reported
                 // usage never adds its partial output to the transcript.
                 self.streamed_bytes = 0;
+                self.agent_turn = TurnFold::default();
+                self.agent_events.clear();
                 let Some(message) = self.agent_message_mut(id) else {
                     return;
                 };
@@ -808,6 +831,38 @@ impl Thread {
         Some(self.context_tokens.unwrap_or(0) + self.streamed_bytes.div_ceil(BYTES_PER_TOKEN))
     }
 
+    /// What every copy of this thread must have identically; see
+    /// [`Conversation`].
+    #[cfg(test)]
+    pub(crate) fn conversation(&self) -> Conversation {
+        let snapshot = self.to_protocol();
+        let files = self
+            .timeline
+            .iter()
+            .filter_map(|message| match message {
+                TimelineMessage::User(group) => Some(&group.blocks),
+                TimelineMessage::Agent(_) => None,
+            })
+            .flatten()
+            .flat_map(|block| &block.attachments)
+            .map(|record| {
+                (
+                    record.id.as_uuid().into_bytes(),
+                    self.draft
+                        .files
+                        .get(&record.id)
+                        .map(|file| file.bytes().to_vec()),
+                )
+            })
+            .collect();
+        Conversation {
+            timeline: snapshot.messages,
+            transcript: self.transcript.clone(),
+            prompt_names: snapshot.prompt_names,
+            files,
+        }
+    }
+
     fn set_timeline(&mut self, timeline: Vec<TimelineMessage>) {
         self.generating = timeline
             .iter()
@@ -815,13 +870,25 @@ impl Thread {
         self.timeline = timeline;
     }
 
-    fn agent_message_mut(&mut self, id: uuid::Bytes) -> Option<&mut AgentMessage> {
+    pub(crate) fn agent_message_mut(&mut self, id: uuid::Bytes) -> Option<&mut AgentMessage> {
         let id = Uuid::from_bytes(id);
         self.timeline.iter_mut().find_map(|entry| match entry {
             TimelineMessage::Agent(message) if message.id == id => Some(message),
             _ => None,
         })
     }
+}
+
+/// A thread's conversation: what was said in it, and what the agent was sent.
+/// The host and every collaborator have the same.
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(crate) struct Conversation {
+    pub(crate) timeline: Vec<protocol::TimelineMessage>,
+    pub(crate) transcript: Vec<RigMessage>,
+    pub(crate) prompt_names: Vec<(uuid::Bytes, String)>,
+    /// The bytes of each file in the timeline, `None` while missing.
+    pub(crate) files: Vec<(uuid::Bytes, Option<Vec<u8>>)>,
 }
 
 impl protocol::ThreadSnapshot {

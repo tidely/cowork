@@ -10,10 +10,11 @@ use crate::models::{ModelCatalog, ModelRef};
 
 /// Bounds how much memory a single frame from a peer can make us buffer.
 ///
-/// Attachment bytes travel in chunks, so frames only need to fit text: a
-/// `Welcome` snapshot of a long thread. A snapshot that grows beyond it cannot
-/// be sent.
-const MAX_FRAME_LENGTH: usize = 16 * 1024 * 1024;
+/// Generous, as transcript prompts carry their files inline: one message's
+/// attachments are up to 32 MB before base64, and a `Welcome` snapshot holds
+/// every prompt of the thread. A frame beyond it cannot be sent, which ends
+/// the connection it was meant for.
+const MAX_FRAME_LENGTH: usize = 1024 * 1024 * 1024;
 pub(crate) const PEER_CHANNEL_CAPACITY: usize = 128;
 /// How many bulk messages may wait to be written. Kept small, since anything
 /// queued here is written before later bulk messages but after every waiting
@@ -30,7 +31,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 11;
+pub(crate) const PROTOCOL_VERSION: u32 = 13;
 
 /// A request from a collaborator to the host.
 ///
@@ -154,8 +155,9 @@ pub(crate) struct PendingRead {
 /// both joins and recovers from falling behind.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum HostMessage {
-    /// Replaces the collaborator's entire view of the thread.
-    Welcome(Welcome),
+    /// Replaces the collaborator's entire view of the thread. Boxed, as it
+    /// is far larger than every other event.
+    Welcome(Box<Welcome>),
     /// The host refused to serve this collaborator and is about to close the
     /// connection. Carries a message to show to the user. Must remain the
     /// second variant.
@@ -199,34 +201,25 @@ pub(crate) enum HostMessage {
     ThreadTitled(String),
     /// A user message was appended to the timeline.
     UserMessage(UserMessage),
-    /// The agent started responding; an empty message is appended and the
-    /// thread is marked as generating. `comment_group_id` identifies the
-    /// submitted user comments rendered at the top of this response.
-    /// `started_at` is when the host started generating it.
+    /// The agent started responding to `prompt`, which joins the transcript;
+    /// an empty message is appended and the thread is marked as generating.
+    /// `comment_group_id` identifies the submitted user comments rendered at
+    /// the top of this response. `started_at` is when the host started
+    /// generating it.
     AgentStarted {
         id: uuid::Bytes,
         comment_group_id: Option<uuid::Bytes>,
         started_at: SystemTime,
+        prompt: TranscriptMessage,
     },
-    /// A chunk of streamed agent output to append to an in-flight message.
-    AgentTextAppended {
+    /// Something the agent did while producing message `id`, exactly as the
+    /// host's agent loop reported it. Every participant, the host included,
+    /// folds these into the message and the transcript the same way; see
+    /// `transcript.rs`.
+    AgentEvent {
         id: uuid::Bytes,
-        target: AgentText,
-        text: String,
+        event: AgentEventMessage,
     },
-    /// The agent stopped reasoning and is about to answer.
-    AgentThinkingEnded { id: uuid::Bytes },
-    /// The agent responded to one submitted comment.
-    AgentCommentResponded {
-        id: uuid::Bytes,
-        response_id: uuid::Bytes,
-        comment_id: uuid::Bytes,
-        response: String,
-    },
-    /// An agent request finished, and the provider reported how many tokens
-    /// of the context window the thread fills with its reply. Replaces the
-    /// estimate for the output streamed since the last count.
-    ContextMeasured(u64),
     /// The agent finished. `failure` carries a message to display when the
     /// agent produced no output of its own. `duration` is how long the host
     /// spent generating the message, whether or not it completed.
@@ -235,14 +228,24 @@ pub(crate) enum HostMessage {
         failure: Option<String>,
         duration: Duration,
     },
+    /// `participant` is called `name` in prompts from now on. Sent when their
+    /// first item is submitted; a name never changes afterwards.
+    PromptNamed {
+        participant: uuid::Bytes,
+        name: String,
+    },
 }
 
-/// Which half of an agent message a [`HostMessage::AgentTextAppended`] extends.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) enum AgentText {
-    Thinking,
-    Response,
-}
+/// One message of a thread's transcript, exactly as the agent was sent it or
+/// replied, as the JSON of a Rig message: Rig's message types rely on
+/// self-describing formats, which postcard is not. See `transcript.rs`.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TranscriptMessage(pub(crate) String);
+
+/// An `agent::AgentEvent`, as JSON for the same reason as
+/// [`TranscriptMessage`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct AgentEventMessage(pub(crate) String);
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Welcome {
@@ -271,11 +274,17 @@ pub(crate) struct ThreadSnapshot {
     /// The selected model, if any. It may be missing from `models`; see
     /// [`HostMessage::ModelCatalogChanged`].
     pub(crate) model: Option<ModelRef>,
-    /// The latest count of [`HostMessage::ContextMeasured`], if any.
+    /// The context window use the provider last measured, if any.
     pub(crate) context_tokens: Option<u64>,
     /// Bytes of agent output streamed since `context_tokens` was measured.
     pub(crate) streamed_bytes: u64,
     pub(crate) messages: Vec<TimelineMessage>,
+    pub(crate) transcript: Vec<TranscriptMessage>,
+    /// The running agent's events since the transcript last grew, which the
+    /// transcript's next message is folded from.
+    pub(crate) agent_events: Vec<AgentEventMessage>,
+    /// Everyone's name in prompts, sorted by participant.
+    pub(crate) prompt_names: Vec<(uuid::Bytes, String)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -690,14 +699,20 @@ mod tests {
                     duration: Some(Duration::from_millis(12_345)),
                 }),
             ],
+            transcript: vec![
+                TranscriptMessage(r#"{"role":"user"}"#.into()),
+                TranscriptMessage(r#"{"role":"assistant"}"#.into()),
+            ],
+            agent_events: vec![AgentEventMessage("{}".into())],
+            prompt_names: vec![([11; 16], "Ada".into())],
         };
-        let message = HostMessage::Welcome(Welcome {
+        let message = HostMessage::Welcome(Box::new(Welcome {
             participant_id: [12; 16],
             thread: snapshot,
             draft: vec![1, 2, 3],
             presence: vec![([12; 16], sample_presence())],
             stored_attachments: vec![[14; 16]],
-        });
+        }));
 
         assert_eq!(round_trip(&message), message);
     }
@@ -776,30 +791,21 @@ mod tests {
                 id: [7; 16],
                 comment_group_id: Some([8; 16]),
                 started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                prompt: TranscriptMessage(r#"{"role":"user"}"#.into()),
             },
-            HostMessage::AgentTextAppended {
+            HostMessage::AgentEvent {
                 id: [7; 16],
-                target: AgentText::Thinking,
-                text: "Let me think".into(),
-            },
-            HostMessage::AgentThinkingEnded { id: [7; 16] },
-            HostMessage::AgentCommentResponded {
-                id: [7; 16],
-                response_id: [10; 16],
-                comment_id: [9; 16],
-                response: "Reply".into(),
-            },
-            HostMessage::AgentTextAppended {
-                id: [7; 16],
-                target: AgentText::Response,
-                text: "Here you go".into(),
+                event: AgentEventMessage(r#"{"Model":{}}"#.into()),
             },
             HostMessage::AgentEnded {
                 id: [7; 16],
                 failure: Some("Unable to generate a response".into()),
                 duration: Duration::from_millis(2_500),
             },
-            HostMessage::ContextMeasured(4_096),
+            HostMessage::PromptNamed {
+                participant: [11; 16],
+                name: "Ada".into(),
+            },
         ] {
             assert_eq!(round_trip(&message), message);
         }

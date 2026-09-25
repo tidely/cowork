@@ -5,13 +5,13 @@ Cowork is a GPUI desktop app for collaborating on LLM agent threads (Ollama via 
 ## Project Structure
 
 - `crates/cowork` — the app binary. `src/main.rs` holds the `Cowork` view struct, app startup, and top-level rendering; the rest of `Cowork`'s methods are `impl Cowork` blocks in the module for their area.
-  - State: `thread.rs` (`Thread`, sharing state, applying host events), `thread_draft.rs` (the draft, its editors, and presence), `timeline.rs` (messages and their wire form), `models.rs` (providers and model catalogs).
+  - State: `thread.rs` (`Thread`, sharing state, applying host events), `thread_draft.rs` (the draft, its editors, and presence), `timeline.rs` (messages and their wire form), `transcript.rs` (the transcript and agent events on the wire, and folding them into a thread), `models.rs` (providers and model catalogs).
   - Sharing: `protocol.rs` (wire messages; postcard, length-delimited frames, control vs. bulk queues), `sharing.rs` (hosting, joining, and handling collaborators' requests), `participant.rs` (`ParticipantId` and derived names/colors), `profile.rs`.
   - Agent runs: `submission.rs` (which submission wins, and the prompt), `generation.rs` (running the agent), `prompt.rs`.
   - UI: `composer.rs`, `draft_editing.rs`, `composer_attachments.rs`, `timeline_view.rs`, `model_picker.rs`, `top_bar.rs`, `sidebar.rs`, `profile_page.rs`, `avatars.rs`, `caret.rs`, `highlight.rs`, `assets.rs`.
   - Other: `attachments.rs` (reading and classifying files), `usage.rs` (token usage and the activity chart).
 - `crates/draft` — the collaborative draft as a Yrs CRDT document (prompt blocks, comments, attachment records) plus `verify_change` validation. No GPUI or networking dependencies; keep it that way.
-- `crates/agent` — minimal multi-turn agent loop on Rig's low-level completion stream (see its `README.md` for why it exists instead of Rig's agent).
+- `crates/agent` — minimal multi-turn agent loop on Rig's low-level completion stream (see its `README.md` for why it exists instead of Rig's agent). Its `AgentEvent`s fully describe a run, and `TurnFold` folds them into history; the host forwards them and every participant folds them.
 - `crates/tools` — Rig tools exposed to the model (`respond_to_comment`).
 - `docs/collaboration.md` — the spec for collaborative drafts, the document layout, protocol, and host validation. Read the relevant section before touching draft sync, presence, submission, or attachment transfer, and update it (including its "Status" section) when behavior changes.
 - `TODO.md` — the owner's feature notes; don't edit unless asked.
@@ -45,7 +45,7 @@ For Python scripting, use the `uv` package manager.
 
 ## Making Changes
 
-- **Protocol**: bump `PROTOCOL_VERSION` in `crates/cowork/src/protocol.rs` on any change to wire messages or to model identifier semantics. Never change the encoding of `CollaboratorMessage::Join` or `HostMessage::Rejected`: keep their variant index, and keep `Join`'s version as its only field. `version_handshake_encoding_is_stable` checks this. Nothing is persisted, so there's no backward compatibility to maintain beyond that.
+- **Protocol**: bump `PROTOCOL_VERSION` in `crates/cowork/src/protocol.rs` on any change to wire messages or to model identifier semantics, and on every Rig upgrade: transcript messages and agent events travel in Rig's serde encoding. Never change the encoding of `CollaboratorMessage::Join` or `HostMessage::Rejected`: keep their variant index, and keep `Join`'s version as its only field. `version_handshake_encoding_is_stable` checks this. Nothing is persisted, so there's no backward compatibility to maintain beyond that.
 - **GPUI pins**: `gpui`/`gpui_platform` are pinned `=0.3.6` to match the snapshot the gpui-kit fork (`tidely/gpui-kit`, branch `text-view-source-range-highlights`) uses. Upgrade them together, never one alone.
 
 ## Testing

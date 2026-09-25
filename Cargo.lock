@@ -140,6 +140,7 @@ dependencies = [
  "anyhow",
  "futures",
  "rig",
+ "serde",
  "serde_json",
  "tokio",
  "tools",

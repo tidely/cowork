@@ -139,6 +139,15 @@ fn a_collaborators_file_is_uploaded_and_stored(cx: &mut gpui::TestAppContext) {
             |part| matches!(part, UserContent::Text(part) if part.text.contains("0123456789abcdef"))
         ));
     });
+    // The collaborator mirrors the prompt the agent was sent, file included.
+    session.wait_until("the collaborator mirrors the conversation", |this| {
+        collaborator_thread.read_with(this.cx, |thread, _| thread.conversation())
+            == host_thread.read_with(this.cx, |thread, _| thread.conversation())
+    });
+    collaborator_thread.read_with(session.cx, |thread, _| {
+        assert_eq!(thread.transcript.len(), 1);
+        assert_eq!(thread.prompt_names.len(), 1);
+    });
 }
 
 #[gpui::test]

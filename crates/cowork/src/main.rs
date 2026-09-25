@@ -64,6 +64,7 @@ mod thread_draft;
 mod timeline;
 mod timeline_view;
 mod top_bar;
+mod transcript;
 mod usage;
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
@@ -153,6 +154,8 @@ impl Cowork {
             participants: Vec::new(),
             profiles: HashMap::new(),
             transcript: Vec::new(),
+            agent_turn: Default::default(),
+            agent_events: Vec::new(),
             prompt_names: HashMap::new(),
             tokens_used: 0,
             model,

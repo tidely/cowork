@@ -390,13 +390,15 @@ impl Cowork {
                 ))
             })?
             .context("Thread is no longer shared.")?;
-        peer.send(protocol::HostMessage::Welcome(protocol::Welcome {
-            participant_id: participant_id.into_bytes(),
-            thread: snapshot,
-            draft,
-            presence,
-            stored_attachments,
-        }))
+        peer.send(protocol::HostMessage::Welcome(Box::new(
+            protocol::Welcome {
+                participant_id: participant_id.into_bytes(),
+                thread: snapshot,
+                draft,
+                presence,
+                stored_attachments,
+            },
+        )))
         .await
         .context("Peer disconnected before receiving the thread snapshot.")?;
         Ok((events, files))
@@ -728,7 +730,7 @@ impl Cowork {
                 .context("Timed out waiting for the thread snapshot.")?
                 .context("Host closed the protocol stream before sending the thread snapshot.")?;
             let welcome = match welcome {
-                protocol::HostMessage::Welcome(welcome) => welcome,
+                protocol::HostMessage::Welcome(welcome) => *welcome,
                 protocol::HostMessage::Rejected(reason) => anyhow::bail!(reason),
                 _ => anyhow::bail!("Host sent a thread event before the thread snapshot."),
             };

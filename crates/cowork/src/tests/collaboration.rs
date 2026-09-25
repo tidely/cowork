@@ -261,6 +261,9 @@ fn rebasing_keeps_local_edits_the_host_has_not_seen(cx: &mut gpui::TestAppContex
             model: None,
             context_tokens: None,
             streamed_bytes: 0,
+            transcript: Vec::new(),
+            agent_events: Vec::new(),
+            prompt_names: Vec::new(),
             messages: Vec::new(),
         },
         draft: host_draft.encode_state(),
@@ -279,7 +282,10 @@ fn rebasing_keeps_local_edits_the_host_has_not_seen(cx: &mut gpui::TestAppContex
     thread.update(cx, |thread, cx| {
         let author = thread.draft.author.as_uuid();
         thread.draft.doc.create_prompt(author, "unsent");
-        thread.apply(protocol::HostMessage::Welcome(welcome(&host_draft)), cx);
+        thread.apply(
+            protocol::HostMessage::Welcome(Box::new(welcome(&host_draft))),
+            cx,
+        );
         let bodies = thread
             .draft
             .doc

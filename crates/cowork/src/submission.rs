@@ -187,10 +187,6 @@ impl Cowork {
             &prompt_names,
         );
         let prompt = agent_message(preface.as_deref(), &blocks, &files, &prompt_names);
-        let comment_ids = comments
-            .iter()
-            .map(|comment| comment.id)
-            .collect::<Vec<_>>();
         let has_comments = !comments.is_empty();
         let submitted_group = UserMessageGroup {
             id: Uuid::new_v4(),
@@ -211,7 +207,7 @@ impl Cowork {
                     submitted_group.to_protocol(),
                 ));
                 thread.timeline.push(TimelineMessage::User(submitted_group));
-                thread.prompt_names = prompt_names;
+                thread.name_in_prompts(prompt_names, cx);
             });
             thread_id
         } else {
@@ -230,7 +226,7 @@ impl Cowork {
                 self.new_thread_model.clone(),
                 cx,
             );
-            thread.update(cx, |thread, _| thread.prompt_names = prompt_names);
+            thread.update(cx, |thread, cx| thread.name_in_prompts(prompt_names, cx));
             let thread_id = thread.read(cx).instance_id;
             self.thread_store.update(cx, |store, _| {
                 store.threads.push_front(thread.clone());
@@ -244,7 +240,6 @@ impl Cowork {
             prompt,
             history,
             comment_group_id,
-            comment_ids,
             turn_comments,
             cx,
         );

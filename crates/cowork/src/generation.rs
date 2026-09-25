@@ -1,8 +1,8 @@
-//! Running the agent for a thread and folding its stream into the
-//! timeline.
+//! Running the agent for a thread, and forwarding what it does to everyone
+//! in it; see `transcript.rs` for how that is folded.
 
 use std::{
-    collections::{HashSet, hash_map::Entry},
+    collections::hash_map::Entry,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -17,12 +17,11 @@ use rig::{
     completion::{Message as RigMessage, Usage},
     prelude::*,
     providers::ollama::wire::Ollama,
-    streaming::{BlockClose, Delta, StreamEvent},
     tool::ToolSet,
 };
 use serde_json::json;
 use tokio::sync::mpsc;
-use tools::{RespondToComment, RespondToCommentArgs, TurnComments};
+use tools::{RespondToComment, TurnComments};
 use uuid::Uuid;
 
 use crate::{
@@ -46,7 +45,6 @@ impl Cowork {
         prompt: RigMessage,
         mut history: Vec<RigMessage>,
         comment_group_id: Option<Uuid>,
-        comment_ids: Vec<Uuid>,
         turn_comments: Arc<TurnComments>,
         cx: &mut Context<Self>,
     ) {
@@ -64,18 +62,17 @@ impl Cowork {
         thread.update(cx, |thread, cx| {
             // Recorded before the run starts, so a prompt stays in the
             // transcript even when the run is stopped before sending it.
-            thread.transcript.push(prompt.clone());
             thread.emit(
                 protocol::HostMessage::AgentStarted {
                     id: message_id.into_bytes(),
                     comment_group_id: comment_group_id.map(Uuid::into_bytes),
                     started_at,
+                    prompt: protocol::TranscriptMessage::from_rig(&prompt),
                 },
                 cx,
             );
         });
         let (sender, mut receiver) = mpsc::unbounded_channel();
-        let tool_comments = turn_comments.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let generation_task = self.tokio_handle.spawn(async move {
             let (selected_model, max_tokens) =
@@ -84,7 +81,7 @@ impl Cowork {
                 ModelProvider::Ollama => Ollama::new().bound()?.completion(selected_model.id),
             };
             let mut tools = ToolSet::default();
-            tools.add_tool(RespondToComment::new(tool_comments));
+            tools.add_tool(RespondToComment::new(turn_comments));
             StreamingAgent::new(model, tools)
                 .additional_params(json!({
                     "num_ctx": max_tokens,
@@ -107,65 +104,23 @@ impl Cowork {
 
         cx.spawn(async move |this, cx| {
             let mut stream_completed = true;
-            let mut published_comment_responses = HashSet::new();
             let mut turn_usage = Usage::default();
-            while let Some(item) = receiver.recv().await {
-                if let AgentEvent::HistoryAppended(message) = item {
-                    thread.update(cx, |thread, _| thread.transcript.push(message));
-                    continue;
+            while let Some(event) = receiver.recv().await {
+                if let AgentEvent::TurnEnded { usage, .. } = &event {
+                    turn_usage += *usage;
                 }
-                if let AgentEvent::Usage(usage) = item {
-                    turn_usage += usage;
-                    // Each request sends the whole transcript, so its usage
-                    // is how full the context is.
-                    if usage.is_reported() {
-                        thread.update(cx, |thread, cx| {
-                            thread.emit(
-                                protocol::HostMessage::ContextMeasured(usage_tokens(usage)),
-                                cx,
-                            );
-                        });
-                        _ = this.update(cx, |_, cx| cx.notify());
-                    }
-                    continue;
-                }
-                if let AgentEvent::ToolCall(call) = &item
-                    && call.function.name == "respond_to_comment"
-                    && let Ok(response) = serde_json::from_value::<RespondToCommentArgs>(
-                        call.function.arguments.clone(),
-                    )
-                    && !response.response.trim().is_empty()
-                    && published_comment_responses.insert(response.comment_id.clone())
-                    && let Some(comment_id) = turn_comments
-                        .comment_ids()
-                        .iter()
-                        .position(|comment_id| comment_id.as_str() == response.comment_id)
-                        .and_then(|index| comment_ids.get(index))
-                {
-                    thread.update(cx, |thread, cx| {
-                        thread.emit(
-                            protocol::HostMessage::AgentCommentResponded {
-                                id: message_id.into_bytes(),
-                                response_id: Uuid::new_v4().into_bytes(),
-                                comment_id: comment_id.into_bytes(),
-                                response: response.response,
-                            },
-                            cx,
-                        );
-                    });
-                    if this
-                        .update(cx, |this, cx| this.thread_updated(thread_id, cx))
-                        .is_err()
-                    {
-                        stream_completed = false;
-                        break;
-                    }
-                }
-
-                let Some(event) = Self::agent_stream_event(message_id, item) else {
+                let Some(event) = protocol::AgentEventMessage::shared(event) else {
                     continue;
                 };
-                thread.update(cx, |thread, cx| thread.emit(event, cx));
+                thread.update(cx, |thread, cx| {
+                    thread.emit(
+                        protocol::HostMessage::AgentEvent {
+                            id: message_id.into_bytes(),
+                            event,
+                        },
+                        cx,
+                    );
+                });
 
                 if this
                     .update(cx, |this, cx| this.thread_updated(thread_id, cx))
@@ -209,39 +164,6 @@ impl Cowork {
             }
         })
         .detach();
-    }
-
-    /// Translates one item of the agent's stream into the thread event it
-    /// represents, or `None` for items that do not change the timeline.
-    fn agent_stream_event(message_id: Uuid, item: AgentEvent) -> Option<protocol::HostMessage> {
-        let id = message_id.into_bytes();
-        match item {
-            AgentEvent::Model(StreamEvent::BlockDelta {
-                delta: Delta::Reasoning { text },
-                ..
-            }) => Some(protocol::HostMessage::AgentTextAppended {
-                id,
-                target: protocol::AgentText::Thinking,
-                text,
-            }),
-            AgentEvent::Model(StreamEvent::BlockEnd {
-                end: BlockClose::Reasoning { .. },
-                ..
-            }) => Some(protocol::HostMessage::AgentThinkingEnded { id }),
-            AgentEvent::Model(StreamEvent::BlockDelta {
-                delta: Delta::Text { text },
-                ..
-            }) => Some(protocol::HostMessage::AgentTextAppended {
-                id,
-                target: protocol::AgentText::Response,
-                text,
-            }),
-            AgentEvent::Model(_)
-            | AgentEvent::ToolCall(_)
-            | AgentEvent::ToolResult { .. }
-            | AgentEvent::HistoryAppended(_)
-            | AgentEvent::Usage(_) => None,
-        }
     }
 
     /// Adds a finished turn's usage to its thread and, unless the thread was

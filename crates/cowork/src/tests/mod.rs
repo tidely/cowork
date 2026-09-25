@@ -193,6 +193,118 @@ fn test_cowork(
     }
 }
 
+/// The agent starting message `id` in reply to `prompt`.
+fn agent_started(
+    id: Uuid,
+    comment_group_id: Option<uuid::Bytes>,
+    prompt: &str,
+) -> protocol::HostMessage {
+    protocol::HostMessage::AgentStarted {
+        id: id.into_bytes(),
+        comment_group_id,
+        started_at: SystemTime::UNIX_EPOCH,
+        prompt: protocol::TranscriptMessage::from_rig(&RigMessage::user(prompt)),
+    }
+}
+
+/// What the host sends for an event of the agent producing message `id`.
+fn agent_event(id: Uuid, event: agent::AgentEvent) -> protocol::HostMessage {
+    protocol::HostMessage::AgentEvent {
+        id: id.into_bytes(),
+        event: protocol::AgentEventMessage::shared(event).expect("an event that is folded"),
+    }
+}
+
+/// The stream events of one block: its start, its fragments, and its end.
+fn streamed_block(
+    id: &str,
+    kind: rig::streaming::BlockKind,
+    deltas: impl IntoIterator<Item = rig::streaming::Delta>,
+    end: rig::streaming::BlockClose,
+) -> Vec<agent::AgentEvent> {
+    use rig::streaming::{BlockId, StreamEvent};
+
+    let block = BlockId::from(id);
+    std::iter::once(StreamEvent::BlockStart {
+        id: block.clone(),
+        kind,
+    })
+    .chain(deltas.into_iter().map(|delta| StreamEvent::BlockDelta {
+        id: block.clone(),
+        delta,
+    }))
+    .chain([StreamEvent::BlockEnd {
+        id: block.clone(),
+        end,
+        block: None,
+    }])
+    .map(agent::AgentEvent::Model)
+    .collect()
+}
+
+/// A streamed call of the `name` tool with `arguments`.
+fn streamed_tool_call(
+    id: &str,
+    name: &str,
+    arguments: serde_json::Value,
+) -> Vec<agent::AgentEvent> {
+    use rig::streaming::{BlockClose, BlockKind, Delta, ToolCallEnd, UnparseableToolInput};
+
+    streamed_block(
+        id,
+        BlockKind::ToolCall,
+        [
+            Delta::ToolName { name: name.into() },
+            Delta::ToolArguments {
+                arguments: arguments.to_string(),
+            },
+        ],
+        BlockClose::ToolCall(ToolCallEnd::new(UnparseableToolInput::Error)),
+    )
+}
+
+/// A text fragment streamed into block `id`, thinking or answer.
+fn streamed_text(id: &str, text: &str, thinking: bool) -> agent::AgentEvent {
+    use rig::streaming::{BlockId, Delta, StreamEvent};
+
+    let text = text.to_owned();
+    agent::AgentEvent::Model(StreamEvent::BlockDelta {
+        id: BlockId::from(id),
+        delta: if thinking {
+            Delta::Reasoning { text }
+        } else {
+            Delta::Text { text }
+        },
+    })
+}
+
+/// The end of a model turn that used `total` tokens.
+fn turn_ended(total: u64) -> agent::AgentEvent {
+    agent::AgentEvent::TurnEnded {
+        message_id: None,
+        usage: Usage {
+            total_tokens: Some(total),
+            ..Default::default()
+        },
+    }
+}
+
+/// The results of every tool the turn in `events` called, as the agent
+/// loop would report them.
+fn tool_results(events: &[agent::AgentEvent], output: &str) -> Vec<agent::AgentEvent> {
+    let mut fold = agent::TurnFold::default();
+    for event in events {
+        fold.apply(event);
+    }
+    fold.pending_calls()
+        .iter()
+        .map(|call| agent::AgentEvent::ToolResult {
+            call: call.id.clone(),
+            result: rig::tool::ToolResult::success(rig::tool::ToolOutput::text(output)),
+        })
+        .collect()
+}
+
 /// `participant` joining with the profile derived from their id.
 fn joined(participant: ParticipantId) -> protocol::HostMessage {
     protocol::HostMessage::ParticipantJoined {
@@ -212,6 +324,8 @@ fn test_thread(thread_id: Uuid, timeline: Vec<TimelineMessage>, draft: ThreadDra
         participants: Vec::new(),
         profiles: HashMap::new(),
         transcript: Vec::new(),
+        agent_turn: Default::default(),
+        agent_events: Vec::new(),
         prompt_names: HashMap::new(),
         tokens_used: 0,
         model: None,
@@ -527,7 +641,7 @@ impl<'a> Collaboration<'a> {
                     panic!("expected a welcome");
                 };
                 collaborator.update(cx, |collaborator, cx| {
-                    collaborator.mirror_thread(welcome, collaborator_end, None, cx);
+                    collaborator.mirror_thread(*welcome, collaborator_end, None, cx);
                 });
             })
             .detach();

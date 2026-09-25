@@ -21,6 +21,4 @@ https://gpui-kit.com/component/editor/
 
 https://gpui-kit.com/component/shimmer/
 
-# Transfer the hosts model catalog, dont use the collaborators ones.
-
 # Introduce slash commands, /fork clones the thread into a recent thread

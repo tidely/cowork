@@ -95,12 +95,48 @@ impl Render for ThreadMirrorTestView {
     }
 }
 
-/// The events a host broadcasts while answering one prompt.
+/// The events a host broadcasts while answering one prompt: a turn that
+/// thinks, answers, and replies to a comment with a tool call, then the
+/// tool's result and a second turn.
 fn agent_stream_events(message_id: Uuid) -> Vec<protocol::HostMessage> {
-    let id = message_id.into_bytes();
+    use rig::streaming::{BlockClose, BlockKind};
+
     let user_message_id = Uuid::new_v4().into_bytes();
     let comment_id = Uuid::new_v4().into_bytes();
-    vec![
+    let mut first_turn = vec![
+        streamed_text("thinking", "Weighing ", true),
+        streamed_text("thinking", "options.", true),
+        // No explicit thinking end, so the first answer token closes it.
+        streamed_text("answer", "Here is ", false),
+    ];
+    first_turn.extend(streamed_tool_call(
+        "call",
+        "respond_to_comment",
+        serde_json::json!({"comment_id": "comment_1", "response": "Because of this."}),
+    ));
+    first_turn.extend([
+        streamed_text("answer", "the answer.", false),
+        turn_ended(1_024),
+    ]);
+    let results = tool_results(&first_turn, "Recorded");
+    let mut second_turn = streamed_block(
+        "second",
+        BlockKind::Text {
+            additional_params: None,
+        },
+        [rig::streaming::Delta::Text {
+            text: " Done.".into(),
+        }],
+        BlockClose::Text,
+    );
+    second_turn.push(turn_ended(2_048));
+    let agent = first_turn
+        .into_iter()
+        .chain(results)
+        .chain(second_turn)
+        .map(|event| agent_event(message_id, event));
+
+    let mut events = vec![
         protocol::HostMessage::ThreadTitled("Explain this".into()),
         protocol::HostMessage::UserMessage(protocol::UserMessage {
             id: user_message_id,
@@ -121,41 +157,12 @@ fn agent_stream_events(message_id: Uuid) -> Vec<protocol::HostMessage> {
                 body: "why?".into(),
             }],
         }),
-        protocol::HostMessage::AgentStarted {
-            id,
-            comment_group_id: Some(user_message_id),
-            started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-        },
-        protocol::HostMessage::AgentCommentResponded {
-            id,
-            response_id: Uuid::new_v4().into_bytes(),
-            comment_id,
-            response: "Because of this.".into(),
-        },
-        protocol::HostMessage::AgentTextAppended {
-            id,
-            target: protocol::AgentText::Thinking,
-            text: "Weighing ".into(),
-        },
-        protocol::HostMessage::AgentTextAppended {
-            id,
-            target: protocol::AgentText::Thinking,
-            text: "options.".into(),
-        },
-        // No explicit thinking end, so the first response token closes it.
-        protocol::HostMessage::AgentTextAppended {
-            id,
-            target: protocol::AgentText::Response,
-            text: "Here is ".into(),
-        },
-        protocol::HostMessage::AgentTextAppended {
-            id,
-            target: protocol::AgentText::Response,
-            text: "the answer.".into(),
-        },
-        protocol::HostMessage::ContextMeasured(2_048),
+        agent_started(message_id, Some(user_message_id), "Explain this"),
+    ];
+    events.extend(agent);
+    events.extend([
         protocol::HostMessage::AgentEnded {
-            id,
+            id: message_id.into_bytes(),
             failure: None,
             duration: Duration::from_secs(5),
         },
@@ -175,7 +182,8 @@ fn agent_stream_events(message_id: Uuid) -> Vec<protocol::HostMessage> {
             catalog
         }),
         protocol::HostMessage::ModelSelected(ollama_qwen()),
-    ]
+    ]);
+    events
 }
 
 /// A collaborator that joins midway through a generation has to end up with
@@ -186,7 +194,8 @@ fn collaborators_joining_mid_stream_converge_on_the_host_timeline(cx: &mut gpui:
     cx.update(gpui_component::init);
     let message_id = Uuid::new_v4();
     let events = agent_stream_events(message_id);
-    // The collaborator joins once the agent has started reasoning.
+    // The collaborator joins once the agent has started reasoning, so it has
+    // to fold the rest of that turn from what it missed.
     let joined_after = 4;
 
     let host_participant = ParticipantId::new();
@@ -262,10 +271,35 @@ fn collaborators_joining_mid_stream_converge_on_the_host_timeline(cx: &mut gpui:
             panic!("expected the agent's reply");
         };
         assert_eq!(message.thinking, "Weighing options.");
-        assert_eq!(message.text, "Here is the answer.");
+        assert_eq!(message.text, "Here is the answer. Done.");
         assert!(message.thinking_complete);
         assert!(message.complete);
         assert!(!message.failed);
+        let [response] = message.comment_responses.as_slice() else {
+            panic!("expected the reply to the comment");
+        };
+        assert_eq!(response.response, "Because of this.");
+
+        // The transcript, thinking and tool call included, is the host's,
+        // though the collaborator missed the start of the turn.
+        assert_eq!(collaborator.transcript, host.transcript);
+        let [
+            RigMessage::User { .. },
+            RigMessage::Assistant { content, .. },
+            RigMessage::User { .. },
+            RigMessage::Assistant { .. },
+        ] = collaborator.transcript.as_slice()
+        else {
+            panic!("expected prompt, reply, tool result, reply");
+        };
+        assert!(matches!(
+            content.as_slice(),
+            [
+                rig::completion::AssistantContent::Reasoning(_),
+                rig::completion::AssistantContent::Text(_),
+                rig::completion::AssistantContent::ToolCall(_),
+            ]
+        ));
     });
 }
 
@@ -380,14 +414,7 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
         for (thread, seconds) in [(&local, 20), (&joined, 90)] {
             let id = Uuid::new_v4().into_bytes();
             thread.update(cx, |thread, cx| {
-                thread.apply(
-                    protocol::HostMessage::AgentStarted {
-                        id,
-                        comment_group_id: None,
-                        started_at: SystemTime::UNIX_EPOCH,
-                    },
-                    cx,
-                );
+                thread.apply(agent_started(Uuid::from_bytes(id), None, "prompt"), cx);
                 thread.apply(
                     protocol::HostMessage::AgentEnded {
                         id,
@@ -419,31 +446,20 @@ fn context_tokens_are_estimated_while_streaming(cx: &mut gpui::TestAppContext) {
         }
     });
     let id = Uuid::new_v4().into_bytes();
-    let text = |text: &str| protocol::HostMessage::AgentTextAppended {
-        id,
-        target: protocol::AgentText::Response,
-        text: text.into(),
-    };
+    let text = |text: &str| agent_event(Uuid::from_bytes(id), streamed_text("answer", text, false));
 
     cx.update(|_, cx| {
         let thread = view.read(cx).thread.clone();
         thread.update(cx, |thread, cx| {
             assert_eq!(thread.live_context_tokens(), None);
-            thread.apply(
-                protocol::HostMessage::AgentStarted {
-                    id,
-                    comment_group_id: None,
-                    started_at: SystemTime::UNIX_EPOCH,
-                },
-                cx,
-            );
+            thread.apply(agent_started(Uuid::from_bytes(id), None, "prompt"), cx);
 
             // Before any count, streamed output is all there is.
             thread.apply(text("12345"), cx);
             assert_eq!(thread.live_context_tokens(), Some(2));
 
             // A measurement replaces the estimate, which then grows on.
-            thread.apply(protocol::HostMessage::ContextMeasured(100), cx);
+            thread.apply(agent_event(Uuid::from_bytes(id), turn_ended(100)), cx);
             assert_eq!(thread.live_context_tokens(), Some(100));
             thread.apply(text("12345678"), cx);
             assert_eq!(thread.live_context_tokens(), Some(102));
@@ -501,21 +517,13 @@ fn running_agent_message_is_the_incomplete_one(cx: &mut gpui::TestAppContext) {
         thread.update(cx, |thread, cx| {
             assert_eq!(thread.running_agent_message_id(), None);
             for event in [
-                protocol::HostMessage::AgentStarted {
-                    id: finished.into_bytes(),
-                    comment_group_id: None,
-                    started_at: SystemTime::UNIX_EPOCH,
-                },
+                agent_started(finished, None, "prompt"),
                 protocol::HostMessage::AgentEnded {
                     id: finished.into_bytes(),
                     failure: None,
                     duration: Duration::from_secs(3),
                 },
-                protocol::HostMessage::AgentStarted {
-                    id: running.into_bytes(),
-                    comment_group_id: None,
-                    started_at: SystemTime::UNIX_EPOCH,
-                },
+                agent_started(running, None, "prompt"),
             ] {
                 thread.apply(event, cx);
             }
