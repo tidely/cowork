@@ -70,6 +70,7 @@ use rig::{
         Message as RigMessage, Usage,
         message::{ImageMediaType, UserContent},
     },
+    model::ModelLister,
     prelude::*,
     providers::ollama::wire::Ollama,
     streaming::{BlockClose, Delta, StreamEvent},
@@ -103,7 +104,6 @@ const MACOS_TRAFFIC_LIGHT_X_INSET: gpui::Pixels = px(12.);
 const MACOS_TRAFFIC_LIGHT_SIZE: gpui::Pixels = px(14.);
 const MACOS_TRAFFIC_LIGHT_SPACING: gpui::Pixels = px(6.);
 const MACOS_TRAFFIC_LIGHT_TRAILING_GAP: gpui::Pixels = px(12.);
-const OLLAMA_MODEL: &str = "qwen3.8:27b";
 const OLLAMA_CONTEXT_TOKENS: u64 = 16 * 8_192;
 const OLLAMA_AVATAR_PATH: &str = "providers/ollama.png";
 
@@ -986,38 +986,30 @@ impl ModelProvider {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ModelSelection {
-    catalog_id: &'static str,
+    catalog_id: std::borrow::Cow<'static, str>,
     provider: ModelProvider,
-    model: &'static str,
-    /// The size of the context window the model is run with.
+    model: std::borrow::Cow<'static, str>,
+    /// Requested context window; Ollama's model listing does not report its maximum.
     max_tokens: u64,
 }
 
-const RECOMMENDED_QWEN: ModelSelection = ModelSelection {
-    catalog_id: "recommended-qwen-3.8-27b",
-    provider: ModelProvider::Ollama,
-    model: OLLAMA_MODEL,
-    max_tokens: OLLAMA_CONTEXT_TOKENS,
-};
-const OLLAMA_QWEN: ModelSelection = ModelSelection {
-    catalog_id: "ollama-qwen-3.8-27b",
-    provider: ModelProvider::Ollama,
-    model: OLLAMA_MODEL,
-    max_tokens: OLLAMA_CONTEXT_TOKENS,
-};
-/// Every model the picker offers. Collaborators select models by catalog id,
-/// so changing this catalog also requires bumping
-/// [`protocol::PROTOCOL_VERSION`].
-const MODEL_CATALOG: [ModelSelection; 2] = [RECOMMENDED_QWEN, OLLAMA_QWEN];
-const DEFAULT_MODEL: ModelSelection = RECOMMENDED_QWEN;
-
 impl ModelSelection {
     fn from_catalog_id(catalog_id: &str) -> Option<Self> {
-        MODEL_CATALOG
-            .into_iter()
-            .find(|model| model.catalog_id == catalog_id)
+        catalog_id
+            .strip_prefix("ollama:")
+            .filter(|id| !id.is_empty())
+            .map(|id| Self::discovered(id.to_owned()))
+    }
+
+    fn discovered(id: String) -> Self {
+        Self {
+            catalog_id: format!("ollama:{id}").into(),
+            provider: ModelProvider::Ollama,
+            model: id.into(),
+            max_tokens: OLLAMA_CONTEXT_TOKENS,
+        }
     }
 }
 
@@ -1079,13 +1071,11 @@ impl SearchableListItem for LanguageModel {
 type ModelPickerItems = SearchableVec<SearchableGroup<LanguageModel>>;
 type ModelPickerState = ComboboxState<ModelPickerItems>;
 
-fn language_model_groups() -> ModelPickerItems {
-    SearchableVec::new(vec![
-        SearchableGroup::new("Recommended")
-            .item(LanguageModel::new("Qwen 3.8 27B", RECOMMENDED_QWEN)),
-        SearchableGroup::new(ModelProvider::Ollama.label())
-            .item(LanguageModel::new("Qwen 3.8 27B", OLLAMA_QWEN)),
-    ])
+fn language_model_groups(discovered: &[LanguageModel]) -> ModelPickerItems {
+    SearchableVec::new(vec![discovered.iter().cloned().fold(
+        SearchableGroup::new(ModelProvider::Ollama.label()),
+        |group, model| group.item(model),
+    )])
 }
 
 #[derive(Clone)]
@@ -2033,7 +2023,7 @@ struct ContextUsage {
 impl ContextUsage {
     /// `thread`'s usage, or an empty window of `model` for a thread not
     /// created yet.
-    fn of(thread: Option<&Thread>, model: ModelSelection) -> Self {
+    fn of(thread: Option<&Thread>, model: Option<&ModelSelection>) -> Self {
         match thread {
             Some(thread) => Self {
                 tokens: thread.live_context_tokens().unwrap_or(0),
@@ -2041,7 +2031,7 @@ impl ContextUsage {
             },
             None => Self {
                 tokens: 0,
-                max_tokens: model.max_tokens,
+                max_tokens: model.map_or(0, |model| model.max_tokens),
             },
         }
     }
@@ -2486,7 +2476,7 @@ struct Thread {
     /// turn; see [`Cowork::record_turn_usage`]. Only the host, which runs
     /// the agent, fills it.
     tokens_used: u64,
-    model: ModelSelection,
+    model: Option<ModelSelection>,
     /// The size of the model's context window, as the host last reported it.
     max_tokens: u64,
     /// How much of the context window the thread fills, as the provider
@@ -2726,8 +2716,8 @@ impl Thread {
             transcript: Vec::new(),
             prompt_names: HashMap::new(),
             tokens_used: 0,
-            model: DEFAULT_MODEL,
-            max_tokens: DEFAULT_MODEL.max_tokens,
+            model: None,
+            max_tokens: 0,
             context_tokens: None,
             streamed_bytes: 0,
             timeline: Vec::new(),
@@ -2785,12 +2775,11 @@ impl Thread {
                 )
             })
             .collect();
-        // Only a model this app does not know about can fail to resolve, and
-        // the protocol version check rules that out between matching apps.
-        if let Some(model) = ModelSelection::from_catalog_id(&thread.model) {
-            self.model = model;
-            self.max_tokens = thread.max_tokens;
-        }
+        self.model = thread
+            .model
+            .as_deref()
+            .and_then(ModelSelection::from_catalog_id);
+        self.max_tokens = thread.max_tokens;
         self.context_tokens = thread.context_tokens;
         self.streamed_bytes = thread.streamed_bytes;
         let (summary, timeline) = thread.into_native(cx);
@@ -2814,7 +2803,10 @@ impl Thread {
                 .map(|(participant, profile)| (participant.into_bytes(), profile.to_protocol()))
                 .sorted_by_key(|(participant, _)| *participant)
                 .collect(),
-            model: self.model.catalog_id.into(),
+            model: self
+                .model
+                .as_ref()
+                .map(|model| model.catalog_id.to_string()),
             max_tokens: self.max_tokens,
             context_tokens: self.context_tokens,
             streamed_bytes: self.streamed_bytes,
@@ -3076,23 +3068,23 @@ impl Thread {
     /// apply it; the host's broadcast then settles concurrent selections in
     /// the same order on every participant.
     fn select_model(&mut self, model: ModelSelection, cx: &mut impl AppContext) {
-        if self.model == model {
+        if self.model.as_ref() == Some(&model) {
             return;
         }
         if matches!(self.sharing, ThreadSharing::Connected { .. }) {
             let sent = self.request(protocol::CollaboratorMessage::SelectModel {
-                catalog_id: model.catalog_id.into(),
+                catalog_id: model.catalog_id.to_string(),
             });
             // Showing a model the host never heard about would silently run
             // the agent with a different one.
             if sent {
-                self.model = model;
                 self.max_tokens = model.max_tokens;
+                self.model = Some(model);
             }
         } else {
             self.emit(
                 protocol::HostMessage::ModelSelected {
-                    catalog_id: model.catalog_id.into(),
+                    catalog_id: model.catalog_id.to_string(),
                     max_tokens: model.max_tokens,
                 },
                 cx,
@@ -3210,7 +3202,7 @@ impl Thread {
                 max_tokens,
             } => {
                 if let Some(model) = ModelSelection::from_catalog_id(&catalog_id) {
-                    self.model = model;
+                    self.model = Some(model);
                     self.max_tokens = max_tokens;
                 }
             }
@@ -3631,10 +3623,11 @@ struct Cowork {
     published_presence: HashMap<Uuid, protocol::Presence>,
     caret_label_refresh: Option<gpui::Task<()>>,
     /// The model new threads start with: the last one selected locally.
-    new_thread_model: ModelSelection,
+    new_thread_model: Option<ModelSelection>,
     /// Always shows the active thread's model; see [`Cowork::sync_model_picker`].
     model_picker: Entity<ModelPickerState>,
     model_picker_hovered: bool,
+    discovered_models: Vec<LanguageModel>,
     _model_picker_subscription: Subscription,
     _window_activation_subscription: Subscription,
 }
@@ -3646,13 +3639,51 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) -> (Entity<ModelPickerState>, Subscription) {
         let picker = cx.new(|cx| {
-            let mut picker = ComboboxState::new(language_model_groups(), Vec::new(), window, cx)
+            let picker = ComboboxState::new(language_model_groups(&[]), Vec::new(), window, cx)
                 .searchable(true);
-            picker.set_selected_values(&[DEFAULT_MODEL], window, cx);
             picker
         });
         let subscription = cx.subscribe(&picker, Self::model_picker_event);
         (picker, subscription)
+    }
+
+    fn discover_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let task = self.tokio_handle.spawn(async {
+            Ollama::new()
+                .bound()?
+                .models()
+                .list_all()
+                .await
+                .map_err(anyhow::Error::from)
+        });
+        cx.spawn_in(window, async move |this, cx| match task.await {
+            Ok(Ok(models)) => {
+                _ = this.update_in(cx, |this, window, cx| {
+                    this.discovered_models = models
+                        .data
+                        .into_iter()
+                        .filter(|model| !model.id.is_empty())
+                        .map(|model| {
+                            let name = model.name.unwrap_or_else(|| model.id.clone());
+                            LanguageModel::new(name, ModelSelection::discovered(model.id))
+                        })
+                        .collect();
+                    this.discovered_models.sort_by(|a, b| a.name.cmp(&b.name));
+                    this.model_picker.update(cx, |picker, cx| {
+                        picker.set_items(
+                            language_model_groups(&this.discovered_models),
+                            window,
+                            cx,
+                        );
+                    });
+                    this.sync_model_picker(window, cx);
+                    cx.notify();
+                });
+            }
+            Ok(Err(error)) => eprintln!("could not discover Ollama models: {error:#}"),
+            Err(error) => eprintln!("Ollama discovery task failed: {error}"),
+        })
+        .detach();
     }
 
     fn model_picker_event(
@@ -3662,7 +3693,7 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) {
         if let ComboboxEvent::Change(selection) = event
-            && let Some(model) = selection.first().copied()
+            && let Some(model) = selection.first().cloned()
         {
             self.select_model(model, cx);
         }
@@ -3671,7 +3702,7 @@ impl Cowork {
     /// Applies a model picked by the local user to the active thread, and to
     /// every new thread from now on.
     fn select_model(&mut self, model: ModelSelection, cx: &mut Context<Self>) {
-        self.new_thread_model = model;
+        self.new_thread_model = Some(model.clone());
         if let Some(thread) = self.active_thread(cx) {
             thread.update(cx, |thread, cx| thread.select_model(model, cx));
         }
@@ -3684,10 +3715,10 @@ impl Cowork {
     }
 
     /// The model of the active thread, or of the thread about to be created.
-    fn active_model(&self, cx: &App) -> ModelSelection {
+    fn active_model(&self, cx: &App) -> Option<ModelSelection> {
         self.active_thread(cx)
-            .map(|thread| thread.read(cx).model)
-            .unwrap_or(self.new_thread_model)
+            .map(|thread| thread.read(cx).model.clone())
+            .unwrap_or_else(|| self.new_thread_model.clone())
     }
 
     /// Points the picker at the active thread's model.
@@ -3699,9 +3730,13 @@ impl Cowork {
     /// back into [`Cowork::select_model`].
     fn sync_model_picker(&self, window: &mut Window, cx: &mut App) {
         let model = self.active_model(cx);
-        if self.model_picker.read(cx).selected_value() != Some(model) {
+        if self.model_picker.read(cx).selected_value() != model {
             self.model_picker.update(cx, |picker, cx| {
-                picker.set_selected_values(&[model], window, cx);
+                if let Some(model) = model {
+                    picker.set_selected_values(&[model], window, cx);
+                } else {
+                    picker.clear_selection(cx);
+                }
             });
         }
     }
@@ -4292,7 +4327,7 @@ impl Cowork {
         timeline: Vec<TimelineMessage>,
         draft: ThreadDraft,
         participant_id: ParticipantId,
-        model: ModelSelection,
+        model: Option<ModelSelection>,
         cx: &mut App,
     ) -> Entity<Thread> {
         let thread_id = Uuid::new_v4();
@@ -4308,8 +4343,8 @@ impl Cowork {
             transcript: Vec::new(),
             prompt_names: HashMap::new(),
             tokens_used: 0,
+            max_tokens: model.as_ref().map_or(0, |model| model.max_tokens),
             model,
-            max_tokens: model.max_tokens,
             context_tokens: None,
             streamed_bytes: 0,
             timeline,
@@ -4323,7 +4358,7 @@ impl Cowork {
     fn new_empty_local_thread(
         draft: ThreadDraft,
         participant_id: ParticipantId,
-        model: ModelSelection,
+        model: Option<ModelSelection>,
         cx: &mut App,
     ) -> Entity<Thread> {
         Self::new_local_thread(
@@ -4351,7 +4386,7 @@ impl Cowork {
         let thread = Self::new_empty_local_thread(
             draft,
             self.local_participant_id,
-            self.new_thread_model,
+            self.new_thread_model.clone(),
             cx,
         );
         self.active_thread_id = Some(thread.read(cx).instance_id);
@@ -4776,7 +4811,9 @@ impl Cowork {
                     let thread = thread.read(cx);
                     (
                         thread.draft.id,
-                        thread.generating || thread.submission_count() != sequence,
+                        thread.model.is_none()
+                            || thread.generating
+                            || thread.submission_count() != sequence,
                     )
                 };
                 // A stale sequence means another submission won the race;
@@ -4815,6 +4852,13 @@ impl Cowork {
                 cx.notify();
             }
             protocol::CollaboratorMessage::SelectModel { catalog_id } => {
+                if !self
+                    .discovered_models
+                    .iter()
+                    .any(|entry| entry.selection.catalog_id == catalog_id)
+                {
+                    return Ok(());
+                }
                 let Some(model) = ModelSelection::from_catalog_id(&catalog_id) else {
                     return Ok(());
                 };
@@ -7449,7 +7493,7 @@ impl Cowork {
         let started_at = SystemTime::now();
         // Monotonic, so the duration survives clock changes.
         let started = Instant::now();
-        let selected_model = thread.read(cx).model;
+        let selected_model = thread.read(cx).model.clone();
         thread.update(cx, |thread, cx| {
             // Recorded before the run starts, so a prompt stays in the
             // transcript even when the run is stopped before sending it.
@@ -7467,6 +7511,7 @@ impl Cowork {
         let tool_comments = turn_comments.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let generation_task = self.tokio_handle.spawn(async move {
+            let selected_model = selected_model.context("No Ollama model selected")?;
             let client = Ollama::new().bound()?;
             let model = match selected_model.provider {
                 ModelProvider::Ollama => client.completion(selected_model.model),
@@ -8322,6 +8367,9 @@ impl Cowork {
 
     fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active_thread = self.active_thread(cx);
+        if self.active_model(cx).is_none() {
+            return;
+        }
         if active_thread
             .as_ref()
             .is_some_and(|thread| thread.read(cx).generating)
@@ -8491,7 +8539,7 @@ impl Cowork {
                 vec![TimelineMessage::User(submitted_group)],
                 draft,
                 self.local_participant_id,
-                self.new_thread_model,
+                self.new_thread_model.clone(),
                 cx,
             );
             thread.update(cx, |thread, _| thread.prompt_names = prompt_names);
@@ -8603,7 +8651,9 @@ impl Cowork {
         let generating = active_thread
             .as_ref()
             .is_some_and(|thread| thread.read(cx).generating);
-        let context_indicator = self.render_context_indicator(active_thread.as_ref(), cx);
+        let has_model = self.active_model(cx).is_some();
+        let context_indicator =
+            has_model.then(|| self.render_context_indicator(active_thread.as_ref(), cx));
         let selected_model_title = self
             .model_picker
             .read(cx)
@@ -8717,12 +8767,14 @@ impl Cowork {
                 Button::new("send-message")
                     .icon(Icon::new(AssetIconName::SendHorizontal))
                     .small()
-                    .accessibility_label(if loading_attachments {
+                    .accessibility_label(if !has_model {
+                        "Send message (select a model first)"
+                    } else if loading_attachments {
                         "Send message (waiting for attachments)"
                     } else {
                         "Send message"
                     })
-                    .disabled(loading_attachments)
+                    .disabled(loading_attachments || !has_model)
                     .on_click(cx.listener(Self::composer_button_clicked)),
             )
         } else {
@@ -8790,7 +8842,7 @@ impl Cowork {
             })
             .when(can_control, |this| {
                 this.child(div().flex_1())
-                    .child(context_indicator)
+                    .children(context_indicator)
                     .child(model_picker)
                     .children(button)
             })
@@ -8803,8 +8855,8 @@ impl Cowork {
         thread: Option<&Entity<Thread>>,
         cx: &App,
     ) -> impl IntoElement + use<> {
-        let model = self.new_thread_model;
-        let usage = ContextUsage::of(thread.map(|thread| thread.read(cx)), model);
+        let model = self.new_thread_model.clone();
+        let usage = ContextUsage::of(thread.map(|thread| thread.read(cx)), model.as_ref());
         let thread = thread.map(Entity::downgrade);
         div()
             .id("context-indicator")
@@ -8823,12 +8875,15 @@ impl Cowork {
             )
             .tooltip(move |window, cx| {
                 let thread = thread.clone();
+                let model = model.clone();
                 // Reads the thread on every render, so the numbers keep up
                 // with a streaming reply while the tooltip is open.
                 Tooltip::element(move |_, cx| {
                     let thread = thread.as_ref().and_then(WeakEntity::upgrade);
-                    let usage =
-                        ContextUsage::of(thread.as_ref().map(|thread| thread.read(cx)), model);
+                    let usage = ContextUsage::of(
+                        thread.as_ref().map(|thread| thread.read(cx)),
+                        model.as_ref(),
+                    );
                     Self::render_context_details(usage)
                 })
                 .py_2()
@@ -9564,14 +9619,18 @@ fn main() -> anyhow::Result<()> {
                         typing_in: None,
                         published_presence: HashMap::new(),
                         caret_label_refresh: None,
-                        new_thread_model: DEFAULT_MODEL,
+                        new_thread_model: None,
                         model_picker,
                         model_picker_hovered: false,
+                        discovered_models: Vec::new(),
                         _model_picker_subscription: model_picker_subscription,
                         _window_activation_subscription: window_activation_subscription,
                     }
                 });
-                cowork.update(cx, |cowork, cx| cowork.focus_composer(window, cx));
+                cowork.update(cx, |cowork, cx| {
+                    cowork.focus_composer(window, cx);
+                    cowork.discover_models(window, cx);
+                });
                 cx.new(|cx| Root::new(cowork, window, cx))
             }) {
                 eprintln!("failed to open Cowork window: {error}");
@@ -9590,7 +9649,33 @@ fn main() -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    const RECOMMENDED_QWEN: ModelSelection = ModelSelection {
+        catalog_id: std::borrow::Cow::Borrowed("ollama:test-default"),
+        provider: ModelProvider::Ollama,
+        model: std::borrow::Cow::Borrowed("test-default"),
+        max_tokens: OLLAMA_CONTEXT_TOKENS,
+    };
+    const OLLAMA_QWEN: ModelSelection = ModelSelection {
+        catalog_id: std::borrow::Cow::Borrowed("ollama:test-other"),
+        provider: ModelProvider::Ollama,
+        model: std::borrow::Cow::Borrowed("test-other"),
+        max_tokens: OLLAMA_CONTEXT_TOKENS,
+    };
+    const MODEL_CATALOG: [ModelSelection; 2] = [RECOMMENDED_QWEN, OLLAMA_QWEN];
+
     use gpui_base::TextSelectionLayer;
+
+    #[test]
+    fn discovered_model_identifiers_round_trip_without_a_catalog() {
+        let model = ModelSelection::discovered("my-model:latest".to_owned());
+        assert_eq!(model.model, "my-model:latest");
+        assert_eq!(
+            ModelSelection::from_catalog_id(&model.catalog_id),
+            Some(model)
+        );
+        assert_eq!(ModelSelection::from_catalog_id("other:my-model"), None);
+        assert_eq!(ModelSelection::from_catalog_id("ollama:"), None);
+    }
 
     fn encoded_image(width: u32, format: image::ImageFormat) -> Vec<u8> {
         let mut bytes = Vec::new();
@@ -9857,9 +9942,10 @@ mod tests {
             typing_in: None,
             published_presence: HashMap::new(),
             caret_label_refresh: None,
-            new_thread_model: DEFAULT_MODEL,
+            new_thread_model: None,
             model_picker,
             model_picker_hovered: false,
+            discovered_models: Vec::new(),
             _model_picker_subscription: model_picker_subscription,
             _window_activation_subscription: cx.observe_window_activation(window, |_, _, _| {}),
         }
@@ -9886,8 +9972,8 @@ mod tests {
             transcript: Vec::new(),
             prompt_names: HashMap::new(),
             tokens_used: 0,
-            model: DEFAULT_MODEL,
-            max_tokens: DEFAULT_MODEL.max_tokens,
+            model: None,
+            max_tokens: 0,
             context_tokens: None,
             streamed_bytes: 0,
             timeline,
@@ -10722,7 +10808,7 @@ mod tests {
             let draft = ThreadDraft::new(ParticipantId::new());
             let draft_id = draft.id;
             let thread =
-                Cowork::new_empty_local_thread(draft, ParticipantId::new(), OLLAMA_QWEN, cx);
+                Cowork::new_empty_local_thread(draft, ParticipantId::new(), Some(OLLAMA_QWEN), cx);
             EmptyThreadTestView { thread, draft_id }
         });
 
@@ -10732,7 +10818,7 @@ mod tests {
             assert_eq!(thread.draft.id, view.draft_id);
             assert_eq!(thread.summary.title, "New thread");
             assert_eq!(thread.ownership, ThreadOwnership::Local);
-            assert_eq!(thread.model, OLLAMA_QWEN);
+            assert_eq!(thread.model, Some(OLLAMA_QWEN));
             assert!(thread.participants.is_empty());
             assert!(matches!(thread.sharing, ThreadSharing::NotShared));
         });
@@ -10840,7 +10926,7 @@ mod tests {
             host: Cowork::new_empty_local_thread(
                 ThreadDraft::new(ParticipantId::new()),
                 host_participant,
-                DEFAULT_MODEL,
+                None,
                 cx,
             ),
             collaborator: None,
@@ -10896,7 +10982,7 @@ mod tests {
                 collaborator.participants[..2],
                 [host_participant, collaborator_participant]
             );
-            assert_eq!(collaborator.model, OLLAMA_QWEN);
+            assert_eq!(collaborator.model, Some(OLLAMA_QWEN));
             assert_eq!(collaborator.max_tokens, 65_536);
             assert_eq!(collaborator.context_tokens, Some(2_048));
             assert!(!host.generating);
@@ -10921,12 +11007,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, cx| {
             let draft = ThreadDraft::new(ParticipantId::new());
             EmptyThreadTestView {
-                thread: Cowork::new_empty_local_thread(
-                    draft,
-                    ParticipantId::new(),
-                    DEFAULT_MODEL,
-                    cx,
-                ),
+                thread: Cowork::new_empty_local_thread(draft, ParticipantId::new(), None, cx),
                 draft_id: Uuid::nil(),
             }
         });
@@ -10948,8 +11029,8 @@ mod tests {
                     thread.apply(event, cx);
                 }
                 assert_eq!(thread.participants, [first, second]);
-                assert_eq!(thread.model, DEFAULT_MODEL);
-                assert_eq!(thread.max_tokens, DEFAULT_MODEL.max_tokens);
+                assert_eq!(thread.model, None);
+                assert_eq!(thread.max_tokens, 0);
 
                 thread.apply(
                     protocol::HostMessage::ParticipantLeft(first.into_bytes()),
@@ -10972,13 +11053,25 @@ mod tests {
         let (cowork, thread_id, cx) = attachment_test_cowork(cx, runtime.handle().clone());
 
         cowork.update_in(cx, |cowork, window, cx| {
+            cowork.model_picker.update(cx, |picker, cx| {
+                picker.set_items(
+                    language_model_groups(
+                        &MODEL_CATALOG
+                            .into_iter()
+                            .map(|model| LanguageModel::new(model.model.to_string(), model))
+                            .collect::<Vec<_>>(),
+                    ),
+                    window,
+                    cx,
+                );
+            });
             let thread = cowork.active_thread(cx).expect("active thread");
-            assert_eq!(thread.read(cx).model, DEFAULT_MODEL);
+            assert_eq!(thread.read(cx).model, None);
 
             // Picking a model changes the active thread and later new threads.
             cowork.select_model(OLLAMA_QWEN, cx);
-            assert_eq!(thread.read(cx).model, OLLAMA_QWEN);
-            assert_eq!(cowork.new_thread_model, OLLAMA_QWEN);
+            assert_eq!(thread.read(cx).model, Some(OLLAMA_QWEN));
+            assert_eq!(cowork.new_thread_model, Some(OLLAMA_QWEN));
 
             // A change made by someone else only moves the picker along.
             thread.update(cx, |thread, cx| {
@@ -10995,7 +11088,7 @@ mod tests {
                 cowork.model_picker.read(cx).selected_value(),
                 Some(RECOMMENDED_QWEN)
             );
-            assert_eq!(cowork.new_thread_model, OLLAMA_QWEN);
+            assert_eq!(cowork.new_thread_model, Some(OLLAMA_QWEN));
 
             // Without an active thread the picker shows the new thread model.
             cowork.active_thread_id = None;
@@ -11361,13 +11454,28 @@ mod tests {
         let (cowork, _, cx) = attachment_test_cowork(cx, runtime.handle().clone());
 
         cowork.update_in(cx, |cowork, window, cx| {
+            cowork.model_picker.update(cx, |picker, cx| {
+                picker.set_items(
+                    language_model_groups(
+                        &MODEL_CATALOG
+                            .into_iter()
+                            .map(|model| LanguageModel::new(model.model.to_string(), model))
+                            .collect::<Vec<_>>(),
+                    ),
+                    window,
+                    cx,
+                );
+            });
             for model in MODEL_CATALOG {
                 cowork.model_picker.update(cx, |picker, cx| {
-                    picker.set_selected_values(&[model], window, cx);
+                    picker.set_selected_values(&[model.clone()], window, cx);
                 });
-                assert_eq!(cowork.model_picker.read(cx).selected_value(), Some(model));
                 assert_eq!(
-                    ModelSelection::from_catalog_id(model.catalog_id),
+                    cowork.model_picker.read(cx).selected_value(),
+                    Some(model.clone())
+                );
+                assert_eq!(
+                    ModelSelection::from_catalog_id(&model.catalog_id),
                     Some(model)
                 );
             }
@@ -11380,12 +11488,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, cx| {
             let draft = ThreadDraft::new(ParticipantId::new());
             EmptyThreadTestView {
-                thread: Cowork::new_empty_local_thread(
-                    draft,
-                    ParticipantId::new(),
-                    DEFAULT_MODEL,
-                    cx,
-                ),
+                thread: Cowork::new_empty_local_thread(draft, ParticipantId::new(), None, cx),
                 draft_id: Uuid::nil(),
             }
         });
@@ -11454,12 +11557,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, cx| {
             let draft = ThreadDraft::new(ParticipantId::new());
             EmptyThreadTestView {
-                thread: Cowork::new_empty_local_thread(
-                    draft,
-                    ParticipantId::new(),
-                    DEFAULT_MODEL,
-                    cx,
-                ),
+                thread: Cowork::new_empty_local_thread(draft, ParticipantId::new(), None, cx),
                 draft_id: Uuid::nil(),
             }
         });
@@ -11521,6 +11619,9 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
 
         cowork.update(cx, |cowork, cx| {
+            cowork
+                .discovered_models
+                .push(LanguageModel::new("Other", OLLAMA_QWEN));
             let thread = cowork.active_thread(cx).expect("active thread");
             cowork.active_generations.insert(
                 thread_id,
@@ -11543,7 +11644,7 @@ mod tests {
                     .collaborator_request(&thread, ParticipantId::new(), request, cx)
                     .expect("valid request");
             }
-            assert_eq!(thread.read(cx).model, DEFAULT_MODEL);
+            assert_eq!(thread.read(cx).model, None);
             assert!(!cancelled.load(Ordering::Acquire));
 
             for request in [
@@ -11558,11 +11659,11 @@ mod tests {
                     .collaborator_request(&thread, ParticipantId::new(), request, cx)
                     .expect("valid request");
             }
-            assert_eq!(thread.read(cx).model, OLLAMA_QWEN);
+            assert_eq!(thread.read(cx).model, Some(OLLAMA_QWEN));
             assert!(cancelled.load(Ordering::Acquire));
             // Only the requesting peer picked it; new local threads keep the
             // local user's choice.
-            assert_eq!(cowork.new_thread_model, DEFAULT_MODEL);
+            assert_eq!(cowork.new_thread_model, None);
         });
         let aborted = runtime
             .block_on(task)
@@ -11645,9 +11746,42 @@ mod tests {
         });
         // Focus and blur events are only delivered to an active window.
         cx.update(|window, _| window.activate_window());
-        cx.update(|window, cx| cowork.update(cx, |cowork, cx| cowork.focus_composer(window, cx)));
+        cx.update(|window, cx| {
+            cowork.update(cx, |cowork, cx| {
+                cowork.select_model(OLLAMA_QWEN, cx);
+                cowork.focus_composer(window, cx);
+            })
+        });
         cx.run_until_parked();
         (cowork, runtime, cx)
+    }
+
+    #[gpui::test]
+    fn submission_waits_for_a_selected_model(cx: &mut gpui::TestAppContext) {
+        let (cowork, _runtime, cx) = composer_test_cowork(cx);
+        cowork.update_in(cx, |cowork, window, cx| {
+            cowork.new_thread_model = None;
+            cowork.sync_model_picker(window, cx);
+        });
+        cx.simulate_input("question");
+        cx.run_until_parked();
+        cx.update(|window, cx| cowork.update(cx, |cowork, cx| cowork.submit_composer(window, cx)));
+        cowork.read_with(cx, |cowork, cx| {
+            assert!(cowork.active_thread(cx).is_none());
+            assert!(
+                cowork
+                    .new_thread_draft
+                    .doc
+                    .items()
+                    .iter()
+                    .any(|item| !item.is_empty())
+            );
+        });
+        cowork.update(cx, |cowork, cx| cowork.select_model(OLLAMA_QWEN, cx));
+        cx.update(|window, cx| cowork.update(cx, |cowork, cx| cowork.submit_composer(window, cx)));
+        cowork.read_with(cx, |cowork, cx| {
+            assert!(cowork.active_thread(cx).is_some());
+        });
     }
 
     #[gpui::test]
@@ -12476,6 +12610,8 @@ mod tests {
                     .doc
                     .create_prompt(draft.author.as_uuid(), "from the host");
                 let mut thread = test_thread(thread_id, Vec::new(), draft);
+                thread.model = Some(OLLAMA_QWEN);
+                thread.max_tokens = OLLAMA_QWEN.max_tokens;
                 thread.participant_id = thread.draft.author;
                 thread.participants = vec![thread.participant_id];
                 thread.sharing = ThreadSharing::Shared {
@@ -12855,8 +12991,8 @@ mod tests {
                 title: "Shared".into(),
                 participants: Vec::new(),
                 profiles: Vec::new(),
-                model: DEFAULT_MODEL.catalog_id.into(),
-                max_tokens: DEFAULT_MODEL.max_tokens,
+                model: None,
+                max_tokens: 0,
                 context_tokens: None,
                 streamed_bytes: 0,
                 messages: Vec::new(),

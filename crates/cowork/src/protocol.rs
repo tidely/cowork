@@ -22,13 +22,13 @@ const BULK_CHANNEL_CAPACITY: usize = 2;
 pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 
 /// Host and collaborator must speak the same version exactly. Bump it on any
-/// change to the messages below or to the model catalog.
+/// change to the messages below or to model identifier semantics.
 ///
 /// For a mismatch to be reported rather than fail to decode, the encoding of
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 8;
+pub(crate) const PROTOCOL_VERSION: u32 = 10;
 
 /// A request from a collaborator to the host.
 ///
@@ -260,8 +260,8 @@ pub(crate) struct ThreadSnapshot {
     pub(crate) participants: Vec<uuid::Bytes>,
     /// The profile of everyone who has joined, including those who left.
     pub(crate) profiles: Vec<(uuid::Bytes, Profile)>,
-    /// Catalog id of the thread's model.
-    pub(crate) model: String,
+    /// Model identifier, if one has been selected for the thread.
+    pub(crate) model: Option<String>,
     /// See [`HostMessage::ModelSelected`].
     pub(crate) max_tokens: u64,
     /// The latest count of [`HostMessage::ContextMeasured`], if any.
@@ -604,7 +604,7 @@ mod tests {
             title: "Shared thread".into(),
             participants: vec![[11; 16], [12; 16]],
             profiles: vec![([11; 16], sample_profile()), ([13; 16], Profile::default())],
-            model: "catalog-model".into(),
+            model: Some("catalog-model".into()),
             max_tokens: 131_072,
             context_tokens: Some(4_096),
             streamed_bytes: 120,
