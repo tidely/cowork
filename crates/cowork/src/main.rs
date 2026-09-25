@@ -8760,6 +8760,7 @@ impl Cowork {
                     .danger()
                     .small()
                     .accessibility_label("Stop generating")
+                    .tooltip("Stop generating")
                     .on_click(cx.listener(Self::composer_button_clicked)),
             )
         } else if can_write {
@@ -8773,6 +8774,15 @@ impl Cowork {
                         "Send message (waiting for attachments)"
                     } else {
                         "Send message"
+                    })
+                    .tooltip(if !has_model {
+                        "Select a model to send"
+                    } else if loading_attachments {
+                        "Waiting for attachments"
+                    } else if cfg!(target_os = "macos") {
+                        "Send message (Cmd-Enter)"
+                    } else {
+                        "Send message (Ctrl-Enter)"
                     })
                     .disabled(loading_attachments || !has_model)
                     .on_click(cx.listener(Self::composer_button_clicked)),
@@ -8837,6 +8847,7 @@ impl Cowork {
                         .ghost()
                         .small()
                         .accessibility_label("Attach files")
+                        .tooltip("Attach files")
                         .on_click(cx.listener(Self::pick_attachments)),
                 )
             })
