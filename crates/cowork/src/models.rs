@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 /// Providers are known at compile time, so the variant is the provider's
 /// identity: a catalog lists each at most once, and a model reference cannot
 /// name a provider that does not exist. Its name and icon are fixed per
-/// variant (see `ModelProvider::label` in `main.rs`) and never travel over the
+/// variant (see `ModelProvider::label` in `model_picker.rs`) and never travel over the
 /// wire. A generic OpenAI-compatible endpoint would be one more variant.
 ///
 /// Declaration order is the order providers are listed in.

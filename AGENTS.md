@@ -4,9 +4,12 @@ Cowork is a GPUI desktop app for collaborating on LLM agent threads (Ollama via 
 
 ## Project Structure
 
-- `crates/cowork` — the app binary. Almost everything (UI, thread state, host/collaborator networking, agent runs, most tests) is in one large `src/main.rs`; use `grep` and targeted reads rather than reading it whole.
-  - `protocol.rs` — host/collaborator wire messages (postcard, length-delimited frames, control vs. bulk queues).
-  - `participant.rs` — `ParticipantId` and derived names/colors.
+- `crates/cowork` — the app binary. `src/main.rs` holds the `Cowork` view struct, app startup, and top-level rendering; the rest of `Cowork`'s methods are `impl Cowork` blocks in the module for their area.
+  - State: `thread.rs` (`Thread`, sharing state, applying host events), `thread_draft.rs` (the draft, its editors, and presence), `timeline.rs` (messages and their wire form), `models.rs` (providers and model catalogs).
+  - Sharing: `protocol.rs` (wire messages; postcard, length-delimited frames, control vs. bulk queues), `sharing.rs` (hosting, joining, and handling collaborators' requests), `participant.rs` (`ParticipantId` and derived names/colors), `profile.rs`.
+  - Agent runs: `submission.rs` (which submission wins, and the prompt), `generation.rs` (running the agent), `prompt.rs`.
+  - UI: `composer.rs`, `draft_editing.rs`, `composer_attachments.rs`, `timeline_view.rs`, `model_picker.rs`, `top_bar.rs`, `sidebar.rs`, `profile_page.rs`, `avatars.rs`, `caret.rs`, `highlight.rs`, `assets.rs`.
+  - Other: `attachments.rs` (reading and classifying files), `usage.rs` (token usage and the activity chart).
 - `crates/draft` — the collaborative draft as a Yrs CRDT document (prompt blocks, comments, attachment records) plus `verify_change` validation. No GPUI or networking dependencies; keep it that way.
 - `crates/agent` — minimal multi-turn agent loop on Rig's low-level completion stream (see its `README.md` for why it exists instead of Rig's agent).
 - `crates/tools` — Rig tools exposed to the model (`respond_to_comment`).
@@ -49,4 +52,5 @@ For Python scripting, use the `uv` package manager.
 
 - Unit tests live next to the code in `#[cfg(test)] mod tests`. `draft` keeps its larger suite in `crates/draft/src/tests.rs`, grouped by numbered section comments and using its helpers (`replica_of`, `sync`, and so on) to simulate multiple replicas.
 - In `cowork`, UI and entity tests use `#[gpui::test]` (with gpui's `test-support` dev feature), and async protocol tests use `#[tokio::test]`. Tests don't need a running Ollama server or network.
+- Tests that drive the whole app (a `Cowork`, threads, or a host and collaborator pair) are in `crates/cowork/src/tests/`, one file per area, with the shared helpers (`test_cowork`, `composer_test_cowork`, `Collaboration`, and so on) in `tests/mod.rs`. Test helpers needed by modules outside `tests/` are in `test_support.rs`.
 - Add a regression test for bug fixes where feasible, especially convergence cases in `draft` and round-trip tests in `protocol.rs` for new messages.
