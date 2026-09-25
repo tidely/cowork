@@ -7859,6 +7859,7 @@ impl Cowork {
         draft_id: Uuid,
         target: AttachmentTarget,
         sources: Vec<AttachmentSource>,
+        window: Option<gpui::AnyWindowHandle>,
         cx: &mut Context<Self>,
     ) {
         if sources.is_empty() {
@@ -7896,13 +7897,29 @@ impl Cowork {
             .detach();
         cx.spawn(async move |this, cx| {
             while let Some(event) = receiver.recv().await {
-                if this
-                    .update(cx, |this, cx| {
-                        this.attachment_read_event(draft_id, event, cx)
-                    })
-                    .is_err()
-                {
+                let Ok(new_block) = this.update(cx, |this, cx| {
+                    this.attachment_read_event(draft_id, event, cx)
+                }) else {
                     break;
+                };
+                if let (Some(block), Some(window_handle)) = (new_block, window) {
+                    _ = cx.update_window(window_handle, |_, window, cx| {
+                        _ = this.update(cx, |this, cx| {
+                            if matches!(
+                                this.focused_draft_editor(window, cx),
+                                Some((focused_draft, EditorSlot::DraftPosition, _))
+                                    if focused_draft == draft_id
+                            ) {
+                                this.focus_draft_editor(
+                                    draft_id,
+                                    EditorSlot::Prompt(block),
+                                    None,
+                                    window,
+                                    cx,
+                                );
+                            }
+                        });
+                    });
                 }
             }
         })
@@ -7914,7 +7931,7 @@ impl Cowork {
         draft_id: Uuid,
         event: AttachmentReadEvent,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Option<ItemId> {
         let id = match &event {
             AttachmentReadEvent::Progress(id, _) | AttachmentReadEvent::Finished(id, _) => *id,
         };
@@ -7923,8 +7940,9 @@ impl Cowork {
             .iter()
             .position(|pending| pending.id == id)
         else {
-            return;
+            return None;
         };
+        let mut new_block = None;
         match event {
             AttachmentReadEvent::Progress(_, progress) => {
                 self.pending_attachments[index].progress = Some(progress);
@@ -7956,14 +7974,17 @@ impl Cowork {
                         let id = record.id;
                         draft.files.insert(id, attachment);
                         draft.doc.add_attachment(block, record);
-                        Ok(Some(id))
+                        Ok(Some((id, block)))
                     })
                     // The draft is gone (sent, or its thread was closed).
                     .unwrap_or(Ok(None))
                 });
                 let result = result.map(|added| {
-                    if let Some(id) = added {
+                    if let Some((id, block)) = added {
                         self.attachment_added(draft_id, id, cx);
+                        if matches!(target, AttachmentTarget::NewBlock(_)) {
+                            new_block = Some(block);
+                        }
                     }
                 });
                 if let Err(error) = result {
@@ -7978,6 +7999,7 @@ impl Cowork {
         // others cannot submit while a read is announced.
         self.publish_presence(cx);
         cx.notify();
+        new_block
     }
 
     /// Gets a file the local user just attached to whoever needs it: the host
@@ -8128,6 +8150,7 @@ impl Cowork {
                         draft_id,
                         target,
                         paths.into_iter().map(AttachmentSource::Path).collect(),
+                        Some(window.window_handle()),
                         cx,
                     ),
                     Ok(Ok(None)) | Err(_) => {}
@@ -8154,8 +8177,9 @@ impl Cowork {
         let Some(draft_id) = self.writable_draft_id(cx) else {
             return;
         };
-        // Drops onto a block are handled by the block itself.
-        let target = AttachmentTarget::NewBlock(Uuid::new_v4());
+        // Drops onto a block are handled by the block itself; elsewhere,
+        // attach to the block the user is editing when there is one.
+        let target = self.attachment_target_at_focus(window, cx);
         self.drop_attachments_on(draft_id, target, paths, window, cx);
     }
 
@@ -8176,9 +8200,20 @@ impl Cowork {
                 .cloned()
                 .map(AttachmentSource::Path)
                 .collect(),
+            Some(window.window_handle()),
             cx,
         );
-        self.ensure_composer_focus(window, cx);
+        if let AttachmentTarget::Block(id) = target {
+            if !matches!(
+                self.focused_draft_editor(window, cx),
+                Some((focused_draft, EditorSlot::Prompt(focused_id), _))
+                    if focused_draft == draft_id && focused_id == id
+            ) {
+                self.focus_draft_editor(draft_id, EditorSlot::Prompt(id), None, window, cx);
+            }
+        } else {
+            self.ensure_composer_focus(window, cx);
+        }
     }
 
     /// Runs before an editor's own paste so images and copied files become
@@ -8202,7 +8237,7 @@ impl Cowork {
         }
         // Files are not pasted as text even where they cannot be attached.
         cx.stop_propagation();
-        self.add_attachments(draft_id, target, sources, cx);
+        self.add_attachments(draft_id, target, sources, Some(window.window_handle()), cx);
     }
 
     fn render_pending_attachment(pending: &PendingAttachment) -> Attachment {
@@ -10068,6 +10103,7 @@ mod tests {
                 draft_id,
                 AttachmentTarget::NewBlock(Uuid::new_v4()),
                 vec![AttachmentSource::Path(path.clone())],
+                None,
                 cx,
             );
             assert!(cowork.draft_is_loading_attachments(draft_id, cx));
@@ -12326,6 +12362,75 @@ mod tests {
     }
 
     #[gpui::test]
+    fn dropping_an_image_keeps_the_caret_in_its_block(cx: &mut gpui::TestAppContext) {
+        let (cowork, _runtime, cx) = composer_test_cowork(cx);
+        cx.simulate_input("question");
+        cx.run_until_parked();
+        let block = new_thread_items(&cowork, cx)[0].id;
+        let path = std::env::temp_dir().join(format!("cowork-{}.png", Uuid::new_v4()));
+        std::fs::write(&path, encoded_image(2, image::ImageFormat::Png)).expect("write test image");
+        let mut paths = ExternalPaths::default();
+        paths.0.push(path.clone());
+
+        cx.update(|window, cx| {
+            cowork.update(cx, |cowork, cx| {
+                cowork.drop_attachments(&paths, window, cx);
+            });
+        });
+        cx.run_until_parked();
+        std::fs::remove_file(&path).expect("remove test image");
+
+        let items = new_thread_items(&cowork, cx);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, block);
+        assert!(matches!(
+            &items[0].kind,
+            DraftItemKind::Prompt { attachments } if attachments.len() == 1
+        ));
+        cx.update(|window, cx| {
+            assert!(matches!(
+                cowork.read(cx).focused_draft_editor(window, cx),
+                Some((_, EditorSlot::Prompt(id), _)) if id == block
+            ));
+        });
+    }
+
+    #[gpui::test]
+    fn dropping_an_image_into_an_empty_composer_focuses_its_block(cx: &mut gpui::TestAppContext) {
+        let (cowork, _runtime, cx) = composer_test_cowork(cx);
+        let path = std::env::temp_dir().join(format!("cowork-{}.png", Uuid::new_v4()));
+        std::fs::write(&path, encoded_image(2, image::ImageFormat::Png)).expect("write test image");
+        let mut paths = ExternalPaths::default();
+        paths.0.push(path.clone());
+
+        cx.update(|window, cx| {
+            cowork.update(cx, |cowork, cx| cowork.drop_attachments(&paths, window, cx));
+        });
+        cx.run_until_parked();
+        std::fs::remove_file(&path).expect("remove test image");
+
+        let items = new_thread_items(&cowork, cx);
+        assert_eq!(items.len(), 1);
+        let block = items[0].id;
+        assert!(matches!(
+            &items[0].kind,
+            DraftItemKind::Prompt { attachments } if attachments.len() == 1
+        ));
+        cx.update(|window, cx| {
+            assert!(matches!(
+                cowork.read(cx).focused_draft_editor(window, cx),
+                Some((_, EditorSlot::Prompt(id), _)) if id == block
+            ));
+        });
+        cx.simulate_input("caption");
+        cx.run_until_parked();
+        let items = new_thread_items(&cowork, cx);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, block);
+        assert_eq!(items[0].body, "caption");
+    }
+
+    #[gpui::test]
     fn files_for_a_removed_block_land_in_a_new_one(cx: &mut gpui::TestAppContext) {
         let (cowork, _runtime, cx) = composer_test_cowork(cx);
         cx.simulate_input("block");
@@ -12340,6 +12445,7 @@ mod tests {
                 draft_id,
                 AttachmentTarget::Block(block),
                 vec![AttachmentSource::Path(path.clone())],
+                None,
                 cx,
             );
             cowork.new_thread_draft.remove_items(&[block]);
@@ -12605,6 +12711,10 @@ mod tests {
         /// Starts with the host sharing a thread whose draft has one block,
         /// and the collaborator joined to it.
         fn start(cx: &'a mut gpui::TestAppContext) -> Self {
+            Self::start_with_history(cx, false)
+        }
+
+        fn start_with_history(cx: &'a mut gpui::TestAppContext, long_history: bool) -> Self {
             cx.update(gpui_component::init);
             // Never driven, so nothing ever runs on it: the test scheduler
             // rejects wake-ups from other threads. The agent never answers.
@@ -12622,7 +12732,29 @@ mod tests {
                 draft
                     .doc
                     .create_prompt(draft.author.as_uuid(), "from the host");
-                let mut thread = test_thread(thread_id, Vec::new(), draft);
+                let timeline = if long_history {
+                    let text = (0..60)
+                        .map(|index| format!("Paragraph {index}: a response to scroll past.\n\n"))
+                        .collect::<String>();
+                    vec![TimelineMessage::Agent(AgentMessage {
+                        id: Uuid::new_v4(),
+                        comment_group_id: None,
+                        started_at: SystemTime::UNIX_EPOCH,
+                        comment_responses: Vec::new(),
+                        thinking: String::new(),
+                        thinking_view: cx.new(|cx| TextViewState::markdown("", cx)),
+                        thinking_complete: true,
+                        thinking_expanded: false,
+                        text: text.clone(),
+                        text_view: cx.new(|cx| TextViewState::markdown(&text, cx)),
+                        duration: None,
+                        complete: true,
+                        failed: false,
+                    })]
+                } else {
+                    Vec::new()
+                };
+                let mut thread = test_thread(thread_id, timeline, draft);
                 thread.model = Some(OLLAMA_QWEN);
                 thread.max_tokens = OLLAMA_QWEN.max_tokens;
                 thread.participant_id = thread.draft.author;
@@ -12646,7 +12778,12 @@ mod tests {
                 });
                 let collaborator_store = cx.new(|_| ThreadStore::default());
                 let collaborator = cx.new(|cx| {
-                    test_cowork(collaborator_store, None, tokio_handle.clone(), window, cx)
+                    let mut collaborator =
+                        test_cowork(collaborator_store, None, tokio_handle.clone(), window, cx);
+                    if long_history {
+                        collaborator.follow_generation = false;
+                    }
+                    collaborator
                 });
                 let pair = cx.new(|_| PairRoot { host, collaborator });
                 Root::new(pair, window, cx)
@@ -13510,6 +13647,7 @@ mod tests {
                 draft_id,
                 AttachmentTarget::Block(block),
                 vec![AttachmentSource::Path(path.clone())],
+                None,
                 cx,
             );
         });
@@ -13586,6 +13724,7 @@ mod tests {
                 draft_id,
                 AttachmentTarget::Block(block),
                 vec![AttachmentSource::Path(path.clone())],
+                None,
                 cx,
             );
         });
