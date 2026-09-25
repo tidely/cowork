@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
+use crate::models::{ModelCatalog, ModelRef};
+
 /// Bounds how much memory a single frame from a peer can make us buffer.
 ///
 /// Attachment bytes travel in chunks, so frames only need to fit text: a
@@ -28,7 +30,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 10;
+pub(crate) const PROTOCOL_VERSION: u32 = 11;
 
 /// A request from a collaborator to the host.
 ///
@@ -45,8 +47,9 @@ pub(crate) enum CollaboratorMessage {
     /// waits for before admitting the collaborator, and sent again whenever
     /// the collaborator changes it.
     Profile(Profile),
-    /// Selects the thread's model by its catalog id. Unknown ids are ignored.
-    SelectModel { catalog_id: String },
+    /// Selects the thread's model. The host ignores models the thread's
+    /// catalog does not offer.
+    SelectModel(ModelRef),
     /// Stops the agent run producing message `message_id`, if it is still
     /// running.
     Stop { message_id: uuid::Bytes },
@@ -170,9 +173,12 @@ pub(crate) enum HostMessage {
         participant: uuid::Bytes,
         profile: Profile,
     },
-    /// The thread's model changed. `max_tokens` is the size of the context
-    /// window the host runs it with.
-    ModelSelected { catalog_id: String, max_tokens: u64 },
+    /// The thread's model changed. The host only selects models the thread's
+    /// catalog offers.
+    ModelSelected(ModelRef),
+    /// Replaces the thread's catalog. A selected model the new catalog no
+    /// longer offers stays selected, but cannot run until another is picked.
+    ModelCatalogChanged(ModelCatalog),
     /// A Yrs update to the draft, made by the host or a collaborator.
     DraftUpdate(Vec<u8>),
     /// A participant's presence changed.
@@ -260,10 +266,11 @@ pub(crate) struct ThreadSnapshot {
     pub(crate) participants: Vec<uuid::Bytes>,
     /// The profile of everyone who has joined, including those who left.
     pub(crate) profiles: Vec<(uuid::Bytes, Profile)>,
-    /// Model identifier, if one has been selected for the thread.
-    pub(crate) model: Option<String>,
-    /// See [`HostMessage::ModelSelected`].
-    pub(crate) max_tokens: u64,
+    /// The models the thread can run: the host's.
+    pub(crate) models: ModelCatalog,
+    /// The selected model, if any. It may be missing from `models`; see
+    /// [`HostMessage::ModelCatalogChanged`].
+    pub(crate) model: Option<ModelRef>,
     /// The latest count of [`HostMessage::ContextMeasured`], if any.
     pub(crate) context_tokens: Option<u64>,
     /// Bytes of agent output streamed since `context_tokens` was measured.
@@ -469,6 +476,38 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::models::{ModelInfo, ModelProvider};
+
+    fn sample_model() -> ModelRef {
+        ModelRef {
+            provider: ModelProvider::Ollama,
+            id: "qwen:latest".into(),
+        }
+    }
+
+    fn sample_catalog() -> ModelCatalog {
+        let mut catalog = ModelCatalog::default();
+        catalog.set_provider(
+            ModelProvider::Ollama,
+            [
+                (
+                    "qwen:latest".into(),
+                    ModelInfo {
+                        name: "Qwen".into(),
+                        max_tokens: 131_072,
+                    },
+                ),
+                (
+                    "llama:latest".into(),
+                    ModelInfo {
+                        name: "Llama".into(),
+                        max_tokens: 8_192,
+                    },
+                ),
+            ],
+        );
+        catalog
+    }
 
     fn sample_profile() -> Profile {
         Profile {
@@ -604,8 +643,8 @@ mod tests {
             title: "Shared thread".into(),
             participants: vec![[11; 16], [12; 16]],
             profiles: vec![([11; 16], sample_profile()), ([13; 16], Profile::default())],
-            model: Some("catalog-model".into()),
-            max_tokens: 131_072,
+            models: sample_catalog(),
+            model: Some(sample_model()),
             context_tokens: Some(4_096),
             streamed_bytes: 120,
             messages: vec![
@@ -683,6 +722,8 @@ mod tests {
     fn membership_and_control_messages_round_trip_through_postcard() {
         for message in [
             HostMessage::Rejected("Version mismatch".into()),
+            HostMessage::ModelCatalogChanged(ModelCatalog::default()),
+            HostMessage::ModelCatalogChanged(sample_catalog()),
             HostMessage::ParticipantJoined {
                 participant: [1; 16],
                 profile: sample_profile(),
@@ -692,10 +733,7 @@ mod tests {
                 participant: [1; 16],
                 profile: Profile::default(),
             },
-            HostMessage::ModelSelected {
-                catalog_id: "catalog-model".into(),
-                max_tokens: 131_072,
-            },
+            HostMessage::ModelSelected(sample_model()),
             HostMessage::DraftUpdate(vec![4, 5, 6]),
             HostMessage::Presence {
                 participant: [1; 16],
@@ -715,9 +753,7 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
             },
             CollaboratorMessage::Profile(sample_profile()),
-            CollaboratorMessage::SelectModel {
-                catalog_id: "catalog-model".into(),
-            },
+            CollaboratorMessage::SelectModel(sample_model()),
             CollaboratorMessage::Stop {
                 message_id: [2; 16],
             },

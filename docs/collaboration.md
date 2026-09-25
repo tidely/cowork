@@ -7,9 +7,10 @@ Yrs document, and the protocol between host and collaborators.
 ## Status
 
 All five steps of the [implementation order](#implementation-order) are done:
-participant identity, the protocol version handshake, shared model selection,
-stopping from any participant, Yrs drafts with prompt blocks, comments as
-items, per-block attachments, navigation, and empty-item removal, the draft
+participant identity, the protocol version handshake, shared model selection
+from the host's catalog (grouped by provider), stopping from any participant,
+Yrs drafts with prompt blocks, comments as items, per-block attachments,
+navigation, and empty-item removal, the draft
 synced through the host with host-coordinated submission, presence, and
 attachment transfer.
 
@@ -380,9 +381,28 @@ and ignores the request otherwise. The message ends as it does today.
 
 - Model selection is per thread. New local threads start with the last model
   selected locally.
-- Anyone can pick a model. The client sends `SelectModel` with the catalog
-  ID. The host applies it in arrival order, ignores unknown IDs, and
-  broadcasts `ModelSelected`. Every picker updates live.
+- Every thread carries a model catalog: the models of whoever runs its agent,
+  grouped by provider. Local and hosted threads use this app's discovered
+  catalog; a mirrored thread uses the host's, which arrives in the
+  `Welcome` snapshot and is replaced by `ModelCatalogChanged` after each
+  successful discovery (including with an empty catalog). Failed discovery
+  leaves the previous catalog in place.
+- Providers are a fixed enum known at compile time, and the provider is part
+  of a model's identity (`ModelRef` is a provider and the provider's model
+  ID). The catalog is keyed by provider and then by model ID, so neither can
+  repeat. Provider names and icons are fixed per provider and never sent.
+- Anyone can pick a model the thread's catalog offers. The client sends
+  `SelectModel`. The host applies it in arrival order if its catalog offers
+  the model, ignores it otherwise, and broadcasts `ModelSelected`. A peer
+  waits for that confirmation before showing the new selection, since the
+  host's catalog may have changed. Picking a host model does not change the
+  default for new local threads.
+- When a catalog stops offering the selected model, the model stays
+  selected but is shown grayed out, with a tooltip saying it is unavailable,
+  and nobody can send until another model is picked. The host refuses
+  submissions for it as well. Once another model is picked, the unavailable
+  one is no longer listed. It becomes available again if the catalog offers
+  it again.
 - A run uses the model selected when its submission is accepted. Changing
   the model during a run affects the next run.
 
@@ -490,32 +510,33 @@ The messages below are conceptual. Names and shapes will follow the existing
 
 **Collaborator to host**
 
-| Message            | Purpose                                                         |
-| ------------------ | --------------------------------------------------------------- |
-| `Join`             | First message; carries the protocol version                     |
-| `Profile`          | Second message, and again whenever the profile changes          |
-| `DraftUpdate`      | Encoded Yrs update from a local transaction                     |
-| `Presence`         | Replaces this participant's presence state                      |
-| `AttachmentData`   | Bytes of an attachment this participant added                   |
-| `Submit`           | Requests a submission at the given sequence                     |
-| `Stop`             | Stops the named agent run                                       |
-| `SelectModel`      | Selects a model by catalog ID                                   |
+| Message          | Purpose                                                |
+| ---------------- | ------------------------------------------------------ |
+| `Join`           | First message; carries the protocol version            |
+| `Profile`        | Second message, and again whenever the profile changes |
+| `DraftUpdate`    | Encoded Yrs update from a local transaction            |
+| `Presence`       | Replaces this participant's presence state             |
+| `AttachmentData` | Bytes of an attachment this participant added          |
+| `Submit`         | Requests a submission at the given sequence            |
+| `Stop`           | Stops the named agent run                              |
+| `SelectModel`    | Selects a model by provider and model ID               |
 
 **Host to collaborators**
 
-| Message                      | Purpose                                                                                                                                  |
-| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
-| `Welcome`                    | Participant UUID, timeline snapshot, draft state, participants, their profiles and presence, model, submission sequence, stored attachment IDs |
-| `Rejected`                   | Join refused (e.g. protocol version) or a request refused; peer-specific                                                                 |
-| `DraftUpdate`                | Yrs update from another participant or the host                                                                                          |
-| `ParticipantJoined` / `Left` | Membership changes; joining carries the participant's profile                                                                            |
-| `ProfileChanged`             | A participant's new profile                                                                                                              |
-| `Presence`                   | A participant's latest presence                                                                                                          |
-| `AttachmentData`             | Relayed attachment bytes                                                                                                                 |
-| `AttachmentStored`           | The host holds every byte of an attachment                                                                                               |
-| `ModelSelected`              | The thread's model changed                                                                                                               |
-| `UserMessage`                | An accepted submission, now carrying its sequence, creators, and attachment references instead of bytes                                  |
-| existing agent events        | Unchanged: title, agent start, streamed text, comment replies, end                                                                       |
+| Message                      | Purpose                                                                                                                                                                                  |
+| ---------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Welcome`                    | Participant UUID, timeline snapshot (including the model catalog and selected model), draft state, participants, their profiles and presence, submission sequence, stored attachment IDs |
+| `Rejected`                   | Join refused (e.g. protocol version) or a request refused; peer-specific                                                                                                                 |
+| `DraftUpdate`                | Yrs update from another participant or the host                                                                                                                                          |
+| `ParticipantJoined` / `Left` | Membership changes; joining carries the participant's profile                                                                                                                            |
+| `ProfileChanged`             | A participant's new profile                                                                                                                                                              |
+| `Presence`                   | A participant's latest presence                                                                                                                                                          |
+| `AttachmentData`             | Relayed attachment bytes                                                                                                                                                                 |
+| `AttachmentStored`           | The host holds every byte of an attachment                                                                                                                                               |
+| `ModelSelected`              | The thread's model changed                                                                                                                                                               |
+| `ModelCatalogChanged`        | Replaces the thread's model catalog (including with an empty one)                                                                                                                        |
+| `UserMessage`                | An accepted submission, now carrying its sequence, creators, and attachment references instead of bytes                                                                                  |
+| existing agent events        | Unchanged: title, agent start, streamed text, comment replies, end                                                                                                                       |
 
 The host is itself a participant. Its local edits, submissions, stops, and
 model changes go through the same logic as a collaborator's.
