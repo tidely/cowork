@@ -5200,6 +5200,8 @@ impl Cowork {
         self.active_thread_id = Some(thread_id);
         self.selection_message_id = None;
         self.profile_open = false;
+        self.follow_generation = true;
+        self.timeline_scroll_handle.scroll_to_bottom();
         cx.notify();
 
         cx.spawn(async move |this, cx| {
@@ -13131,6 +13133,25 @@ mod tests {
             };
             assert_eq!(message.blocks[0].text, "from the host?");
         });
+    }
+
+    #[gpui::test]
+    fn joining_a_thread_scrolls_to_the_bottom(cx: &mut gpui::TestAppContext) {
+        let mut session = Collaboration::start_with_history(cx, true);
+        session.settle();
+
+        session
+            .collaborator
+            .read_with(session.cx, |collaborator, _| {
+                let scroll = &collaborator.timeline_scroll_handle;
+                assert!(collaborator.follow_generation);
+                assert!(
+                    scroll.max_offset().y > px(500.),
+                    "history must overflow the timeline: {:?}",
+                    scroll.max_offset().y
+                );
+                assert_eq!(scroll.offset().y, -scroll.max_offset().y);
+            });
     }
 
     #[gpui::test]
