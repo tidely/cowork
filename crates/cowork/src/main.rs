@@ -115,6 +115,8 @@ struct Cowork {
     /// The presence last sent for each shared thread, by instance id.
     published_presence: HashMap<Uuid, protocol::Presence>,
     caret_label_refresh: Option<gpui::Task<()>>,
+    /// The next redraw of a running agent's "Working for" line.
+    working_refresh: Option<gpui::Task<()>>,
     /// The model new threads start with: the last one selected locally.
     new_thread_model: Option<ModelRef>,
     /// Always shows the active thread's model; see [`Cowork::sync_model_picker`].
@@ -354,6 +356,7 @@ impl Render for Cowork {
         }
         self.publish_presence(cx);
         self.schedule_caret_label_refresh(cx);
+        self.schedule_working_refresh(cx);
         let composer = self.last_composer_editor(window, cx);
         let can_write = composer.is_some();
         let read_only_line_bounds = Rc::new(Cell::new(None));
@@ -535,6 +538,7 @@ fn main() -> anyhow::Result<()> {
                         typing_in: None,
                         published_presence: HashMap::new(),
                         caret_label_refresh: None,
+                        working_refresh: None,
                         new_thread_model: None,
                         model_picker,
                         model_picker_hovered: false,

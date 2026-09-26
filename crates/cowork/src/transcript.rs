@@ -42,7 +42,7 @@ use tools::{RespondToComment, RespondToCommentArgs, TurnComments};
 use uuid::Uuid;
 
 use crate::{
-    protocol::{self, AgentRun, Json},
+    protocol::{self, AgentRun, Json, RunOutcome},
     thread::Thread,
     timeline::{
         AgentCommentResponse, AgentMessage, AgentOutput, AgentStep, AgentToolCall, OutputMark,
@@ -195,7 +195,7 @@ impl Thread {
     pub(crate) fn end_agent_run(
         &mut self,
         id: uuid::Bytes,
-        failure: Option<String>,
+        outcome: RunOutcome,
         duration: std::time::Duration,
         cx: &mut impl AppContext,
     ) {
@@ -208,7 +208,9 @@ impl Thread {
         let Some(message) = self.agent_message_mut(id) else {
             return;
         };
-        message.run = AgentRun::Ended { failure, duration };
+        message.run = AgentRun::Ended { outcome, duration };
+        // The work collapses under its summary, leaving the response.
+        message.work_expanded = false;
         message.advance(None, partial.as_ref(), cx);
     }
 
@@ -357,7 +359,7 @@ impl AgentOutput {
                         AssistantContent::Reasoning(reasoning) => {
                             self.push_thinking(reasoning.display_text());
                         }
-                        AssistantContent::Text(text) => self.text.push_str(&text.text),
+                        AssistantContent::Text(text) => self.push_text(&text.text),
                         AssistantContent::ToolCall(call) => {
                             self.steps.push(AgentStep::ToolCall(AgentToolCall {
                                 call: call.clone(),
@@ -380,12 +382,21 @@ impl AgentOutput {
     }
 
     /// Continues the thinking the output ends with, or starts new thinking
-    /// if the agent called a tool since.
+    /// if it ends with something else.
     fn push_thinking(&mut self, text: String) {
         match self.steps.last_mut() {
             Some(AgentStep::Thinking(thinking)) => thinking.push_str(&text),
             _ if text.is_empty() => {}
             _ => self.steps.push(AgentStep::Thinking(text)),
+        }
+    }
+
+    /// Continues the text the output ends with, or starts new text.
+    fn push_text(&mut self, text: &str) {
+        match self.steps.last_mut() {
+            Some(AgentStep::Text(existing)) => existing.push_str(text),
+            _ if text.is_empty() => {}
+            _ => self.steps.push(AgentStep::Text(text.to_owned())),
         }
     }
 
@@ -398,7 +409,7 @@ impl AgentOutput {
     fn tool_calls_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut AgentToolCall> {
         self.steps.iter_mut().filter_map(|step| match step {
             AgentStep::ToolCall(call) => Some(call),
-            AgentStep::Thinking(_) => None,
+            AgentStep::Thinking(_) | AgentStep::Text(_) => None,
         })
     }
 
@@ -429,11 +440,10 @@ impl AgentOutput {
         );
         OutputMark {
             steps: self.steps.len(),
-            thinking_tail: match self.steps.last() {
-                Some(AgentStep::Thinking(thinking)) => thinking.len(),
+            tail: match self.steps.last() {
+                Some(AgentStep::Thinking(text) | AgentStep::Text(text)) => text.len(),
                 _ => 0,
             },
-            text: self.text.len(),
             answered,
         }
     }
@@ -442,10 +452,9 @@ impl AgentOutput {
     /// run is folding added, including results for committed calls.
     fn rewind(&mut self, mark: OutputMark) {
         self.steps.truncate(mark.steps);
-        if let Some(AgentStep::Thinking(thinking)) = self.steps.last_mut() {
-            thinking.truncate(mark.thinking_tail);
+        if let Some(AgentStep::Thinking(text) | AgentStep::Text(text)) = self.steps.last_mut() {
+            text.truncate(mark.tail);
         }
-        self.text.truncate(mark.text);
         for call in self.tool_calls_mut().skip(mark.answered) {
             call.result = None;
         }
@@ -479,17 +488,16 @@ impl AgentMessage {
         cx: &mut impl AppContext,
     ) {
         let from = self.committed;
-        // Only the last committed step, if it is thinking, and the steps
-        // after it can change what they show.
+        // Only the last committed step, if it is thinking or text, and the
+        // steps after it can change what they show.
         let first_changed = from.steps.saturating_sub(1);
-        let old_thinking = self.output.steps[first_changed..]
+        let old_texts = self.output.steps[first_changed..]
             .iter()
             .map(|step| match step {
-                AgentStep::Thinking(thinking) => Some(thinking.clone()),
+                AgentStep::Thinking(text) | AgentStep::Text(text) => Some(text.clone()),
                 AgentStep::ToolCall(_) => None,
             })
             .collect::<Vec<_>>();
-        let old_text = self.output.text.split_off(from.text);
         self.output.rewind(from);
         if let Some(completed) = completed {
             self.output.push(completed);
@@ -497,21 +505,24 @@ impl AgentMessage {
         }
         self.output.extend(partial);
         self.set_thinking_complete(partial);
-        self.show_steps(first_changed, &old_thinking, cx);
-        show_tail(&self.text_view, &self.output.text, from.text, &old_text, cx);
+        self.show_steps(first_changed, &old_texts, cx);
+        let response = self.output.response();
+        let old_response = std::mem::replace(&mut self.output.text, response);
+        show_tail(&self.text_view, &self.output.text, 0, &old_response, cx);
     }
 
     /// Brings the step views, which showed steps `..first` as they are now
-    /// followed by steps whose thinking was `old`, to showing
+    /// followed by steps whose thinking or text was `old`, to showing
     /// `output.steps`. A step that stays what it was keeps its view state.
     fn show_steps(&mut self, first: usize, old: &[Option<String>], cx: &mut impl AppContext) {
         self.step_views.truncate(self.output.steps.len());
         for (index, step) in self.output.steps.iter().enumerate().skip(first) {
             match (self.step_views.get_mut(index), step) {
-                (Some(StepView::Thinking { view, .. }), AgentStep::Thinking(thinking)) => {
+                (Some(StepView::Thinking { view, .. }), AgentStep::Thinking(text))
+                | (Some(StepView::Text { view }), AgentStep::Text(text)) => {
                     match old.get(index - first) {
-                        Some(Some(old)) => show_tail(view, thinking, 0, old, cx),
-                        _ => view.update(cx, |view, cx| view.set_text(thinking, cx)),
+                        Some(Some(old)) => show_tail(view, text, 0, old, cx),
+                        _ => view.update(cx, |view, cx| view.set_text(text, cx)),
                     }
                 }
                 (Some(StepView::ToolCall { .. }), AgentStep::ToolCall(_)) => {}
@@ -536,6 +547,7 @@ impl AgentMessage {
         self.committed = self.output.mark();
         self.output.extend(partial);
         self.set_thinking_complete(partial);
+        self.output.text = self.output.response();
         self.step_views = self
             .output
             .steps

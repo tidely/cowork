@@ -26,6 +26,7 @@ use crate::{
     caret::{paint_caret_label, selection_rects},
     composer_attachments::AttachmentCard,
     participant::ParticipantId,
+    protocol::RunOutcome,
     thread_draft::{CARET_LABEL_DURATION, EditorSlot, RemoteCaret},
     timeline::{
         AgentMessage, AgentStep, AgentToolCall, MessageAuthor, StepView, ThreadMessageId,
@@ -860,9 +861,10 @@ impl Cowork {
             .into_any_element()
     }
 
-    /// An agent message's steps in order. Consecutive tool calls sit back
-    /// to back; thinking gets the timeline's usual spacing.
-    fn render_steps(
+    /// An agent message's work in order: its steps except the response.
+    /// Consecutive tool calls sit back to back; everything else gets the
+    /// timeline's usual spacing.
+    fn render_work(
         thread_id: Uuid,
         message: &AgentMessage,
         cx: &Context<Self>,
@@ -881,13 +883,13 @@ impl Cowork {
                 );
             }
         };
-        for (step_index, (step, view)) in message
-            .output
-            .steps
-            .iter()
-            .zip(&message.step_views)
-            .enumerate()
-        {
+        for step_index in message.output.work() {
+            let (Some(step), Some(view)) = (
+                message.output.steps.get(step_index),
+                message.step_views.get(step_index),
+            ) else {
+                continue;
+            };
             match (step, view) {
                 (AgentStep::ToolCall(call), view) => calls.push(Self::render_tool_call(
                     thread_id,
@@ -903,12 +905,126 @@ impl Cowork {
                         thread_id, message, step_index, view, cx,
                     ));
                 }
+                (AgentStep::Text(_), StepView::Text { view }) => {
+                    flush(&mut calls, &mut rendered);
+                    rendered.push(
+                        TextView::new(view)
+                            .selection_format(SelectionFormat::Plain)
+                            .style(Self::markdown_style())
+                            .w_full()
+                            .into_any_element(),
+                    );
+                }
                 // The views are kept in step with the output.
-                (AgentStep::Thinking(_), StepView::ToolCall { .. }) => {}
+                _ => {}
             }
         }
         flush(&mut calls, &mut rendered);
         rendered
+    }
+
+    /// The line summing up an agent message's work, which opens and closes
+    /// it: how long the agent has been working, or worked, and whether it
+    /// was stopped or failed.
+    fn render_work_summary(
+        thread_id: Uuid,
+        message: &AgentMessage,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let message_id = message.id;
+        // Shimmering while the agent works, to draw the eye; static after.
+        let label = match message.run.duration() {
+            None => ShimmerText::new(format!(
+                "Working for {}",
+                format_duration(message.started_at.elapsed().unwrap_or_default())
+            ))
+            // The text changes every second; a stable id keeps the sweep
+            // going instead of restarting it.
+            .id(format!("working-{message_id}"))
+            .into_any_element(),
+            Some(duration) => {
+                format!("Worked for {}", format_duration(duration)).into_any_element()
+            }
+        };
+        let outcome = match message.run.outcome() {
+            Some(RunOutcome::Stopped) => Some(("Stopped", rgb(0x71717a))),
+            Some(RunOutcome::Failed(_)) => Some(("Failed", rgb(0xf87171))),
+            Some(RunOutcome::Completed) | None => None,
+        };
+        div()
+            .w_full()
+            .pb_2()
+            .border_b_1()
+            .border_color(rgb(0x2e2e33))
+            .flex()
+            .child(
+                div()
+                    .id(format!("toggle-work-{message_id}"))
+                    .debug_selector(move || format!("toggle-work-{message_id}"))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .cursor_pointer()
+                    .text_sm()
+                    .text_color(rgb(0x71717a))
+                    .hover(|this| this.text_color(rgb(0xa1a1aa)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_work(thread_id, message_id, cx);
+                    }))
+                    .child(label)
+                    .children(outcome.map(|(outcome, color)| {
+                        div()
+                            .flex()
+                            .gap_1()
+                            .child("\u{b7}")
+                            .child(div().text_color(color).child(outcome))
+                    }))
+                    .child(
+                        Icon::new(if message.work_expanded {
+                            AssetIconName::ChevronDown
+                        } else {
+                            AssetIconName::ChevronRight
+                        })
+                        .size_3p5(),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    fn toggle_work(&mut self, thread_id: Uuid, message_id: Uuid, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+            return;
+        };
+        thread.update(cx, |thread, _| {
+            for entry in &mut thread.timeline {
+                if let TimelineMessage::Agent(message) = entry
+                    && message.id == message_id
+                {
+                    message.work_expanded = !message.work_expanded;
+                    break;
+                }
+            }
+        });
+        cx.notify();
+    }
+
+    /// Redraws every second while the active thread's agent is working, so
+    /// its "Working for" line keeps counting.
+    pub(crate) fn schedule_working_refresh(&mut self, cx: &mut Context<Self>) {
+        if self.working_refresh.is_some()
+            || !self
+                .active_thread(cx)
+                .is_some_and(|thread| thread.read(cx).generating)
+        {
+            return;
+        }
+        self.working_refresh = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Duration::from_secs(1)).await;
+            _ = this.update(cx, |this, cx| {
+                this.working_refresh = None;
+                cx.notify();
+            });
+        }));
     }
 
     pub(crate) fn render_agent_text(
@@ -1135,7 +1251,16 @@ impl Cowork {
             .failure()
             .filter(|_| message.output.text.is_empty())
             .map(|failure| div().child(failure.to_owned()));
-        let steps = Self::render_steps(thread_id, message, cx);
+        // A plain reply that completed needs no summary.
+        let summarized = message.is_generating()
+            || message.output.work().next().is_some()
+            || !matches!(message.run.outcome(), Some(RunOutcome::Completed));
+        let summary = summarized.then(|| Self::render_work_summary(thread_id, message, cx));
+        let work = if message.work_expanded {
+            Self::render_work(thread_id, message, cx)
+        } else {
+            Vec::new()
+        };
         div()
             .id(("timeline-message", index))
             .on_mouse_down(
@@ -1166,14 +1291,15 @@ impl Cowork {
                         this.text_color(rgb(0xf87171))
                     })
                     .children(submitted_comment_content)
+                    .children(summary)
                     .when(waiting, |this| {
                         this.child(
-                            ShimmerText::new("Thinking…")
+                            ShimmerText::new("Thinking\u{2026}")
                                 .id(("agent-waiting", index))
                                 .text_color(rgb(0x8b8b95)),
                         )
                     })
-                    .children(steps)
+                    .children(work)
                     .children(message_content)
                     .children(failure),
             )
@@ -1245,5 +1371,31 @@ impl Cowork {
                 self.follow_generation = true;
             }
         }
+    }
+}
+
+/// A duration as the work summary shows it: `8s`, `2m 5s`, `1h 3m`.
+fn format_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    match (seconds / 3600, seconds / 60 % 60, seconds % 60) {
+        (0, 0, seconds) => format!("{seconds}s"),
+        (0, minutes, seconds) => format!("{minutes}m {seconds}s"),
+        (hours, minutes, _) => format!("{hours}h {minutes}m"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durations_read_in_the_largest_units() {
+        let format = |seconds| format_duration(Duration::from_secs(seconds));
+        assert_eq!(format(0), "0s");
+        assert_eq!(format(53), "53s");
+        assert_eq!(format(125), "2m 5s");
+        assert_eq!(format(3_600), "1h 0m");
+        assert_eq!(format(3_780), "1h 3m");
+        assert_eq!(format_duration(Duration::from_millis(1_999)), "1s");
     }
 }

@@ -61,6 +61,11 @@ pub(crate) struct AgentMessage {
     /// How many of `output`'s tool calls have been checked for replies to
     /// comments.
     pub(crate) comment_calls_checked: usize,
+
+    // Local view state.
+    /// Whether the agent's work (everything but its response) is shown. Open
+    /// while the run is going, and closed when it ends.
+    pub(crate) work_expanded: bool,
 }
 
 /// What an agent message shows: a function of its run's output alone, the
@@ -69,14 +74,15 @@ pub(crate) struct AgentMessage {
 /// from the same messages; see `AgentOutput::of`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct AgentOutput {
-    /// The agent's reasoning and tool calls, in the order it produced them.
+    /// Everything the agent produced, in order.
     pub(crate) steps: Vec<AgentStep>,
     /// False only while the model is still reasoning: the run is generating
     /// and reasoning is the last part of the reply streaming. The last step
     /// is then the thinking in progress.
     pub(crate) thinking_complete: bool,
-    /// The reply, all of it in one: comments on it are anchored by offsets
-    /// into this text.
+    /// The response: the text steps after the last tool call, joined. Only
+    /// it can be commented on, by offsets into this text; text before a tool
+    /// call is part of the agent's work.
     pub(crate) text: String,
 }
 
@@ -89,6 +95,8 @@ pub(crate) enum AgentStep {
     /// A stretch of reasoning. Reasoning continues the previous step if that
     /// is reasoning too, so consecutive steps are never both thinking.
     Thinking(String),
+    /// A stretch of text, continued the same way.
+    Text(String),
     ToolCall(AgentToolCall),
 }
 
@@ -100,19 +108,21 @@ pub(crate) enum StepView {
         view: Entity<TextViewState>,
         expanded: bool,
     },
+    /// Text in the agent's work. The response is shown by
+    /// [`AgentMessage::text_view`] instead.
+    Text { view: Entity<TextViewState> },
     /// Whether the call's input and output are shown.
     ToolCall { expanded: bool },
 }
 
-/// Where an [`AgentOutput`]'s committed part ends: how many steps it has and,
-/// if the last is thinking, its length, the length of its text, and how many
-/// of its tool calls have their results. Committed calls are answered in
-/// order, a reply's results all at once, so the answered ones come first.
+/// Where an [`AgentOutput`]'s committed part ends: how many steps it has,
+/// the length of the last if it is thinking or text, and how many of its
+/// tool calls have their results. Committed calls are answered in order, a
+/// reply's results all at once, so the answered ones come first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OutputMark {
     pub(crate) steps: usize,
-    pub(crate) thinking_tail: usize,
-    pub(crate) text: usize,
+    pub(crate) tail: usize,
     pub(crate) answered: usize,
 }
 
@@ -163,7 +173,7 @@ impl AgentOutput {
     pub(crate) fn tool_calls(&self) -> impl DoubleEndedIterator<Item = &AgentToolCall> {
         self.steps.iter().filter_map(|step| match step {
             AgentStep::ToolCall(call) => Some(call),
-            AgentStep::Thinking(_) => None,
+            AgentStep::Thinking(_) | AgentStep::Text(_) => None,
         })
     }
 
@@ -171,8 +181,41 @@ impl AgentOutput {
     pub(crate) fn thinking(&self) -> impl Iterator<Item = &str> {
         self.steps.iter().filter_map(|step| match step {
             AgentStep::Thinking(text) => Some(text.as_str()),
-            AgentStep::ToolCall(_) => None,
+            AgentStep::Text(_) | AgentStep::ToolCall(_) => None,
         })
+    }
+
+    /// Where the steps that can hold the response start: after the last
+    /// tool call.
+    pub(crate) fn response_start(&self) -> usize {
+        self.steps
+            .iter()
+            .rposition(|step| matches!(step, AgentStep::ToolCall(_)))
+            .map_or(0, |index| index + 1)
+    }
+
+    /// The positions of the steps that are the agent's work rather than its
+    /// response: all but the text after the last tool call.
+    pub(crate) fn work(&self) -> impl Iterator<Item = usize> + '_ {
+        let response_start = self.response_start();
+        self.steps
+            .iter()
+            .enumerate()
+            .filter(move |(index, step)| {
+                !matches!(step, AgentStep::Text(_)) || *index < response_start
+            })
+            .map(|(index, _)| index)
+    }
+
+    /// The response, from the steps.
+    pub(crate) fn response(&self) -> String {
+        self.steps[self.response_start()..]
+            .iter()
+            .filter_map(|step| match step {
+                AgentStep::Text(text) => Some(text.as_str()),
+                AgentStep::Thinking(_) | AgentStep::ToolCall(_) => None,
+            })
+            .collect()
     }
 
     /// Whether step `index` is the thinking the model is still writing.
@@ -190,19 +233,25 @@ impl StepView {
                 view: cx.new(|cx| TextViewState::markdown(text, cx)),
                 expanded: false,
             },
+            AgentStep::Text(text) => Self::Text {
+                view: cx.new(|cx| TextViewState::markdown(text, cx)),
+            },
             AgentStep::ToolCall(_) => Self::ToolCall { expanded: false },
         }
     }
 
+    /// Whether the step is opened up. Text has nothing to open.
     pub(crate) fn expanded(&self) -> bool {
         match self {
             Self::Thinking { expanded, .. } | Self::ToolCall { expanded } => *expanded,
+            Self::Text { .. } => false,
         }
     }
 
     pub(crate) fn set_expanded(&mut self, value: bool) {
         match self {
             Self::Thinking { expanded, .. } | Self::ToolCall { expanded } => *expanded = value,
+            Self::Text { .. } => {}
         }
     }
 }
@@ -386,6 +435,7 @@ impl AgentMessage {
             started_at,
             prompt,
             pending_events,
+            work_expanded: run.is_generating(),
             run,
             // What an empty output shows: the model is not reasoning yet.
             output: AgentOutput {

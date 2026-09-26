@@ -163,7 +163,7 @@ fn agent_stream_events(message_id: Uuid) -> Vec<protocol::HostMessage> {
     events.extend([
         protocol::HostMessage::AgentEnded {
             id: message_id.into_bytes(),
-            failure: None,
+            outcome: crate::protocol::RunOutcome::Completed,
             duration: Duration::from_secs(5),
         },
         joined(ParticipantId::new()),
@@ -374,10 +374,19 @@ fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_a
             message.output.thinking().collect::<Vec<_>>(),
             ["Weighing options."]
         );
-        assert_eq!(message.output.text, "Here is the answer. Done.");
-        let [call] = message.output.tool_calls().collect::<Vec<_>>()[..] else {
-            panic!("expected one tool call");
+        // Text before the tool call is work; the response is what follows.
+        let [
+            AgentStep::Thinking(_),
+            AgentStep::Text(work),
+            AgentStep::ToolCall(call),
+            AgentStep::Text(_),
+        ] = &message.output.steps[..]
+        else {
+            panic!("expected thinking, text, a call, and the response");
         };
+        assert_eq!(work, "Here is the answer.");
+        assert_eq!(message.output.text, " Done.");
+        assert!(!message.work_expanded);
         assert_eq!(call.call.function.name, "respond_to_comment");
         assert!(call.arguments_text().contains("comment_1"));
         assert_eq!(call.result_text().as_deref(), Some("Recorded"));
@@ -434,7 +443,7 @@ fn failed_run_without_rig_output_shows_its_failure(cx: &mut gpui::TestAppContext
             thread.apply(
                 protocol::HostMessage::AgentEnded {
                     id: message_id.into_bytes(),
-                    failure: Some("Model unavailable".into()),
+                    outcome: crate::protocol::RunOutcome::Failed("Model unavailable".into()),
                     duration: Duration::from_secs(1),
                 },
                 cx,
@@ -505,7 +514,7 @@ fn separate_runs_reconstruct_only_their_own_tool_calls(cx: &mut gpui::TestAppCon
             thread.apply(
                 protocol::HostMessage::AgentEnded {
                     id: second_id.into_bytes(),
-                    failure: None,
+                    outcome: crate::protocol::RunOutcome::Completed,
                     duration: Duration::from_secs(1),
                 },
                 cx,
@@ -586,7 +595,7 @@ fn failed_run_keeps_output_the_transcript_never_got_for_joiners(cx: &mut gpui::T
             thread.apply(
                 protocol::HostMessage::AgentEnded {
                     id: message_id.into_bytes(),
-                    failure: Some("stream failed".into()),
+                    outcome: crate::protocol::RunOutcome::Failed("stream failed".into()),
                     duration: Duration::from_secs(1),
                 },
                 cx,
@@ -629,7 +638,12 @@ fn failed_run_keeps_output_the_transcript_never_got_for_joiners(cx: &mut gpui::T
             restored.output.thinking().collect::<Vec<_>>(),
             ["Weighing options."]
         );
-        assert_eq!(restored.output.text, "Here is ");
+        // The run stopped at a tool call, so all its text is work.
+        assert_eq!(restored.output.text, "");
+        assert!(matches!(
+            &restored.output.steps[1],
+            AgentStep::Text(text) if text == "Here is "
+        ));
         assert_eq!(restored.comment_responses.len(), 1);
         assert_eq!(restored.comment_responses[0].response, "Because of this.");
     });
@@ -670,7 +684,7 @@ fn incremental_output_matches_a_fresh_derivation_after_every_event(cx: &mut gpui
     events.extend(turn.into_iter().map(|event| agent_event(second_id, event)));
     events.push(protocol::HostMessage::AgentEnded {
         id: second_id.into_bytes(),
-        failure: None,
+        outcome: crate::protocol::RunOutcome::Completed,
         duration: Duration::from_secs(2),
     });
 
@@ -1013,6 +1027,7 @@ fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
             assert!(message.output.thinking_in_progress(2));
             assert_eq!(message.step_views.len(), 3);
             assert!(!message.step_views[0].expanded());
+            assert!(message.work_expanded, "work shows while the run goes");
 
             for event in turn.iter().skip(second_thinking_started) {
                 thread.apply(agent_event(message_id, event.clone()), cx);
@@ -1020,7 +1035,7 @@ fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
             thread.apply(
                 protocol::HostMessage::AgentEnded {
                     id: message_id.into_bytes(),
-                    failure: None,
+                    outcome: crate::protocol::RunOutcome::Completed,
                     duration: Duration::from_secs(1),
                 },
                 cx,
@@ -1037,6 +1052,7 @@ fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
         assert!(matches!(message.output.steps[1], AgentStep::ToolCall(_)));
         assert_eq!(message.output.text, "It is 3.");
         assert!(message.output.thinking_complete);
+        assert!(!message.work_expanded, "work collapses when the run ends");
 
         let welcome = protocol::Welcome {
             participant_id: ParticipantId::new().into_bytes(),
@@ -1170,7 +1186,7 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
                 thread.apply(
                     protocol::HostMessage::AgentEnded {
                         id,
-                        failure: None,
+                        outcome: crate::protocol::RunOutcome::Completed,
                         duration: Duration::from_secs(seconds),
                     },
                     cx,
@@ -1235,7 +1251,7 @@ fn context_tokens_are_estimated_while_streaming(cx: &mut gpui::TestAppContext) {
             thread.apply(
                 protocol::HostMessage::AgentEnded {
                     id,
-                    failure: None,
+                    outcome: crate::protocol::RunOutcome::Completed,
                     duration: Duration::from_secs(1),
                 },
                 cx,
@@ -1272,7 +1288,7 @@ fn running_agent_message_is_the_incomplete_one(cx: &mut gpui::TestAppContext) {
                 agent_started(finished, None, "prompt"),
                 protocol::HostMessage::AgentEnded {
                     id: finished.into_bytes(),
-                    failure: None,
+                    outcome: crate::protocol::RunOutcome::Completed,
                     duration: Duration::from_secs(3),
                 },
                 agent_started(running, None, "prompt"),
@@ -1286,7 +1302,7 @@ fn running_agent_message_is_the_incomplete_one(cx: &mut gpui::TestAppContext) {
             thread.apply(
                 protocol::HostMessage::AgentEnded {
                     id: running.into_bytes(),
-                    failure: None,
+                    outcome: crate::protocol::RunOutcome::Completed,
                     duration: Duration::from_millis(4_500),
                 },
                 cx,
@@ -1436,4 +1452,84 @@ fn renaming_never_changes_what_the_agent_was_sent(cx: &mut gpui::TestAppContext)
         cowork.read_with(cx, |cowork, _| cowork.profile_name()),
         "Grace"
     );
+}
+
+/// A stopped run says so, and its work collapses like any other's. Text the
+/// agent wrote before its last tool call is work, not the response.
+#[gpui::test]
+fn a_stopped_run_keeps_its_outcome_and_collapses_its_work(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let message_id = Uuid::new_v4();
+    let mut turn = vec![streamed_text("answer", "Let me check.", false)];
+    turn.extend(streamed_tool_call(
+        "sum",
+        "calculate",
+        serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+    ));
+    let (view, cx) = cx.add_window_view(|_, cx| ThreadMirrorTestView {
+        host: Cowork::new_empty_local_thread(
+            ThreadDraft::new(ParticipantId::new()),
+            ParticipantId::new(),
+            Arc::default(),
+            None,
+            cx,
+        ),
+        collaborator: None,
+    });
+    view.update(cx, |view, cx| {
+        view.host.update(cx, |thread, cx| {
+            thread.apply(agent_started(message_id, None, "Add 1 and 2"), cx);
+            thread.apply(
+                agent_event(message_id, streamed_text("answer", "Let me check.", false)),
+                cx,
+            );
+            let message = thread
+                .agent_message_mut(message_id.into_bytes())
+                .expect("the agent message");
+            // Until a tool call follows, the text may be the response.
+            assert_eq!(message.output.text, "Let me check.");
+            for event in turn.iter().skip(1) {
+                thread.apply(agent_event(message_id, event.clone()), cx);
+            }
+            thread.apply(
+                protocol::HostMessage::AgentEnded {
+                    id: message_id.into_bytes(),
+                    outcome: protocol::RunOutcome::Stopped,
+                    duration: Duration::from_secs(2),
+                },
+                cx,
+            );
+        });
+        let host = view.host.read(cx);
+        let TimelineMessage::Agent(message) = &host.timeline[0] else {
+            panic!("expected the agent message");
+        };
+        assert_eq!(message.run.outcome(), Some(&protocol::RunOutcome::Stopped));
+        assert_eq!(message.run.failure(), None);
+        assert!(!message.work_expanded);
+        assert_eq!(message.output.text, "");
+        assert_eq!(message.output.work().collect::<Vec<_>>(), [0, 1]);
+
+        let welcome = protocol::Welcome {
+            participant_id: ParticipantId::new().into_bytes(),
+            thread: host.to_protocol(),
+            draft: host.draft.doc.encode_state(),
+            presence: Vec::new(),
+            stored_attachments: Vec::new(),
+        };
+        let restored = Thread::from_welcome(
+            welcome,
+            ThreadDraft::new(ParticipantId::new()),
+            ThreadSharing::NotShared,
+            cx,
+        );
+        assert_eq!(restored.conversation(), view.host.read(cx).conversation());
+        let TimelineMessage::Agent(restored) = &restored.timeline[0] else {
+            panic!("expected the agent message");
+        };
+        assert!(
+            !restored.work_expanded,
+            "a joiner sees ended runs collapsed"
+        );
+    });
 }

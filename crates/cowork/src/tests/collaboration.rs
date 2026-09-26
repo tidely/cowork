@@ -94,7 +94,7 @@ fn the_host_accepts_one_submission_per_sequence(cx: &mut gpui::TestAppContext) {
         thread.emit(
             protocol::HostMessage::AgentEnded {
                 id: id.into_bytes(),
-                failure: None,
+                outcome: crate::protocol::RunOutcome::Completed,
                 duration: Duration::ZERO,
             },
             cx,

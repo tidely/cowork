@@ -133,19 +133,23 @@ impl Cowork {
             }
 
             if stream_completed {
-                let error = match generation_task.await {
-                    Ok(Ok(())) => None,
-                    Ok(Err(error)) => Some(error),
-                    Err(error) if error.is_cancelled() && cancelled.load(Ordering::Acquire) => None,
-                    Err(error) => Some(error.into()),
+                let failed = |error: anyhow::Error| {
+                    protocol::RunOutcome::Failed(format!("Unable to generate a response: {error}"))
+                };
+                let outcome = match generation_task.await {
+                    Ok(Ok(())) => protocol::RunOutcome::Completed,
+                    Ok(Err(error)) => failed(error),
+                    Err(error) if error.is_cancelled() && cancelled.load(Ordering::Acquire) => {
+                        protocol::RunOutcome::Stopped
+                    }
+                    Err(error) => failed(error.into()),
                 };
                 let duration = started.elapsed();
                 thread.update(cx, |thread, cx| {
                     thread.emit(
                         protocol::HostMessage::AgentEnded {
                             id: message_id.into_bytes(),
-                            failure: error
-                                .map(|error| format!("Unable to generate a response: {error}")),
+                            outcome,
                             duration,
                         },
                         cx,

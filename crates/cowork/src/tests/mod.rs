@@ -183,6 +183,7 @@ fn test_cowork(
         typing_in: None,
         published_presence: HashMap::new(),
         caret_label_refresh: None,
+        working_refresh: None,
         new_thread_model: None,
         model_picker,
         model_picker_hovered: false,
@@ -555,7 +556,7 @@ impl<'a> Collaboration<'a> {
                     prompt: 0,
                     pending_events: Vec::new(),
                     run: crate::protocol::AgentRun::Ended {
-                        failure: None,
+                        outcome: crate::protocol::RunOutcome::Completed,
                         duration: std::time::Duration::ZERO,
                     },
                     output: crate::timeline::AgentOutput {
@@ -566,6 +567,7 @@ impl<'a> Collaboration<'a> {
                     committed: Default::default(),
                     comment_calls_checked: 0,
                     step_views: Vec::new(),
+                    work_expanded: false,
                     text_view: cx.new(|cx| TextViewState::markdown(&text, cx)),
                 })]
             } else {

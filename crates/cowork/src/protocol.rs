@@ -34,7 +34,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 14;
+pub(crate) const PROTOCOL_VERSION: u32 = 15;
 
 /// A request from a collaborator to the host.
 ///
@@ -223,12 +223,11 @@ pub(crate) enum HostMessage {
         id: uuid::Bytes,
         event: Json<agent::AgentEvent>,
     },
-    /// The agent finished. `failure` carries a message to display when the
-    /// agent produced no output of its own. `duration` is how long the host
-    /// spent generating the message, whether or not it completed.
+    /// The agent finished, and how. `duration` is how long the host spent
+    /// generating the message, whether or not it completed.
     AgentEnded {
         id: uuid::Bytes,
-        failure: Option<String>,
+        outcome: RunOutcome,
         duration: Duration,
     },
     /// `participant` is called `name` in prompts from now on. Sent when their
@@ -406,12 +405,22 @@ pub(crate) struct AgentMessage {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum AgentRun {
     Generating,
-    /// The run completed, was stopped, or failed. See
-    /// [`HostMessage::AgentEnded`] for `failure` and `duration`.
+    /// See [`HostMessage::AgentEnded`].
     Ended {
-        failure: Option<String>,
+        outcome: RunOutcome,
         duration: Duration,
     },
+}
+
+/// How an agent run ended.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum RunOutcome {
+    Completed,
+    /// Someone stopped it.
+    Stopped,
+    /// It failed, with a message to display when the agent produced no
+    /// output of its own.
+    Failed(String),
 }
 
 impl AgentRun {
@@ -419,11 +428,19 @@ impl AgentRun {
         matches!(self, Self::Generating)
     }
 
-    /// Why the run failed, if it did.
-    pub(crate) fn failure(&self) -> Option<&str> {
+    /// How the run ended. `None` while it is still going.
+    pub(crate) fn outcome(&self) -> Option<&RunOutcome> {
         match self {
             Self::Generating => None,
-            Self::Ended { failure, .. } => failure.as_deref(),
+            Self::Ended { outcome, .. } => Some(outcome),
+        }
+    }
+
+    /// Why the run failed, if it did.
+    pub(crate) fn failure(&self) -> Option<&str> {
+        match self.outcome() {
+            Some(RunOutcome::Failed(failure)) => Some(failure),
+            _ => None,
         }
     }
 
@@ -782,7 +799,7 @@ mod tests {
                     prompt: 0,
                     pending_events: vec![json("{}")],
                     run: AgentRun::Ended {
-                        failure: Some("Failed".into()),
+                        outcome: RunOutcome::Failed("Failed".into()),
                         duration: Duration::from_millis(12_345),
                     },
                 }),
@@ -883,8 +900,18 @@ mod tests {
             },
             HostMessage::AgentEnded {
                 id: [7; 16],
-                failure: Some("Unable to generate a response".into()),
+                outcome: RunOutcome::Failed("Unable to generate a response".into()),
                 duration: Duration::from_millis(2_500),
+            },
+            HostMessage::AgentEnded {
+                id: [7; 16],
+                outcome: RunOutcome::Stopped,
+                duration: Duration::from_millis(900),
+            },
+            HostMessage::AgentEnded {
+                id: [7; 16],
+                outcome: RunOutcome::Completed,
+                duration: Duration::from_secs(53),
             },
             HostMessage::PromptNamed {
                 participant: [11; 16],

@@ -376,7 +376,7 @@ fn assert_backslash_selection_creates_comment(
             prompt: 0,
             pending_events: Vec::new(),
             run: crate::protocol::AgentRun::Ended {
-                failure: None,
+                outcome: crate::protocol::RunOutcome::Completed,
                 duration: std::time::Duration::ZERO,
             },
             output: crate::timeline::AgentOutput {
@@ -387,6 +387,7 @@ fn assert_backslash_selection_creates_comment(
             committed: Default::default(),
             comment_calls_checked: 0,
             step_views: Vec::new(),
+            work_expanded: false,
             text_view: main_text_view,
         })];
         let thread = cx.new(|_| test_thread(thread_id, timeline, draft));
@@ -687,7 +688,7 @@ fn commenting_on_a_long_response_keeps_the_timeline_scroll_position(cx: &mut gpu
             prompt: 0,
             pending_events: Vec::new(),
             run: crate::protocol::AgentRun::Ended {
-                failure: None,
+                outcome: crate::protocol::RunOutcome::Completed,
                 duration: std::time::Duration::ZERO,
             },
             output: crate::timeline::AgentOutput {
@@ -698,6 +699,7 @@ fn commenting_on_a_long_response_keeps_the_timeline_scroll_position(cx: &mut gpu
             committed: Default::default(),
             comment_calls_checked: 0,
             step_views: Vec::new(),
+            work_expanded: false,
             text_view: cx.new(|cx| TextViewState::markdown(&markdown, cx)),
         })];
         let draft = ThreadDraft::new(ParticipantId::new());

@@ -811,9 +811,9 @@ impl Thread {
             }
             protocol::HostMessage::AgentEnded {
                 id,
-                failure,
+                outcome,
                 duration,
-            } => self.end_agent_run(id, failure, duration, cx),
+            } => self.end_agent_run(id, outcome, duration, cx),
         }
         Ok(())
     }

@@ -41,7 +41,7 @@ fn sidebar_bottom_bar_lines_up_with_the_main_bottom_bar(cx: &mut gpui::TestAppCo
 }
 
 #[gpui::test]
-fn tool_calls_expand_and_collapse_individually_in_the_timeline(cx: &mut gpui::TestAppContext) {
+fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::TestAppContext) {
     cx.update(gpui_component::init);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -55,7 +55,7 @@ fn tool_calls_expand_and_collapse_individually_in_the_timeline(cx: &mut gpui::Te
             SystemTime::UNIX_EPOCH,
             0,
             crate::protocol::AgentRun::Ended {
-                failure: None,
+                outcome: crate::protocol::RunOutcome::Completed,
                 duration: Duration::from_secs(1),
             },
             Vec::new(),
@@ -127,12 +127,23 @@ fn tool_calls_expand_and_collapse_individually_in_the_timeline(cx: &mut gpui::Te
     let second_details = leak(format!("tool-call-details-{message_id}-2"));
     let first_thinking = leak(format!("toggle-thinking-{message_id}-0"));
     let last_thinking = leak(format!("toggle-thinking-{message_id}-3"));
+    let work_summary = leak(format!("toggle-work-{message_id}"));
     cx.run_until_parked();
 
-    // The steps show in order, each thinking collapsed on its own.
+    // The run has ended, so its work is collapsed under the summary.
+    let summary = cx.debug_bounds(work_summary).expect("the work summary");
+    assert!(cx.debug_bounds(first_thinking).is_none());
+    assert!(cx.debug_bounds(first_row).is_none());
+    cx.simulate_click(summary.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    // Opened, the steps show below it in order, each thinking collapsed on
+    // its own.
+    let summary = cx.debug_bounds(work_summary).unwrap();
     let before = cx.debug_bounds(first_thinking).expect("the first thinking");
     let after = cx.debug_bounds(last_thinking).expect("the later thinking");
     let rows = cx.debug_bounds(first_row).expect("first tool call row");
+    assert!(summary.bottom() <= before.top());
     assert!(before.bottom() <= rows.top());
     assert!(cx.debug_bounds(second_row).unwrap().bottom() <= after.top());
     assert!(

@@ -355,7 +355,8 @@ A single-block submission looks like the current user message.
   provider payloads Rig does not model are not forwarded, and a block's end
   drops the completed block, which folding rebuilds.
 - What an agent message shows (its thinking, text, tool calls with their
-  results, and replies to comments) is never sent. It is a function of Rig
+  results, and replies to comments, in the order the agent produced them)
+  is never sent. It is a function of Rig
   messages alone: the transcript entries its run added (those after its
   prompt, up to the next run's prompt), followed by the message the run is
   folding, as far as it has come, as Rig's stream accumulator has it. That
@@ -364,8 +365,13 @@ A single-block submission looks like the current user message.
   mid-turn keeps its pending events, since that output never joins the
   transcript. Comment replies
   come from `respond_to_comment` calls, with ids derived from the message
-  and call, so every participant names them alike. A failure message is
-  kept apart from the agent's output, and shown only when there is none.
+  and call, so every participant names them alike. Only the **response**,
+  the text after the agent's last tool call, can be commented on; comment
+  ranges are offsets into it. Everything before it is the agent's work,
+  shown under a "Working for" line while the run goes and collapsed under
+  "Worked for" once it ends, with whether it was stopped or failed. That
+  line and whether it is open are local. A failure message is kept apart
+  from the agent's output, and shown only when there is none.
 - The transcript is kept as Rig messages; they and the agent events travel
   as JSON, which postcard cannot represent directly. Their encoding is
   Rig's, so upgrading Rig bumps the protocol version. A prompt joins the
@@ -412,7 +418,8 @@ editing the draft during generation.
 
 Everyone sees the Stop button while the agent is generating. `Stop` names
 the running agent message. The host cancels that run if it is still active
-and ignores the request otherwise. The message ends as it does today.
+and ignores the request otherwise. The run then ends with `AgentEnded`
+marked as stopped, so everyone can tell it apart from one that completed.
 
 ### Model selection
 
@@ -576,7 +583,7 @@ The messages below are conceptual. Names and shapes will follow the existing
 | `ModelSelected`                              | The thread's model changed                                                                                                                                                                                                                                                                 |
 | `ModelCatalogChanged`                        | Replaces the thread's model catalog (including with an empty one)                                                                                                                                                                                                                          |
 | `UserMessage`                                | An accepted submission, now carrying its sequence, creators, and attachment references instead of bytes                                                                                                                                                                                    |
-| `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and any failure                                                                                                                                                                                                  |
+| `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and whether it completed, was stopped, or failed (with a message)                                                                                                                                                |
 | `AgentEvent`                                 | What the host's agent loop reported during a run, which everyone folds into the agent message and transcript                                                                                                                                                                               |
 | `PromptNamed`                                | A participant's prompt name, fixed on their first submitted item                                                                                                                                                                                                                           |
 
