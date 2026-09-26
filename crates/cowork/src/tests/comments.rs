@@ -340,7 +340,6 @@ fn assert_backslash_selection_creates_comment(
         } else {
             text_view.clone()
         };
-        let thinking_view = cx.new(|cx| TextViewState::markdown("", cx));
         let thread_id = Uuid::new_v4();
         let draft = ThreadDraft::new(ParticipantId::new());
         if let Some(range) = existing_comment_range.clone() {
@@ -387,10 +386,8 @@ fn assert_backslash_selection_creates_comment(
             },
             committed: Default::default(),
             comment_calls_checked: 0,
-            thinking_view,
+            step_views: Vec::new(),
             text_view: main_text_view,
-            thinking_expanded: false,
-            tool_calls_expanded: false,
         })];
         let thread = cx.new(|_| test_thread(thread_id, timeline, draft));
         let thread_store = cx.new(|_| ThreadStore {
@@ -700,10 +697,8 @@ fn commenting_on_a_long_response_keeps_the_timeline_scroll_position(cx: &mut gpu
             },
             committed: Default::default(),
             comment_calls_checked: 0,
-            thinking_view: cx.new(|cx| TextViewState::markdown("", cx)),
+            step_views: Vec::new(),
             text_view: cx.new(|cx| TextViewState::markdown(&markdown, cx)),
-            thinking_expanded: false,
-            tool_calls_expanded: false,
         })];
         let draft = ThreadDraft::new(ParticipantId::new());
         let thread = cx.new(|_| test_thread(thread_id, timeline, draft));

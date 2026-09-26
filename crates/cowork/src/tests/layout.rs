@@ -41,7 +41,7 @@ fn sidebar_bottom_bar_lines_up_with_the_main_bottom_bar(cx: &mut gpui::TestAppCo
 }
 
 #[gpui::test]
-fn tool_calls_expand_and_collapse_in_the_timeline(cx: &mut gpui::TestAppContext) {
+fn tool_calls_expand_and_collapse_individually_in_the_timeline(cx: &mut gpui::TestAppContext) {
     cx.update(gpui_component::init);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
@@ -67,22 +67,32 @@ fn tool_calls_expand_and_collapse_in_the_timeline(cx: &mut gpui::TestAppContext)
                 rig::message::ToolFunction::new("calculate".into(), arguments),
             )
         };
-        message.output.tool_calls = vec![
-            crate::timeline::AgentToolCall {
+        let steps = vec![
+            AgentStep::Thinking("Plan the sums.".into()),
+            AgentStep::ToolCall(crate::timeline::AgentToolCall {
                 call: call(
                     "first",
                     serde_json::json!({"a": 1, "b": 2, "operation": "add"}),
                 ),
                 result: Some(vec![rig::completion::message::ToolResultContent::text("3")]),
-            },
-            crate::timeline::AgentToolCall {
+            }),
+            AgentStep::ToolCall(crate::timeline::AgentToolCall {
                 call: call(
                     "second",
                     serde_json::json!({"a": 3, "b": 2, "operation": "multiply"}),
                 ),
                 result: None,
-            },
+            }),
+            AgentStep::Thinking("Check them.".into()),
         ];
+        message.show_output(
+            crate::timeline::AgentOutput {
+                steps,
+                thinking_complete: true,
+                text: String::new(),
+            },
+            cx,
+        );
         let thread = cx.new(|_| {
             test_thread(
                 thread_id,
@@ -110,25 +120,71 @@ fn tool_calls_expand_and_collapse_in_the_timeline(cx: &mut gpui::TestAppContext)
     let cowork = root.read_with(cx, |root, _| {
         root.view().clone().downcast::<Cowork>().unwrap()
     });
-    let header_id: &'static str =
-        Box::leak(format!("toggle-tool-calls-{message_id}").into_boxed_str());
-    let first_id: &'static str = Box::leak(format!("tool-call-{message_id}-0").into_boxed_str());
-    let second_id: &'static str = Box::leak(format!("tool-call-{message_id}-1").into_boxed_str());
+    let leak = |id: String| -> &'static str { Box::leak(id.into_boxed_str()) };
+    let first_row = leak(format!("tool-call-{message_id}-1"));
+    let second_row = leak(format!("tool-call-{message_id}-2"));
+    let first_details = leak(format!("tool-call-details-{message_id}-1"));
+    let second_details = leak(format!("tool-call-details-{message_id}-2"));
+    let first_thinking = leak(format!("toggle-thinking-{message_id}-0"));
+    let last_thinking = leak(format!("toggle-thinking-{message_id}-3"));
     cx.run_until_parked();
-    let header = cx.debug_bounds(header_id).expect("tool call summary");
-    assert!(cx.debug_bounds(first_id).is_none());
-    cx.simulate_click(header.center(), gpui::Modifiers::default());
+
+    // The steps show in order, each thinking collapsed on its own.
+    let before = cx.debug_bounds(first_thinking).expect("the first thinking");
+    let after = cx.debug_bounds(last_thinking).expect("the later thinking");
+    let rows = cx.debug_bounds(first_row).expect("first tool call row");
+    assert!(before.bottom() <= rows.top());
+    assert!(cx.debug_bounds(second_row).unwrap().bottom() <= after.top());
+    assert!(
+        cx.debug_bounds(leak(format!("thinking-{message_id}-0")))
+            .is_none()
+    );
+    assert!(
+        cx.debug_bounds(leak(format!("thinking-{message_id}-3")))
+            .is_none()
+    );
+
+    // Both calls show as rows, one right after the other, with no details.
+    let first = cx.debug_bounds(first_row).expect("first tool call row");
+    let second = cx.debug_bounds(second_row).expect("second tool call row");
+    assert_eq!(first.bottom(), second.top());
+    assert!(cx.debug_bounds(first_details).is_none());
+    assert!(cx.debug_bounds(second_details).is_none());
+
+    // Opening one call leaves the other closed.
+    cx.simulate_click(second.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    assert!(cx.debug_bounds(first_id).is_some());
-    assert!(cx.debug_bounds(second_id).is_some());
-    assert!(cowork.read_with(cx, |cowork, cx| {
-        let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
-        matches!(&thread.read(cx).timeline[0], TimelineMessage::Agent(message) if message.tool_calls_expanded)
-    }));
-    let header = cx.debug_bounds(header_id).unwrap();
-    cx.simulate_click(header.center(), gpui::Modifiers::default());
+    assert!(cx.debug_bounds(first_details).is_none());
+    assert!(cx.debug_bounds(second_details).is_some());
+    let expanded = |cx: &mut gpui::VisualTestContext| {
+        cowork.read_with(cx, |cowork, cx| {
+            let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
+            let TimelineMessage::Agent(message) = &thread.read(cx).timeline[0] else {
+                panic!("expected the agent message");
+            };
+            message
+                .step_views
+                .iter()
+                .enumerate()
+                .filter(|(_, view)| view.expanded())
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(expanded(cx), vec![2]);
+
+    let first = cx.debug_bounds(first_row).unwrap();
+    cx.simulate_click(first.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    assert!(cx.debug_bounds(first_id).is_none());
+    assert!(cx.debug_bounds(first_details).is_some());
+    assert_eq!(expanded(cx), vec![1, 2]);
+
+    let second = cx.debug_bounds(second_row).unwrap();
+    cx.simulate_click(second.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds(first_details).is_some());
+    assert!(cx.debug_bounds(second_details).is_none());
+    assert_eq!(expanded(cx), vec![1]);
 }
 
 #[gpui::test]

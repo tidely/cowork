@@ -57,8 +57,8 @@ use crate::{
     },
     thread_draft::{AttachmentTarget, EditorSlot, ItemPresence, RemoteCaret, ThreadDraft},
     timeline::{
-        AgentCommentResponse, AgentMessage, CommentReference, PromptBlock, ThreadMessageId,
-        TimelineMessage, UserComment, UserCommentBody, UserMessageGroup,
+        AgentCommentResponse, AgentMessage, AgentStep, CommentReference, PromptBlock, StepView,
+        ThreadMessageId, TimelineMessage, UserComment, UserCommentBody, UserMessageGroup,
     },
     usage::{ActivityRange, TokenActivity},
 };
@@ -565,10 +565,8 @@ impl<'a> Collaboration<'a> {
                     },
                     committed: Default::default(),
                     comment_calls_checked: 0,
-                    thinking_view: cx.new(|cx| TextViewState::markdown("", cx)),
+                    step_views: Vec::new(),
                     text_view: cx.new(|cx| TextViewState::markdown(&text, cx)),
-                    thinking_expanded: false,
-                    tool_calls_expanded: false,
                 })]
             } else {
                 Vec::new()

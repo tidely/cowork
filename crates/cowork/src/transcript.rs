@@ -45,7 +45,8 @@ use crate::{
     protocol::{self, AgentRun, Json},
     thread::Thread,
     timeline::{
-        AgentCommentResponse, AgentMessage, AgentOutput, AgentToolCall, OutputMark, TimelineMessage,
+        AgentCommentResponse, AgentMessage, AgentOutput, AgentStep, AgentToolCall, OutputMark,
+        StepView, TimelineMessage,
     },
     usage::usage_tokens,
 };
@@ -273,14 +274,13 @@ impl Thread {
         let Some(message) = self.agent_message_mut(message_id.into_bytes()) else {
             return;
         };
-        let checked = message
-            .comment_calls_checked
-            .min(message.output.tool_calls.len());
-        let calls = message.output.tool_calls[checked..]
-            .iter()
+        let calls = message
+            .output
+            .tool_calls()
+            .skip(message.comment_calls_checked)
             .map(|call| call.call.clone())
             .collect::<Vec<_>>();
-        message.comment_calls_checked = message.output.tool_calls.len();
+        message.comment_calls_checked = message.output.tool_calls().count();
         for call in &calls {
             self.show_comment_response(message_id, call, cx);
         }
@@ -355,13 +355,15 @@ impl AgentOutput {
                 for part in content {
                     match part {
                         AssistantContent::Reasoning(reasoning) => {
-                            self.thinking.push_str(&reasoning.display_text());
+                            self.push_thinking(reasoning.display_text());
                         }
                         AssistantContent::Text(text) => self.text.push_str(&text.text),
-                        AssistantContent::ToolCall(call) => self.tool_calls.push(AgentToolCall {
-                            call: call.clone(),
-                            result: None,
-                        }),
+                        AssistantContent::ToolCall(call) => {
+                            self.steps.push(AgentStep::ToolCall(AgentToolCall {
+                                call: call.clone(),
+                                result: None,
+                            }));
+                        }
                         AssistantContent::Image(_) => {}
                     }
                 }
@@ -377,10 +379,27 @@ impl AgentOutput {
         }
     }
 
+    /// Continues the thinking the output ends with, or starts new thinking
+    /// if the agent called a tool since.
+    fn push_thinking(&mut self, text: String) {
+        match self.steps.last_mut() {
+            Some(AgentStep::Thinking(thinking)) => thinking.push_str(&text),
+            _ if text.is_empty() => {}
+            _ => self.steps.push(AgentStep::Thinking(text)),
+        }
+    }
+
     fn extend(&mut self, message: Option<&RigMessage>) {
         if let Some(message) = message {
             self.push(message);
         }
+    }
+
+    fn tool_calls_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut AgentToolCall> {
+        self.steps.iter_mut().filter_map(|step| match step {
+            AgentStep::ToolCall(call) => Some(call),
+            AgentStep::Thinking(_) => None,
+        })
     }
 
     /// Records what the tool returned for `call`. Results answer the latest
@@ -388,8 +407,7 @@ impl AgentOutput {
     /// replies, so the latest call with that id is the one answered.
     fn record_tool_result(&mut self, call: &ToolCallId, content: &[ToolResultContent]) {
         if let Some(tool_call) = self
-            .tool_calls
-            .iter_mut()
+            .tool_calls_mut()
             .rev()
             .find(|tool_call| tool_call.call.id == *call)
         {
@@ -400,20 +418,22 @@ impl AgentOutput {
     /// Where the output ends now, as its committed part.
     fn mark(&self) -> OutputMark {
         let answered = self
-            .tool_calls
-            .iter()
-            .position(|call| call.result.is_none())
-            .unwrap_or(self.tool_calls.len());
+            .tool_calls()
+            .take_while(|call| call.result.is_some())
+            .count();
         debug_assert!(
-            self.tool_calls[answered..]
-                .iter()
+            self.tool_calls()
+                .skip(answered)
                 .all(|call| call.result.is_none()),
             "committed calls are answered in order"
         );
         OutputMark {
-            thinking: self.thinking.len(),
+            steps: self.steps.len(),
+            thinking_tail: match self.steps.last() {
+                Some(AgentStep::Thinking(thinking)) => thinking.len(),
+                _ => 0,
+            },
             text: self.text.len(),
-            tool_calls: self.tool_calls.len(),
             answered,
         }
     }
@@ -421,21 +441,28 @@ impl AgentOutput {
     /// Drops everything after `mark`, the committed part: what the message a
     /// run is folding added, including results for committed calls.
     fn rewind(&mut self, mark: OutputMark) {
-        self.thinking.truncate(mark.thinking);
+        self.steps.truncate(mark.steps);
+        if let Some(AgentStep::Thinking(thinking)) = self.steps.last_mut() {
+            thinking.truncate(mark.thinking_tail);
+        }
         self.text.truncate(mark.text);
-        self.tool_calls.truncate(mark.tool_calls);
-        for call in &mut self.tool_calls[mark.answered..] {
+        for call in self.tool_calls_mut().skip(mark.answered) {
             call.result = None;
         }
     }
 
     /// Whether `partial`, the message a run is folding, shows the model
-    /// still reasoning: it is the reply streaming, ending in reasoning.
+    /// still reasoning: it is the reply streaming, ending in reasoning that
+    /// has some text, which is then the output's last step.
     fn still_reasoning(partial: Option<&RigMessage>) -> bool {
         matches!(
             partial,
             Some(RigMessage::Assistant { content, .. })
-                if matches!(content.last(), Some(AssistantContent::Reasoning(_)))
+                if matches!(
+                    content.last(),
+                    Some(AssistantContent::Reasoning(reasoning))
+                        if !reasoning.display_text().is_empty()
+                )
         )
     }
 }
@@ -452,7 +479,16 @@ impl AgentMessage {
         cx: &mut impl AppContext,
     ) {
         let from = self.committed;
-        let old_thinking = self.output.thinking.split_off(from.thinking);
+        // Only the last committed step, if it is thinking, and the steps
+        // after it can change what they show.
+        let first_changed = from.steps.saturating_sub(1);
+        let old_thinking = self.output.steps[first_changed..]
+            .iter()
+            .map(|step| match step {
+                AgentStep::Thinking(thinking) => Some(thinking.clone()),
+                AgentStep::ToolCall(_) => None,
+            })
+            .collect::<Vec<_>>();
         let old_text = self.output.text.split_off(from.text);
         self.output.rewind(from);
         if let Some(completed) = completed {
@@ -461,14 +497,28 @@ impl AgentMessage {
         }
         self.output.extend(partial);
         self.set_thinking_complete(partial);
-        show_tail(
-            &self.thinking_view,
-            &self.output.thinking,
-            from.thinking,
-            &old_thinking,
-            cx,
-        );
+        self.show_steps(first_changed, &old_thinking, cx);
         show_tail(&self.text_view, &self.output.text, from.text, &old_text, cx);
+    }
+
+    /// Brings the step views, which showed steps `..first` as they are now
+    /// followed by steps whose thinking was `old`, to showing
+    /// `output.steps`. A step that stays what it was keeps its view state.
+    fn show_steps(&mut self, first: usize, old: &[Option<String>], cx: &mut impl AppContext) {
+        self.step_views.truncate(self.output.steps.len());
+        for (index, step) in self.output.steps.iter().enumerate().skip(first) {
+            match (self.step_views.get_mut(index), step) {
+                (Some(StepView::Thinking { view, .. }), AgentStep::Thinking(thinking)) => {
+                    match old.get(index - first) {
+                        Some(Some(old)) => show_tail(view, thinking, 0, old, cx),
+                        _ => view.update(cx, |view, cx| view.set_text(thinking, cx)),
+                    }
+                }
+                (Some(StepView::ToolCall { .. }), AgentStep::ToolCall(_)) => {}
+                (Some(shown), step) => *shown = StepView::new(step, cx),
+                (None, step) => self.step_views.push(StepView::new(step, cx)),
+            }
+        }
     }
 
     /// Shows `output`, a run's transcript entries, followed by `partial`, the
@@ -486,18 +536,20 @@ impl AgentMessage {
         self.committed = self.output.mark();
         self.output.extend(partial);
         self.set_thinking_complete(partial);
-        self.thinking_view = cx.new(|cx| TextViewState::markdown(&self.output.thinking, cx));
+        self.step_views = self
+            .output
+            .steps
+            .iter()
+            .map(|step| StepView::new(step, cx))
+            .collect();
         self.text_view = cx.new(|cx| TextViewState::markdown(&self.output.text, cx));
     }
 
-    /// Thinking is complete unless the model is still reasoning, and
-    /// collapses whenever it completes.
+    /// Thinking is complete unless the model is still reasoning. Thinking in
+    /// progress cannot be expanded by hand, so it completes collapsed.
     fn set_thinking_complete(&mut self, partial: Option<&RigMessage>) {
-        let complete = !(self.is_generating() && AgentOutput::still_reasoning(partial));
-        if complete && !self.output.thinking_complete {
-            self.thinking_expanded = false;
-        }
-        self.output.thinking_complete = complete;
+        self.output.thinking_complete =
+            !(self.is_generating() && AgentOutput::still_reasoning(partial));
     }
 }
 

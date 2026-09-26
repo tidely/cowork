@@ -312,11 +312,9 @@ fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_a
                 let TimelineMessage::Agent(message) = &host.timeline[1] else {
                     panic!("expected the agent message");
                 };
-                assert_eq!(message.output.tool_calls.len(), 1);
-                assert_eq!(
-                    message.output.tool_calls[0].result.is_some(),
-                    !matches!(join_at, JoinAt::Call)
-                );
+                let calls = message.output.tool_calls().collect::<Vec<_>>();
+                assert_eq!(calls.len(), 1);
+                assert_eq!(calls[0].result.is_some(), !matches!(join_at, JoinAt::Call));
             }
             let welcome = protocol::Welcome {
                 participant_id: collaborator_participant.into_bytes(),
@@ -372,15 +370,18 @@ fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_a
         let TimelineMessage::Agent(message) = &collaborator.timeline[1] else {
             panic!("expected the agent's reply");
         };
-        assert_eq!(message.output.thinking, "Weighing options.");
+        assert_eq!(
+            message.output.thinking().collect::<Vec<_>>(),
+            ["Weighing options."]
+        );
         assert_eq!(message.output.text, "Here is the answer. Done.");
-        let [call] = message.output.tool_calls.as_slice() else {
+        let [call] = message.output.tool_calls().collect::<Vec<_>>()[..] else {
             panic!("expected one tool call");
         };
         assert_eq!(call.call.function.name, "respond_to_comment");
         assert!(call.arguments_text().contains("comment_1"));
         assert_eq!(call.result_text().as_deref(), Some("Recorded"));
-        assert!(!message.tool_calls_expanded);
+        assert!(!message.step_views.iter().any(StepView::expanded));
         assert!(message.output.thinking_complete);
         assert!(!message.is_generating());
         assert_eq!(message.run.failure(), None);
@@ -534,7 +535,9 @@ fn separate_runs_reconstruct_only_their_own_tool_calls(cx: &mut gpui::TestAppCon
             .timeline
             .iter()
             .filter_map(|entry| match entry {
-                TimelineMessage::Agent(message) => Some(&message.output.tool_calls),
+                TimelineMessage::Agent(message) => {
+                    Some(message.output.tool_calls().collect::<Vec<_>>())
+                }
                 _ => None,
             })
             .collect::<Vec<_>>();
@@ -619,12 +622,13 @@ fn failed_run_keeps_output_the_transcript_never_got_for_joiners(cx: &mut gpui::T
         let TimelineMessage::Agent(restored) = &restored.timeline[1] else {
             panic!("expected agent message");
         };
+        let calls = restored.output.tool_calls().collect::<Vec<_>>();
+        assert_eq!(calls[0].call.function.name, "respond_to_comment");
+        assert!(calls[0].result.is_none());
         assert_eq!(
-            restored.output.tool_calls[0].call.function.name,
-            "respond_to_comment"
+            restored.output.thinking().collect::<Vec<_>>(),
+            ["Weighing options."]
         );
-        assert!(restored.output.tool_calls[0].result.is_none());
-        assert_eq!(restored.output.thinking, "Weighing options.");
         assert_eq!(restored.output.text, "Here is ");
         assert_eq!(restored.comment_responses.len(), 1);
         assert_eq!(restored.comment_responses[0].response, "Because of this.");
@@ -707,13 +711,12 @@ fn incremental_output_matches_a_fresh_derivation_after_every_event(cx: &mut gpui
         let TimelineMessage::Agent(message) = &host.timeline[2] else {
             panic!("expected the second run's message");
         };
-        assert_eq!(message.output.thinking, "Two sums.");
+        assert_eq!(message.output.thinking().collect::<Vec<_>>(), ["Two sums."]);
         assert_eq!(message.output.text, "3 and 7.");
         assert!(
             message
                 .output
-                .tool_calls
-                .iter()
+                .tool_calls()
                 .all(|call| call.result_text().as_deref() == Some("sum"))
         );
     });
@@ -760,7 +763,10 @@ fn a_restated_block_shows_as_rig_accumulates_it(cx: &mut gpui::TestAppContext) {
         let TimelineMessage::Agent(message) = &host.timeline[0] else {
             panic!("expected the agent message");
         };
-        assert_eq!(message.output.thinking, "Considered.");
+        assert_eq!(
+            message.output.thinking().collect::<Vec<_>>(),
+            ["Considered."]
+        );
         assert_eq!(message.output.text, "Yes.");
         let welcome = protocol::Welcome {
             participant_id: ParticipantId::new().into_bytes(),
@@ -784,7 +790,10 @@ fn a_restated_block_shows_as_rig_accumulates_it(cx: &mut gpui::TestAppContext) {
         let TimelineMessage::Agent(message) = &host.timeline[0] else {
             panic!("expected the agent message");
         };
-        assert_eq!(message.output.thinking, "Considered.");
+        assert_eq!(
+            message.output.thinking().collect::<Vec<_>>(),
+            ["Considered."]
+        );
         let [_, RigMessage::Assistant { content, .. }] = host.transcript.as_slice() else {
             panic!("expected the prompt and the reply");
         };
@@ -936,16 +945,113 @@ fn expanded_thinking_stays_open_as_the_run_continues(cx: &mut gpui::TestAppConte
                 .agent_message_mut(message_id.into_bytes())
                 .expect("the agent message");
             assert!(message.output.thinking_complete);
-            assert!(!message.thinking_expanded);
-            message.thinking_expanded = true;
+            assert!(matches!(message.output.steps[0], AgentStep::Thinking(_)));
+            assert!(!message.step_views[0].expanded());
+            message.step_views[0].set_expanded(true);
             for event in events.iter().skip(thinking_done) {
                 thread.apply(event.clone(), cx);
             }
             let message = thread
                 .agent_message_mut(message_id.into_bytes())
                 .expect("the agent message");
-            assert!(message.thinking_expanded);
+            assert!(message.step_views[0].expanded());
         });
+    });
+}
+
+/// Thinking after a tool call is a step of its own, after the call. The
+/// earlier thinking stays as it was, collapsed, rather than reopening to
+/// take the new reasoning.
+#[gpui::test]
+fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let message_id = Uuid::new_v4();
+    let mut turn = vec![streamed_text("thinking", "Add first.", true)];
+    turn.extend(streamed_tool_call(
+        "sum",
+        "calculate",
+        serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+    ));
+    turn.push(turn_ended(100));
+    turn.extend(tool_results(&turn, "3"));
+    turn.push(streamed_text("second-thinking", "Now ", true));
+    let second_thinking_started = turn.len();
+    turn.extend([
+        streamed_text("second-thinking", "answer.", true),
+        streamed_text("answer", "It is 3.", false),
+        turn_ended(200),
+    ]);
+    let (view, cx) = cx.add_window_view(|_, cx| ThreadMirrorTestView {
+        host: Cowork::new_empty_local_thread(
+            ThreadDraft::new(ParticipantId::new()),
+            ParticipantId::new(),
+            Arc::default(),
+            None,
+            cx,
+        ),
+        collaborator: None,
+    });
+    view.update(cx, |view, cx| {
+        view.host.update(cx, |thread, cx| {
+            thread.apply(agent_started(message_id, None, "Add 1 and 2"), cx);
+            for event in turn.iter().take(second_thinking_started) {
+                thread.apply(agent_event(message_id, event.clone()), cx);
+            }
+            let message = thread
+                .agent_message_mut(message_id.into_bytes())
+                .expect("the agent message");
+            let [
+                AgentStep::Thinking(first),
+                AgentStep::ToolCall(_),
+                AgentStep::Thinking(second),
+            ] = &message.output.steps[..]
+            else {
+                panic!("expected thinking, a call, and thinking");
+            };
+            assert_eq!((first.as_str(), second.as_str()), ("Add first.", "Now "));
+            assert!(!message.output.thinking_in_progress(0));
+            assert!(message.output.thinking_in_progress(2));
+            assert_eq!(message.step_views.len(), 3);
+            assert!(!message.step_views[0].expanded());
+
+            for event in turn.iter().skip(second_thinking_started) {
+                thread.apply(agent_event(message_id, event.clone()), cx);
+            }
+            thread.apply(
+                protocol::HostMessage::AgentEnded {
+                    id: message_id.into_bytes(),
+                    failure: None,
+                    duration: Duration::from_secs(1),
+                },
+                cx,
+            );
+        });
+        let host = view.host.read(cx);
+        let TimelineMessage::Agent(message) = &host.timeline[0] else {
+            panic!("expected the agent message");
+        };
+        assert_eq!(
+            message.output.thinking().collect::<Vec<_>>(),
+            ["Add first.", "Now answer."]
+        );
+        assert!(matches!(message.output.steps[1], AgentStep::ToolCall(_)));
+        assert_eq!(message.output.text, "It is 3.");
+        assert!(message.output.thinking_complete);
+
+        let welcome = protocol::Welcome {
+            participant_id: ParticipantId::new().into_bytes(),
+            thread: host.to_protocol(),
+            draft: host.draft.doc.encode_state(),
+            presence: Vec::new(),
+            stored_attachments: Vec::new(),
+        };
+        let restored = Thread::from_welcome(
+            welcome,
+            ThreadDraft::new(ParticipantId::new()),
+            ThreadSharing::NotShared,
+            cx,
+        );
+        assert_eq!(restored.conversation(), view.host.read(cx).conversation());
     });
 }
 

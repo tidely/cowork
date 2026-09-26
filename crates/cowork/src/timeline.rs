@@ -50,8 +50,10 @@ pub(crate) struct AgentMessage {
     /// How much of `output` comes from the run's transcript entries, which
     /// never change; the rest comes from the message the run is folding.
     pub(crate) committed: OutputMark,
-    /// `output`'s thinking and text, kept in step with it.
-    pub(crate) thinking_view: Entity<TextViewState>,
+    /// How each of `output`'s steps is shown, position for position, and the
+    /// view of its text. Kept in step with `output`, but not part of it: the
+    /// output is refolded on every event, and this state must outlive that.
+    pub(crate) step_views: Vec<StepView>,
     pub(crate) text_view: Entity<TextViewState>,
     /// The replies to comments among `output`'s tool calls. Kept rather than
     /// derived each time, since comments on a reply refer to its view.
@@ -59,11 +61,6 @@ pub(crate) struct AgentMessage {
     /// How many of `output`'s tool calls have been checked for replies to
     /// comments.
     pub(crate) comment_calls_checked: usize,
-
-    // Local view state.
-    /// Whether completed thinking is shown; thinking in progress always is.
-    pub(crate) thinking_expanded: bool,
-    pub(crate) tool_calls_expanded: bool,
 }
 
 /// What an agent message shows: a function of its run's output alone, the
@@ -72,23 +69,50 @@ pub(crate) struct AgentMessage {
 /// from the same messages; see `AgentOutput::of`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct AgentOutput {
-    pub(crate) thinking: String,
+    /// The agent's reasoning and tool calls, in the order it produced them.
+    pub(crate) steps: Vec<AgentStep>,
     /// False only while the model is still reasoning: the run is generating
-    /// and reasoning is the last part of the reply streaming.
+    /// and reasoning is the last part of the reply streaming. The last step
+    /// is then the thinking in progress.
     pub(crate) thinking_complete: bool,
+    /// The reply, all of it in one: comments on it are anchored by offsets
+    /// into this text.
     pub(crate) text: String,
-    pub(crate) tool_calls: Vec<AgentToolCall>,
 }
 
-/// Where an [`AgentOutput`]'s committed part ends: the lengths of its
-/// thinking, text, and tool calls, and how many of those calls have their
-/// results. Committed calls are answered in order, a reply's results all at
-/// once, so the answered ones come first.
+/// One step of an agent's work, as [`AgentOutput::steps`] orders them.
+// Most steps are tool calls, so boxing the larger variant would only add
+// an indirection.
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AgentStep {
+    /// A stretch of reasoning. Reasoning continues the previous step if that
+    /// is reasoning too, so consecutive steps are never both thinking.
+    Thinking(String),
+    ToolCall(AgentToolCall),
+}
+
+/// How an [`AgentStep`] is shown: local state, never sent.
+#[derive(Clone)]
+pub(crate) enum StepView {
+    /// Whether completed thinking is shown; thinking in progress always is.
+    Thinking {
+        view: Entity<TextViewState>,
+        expanded: bool,
+    },
+    /// Whether the call's input and output are shown.
+    ToolCall { expanded: bool },
+}
+
+/// Where an [`AgentOutput`]'s committed part ends: how many steps it has and,
+/// if the last is thinking, its length, the length of its text, and how many
+/// of its tool calls have their results. Committed calls are answered in
+/// order, a reply's results all at once, so the answered ones come first.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OutputMark {
-    pub(crate) thinking: usize,
+    pub(crate) steps: usize,
+    pub(crate) thinking_tail: usize,
     pub(crate) text: usize,
-    pub(crate) tool_calls: usize,
     pub(crate) answered: usize,
 }
 
@@ -113,6 +137,11 @@ impl AgentToolCall {
         pretty_json(&self.call.function.arguments)
     }
 
+    /// The arguments on one line, for the call's collapsed row.
+    pub(crate) fn arguments_summary(&self) -> String {
+        self.call.function.arguments.to_string()
+    }
+
     /// The result's content as text, one item per line.
     pub(crate) fn result_text(&self) -> Option<String> {
         let content = self.result.as_ref()?;
@@ -127,6 +156,54 @@ impl AgentToolCall {
                 .collect::<Vec<_>>()
                 .join("\n"),
         )
+    }
+}
+
+impl AgentOutput {
+    pub(crate) fn tool_calls(&self) -> impl DoubleEndedIterator<Item = &AgentToolCall> {
+        self.steps.iter().filter_map(|step| match step {
+            AgentStep::ToolCall(call) => Some(call),
+            AgentStep::Thinking(_) => None,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn thinking(&self) -> impl Iterator<Item = &str> {
+        self.steps.iter().filter_map(|step| match step {
+            AgentStep::Thinking(text) => Some(text.as_str()),
+            AgentStep::ToolCall(_) => None,
+        })
+    }
+
+    /// Whether step `index` is the thinking the model is still writing.
+    pub(crate) fn thinking_in_progress(&self, index: usize) -> bool {
+        !self.thinking_complete
+            && index + 1 == self.steps.len()
+            && matches!(self.steps[index], AgentStep::Thinking(_))
+    }
+}
+
+impl StepView {
+    pub(crate) fn new(step: &AgentStep, cx: &mut impl AppContext) -> Self {
+        match step {
+            AgentStep::Thinking(text) => Self::Thinking {
+                view: cx.new(|cx| TextViewState::markdown(text, cx)),
+                expanded: false,
+            },
+            AgentStep::ToolCall(_) => Self::ToolCall { expanded: false },
+        }
+    }
+
+    pub(crate) fn expanded(&self) -> bool {
+        match self {
+            Self::Thinking { expanded, .. } | Self::ToolCall { expanded } => *expanded,
+        }
+    }
+
+    pub(crate) fn set_expanded(&mut self, value: bool) {
+        match self {
+            Self::Thinking { expanded, .. } | Self::ToolCall { expanded } => *expanded = value,
+        }
     }
 }
 
@@ -317,12 +394,23 @@ impl AgentMessage {
             },
             committed: OutputMark::default(),
             comment_calls_checked: 0,
-            thinking_view: cx.new(|cx| TextViewState::markdown("", cx)),
+            step_views: Vec::new(),
             text_view: cx.new(|cx| TextViewState::markdown("", cx)),
             comment_responses: Vec::new(),
-            thinking_expanded: false,
-            tool_calls_expanded: false,
         }
+    }
+
+    /// Shows `output` afresh, with new views and everything collapsed.
+    #[cfg(test)]
+    pub(crate) fn show_output(&mut self, output: AgentOutput, cx: &mut impl AppContext) {
+        self.output = output;
+        self.step_views = self
+            .output
+            .steps
+            .iter()
+            .map(|step| StepView::new(step, cx))
+            .collect();
+        self.text_view = cx.new(|cx| TextViewState::markdown(&self.output.text, cx));
     }
 
     pub(crate) fn is_generating(&self) -> bool {

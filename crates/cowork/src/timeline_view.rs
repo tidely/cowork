@@ -17,7 +17,8 @@ use gpui_base::{
     RangeHighlight, RenderedText, SelectableText, TextSelection, TextView, TextViewState,
     TextViewStyle, Textarea, input::TextareaState, text::SelectionFormat,
 };
-use gpui_component::shimmer::ShimmerText;
+use gpui_component::{Icon, shimmer::ShimmerText};
+use gpui_kit_assets::IconName as AssetIconName;
 use uuid::Uuid;
 
 use crate::{
@@ -27,8 +28,8 @@ use crate::{
     participant::ParticipantId,
     thread_draft::{CARET_LABEL_DURATION, EditorSlot, RemoteCaret},
     timeline::{
-        AgentMessage, MessageAuthor, ThreadMessageId, TimelineMessage, UserComment,
-        UserCommentBody, UserMessageGroup,
+        AgentMessage, AgentStep, AgentToolCall, MessageAuthor, StepView, ThreadMessageId,
+        TimelineMessage, UserComment, UserCommentBody, UserMessageGroup,
     },
 };
 
@@ -679,7 +680,15 @@ impl Cowork {
             .child(div().w(px(40.)).flex_none())
     }
 
-    fn toggle_thinking(&mut self, thread_id: Uuid, message_id: Uuid, cx: &mut Context<Self>) {
+    /// Opens or closes step `step_index` of an agent message. Thinking in
+    /// progress is always open.
+    fn toggle_step(
+        &mut self,
+        thread_id: Uuid,
+        message_id: Uuid,
+        step_index: usize,
+        cx: &mut Context<Self>,
+    ) {
         let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
             return;
         };
@@ -687,10 +696,12 @@ impl Cowork {
             for entry in &mut thread.timeline {
                 if let TimelineMessage::Agent(message) = entry
                     && message.id == message_id
-                    && message.output.thinking_complete
-                    && !message.output.thinking.is_empty()
                 {
-                    message.thinking_expanded = !message.thinking_expanded;
+                    if !message.output.thinking_in_progress(step_index)
+                        && let Some(view) = message.step_views.get_mut(step_index)
+                    {
+                        view.set_expanded(!view.expanded());
+                    }
                     break;
                 }
             }
@@ -698,22 +709,206 @@ impl Cowork {
         cx.notify();
     }
 
-    fn toggle_tool_calls(&mut self, thread_id: Uuid, message_id: Uuid, cx: &mut Context<Self>) {
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
-            return;
-        };
-        thread.update(cx, |thread, _| {
-            for entry in &mut thread.timeline {
-                if let TimelineMessage::Agent(message) = entry
-                    && message.id == message_id
-                    && !message.output.tool_calls.is_empty()
-                {
-                    message.tool_calls_expanded = !message.tool_calls_expanded;
-                    break;
-                }
+    /// A stretch of the agent's reasoning: open while the model is writing
+    /// it, then collapsed to its header until someone opens it.
+    fn render_thinking(
+        thread_id: Uuid,
+        message: &AgentMessage,
+        step_index: usize,
+        view: &Entity<TextViewState>,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let message_id = message.id;
+        let in_progress = message.output.thinking_in_progress(step_index);
+        let expanded = in_progress
+            || message
+                .step_views
+                .get(step_index)
+                .is_some_and(StepView::expanded);
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(
+                div()
+                    .id(format!("toggle-thinking-{message_id}-{step_index}"))
+                    .debug_selector(move || format!("toggle-thinking-{message_id}-{step_index}"))
+                    .h(px(24.))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .text_sm()
+                    .text_color(rgb(0x71717a))
+                    .when(!in_progress, |this| {
+                        this.hover(|this| this.text_color(rgb(0xa1a1aa)))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.toggle_step(thread_id, message_id, step_index, cx);
+                            }))
+                    })
+                    .child(if in_progress {
+                        "Thinking…"
+                    } else {
+                        "Thinking"
+                    }),
+            )
+            .when(expanded, |this| {
+                this.child(
+                    div()
+                        .debug_selector(move || format!("thinking-{message_id}-{step_index}"))
+                        .pl_3()
+                        .border_l_1()
+                        .border_color(rgb(0x3f3f46))
+                        .opacity(0.7)
+                        .child(
+                            TextView::new(view)
+                                .selection_format(SelectionFormat::Plain)
+                                .style(Self::markdown_style())
+                                .w_full(),
+                        ),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// A tool call as one quiet line, which opens to show what went in and
+    /// what came out.
+    fn render_tool_call(
+        thread_id: Uuid,
+        message: &AgentMessage,
+        step_index: usize,
+        call: &AgentToolCall,
+        expanded: bool,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let message_id = message.id;
+        let running = call.result.is_none() && message.is_generating();
+        let label = |text: &'static str| div().text_xs().text_color(rgb(0x71717a)).child(text);
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .id(format!("tool-call-{message_id}-{step_index}"))
+                    .debug_selector(move || format!("tool-call-{message_id}-{step_index}"))
+                    .h(px(20.))
+                    .w_full()
+                    .min_w_0()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .cursor_pointer()
+                    .text_xs()
+                    .text_color(rgb(0x71717a))
+                    .hover(|this| this.text_color(rgb(0xa1a1aa)))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_step(thread_id, message_id, step_index, cx);
+                    }))
+                    .child(
+                        Icon::new(if expanded {
+                            AssetIconName::ChevronDown
+                        } else {
+                            AssetIconName::ChevronRight
+                        })
+                        .size_3()
+                        .flex_none(),
+                    )
+                    .child(div().flex_none().child(call.call.function.name.clone()))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .opacity(0.7)
+                            .child(call.arguments_summary()),
+                    )
+                    .when(running, |this| {
+                        this.child(div().flex_none().child("Running…"))
+                    }),
+            )
+            .when(expanded, |this| {
+                this.child(
+                    div()
+                        .id(format!("tool-call-details-{message_id}-{step_index}"))
+                        .debug_selector(move || {
+                            format!("tool-call-details-{message_id}-{step_index}")
+                        })
+                        .ml(px(6.))
+                        .mt_1()
+                        .mb_2()
+                        .pl_3()
+                        .border_l_1()
+                        .border_color(rgb(0x3f3f46))
+                        .opacity(0.7)
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .text_sm()
+                        .child(label("Input"))
+                        .child(div().child(call.arguments_text()))
+                        .child(label("Output"))
+                        .child(div().child(call.result_text().unwrap_or_else(|| {
+                            if running {
+                                "Running…".into()
+                            } else {
+                                "No result".into()
+                            }
+                        }))),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// An agent message's steps in order. Consecutive tool calls sit back
+    /// to back; thinking gets the timeline's usual spacing.
+    fn render_steps(
+        thread_id: Uuid,
+        message: &AgentMessage,
+        cx: &Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let mut rendered = Vec::new();
+        let mut calls = Vec::new();
+        let flush = |calls: &mut Vec<gpui::AnyElement>, rendered: &mut Vec<gpui::AnyElement>| {
+            if !calls.is_empty() {
+                rendered.push(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .children(calls.drain(..))
+                        .into_any_element(),
+                );
             }
-        });
-        cx.notify();
+        };
+        for (step_index, (step, view)) in message
+            .output
+            .steps
+            .iter()
+            .zip(&message.step_views)
+            .enumerate()
+        {
+            match (step, view) {
+                (AgentStep::ToolCall(call), view) => calls.push(Self::render_tool_call(
+                    thread_id,
+                    message,
+                    step_index,
+                    call,
+                    view.expanded(),
+                    cx,
+                )),
+                (AgentStep::Thinking(_), StepView::Thinking { view, .. }) => {
+                    flush(&mut calls, &mut rendered);
+                    rendered.push(Self::render_thinking(
+                        thread_id, message, step_index, view, cx,
+                    ));
+                }
+                // The views are kept in step with the output.
+                (AgentStep::Thinking(_), StepView::ToolCall { .. }) => {}
+            }
+        }
+        flush(&mut calls, &mut rendered);
+        rendered
     }
 
     pub(crate) fn render_agent_text(
@@ -874,9 +1069,8 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let waiting = message.is_generating()
-            && message.output.thinking.is_empty()
-            && message.output.text.is_empty()
-            && message.output.tool_calls.is_empty();
+            && message.output.steps.is_empty()
+            && message.output.text.is_empty();
         let mut submitted_comment_content = Vec::new();
         for comment in submitted_comments {
             submitted_comment_content.push(self.render_composer_comment(comment));
@@ -935,129 +1129,13 @@ impl Cowork {
         );
 
         let message_id = message.id;
-        let thinking_expanded = !message.output.thinking_complete || message.thinking_expanded;
-        let thinking_content =
-            (!message.output.thinking.is_empty() && thinking_expanded).then(|| {
-                TextView::new(&message.thinking_view)
-                    .selection_format(SelectionFormat::Plain)
-                    .style(Self::markdown_style())
-                    .w_full()
-                    .into_any_element()
-            });
-        let thinking = (!message.output.thinking.is_empty()).then(|| {
-            div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(
-                    div()
-                        .id(format!("toggle-thinking-{message_id}"))
-                        .h(px(24.))
-                        .flex()
-                        .items_center()
-                        .cursor_pointer()
-                        .text_sm()
-                        .text_color(rgb(0x71717a))
-                        .when(message.output.thinking_complete, |this| {
-                            this.hover(|this| this.text_color(rgb(0xa1a1aa)))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.toggle_thinking(thread_id, message_id, cx);
-                                }))
-                        })
-                        .child(if message.output.thinking_complete {
-                            "Thinking"
-                        } else {
-                            "Thinking…"
-                        }),
-                )
-                .children(thinking_content.map(|content| {
-                    div()
-                        .pl_3()
-                        .border_l_1()
-                        .border_color(rgb(0x3f3f46))
-                        .opacity(0.7)
-                        .child(content)
-                }))
-        });
         // Only surfaced when the agent said nothing itself.
         let failure = message
             .run
             .failure()
             .filter(|_| message.output.text.is_empty())
             .map(|failure| div().child(failure.to_owned()));
-        let tool_calls = (!message.output.tool_calls.is_empty()).then(|| {
-            let count = message.output.tool_calls.len();
-            let label = |text: &'static str| div().text_xs().text_color(rgb(0x71717a)).child(text);
-            div()
-                .w_full()
-                .flex()
-                .flex_col()
-                .gap_2()
-                .child(
-                    div()
-                        .id(format!("toggle-tool-calls-{message_id}"))
-                        .debug_selector(move || format!("toggle-tool-calls-{message_id}"))
-                        .h(px(24.))
-                        .flex()
-                        .items_center()
-                        .cursor_pointer()
-                        .text_sm()
-                        .text_color(rgb(0x71717a))
-                        .hover(|this| this.text_color(rgb(0xa1a1aa)))
-                        .on_click(cx.listener(move |this, _, _, cx| {
-                            this.toggle_tool_calls(thread_id, message_id, cx);
-                        }))
-                        .child(format!(
-                            "Agent called {count} tool{}",
-                            if count == 1 { "" } else { "s" }
-                        )),
-                )
-                .when(message.tool_calls_expanded, |this| {
-                    this.child(
-                        div()
-                            .pl_3()
-                            .border_l_1()
-                            .border_color(rgb(0x3f3f46))
-                            .opacity(0.7)
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .children(message.output.tool_calls.iter().enumerate().map(
-                                |(call_index, call)| {
-                                    // By position: Rig may mint the same id for
-                                    // id-less calls of different replies.
-                                    div()
-                                        .id(format!("tool-call-{message_id}-{call_index}"))
-                                        .debug_selector(move || {
-                                            format!("tool-call-{message_id}-{call_index}")
-                                        })
-                                        .flex()
-                                        .flex_col()
-                                        .gap_1()
-                                        .text_sm()
-                                        .child(
-                                            div()
-                                                .text_color(rgb(0xa1a1aa))
-                                                .child(call.call.function.name.clone()),
-                                        )
-                                        .child(label("Arguments"))
-                                        .child(div().child(call.arguments_text()))
-                                        .child(label("Result"))
-                                        .child(div().child(call.result_text().unwrap_or_else(
-                                            || {
-                                                if message.is_generating() {
-                                                    "Running…".into()
-                                                } else {
-                                                    "No result".into()
-                                                }
-                                            },
-                                        )))
-                                },
-                            )),
-                    )
-                })
-        });
+        let steps = Self::render_steps(thread_id, message, cx);
         div()
             .id(("timeline-message", index))
             .on_mouse_down(
@@ -1095,8 +1173,7 @@ impl Cowork {
                                 .text_color(rgb(0x8b8b95)),
                         )
                     })
-                    .children(thinking)
-                    .children(tool_calls)
+                    .children(steps)
                     .children(message_content)
                     .children(failure),
             )
