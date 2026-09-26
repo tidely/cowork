@@ -72,12 +72,9 @@ impl AgentEventMessage {
 }
 
 impl Thread {
-    pub(crate) fn push_transcript(&mut self, message: &TranscriptMessage) {
-        match message.to_rig() {
-            Ok(message) => self.transcript.push(message),
-            // Leaves this copy's transcript short; nothing else can be done.
-            Err(error) => eprintln!("{error:#}"),
-        }
+    pub(crate) fn push_transcript(&mut self, message: &TranscriptMessage) -> anyhow::Result<()> {
+        self.transcript.push(message.to_rig()?);
+        Ok(())
     }
 
     /// Folds an event of the agent producing message `message_id` into it
@@ -87,22 +84,20 @@ impl Thread {
         message_id: Uuid,
         event: AgentEventMessage,
         cx: &mut impl AppContext,
-    ) {
-        let decoded = match event.to_agent() {
-            Ok(decoded) => decoded,
-            Err(error) => {
-                eprintln!("{error:#}");
-                return;
-            }
-        };
+    ) -> anyhow::Result<()> {
+        let decoded = event.to_agent()?;
         self.agent_events.push(event);
         let block = self.fold_agent_event(&decoded);
         self.show_agent_event(message_id, &decoded, block, cx);
+        Ok(())
     }
 
     /// Picks up the running agent's turn from a snapshot: its transcript,
     /// and the events since the transcript last grew.
-    pub(crate) fn resume_agent_turn(&mut self, events: Vec<AgentEventMessage>) {
+    pub(crate) fn resume_agent_turn(
+        &mut self,
+        events: Vec<AgentEventMessage>,
+    ) -> anyhow::Result<()> {
         self.agent_turn = self
             .transcript
             .last()
@@ -110,15 +105,12 @@ impl Thread {
             .unwrap_or_default();
         self.agent_events.clear();
         for event in events {
-            match event.to_agent() {
-                Ok(decoded) => {
-                    self.agent_events.push(event);
-                    // The snapshot's timeline already shows them.
-                    self.fold_agent_event(&decoded);
-                }
-                Err(error) => eprintln!("{error:#}"),
-            }
+            let decoded = event.to_agent()?;
+            self.agent_events.push(event);
+            // The snapshot's timeline already shows them.
+            self.fold_agent_event(&decoded);
         }
+        Ok(())
     }
 
     /// Folds an event into the transcript. Returns the block of the reply it

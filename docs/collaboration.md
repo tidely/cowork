@@ -445,6 +445,9 @@ This is independent of the draft document and is the first feature to build.
   empty-item and incomplete-upload cleanup described above.
 - **Host disconnects**: the session ends and collaborators' copies of the
   thread are removed, as today. Host migration is out of scope.
+- **Invalid host data**: if a transcript message or agent event from the host
+  is not valid Rig JSON, the collaborator treats it as a protocol error and
+  removes its mirrored thread. The application stays open.
 
 Nothing is persisted. A draft lives as long as its thread exists in the
 host's app.

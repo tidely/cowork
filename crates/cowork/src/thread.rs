@@ -8,6 +8,7 @@ use std::{
 };
 
 use agent::TurnFold;
+use anyhow::Context as _;
 use draft::{AttachmentId, ItemId};
 use gpui::{App, AppContext, Entity, SharedString};
 use iroh::{Endpoint, endpoint::Connection};
@@ -212,11 +213,38 @@ impl Thread {
         thread
     }
 
+    /// Validates the nested Rig JSON in an untrusted host snapshot before an
+    /// entity is created or existing thread state is changed.
+    pub(crate) fn validate_welcome(welcome: &protocol::Welcome) -> anyhow::Result<()> {
+        for (index, message) in welcome.thread.transcript.iter().enumerate() {
+            message
+                .to_rig()
+                .with_context(|| format!("invalid transcript message {index} from host"))?;
+        }
+        for (index, event) in welcome.thread.agent_events.iter().enumerate() {
+            event
+                .to_agent()
+                .with_context(|| format!("invalid agent event {index} from host"))?;
+        }
+        Ok(())
+    }
+
     /// Replaces everything the host is authoritative for with its snapshot.
     ///
     /// The draft is merged rather than replaced: local edits the host has
     /// not received yet are still on their way to it and must survive.
     pub(crate) fn rebase(&mut self, welcome: protocol::Welcome, cx: &mut impl AppContext) {
+        self.try_rebase(welcome, cx)
+            .expect("a valid thread snapshot");
+    }
+
+    /// Applies a snapshot received from the host.
+    pub(crate) fn try_rebase(
+        &mut self,
+        welcome: protocol::Welcome,
+        cx: &mut impl AppContext,
+    ) -> anyhow::Result<()> {
+        Self::validate_welcome(&welcome)?;
         let protocol::Welcome {
             participant_id,
             mut thread,
@@ -224,6 +252,16 @@ impl Thread {
             presence,
             stored_attachments,
         } = welcome;
+        let transcript = thread
+            .transcript
+            .iter()
+            .enumerate()
+            .map(|(index, message)| {
+                message
+                    .to_rig()
+                    .with_context(|| format!("invalid transcript message {index} from host"))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
         self.draft.stored = stored_attachments
             .into_iter()
             .map(|id| AttachmentId::from_uuid(Uuid::from_bytes(id)))
@@ -261,16 +299,7 @@ impl Thread {
         self.model = thread.model.take();
         self.context_tokens = thread.context_tokens;
         self.streamed_bytes = thread.streamed_bytes;
-        self.transcript = thread
-            .transcript
-            .iter()
-            .filter_map(|message| {
-                message
-                    .to_rig()
-                    .inspect_err(|error| eprintln!("{error:#}"))
-                    .ok()
-            })
-            .collect();
+        self.transcript = transcript;
         self.prompt_names = std::mem::take(&mut thread.prompt_names)
             .into_iter()
             .map(|(participant, name)| (ParticipantId::from_bytes(participant), name.into()))
@@ -279,7 +308,8 @@ impl Thread {
         let (summary, timeline) = thread.into_native(cx);
         self.summary = summary;
         self.set_timeline(timeline);
-        self.resume_agent_turn(agent_events);
+        self.resume_agent_turn(agent_events)?;
+        Ok(())
     }
 
     pub(crate) fn to_protocol(&self) -> protocol::ThreadSnapshot {
@@ -685,8 +715,17 @@ impl Thread {
 
     /// Folds a thread event into the timeline.
     pub(crate) fn apply(&mut self, event: protocol::HostMessage, cx: &mut impl AppContext) {
+        self.try_apply(event, cx).expect("a valid thread event");
+    }
+
+    /// Applies an event received from an untrusted host.
+    pub(crate) fn try_apply(
+        &mut self,
+        event: protocol::HostMessage,
+        cx: &mut impl AppContext,
+    ) -> anyhow::Result<()> {
         match event {
-            protocol::HostMessage::Welcome(welcome) => self.rebase(*welcome, cx),
+            protocol::HostMessage::Welcome(welcome) => self.try_rebase(*welcome, cx)?,
             // Only ever sent in place of the first `Welcome`, which the join
             // handshake consumes.
             protocol::HostMessage::Rejected(_) => {}
@@ -761,6 +800,7 @@ impl Thread {
                 started_at,
                 prompt,
             } => {
+                self.push_transcript(&prompt)?;
                 self.timeline.push(TimelineMessage::Agent(AgentMessage::new(
                     Uuid::from_bytes(id),
                     comment_group_id.map(Uuid::from_bytes),
@@ -768,12 +808,11 @@ impl Thread {
                     cx,
                 )));
                 self.generating = true;
-                self.push_transcript(&prompt);
                 self.agent_turn = TurnFold::default();
                 self.agent_events.clear();
             }
             protocol::HostMessage::AgentEvent { id, event } => {
-                self.apply_agent_event(Uuid::from_bytes(id), event, cx);
+                self.apply_agent_event(Uuid::from_bytes(id), event, cx)?;
             }
             protocol::HostMessage::PromptNamed { participant, name } => {
                 self.prompt_names
@@ -791,7 +830,7 @@ impl Thread {
                 self.agent_turn = TurnFold::default();
                 self.agent_events.clear();
                 let Some(message) = self.agent_message_mut(id) else {
-                    return;
+                    return Ok(());
                 };
                 message.complete = true;
                 message.thinking_complete = true;
@@ -808,6 +847,7 @@ impl Thread {
                 }
             }
         }
+        Ok(())
     }
 
     /// How long the agent has spent generating in this thread.

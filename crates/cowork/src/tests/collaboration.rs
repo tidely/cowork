@@ -430,6 +430,30 @@ fn a_joined_thread_closes_when_the_host_stops_sharing(cx: &mut gpui::TestAppCont
 }
 
 #[gpui::test]
+fn a_joined_thread_closes_when_the_host_sends_invalid_json(cx: &mut gpui::TestAppContext) {
+    let mut session = Collaboration::start(cx);
+    session.host_thread.read_with(session.cx, |thread, _| {
+        thread.publish(protocol::HostMessage::AgentEvent {
+            id: Uuid::new_v4().into_bytes(),
+            event: protocol::AgentEventMessage("not json".into()),
+        });
+    });
+
+    session.wait_until("the collaborator rejects the invalid host event", |this| {
+        this.collaborator.read_with(this.cx, |collaborator, cx| {
+            collaborator.active_thread_id.is_none()
+                && collaborator.thread_store.read(cx).threads.is_empty()
+        })
+    });
+
+    assert!(
+        session
+            .host
+            .read_with(session.cx, |host, cx| { host.active_thread(cx).is_some() })
+    );
+}
+
+#[gpui::test]
 fn the_host_sees_where_the_collaborator_is_typing(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
     let collaborator_thread = session.collaborator_thread().expect("joined");

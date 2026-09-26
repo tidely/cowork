@@ -758,14 +758,22 @@ impl Cowork {
                 endpoint,
                 _connection: connection,
             };
-            if this
-                .update(cx, move |this, cx| {
-                    this.mirror_thread(welcome, host, Some(link), cx);
-                    this.join_dialog = None;
-                })
-                .is_err()
-            {
-                return;
+            let mirrored = this.update(cx, move |this, cx| {
+                let thread_id = this.mirror_thread(welcome, host, Some(link), cx)?;
+                this.join_dialog = None;
+                Ok::<_, anyhow::Error>(thread_id)
+            });
+            match mirrored {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    eprintln!("failed to open shared thread: {error:#}");
+                    dialog.update(cx, |dialog, _| {
+                        dialog.status = JoinStatus::Failed(error.to_string());
+                    });
+                    _ = this.update(cx, |_, cx| cx.notify());
+                    return;
+                }
+                Err(_) => return,
             }
             _ = cx.update_window(window_handle, |_, window, cx| {
                 window.close_dialog(cx);
@@ -783,7 +791,8 @@ impl Cowork {
         host: ThreadHost,
         link: Option<PeerLink>,
         cx: &mut Context<Self>,
-    ) -> Uuid {
+    ) -> anyhow::Result<Uuid> {
+        Thread::validate_welcome(&welcome)?;
         let (host_requests, uploads, events) = host.split();
         let (requests, queued_requests) = async_channel::unbounded();
         cx.background_spawn(async move {
@@ -829,7 +838,10 @@ impl Cowork {
                     protocol::HostMessage::Presence { .. }
                         | protocol::HostMessage::AttachmentData(_)
                 );
-                thread.update(cx, |thread, cx| thread.apply(event, cx));
+                if let Err(error) = thread.update(cx, |thread, cx| thread.try_apply(event, cx)) {
+                    eprintln!("closed shared thread after invalid event from host: {error:#}");
+                    break;
+                }
                 if this
                     .update(cx, |this, cx| {
                         if presence_only {
@@ -847,7 +859,7 @@ impl Cowork {
             _ = this.update(cx, |this, cx| this.remove_mirrored_thread(thread_id, cx));
         })
         .detach();
-        thread_id
+        Ok(thread_id)
     }
 
     /// Closes a joined thread, which has nothing left to show once it is no

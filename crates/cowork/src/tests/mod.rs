@@ -641,7 +641,9 @@ impl<'a> Collaboration<'a> {
                     panic!("expected a welcome");
                 };
                 collaborator.update(cx, |collaborator, cx| {
-                    collaborator.mirror_thread(*welcome, collaborator_end, None, cx);
+                    collaborator
+                        .mirror_thread(*welcome, collaborator_end, None, cx)
+                        .expect("valid welcome");
                 });
             })
             .detach();
