@@ -687,10 +687,28 @@ impl Cowork {
             for entry in &mut thread.timeline {
                 if let TimelineMessage::Agent(message) = entry
                     && message.id == message_id
-                    && message.thinking_complete
-                    && !message.thinking.is_empty()
+                    && message.output.thinking_complete
+                    && !message.output.thinking.is_empty()
                 {
                     message.thinking_expanded = !message.thinking_expanded;
+                    break;
+                }
+            }
+        });
+        cx.notify();
+    }
+
+    fn toggle_tool_calls(&mut self, thread_id: Uuid, message_id: Uuid, cx: &mut Context<Self>) {
+        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+            return;
+        };
+        thread.update(cx, |thread, _| {
+            for entry in &mut thread.timeline {
+                if let TimelineMessage::Agent(message) = entry
+                    && message.id == message_id
+                    && !message.output.tool_calls.is_empty()
+                {
+                    message.tool_calls_expanded = !message.tool_calls_expanded;
                     break;
                 }
             }
@@ -855,7 +873,10 @@ impl Cowork {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let waiting = !message.complete && message.thinking.is_empty() && message.text.is_empty();
+        let waiting = message.is_generating()
+            && message.output.thinking.is_empty()
+            && message.output.text.is_empty()
+            && message.output.tool_calls.is_empty();
         let mut submitted_comment_content = Vec::new();
         for comment in submitted_comments {
             submitted_comment_content.push(self.render_composer_comment(comment));
@@ -905,7 +926,7 @@ impl Cowork {
                 thread_id,
                 message_id: message.id,
             },
-            &message.text,
+            &message.output.text,
             &message.text_view,
             comments,
             wrap_width,
@@ -914,15 +935,16 @@ impl Cowork {
         );
 
         let message_id = message.id;
-        let thinking_expanded = !message.thinking_complete || message.thinking_expanded;
-        let thinking_content = (!message.thinking.is_empty() && thinking_expanded).then(|| {
-            TextView::new(&message.thinking_view)
-                .selection_format(SelectionFormat::Plain)
-                .style(Self::markdown_style())
-                .w_full()
-                .into_any_element()
-        });
-        let thinking = (!message.thinking.is_empty()).then(|| {
+        let thinking_expanded = !message.output.thinking_complete || message.thinking_expanded;
+        let thinking_content =
+            (!message.output.thinking.is_empty() && thinking_expanded).then(|| {
+                TextView::new(&message.thinking_view)
+                    .selection_format(SelectionFormat::Plain)
+                    .style(Self::markdown_style())
+                    .w_full()
+                    .into_any_element()
+            });
+        let thinking = (!message.output.thinking.is_empty()).then(|| {
             div()
                 .w_full()
                 .flex()
@@ -937,13 +959,13 @@ impl Cowork {
                         .cursor_pointer()
                         .text_sm()
                         .text_color(rgb(0x71717a))
-                        .when(message.thinking_complete, |this| {
+                        .when(message.output.thinking_complete, |this| {
                             this.hover(|this| this.text_color(rgb(0xa1a1aa)))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.toggle_thinking(thread_id, message_id, cx);
                                 }))
                         })
-                        .child(if message.thinking_complete {
+                        .child(if message.output.thinking_complete {
                             "Thinking"
                         } else {
                             "Thinking…"
@@ -957,6 +979,84 @@ impl Cowork {
                         .opacity(0.7)
                         .child(content)
                 }))
+        });
+        // Only surfaced when the agent said nothing itself.
+        let failure = message
+            .run
+            .failure()
+            .filter(|_| message.output.text.is_empty())
+            .map(|failure| div().child(failure.to_owned()));
+        let tool_calls = (!message.output.tool_calls.is_empty()).then(|| {
+            let count = message.output.tool_calls.len();
+            let label = |text: &'static str| div().text_xs().text_color(rgb(0x71717a)).child(text);
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    div()
+                        .id(format!("toggle-tool-calls-{message_id}"))
+                        .debug_selector(move || format!("toggle-tool-calls-{message_id}"))
+                        .h(px(24.))
+                        .flex()
+                        .items_center()
+                        .cursor_pointer()
+                        .text_sm()
+                        .text_color(rgb(0x71717a))
+                        .hover(|this| this.text_color(rgb(0xa1a1aa)))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.toggle_tool_calls(thread_id, message_id, cx);
+                        }))
+                        .child(format!(
+                            "Agent called {count} tool{}",
+                            if count == 1 { "" } else { "s" }
+                        )),
+                )
+                .when(message.tool_calls_expanded, |this| {
+                    this.child(
+                        div()
+                            .pl_3()
+                            .border_l_1()
+                            .border_color(rgb(0x3f3f46))
+                            .opacity(0.7)
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .children(message.output.tool_calls.iter().enumerate().map(
+                                |(call_index, call)| {
+                                    // By position: Rig may mint the same id for
+                                    // id-less calls of different replies.
+                                    div()
+                                        .id(format!("tool-call-{message_id}-{call_index}"))
+                                        .debug_selector(move || {
+                                            format!("tool-call-{message_id}-{call_index}")
+                                        })
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .text_sm()
+                                        .child(
+                                            div()
+                                                .text_color(rgb(0xa1a1aa))
+                                                .child(call.call.function.name.clone()),
+                                        )
+                                        .child(label("Arguments"))
+                                        .child(div().child(call.arguments_text()))
+                                        .child(label("Result"))
+                                        .child(div().child(call.result_text().unwrap_or_else(
+                                            || {
+                                                if message.is_generating() {
+                                                    "Running…".into()
+                                                } else {
+                                                    "No result".into()
+                                                }
+                                            },
+                                        )))
+                                },
+                            )),
+                    )
+                })
         });
         div()
             .id(("timeline-message", index))
@@ -984,7 +1084,9 @@ impl Cowork {
                     .flex()
                     .flex_col()
                     .gap_3()
-                    .when(message.failed, |this| this.text_color(rgb(0xf87171)))
+                    .when(message.run.failure().is_some(), |this| {
+                        this.text_color(rgb(0xf87171))
+                    })
                     .children(submitted_comment_content)
                     .when(waiting, |this| {
                         this.child(
@@ -994,7 +1096,9 @@ impl Cowork {
                         )
                     })
                     .children(thinking)
-                    .children(message_content),
+                    .children(tool_calls)
+                    .children(message_content)
+                    .children(failure),
             )
             .child(div().w(px(40.)).flex_none())
             .into_any_element()

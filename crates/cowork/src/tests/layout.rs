@@ -41,6 +41,97 @@ fn sidebar_bottom_bar_lines_up_with_the_main_bottom_bar(cx: &mut gpui::TestAppCo
 }
 
 #[gpui::test]
+fn tool_calls_expand_and_collapse_in_the_timeline(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let thread_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let mut message = AgentMessage::new(
+            message_id,
+            None,
+            SystemTime::UNIX_EPOCH,
+            0,
+            crate::protocol::AgentRun::Ended {
+                failure: None,
+                duration: Duration::from_secs(1),
+            },
+            Vec::new(),
+            cx,
+        );
+        let call = |id: &str, arguments: serde_json::Value| {
+            rig::message::ToolCall::new(
+                rig::message::ToolCallId::new(id).expect("a valid id"),
+                rig::message::ToolFunction::new("calculate".into(), arguments),
+            )
+        };
+        message.output.tool_calls = vec![
+            crate::timeline::AgentToolCall {
+                call: call(
+                    "first",
+                    serde_json::json!({"a": 1, "b": 2, "operation": "add"}),
+                ),
+                result: Some(vec![rig::completion::message::ToolResultContent::text("3")]),
+            },
+            crate::timeline::AgentToolCall {
+                call: call(
+                    "second",
+                    serde_json::json!({"a": 3, "b": 2, "operation": "multiply"}),
+                ),
+                result: None,
+            },
+        ];
+        let thread = cx.new(|_| {
+            test_thread(
+                thread_id,
+                vec![TimelineMessage::Agent(message)],
+                ThreadDraft::new(ParticipantId::new()),
+            )
+        });
+        let thread_store = cx.new(|_| ThreadStore {
+            threads: VecDeque::from([thread]),
+        });
+        Root::new(
+            cx.new(|cx| {
+                test_cowork(
+                    thread_store,
+                    Some(thread_id),
+                    runtime.handle().clone(),
+                    window,
+                    cx,
+                )
+            }),
+            window,
+            cx,
+        )
+    });
+    let cowork = root.read_with(cx, |root, _| {
+        root.view().clone().downcast::<Cowork>().unwrap()
+    });
+    let header_id: &'static str =
+        Box::leak(format!("toggle-tool-calls-{message_id}").into_boxed_str());
+    let first_id: &'static str = Box::leak(format!("tool-call-{message_id}-0").into_boxed_str());
+    let second_id: &'static str = Box::leak(format!("tool-call-{message_id}-1").into_boxed_str());
+    cx.run_until_parked();
+    let header = cx.debug_bounds(header_id).expect("tool call summary");
+    assert!(cx.debug_bounds(first_id).is_none());
+    cx.simulate_click(header.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds(first_id).is_some());
+    assert!(cx.debug_bounds(second_id).is_some());
+    assert!(cowork.read_with(cx, |cowork, cx| {
+        let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
+        matches!(&thread.read(cx).timeline[0], TimelineMessage::Agent(message) if message.tool_calls_expanded)
+    }));
+    let header = cx.debug_bounds(header_id).unwrap();
+    cx.simulate_click(header.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds(first_id).is_none());
+}
+
+#[gpui::test]
 fn context_indicator_sits_left_of_the_model_picker(cx: &mut gpui::TestAppContext) {
     let (_cowork, _runtime, cx) = composer_test_cowork(cx);
 

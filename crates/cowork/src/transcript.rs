@@ -7,27 +7,46 @@
 //!
 //! The host forwards what its agent loop reports ([`AgentEvent`]s) as it
 //! happens, and every participant, the host included, folds them with the
-//! agent crate's [`TurnFold`]: into the agent message the timeline shows,
-//! live, and into the transcript, which ends up exactly as the loop recorded
-//! it. So every copy of a thread holds the same conversation.
+//! agent crate's [`TurnFold`] into the transcript, which ends up exactly as
+//! the loop recorded it.
+//!
+//! What an agent message shows ([`AgentOutput`]) is never sent. It is a
+//! function of Rig messages alone: the ones its run added to the transcript,
+//! followed by the message it is folding, as far as it has come
+//! ([`TurnFold::partial`], Rig's own accumulation of the stream). That
+//! message is the fold of the run's pending events, the events since its
+//! output last joined the transcript, which a snapshot carries raw. So
+//! someone joining rebuilds it exactly, and every copy shows the same.
+//!
+//! Live, the transcript part never changes, so only the rest is redone per
+//! event: a message rewinds its output to where the committed part ends,
+//! adds a message that has just joined the transcript, if any, and then the
+//! partial one. An event costs as much as the turn in progress, not the run.
+
+use std::ops::Range;
 
 use agent::{AgentEvent, TurnFold};
 use anyhow::Context as _;
 use gpui::AppContext;
 use gpui_base::TextViewState;
 use rig::{
-    completion::{AssistantContent, Message as RigMessage},
-    message::ToolCall,
-    streaming::{BlockClose, Delta, StreamEvent},
+    completion::{
+        AssistantContent, Message as RigMessage,
+        message::{ToolResultContent, UserContent},
+    },
+    message::{ToolCall, ToolCallId},
+    streaming::{Delta, StreamEvent},
     tool::Tool as _,
 };
 use tools::{RespondToComment, RespondToCommentArgs, TurnComments};
 use uuid::Uuid;
 
 use crate::{
-    protocol::Json,
+    protocol::{self, AgentRun, Json},
     thread::Thread,
-    timeline::{AgentCommentResponse, TimelineMessage},
+    timeline::{
+        AgentCommentResponse, AgentMessage, AgentOutput, AgentToolCall, OutputMark, TimelineMessage,
+    },
     usage::usage_tokens,
 };
 
@@ -70,14 +89,80 @@ impl Json<AgentEvent> {
     }
 }
 
+/// The transcript entries each run output, given where each run's prompt is,
+/// in timeline order: those after its prompt, up to the next run's. Prompts
+/// must be increasing and within the transcript; see [`validate_agent_runs`].
+fn run_outputs(prompts: &[usize], transcript_len: usize) -> Vec<Range<usize>> {
+    prompts
+        .iter()
+        .enumerate()
+        .map(|(index, prompt)| {
+            let end = prompts.get(index + 1).copied().unwrap_or(transcript_len);
+            prompt + 1..end
+        })
+        .collect()
+}
+
+/// A fold resuming after a run's output that joined the transcript, `output`
+/// of [`run_outputs`]. With no output yet, that is after its prompt.
+fn fold_after(transcript: &[RigMessage], output: &Range<usize>) -> TurnFold {
+    TurnFold::after(&transcript[output.end - 1])
+}
+
+/// Checks that a snapshot's agent messages, in timeline order, describe runs
+/// `transcript` can hold: each prompt is a user message there, in order;
+/// only the last run can still be generating; and each run's pending events
+/// continue its output without completing a message, which would have
+/// joined the transcript.
+pub(crate) fn validate_agent_runs(
+    transcript: &[RigMessage],
+    messages: &[&protocol::AgentMessage],
+) -> anyhow::Result<()> {
+    let prompts = messages
+        .iter()
+        .map(|message| message.prompt)
+        .collect::<Vec<_>>();
+    for (index, prompt) in prompts.iter().enumerate() {
+        anyhow::ensure!(
+            matches!(transcript.get(*prompt), Some(RigMessage::User { .. })),
+            "agent message {index}'s prompt is not a user message of the transcript"
+        );
+        anyhow::ensure!(
+            index == 0 || prompts[index - 1] < *prompt,
+            "agent message {index}'s prompt comes before the previous one's"
+        );
+    }
+    for (index, (message, output)) in messages
+        .iter()
+        .zip(run_outputs(&prompts, transcript.len()))
+        .enumerate()
+    {
+        anyhow::ensure!(
+            index + 1 == messages.len() || !message.run.is_generating(),
+            "agent message {index} is generating, but is not the last"
+        );
+        let mut fold = fold_after(transcript, &output);
+        for (event_index, event) in message.pending_events.iter().enumerate() {
+            let event = event.to_agent().with_context(|| {
+                format!("invalid pending event {event_index} of agent message {index}")
+            })?;
+            anyhow::ensure!(
+                fold.apply(&event).message.is_none(),
+                "agent message {index}'s pending events complete a message the transcript lacks"
+            );
+        }
+    }
+    Ok(())
+}
+
 impl Thread {
     pub(crate) fn push_transcript(&mut self, message: &Json<RigMessage>) -> anyhow::Result<()> {
         self.transcript.push(message.to_rig()?);
         Ok(())
     }
 
-    /// Folds an event of the agent producing message `message_id` into it
-    /// and into the transcript.
+    /// Folds an event of the agent producing message `message_id` into the
+    /// transcript, and shows the message's output as it now stands.
     pub(crate) fn apply_agent_event(
         &mut self,
         message_id: Uuid,
@@ -85,88 +170,92 @@ impl Thread {
         cx: &mut impl AppContext,
     ) -> anyhow::Result<()> {
         let decoded = event.to_agent()?;
-        self.agent_events.push(event);
-        let block = self.fold_agent_event(&decoded);
-        self.show_agent_event(message_id, &decoded, block, cx);
+        let folded = self.agent_turn.apply(&decoded);
+        let completed = folded.message.is_some();
+        self.transcript.extend(folded.message);
+        self.measure_agent_event(&decoded);
+        let partial = self.agent_turn.partial();
+        let Some(message) = agent_message(&mut self.timeline, message_id) else {
+            return Ok(());
+        };
+        if completed {
+            message.pending_events.clear();
+        } else {
+            message.pending_events.push(event);
+        }
+        let completed = completed.then(|| self.transcript.last()).flatten();
+        message.advance(completed, partial.as_ref(), cx);
+        self.show_comment_responses(message_id, cx);
         Ok(())
     }
 
-    /// Picks up the running agent's turn from a snapshot: its transcript,
-    /// and the events since the transcript last grew.
-    pub(crate) fn resume_agent_turn(
+    /// Ends the run producing message `id`. What it streamed that never
+    /// joined the transcript stays in the message's pending events.
+    pub(crate) fn end_agent_run(
         &mut self,
-        events: Vec<Json<AgentEvent>>,
-    ) -> anyhow::Result<()> {
-        self.agent_turn = self
-            .transcript
-            .last()
-            .map(TurnFold::after)
-            .unwrap_or_default();
-        self.agent_events.clear();
-        for event in events {
-            let decoded = event.to_agent()?;
-            self.agent_events.push(event);
-            // The snapshot's timeline already shows them.
-            self.fold_agent_event(&decoded);
-        }
-        Ok(())
-    }
-
-    /// Folds an event into the transcript. Returns the block of the reply it
-    /// completed, if any.
-    fn fold_agent_event(&mut self, event: &AgentEvent) -> Option<AssistantContent> {
-        let folded = self.agent_turn.apply(event);
-        if let Some(message) = folded.message {
-            self.transcript.push(message);
-            self.agent_events.clear();
-        }
-        folded.block
-    }
-
-    /// Shows an event in agent message `message_id`: its streamed text and
-    /// thinking, its replies to comments, and the context measured.
-    fn show_agent_event(
-        &mut self,
-        message_id: Uuid,
-        event: &AgentEvent,
-        block: Option<AssistantContent>,
+        id: uuid::Bytes,
+        failure: Option<String>,
+        duration: std::time::Duration,
         cx: &mut impl AppContext,
     ) {
+        let partial = self.agent_turn.partial();
+        self.generating = false;
+        // A request that was stopped or failed before it reported usage
+        // never adds its partial output to the transcript.
+        self.streamed_bytes = 0;
+        self.agent_turn = TurnFold::default();
+        let Some(message) = self.agent_message_mut(id) else {
+            return;
+        };
+        message.run = AgentRun::Ended { failure, duration };
+        message.advance(None, partial.as_ref(), cx);
+    }
+
+    /// Shows the output of every agent message of a timeline fresh from a
+    /// snapshot, and resumes folding the running one. A run's partial message
+    /// is rebuilt by folding its pending events, as it was where they were
+    /// folded. The snapshot must have passed [`validate_agent_runs`].
+    pub(crate) fn restore_agent_output(&mut self, cx: &mut impl AppContext) {
+        let (indices, prompts): (Vec<_>, Vec<_>) = self
+            .timeline
+            .iter()
+            .enumerate()
+            .filter_map(|(index, entry)| match entry {
+                TimelineMessage::Agent(message) => Some((index, message.prompt)),
+                TimelineMessage::User(_) => None,
+            })
+            .unzip();
+        let outputs = run_outputs(&prompts, self.transcript.len());
+        self.agent_turn = TurnFold::default();
+        for (index, output) in indices.into_iter().zip(outputs) {
+            let TimelineMessage::Agent(message) = &mut self.timeline[index] else {
+                unreachable!("an agent message's index");
+            };
+            let mut fold = fold_after(&self.transcript, &output);
+            for event in &message.pending_events {
+                let event = event
+                    .to_agent()
+                    .expect("pending events validated with the snapshot");
+                fold.apply(&event);
+            }
+            message.restore(&self.transcript[output], fold.partial().as_ref(), cx);
+            let message_id = message.id;
+            if message.is_generating() {
+                self.agent_turn = fold;
+            }
+            self.show_comment_responses(message_id, cx);
+        }
+    }
+
+    /// Counts an event towards the context window estimate; see
+    /// [`Thread::live_context_tokens`]. Only live events count: a snapshot
+    /// carries the counts.
+    fn measure_agent_event(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::Model(StreamEvent::BlockDelta { delta, .. }) => {
-                let (text, thinking) = match delta {
-                    Delta::Text { text } => (text, false),
-                    Delta::Reasoning { text } => (text, true),
-                    _ => return,
-                };
-                self.streamed_bytes += text.len() as u64;
-                let Some(message) = self.agent_message_mut(message_id.into_bytes()) else {
-                    return;
-                };
-                let view = if thinking {
-                    message.thinking.push_str(text);
-                    message.thinking_view.clone()
-                } else {
-                    // Some models never close the reasoning block, so the
-                    // first answer token ends it instead.
-                    if !message.thinking.is_empty() && !message.thinking_complete {
-                        message.thinking_complete = true;
-                        message.thinking_expanded = false;
-                    }
-                    message.text.push_str(text);
-                    message.text_view.clone()
-                };
-                view.update(cx, |view, cx| view.push_str(text, cx));
-            }
-            AgentEvent::Model(StreamEvent::BlockEnd {
-                end: BlockClose::Reasoning { .. },
+            AgentEvent::Model(StreamEvent::BlockDelta {
+                delta: Delta::Text { text } | Delta::Reasoning { text },
                 ..
-            }) => {
-                if let Some(message) = self.agent_message_mut(message_id.into_bytes()) {
-                    message.thinking_complete = true;
-                    message.thinking_expanded = false;
-                }
-            }
+            }) => self.streamed_bytes += text.len() as u64,
             // Each request sends the whole transcript, so its usage is how
             // full the context is.
             AgentEvent::TurnEnded { usage, .. } if usage.is_reported() => {
@@ -175,13 +264,28 @@ impl Thread {
             }
             _ => {}
         }
-        if let Some(AssistantContent::ToolCall(call)) = block {
-            self.show_comment_response(message_id, &call, cx);
+    }
+
+    /// Shows the replies to comments that agent message `message_id`'s
+    /// `respond_to_comment` calls make, once per comment, checking only the
+    /// calls added since it last looked.
+    fn show_comment_responses(&mut self, message_id: Uuid, cx: &mut impl AppContext) {
+        let Some(message) = self.agent_message_mut(message_id.into_bytes()) else {
+            return;
+        };
+        let checked = message
+            .comment_calls_checked
+            .min(message.output.tool_calls.len());
+        let calls = message.output.tool_calls[checked..]
+            .iter()
+            .map(|call| call.call.clone())
+            .collect::<Vec<_>>();
+        message.comment_calls_checked = message.output.tool_calls.len();
+        for call in &calls {
+            self.show_comment_response(message_id, call, cx);
         }
     }
 
-    /// Shows the reply to a comment a `respond_to_comment` call makes, once
-    /// per comment.
     fn show_comment_response(
         &mut self,
         message_id: Uuid,
@@ -243,13 +347,190 @@ impl Thread {
     }
 }
 
+impl AgentOutput {
+    /// Adds what `message`, the next message of a run's output, shows.
+    fn push(&mut self, message: &RigMessage) {
+        match message {
+            RigMessage::Assistant { content, .. } => {
+                for part in content {
+                    match part {
+                        AssistantContent::Reasoning(reasoning) => {
+                            self.thinking.push_str(&reasoning.display_text());
+                        }
+                        AssistantContent::Text(text) => self.text.push_str(&text.text),
+                        AssistantContent::ToolCall(call) => self.tool_calls.push(AgentToolCall {
+                            call: call.clone(),
+                            result: None,
+                        }),
+                        AssistantContent::Image(_) => {}
+                    }
+                }
+            }
+            RigMessage::User { content } => {
+                for item in content {
+                    if let UserContent::ToolResult(result) = item {
+                        self.record_tool_result(&result.call, &result.content);
+                    }
+                }
+            }
+            RigMessage::System { .. } => {}
+        }
+    }
+
+    fn extend(&mut self, message: Option<&RigMessage>) {
+        if let Some(message) = message {
+            self.push(message);
+        }
+    }
+
+    /// Records what the tool returned for `call`. Results answer the latest
+    /// reply, and Rig may mint the same id for id-less calls of different
+    /// replies, so the latest call with that id is the one answered.
+    fn record_tool_result(&mut self, call: &ToolCallId, content: &[ToolResultContent]) {
+        if let Some(tool_call) = self
+            .tool_calls
+            .iter_mut()
+            .rev()
+            .find(|tool_call| tool_call.call.id == *call)
+        {
+            tool_call.result = Some(content.to_vec());
+        }
+    }
+
+    /// Where the output ends now, as its committed part.
+    fn mark(&self) -> OutputMark {
+        let answered = self
+            .tool_calls
+            .iter()
+            .position(|call| call.result.is_none())
+            .unwrap_or(self.tool_calls.len());
+        debug_assert!(
+            self.tool_calls[answered..]
+                .iter()
+                .all(|call| call.result.is_none()),
+            "committed calls are answered in order"
+        );
+        OutputMark {
+            thinking: self.thinking.len(),
+            text: self.text.len(),
+            tool_calls: self.tool_calls.len(),
+            answered,
+        }
+    }
+
+    /// Drops everything after `mark`, the committed part: what the message a
+    /// run is folding added, including results for committed calls.
+    fn rewind(&mut self, mark: OutputMark) {
+        self.thinking.truncate(mark.thinking);
+        self.text.truncate(mark.text);
+        self.tool_calls.truncate(mark.tool_calls);
+        for call in &mut self.tool_calls[mark.answered..] {
+            call.result = None;
+        }
+    }
+
+    /// Whether `partial`, the message a run is folding, shows the model
+    /// still reasoning: it is the reply streaming, ending in reasoning.
+    fn still_reasoning(partial: Option<&RigMessage>) -> bool {
+        matches!(
+            partial,
+            Some(RigMessage::Assistant { content, .. })
+                if matches!(content.last(), Some(AssistantContent::Reasoning(_)))
+        )
+    }
+}
+
+impl AgentMessage {
+    /// Shows a run's output after its fold moved on: `completed`, a message
+    /// it has just added to the transcript, if any, then `partial`, the
+    /// message it is folding. Only the part after the committed mark is
+    /// redone, and the text views only get what that part added.
+    fn advance(
+        &mut self,
+        completed: Option<&RigMessage>,
+        partial: Option<&RigMessage>,
+        cx: &mut impl AppContext,
+    ) {
+        let from = self.committed;
+        let old_thinking = self.output.thinking.split_off(from.thinking);
+        let old_text = self.output.text.split_off(from.text);
+        self.output.rewind(from);
+        if let Some(completed) = completed {
+            self.output.push(completed);
+            self.committed = self.output.mark();
+        }
+        self.output.extend(partial);
+        self.set_thinking_complete(partial);
+        show_tail(
+            &self.thinking_view,
+            &self.output.thinking,
+            from.thinking,
+            &old_thinking,
+            cx,
+        );
+        show_tail(&self.text_view, &self.output.text, from.text, &old_text, cx);
+    }
+
+    /// Shows `output`, a run's transcript entries, followed by `partial`, the
+    /// message it is folding, in a message fresh from a snapshot. The text
+    /// views are shown whole, as history rather than as a stream.
+    fn restore(
+        &mut self,
+        output: &[RigMessage],
+        partial: Option<&RigMessage>,
+        cx: &mut impl AppContext,
+    ) {
+        for message in output {
+            self.output.push(message);
+        }
+        self.committed = self.output.mark();
+        self.output.extend(partial);
+        self.set_thinking_complete(partial);
+        self.thinking_view = cx.new(|cx| TextViewState::markdown(&self.output.thinking, cx));
+        self.text_view = cx.new(|cx| TextViewState::markdown(&self.output.text, cx));
+    }
+
+    /// Thinking is complete unless the model is still reasoning, and
+    /// collapses whenever it completes.
+    fn set_thinking_complete(&mut self, partial: Option<&RigMessage>) {
+        let complete = !(self.is_generating() && AgentOutput::still_reasoning(partial));
+        if complete && !self.output.thinking_complete {
+            self.thinking_expanded = false;
+        }
+        self.output.thinking_complete = complete;
+    }
+}
+
+/// Brings `view` from showing `new[..from]` followed by `old_tail` to showing
+/// `new`, appending when `new` extends that, as it does while a run streams.
+fn show_tail(
+    view: &gpui::Entity<TextViewState>,
+    new: &str,
+    from: usize,
+    old_tail: &str,
+    cx: &mut impl AppContext,
+) {
+    match new[from..].strip_prefix(old_tail) {
+        Some("") => {}
+        Some(added) => view.update(cx, |view, cx| view.push_str(added, cx)),
+        None => view.update(cx, |view, cx| view.set_text(new, cx)),
+    }
+}
+
+/// Agent message `id` of `timeline`, borrowed apart from the thread's other
+/// fields.
+fn agent_message(timeline: &mut [TimelineMessage], id: Uuid) -> Option<&mut AgentMessage> {
+    timeline.iter_mut().find_map(|entry| match entry {
+        TimelineMessage::Agent(message) if message.id == id => Some(message),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use rig::message::{
-        ImageMediaType, Reasoning, ToolCall, ToolCallId, ToolFunction, UserContent,
-    };
+    use rig::message::{ImageMediaType, Reasoning, ToolCall, ToolFunction, UserContent};
     use serde_json::json;
 
     /// A prompt with an image, a reply with reasoning and a tool call, and

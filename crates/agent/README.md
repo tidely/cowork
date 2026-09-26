@@ -22,14 +22,16 @@ A run is fully described by its events. `TurnFold` folds them into the
 messages they add to the history, and the loop records its own history by
 folding them, so anyone folding the same events, in this process or after
 sending them elsewhere (they are serializable), ends up with exactly the same
-history.
+history. Mid-turn, `TurnFold::partial` is the message being folded as far as
+it has come, as Rig accumulates it, so the history followed by it is
+everything the run has produced so far.
 
 ## Sketch
 
 ```rust,no_run
 use agent::{Agent, AgentEvent, TurnFold};
 use rig::{completion::Message, prelude::*, providers::ollama::wire::Ollama, tool::ToolSet};
-use tools::{RespondToComment, TurnComments};
+use tools::{Calculate, RespondToComment, TurnComments};
 
 # async fn example() -> anyhow::Result<()> {
 let client = Ollama::new().bound()?;
@@ -38,6 +40,7 @@ let model = client.completion("qwen3.8:27b");
 let comments = std::sync::Arc::new(TurnComments::new(2));
 let mut tools = ToolSet::default();
 tools.add_tool(RespondToComment::new(comments));
+tools.add_tool(Calculate);
 
 let mut history = Vec::new();
 let mut fold = TurnFold::default();

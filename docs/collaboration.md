@@ -350,22 +350,38 @@ A single-block submission looks like the current user message.
   `AgentEvent`: Rig's stream events (deltas and block boundaries), the end
   of each model turn with its usage, and each tool's result. Everyone, the
   host included, folds them the same way (the agent crate's `TurnFold`)
-  into the agent message the timeline shows, live, and into the
-  transcript, which comes out exactly as the agent loop recorded it. Each
-  piece of output travels once: the stream's terminal record and provider
-  payloads Rig does not model are not forwarded, and a block's end drops
-  the completed block, which folding rebuilds. Comment replies come from
-  `respond_to_comment` calls, with ids derived from the message and call,
-  so every participant names them alike.
+  into the transcript, which comes out exactly as the agent loop recorded
+  it. Each piece of output travels once: the stream's terminal record and
+  provider payloads Rig does not model are not forwarded, and a block's end
+  drops the completed block, which folding rebuilds.
+- What an agent message shows (its thinking, text, tool calls with their
+  results, and replies to comments) is never sent. It is a function of Rig
+  messages alone: the transcript entries its run added (those after its
+  prompt, up to the next run's prompt), followed by the message the run is
+  folding, as far as it has come, as Rig's stream accumulator has it. That
+  message is the fold of the run's **pending events**: those folded since
+  its output last joined the transcript. A run that is stopped or fails
+  mid-turn keeps its pending events, since that output never joins the
+  transcript. Comment replies
+  come from `respond_to_comment` calls, with ids derived from the message
+  and call, so every participant names them alike. A failure message is
+  kept apart from the agent's output, and shown only when there is none.
 - The transcript is kept as Rig messages; they and the agent events travel
   as JSON, which postcard cannot represent directly. Their encoding is
   Rig's, so upgrading Rig bumps the protocol version. A prompt joins the
   transcript with `AgentStarted`, including its files' content, images as
   base64, so attachment bytes also travel inline besides as
-  `AttachmentData`. A `Welcome` carries the transcript and the agent's
-  events since it last grew, so someone joining mid-turn folds the rest of
-  it. A frame larger than 1 GiB cannot be sent; the collaborator is then
-  disconnected.
+  `AttachmentData`. A `Welcome` carries the transcript and, for each agent
+  message, where its prompt is, its pending events, and whether its run
+  has ended. The joiner folds each run's pending events, which rebuilds the
+  message it was folding exactly, and so shows what everyone else does. For
+  the running message, it keeps that fold, so someone joining mid-turn
+  folds the rest of it. Before that, the
+  joiner checks that the snapshot fits its transcript: every prompt is a
+  user message there, in order, only the last run can still be
+  generating, and no run's pending events complete a message the
+  transcript lacks. A frame larger than 1 GiB cannot be sent; the
+  collaborator is then disconnected.
 - Each block's attachments stay with that block, using today's encoding.
 - Mentions (once supported) render as `@Name`.
 
@@ -547,22 +563,22 @@ The messages below are conceptual. Names and shapes will follow the existing
 
 **Host to collaborators**
 
-| Message                                      | Purpose                                                                                                                                                                                                                                                               |
-| -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Welcome`                                    | Participant UUID, timeline snapshot (including the model catalog and selected model, transcript, the running agent's events since it last grew, and prompt names), draft state, participants, their profiles and presence, submission sequence, stored attachment IDs |
-| `Rejected`                                   | Join refused (e.g. protocol version) or a request refused; peer-specific                                                                                                                                                                                              |
-| `DraftUpdate`                                | Yrs update from another participant or the host                                                                                                                                                                                                                       |
-| `ParticipantJoined` / `Left`                 | Membership changes; joining carries the participant's profile                                                                                                                                                                                                         |
-| `ProfileChanged`                             | A participant's new profile                                                                                                                                                                                                                                           |
-| `Presence`                                   | A participant's latest presence                                                                                                                                                                                                                                       |
-| `AttachmentData`                             | Relayed attachment bytes                                                                                                                                                                                                                                              |
-| `AttachmentStored`                           | The host holds every byte of an attachment                                                                                                                                                                                                                            |
-| `ModelSelected`                              | The thread's model changed                                                                                                                                                                                                                                            |
-| `ModelCatalogChanged`                        | Replaces the thread's model catalog (including with an empty one)                                                                                                                                                                                                     |
-| `UserMessage`                                | An accepted submission, now carrying its sequence, creators, and attachment references instead of bytes                                                                                                                                                               |
-| `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and any failure                                                                                                                                                                             |
-| `AgentEvent`                                 | What the host's agent loop reported during a run, which everyone folds into the agent message and transcript                                                                                                                                                          |
-| `PromptNamed`                                | A participant's prompt name, fixed on their first submitted item                                                                                                                                                                                                      |
+| Message                                      | Purpose                                                                                                                                                                                                                                                                                    |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Welcome`                                    | Participant UUID, timeline snapshot (including the model catalog and selected model, transcript, each agent message's prompt position, pending events and run state, and prompt names), draft state, participants, their profiles and presence, submission sequence, stored attachment IDs |
+| `Rejected`                                   | Join refused (e.g. protocol version) or a request refused; peer-specific                                                                                                                                                                                                                   |
+| `DraftUpdate`                                | Yrs update from another participant or the host                                                                                                                                                                                                                                            |
+| `ParticipantJoined` / `Left`                 | Membership changes; joining carries the participant's profile                                                                                                                                                                                                                              |
+| `ProfileChanged`                             | A participant's new profile                                                                                                                                                                                                                                                                |
+| `Presence`                                   | A participant's latest presence                                                                                                                                                                                                                                                            |
+| `AttachmentData`                             | Relayed attachment bytes                                                                                                                                                                                                                                                                   |
+| `AttachmentStored`                           | The host holds every byte of an attachment                                                                                                                                                                                                                                                 |
+| `ModelSelected`                              | The thread's model changed                                                                                                                                                                                                                                                                 |
+| `ModelCatalogChanged`                        | Replaces the thread's model catalog (including with an empty one)                                                                                                                                                                                                                          |
+| `UserMessage`                                | An accepted submission, now carrying its sequence, creators, and attachment references instead of bytes                                                                                                                                                                                    |
+| `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and any failure                                                                                                                                                                                                  |
+| `AgentEvent`                                 | What the host's agent loop reported during a run, which everyone folds into the agent message and transcript                                                                                                                                                                               |
+| `PromptNamed`                                | A participant's prompt name, fixed on their first submitted item                                                                                                                                                                                                                           |
 
 The host is itself a participant. Its local edits, submissions, stops, and
 model changes go through the same logic as a collaborator's.

@@ -325,7 +325,6 @@ fn test_thread(thread_id: Uuid, timeline: Vec<TimelineMessage>, draft: ThreadDra
         profiles: HashMap::new(),
         transcript: Vec::new(),
         agent_turn: Default::default(),
-        agent_events: Vec::new(),
         prompt_names: HashMap::new(),
         tokens_used: 0,
         model: None,
@@ -553,20 +552,38 @@ impl<'a> Collaboration<'a> {
                     comment_group_id: None,
                     started_at: SystemTime::UNIX_EPOCH,
                     comment_responses: Vec::new(),
-                    thinking: String::new(),
+                    prompt: 0,
+                    pending_events: Vec::new(),
+                    run: crate::protocol::AgentRun::Ended {
+                        failure: None,
+                        duration: std::time::Duration::ZERO,
+                    },
+                    output: crate::timeline::AgentOutput {
+                        thinking_complete: true,
+                        text: text.clone(),
+                        ..Default::default()
+                    },
+                    committed: Default::default(),
+                    comment_calls_checked: 0,
                     thinking_view: cx.new(|cx| TextViewState::markdown("", cx)),
-                    thinking_complete: true,
-                    thinking_expanded: false,
-                    text: text.clone(),
                     text_view: cx.new(|cx| TextViewState::markdown(&text, cx)),
-                    duration: None,
-                    complete: true,
-                    failed: false,
+                    thinking_expanded: false,
+                    tool_calls_expanded: false,
                 })]
             } else {
                 Vec::new()
             };
             let mut thread = test_thread(thread_id, timeline, draft);
+            if long_history {
+                // What a joiner derives the message's text from.
+                let TimelineMessage::Agent(message) = &thread.timeline[0] else {
+                    unreachable!("the long history's agent message");
+                };
+                let reply = RigMessage::assistant(message.output.text.clone());
+                thread
+                    .transcript
+                    .extend([RigMessage::user("Long history prompt"), reply]);
+            }
             thread.models = Arc::new(test_catalog());
             thread.model = Some(ollama_qwen());
             thread.participant_id = thread.draft.author;

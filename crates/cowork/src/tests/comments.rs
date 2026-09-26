@@ -374,15 +374,23 @@ fn assert_backslash_selection_creates_comment(
                 })
                 .into_iter()
                 .collect(),
-            thinking: String::new(),
+            prompt: 0,
+            pending_events: Vec::new(),
+            run: crate::protocol::AgentRun::Ended {
+                failure: None,
+                duration: std::time::Duration::ZERO,
+            },
+            output: crate::timeline::AgentOutput {
+                thinking_complete: true,
+                text: main_text.into(),
+                ..Default::default()
+            },
+            committed: Default::default(),
+            comment_calls_checked: 0,
             thinking_view,
-            thinking_complete: true,
-            thinking_expanded: false,
-            text: main_text.into(),
             text_view: main_text_view,
-            duration: None,
-            complete: true,
-            failed: false,
+            thinking_expanded: false,
+            tool_calls_expanded: false,
         })];
         let thread = cx.new(|_| test_thread(thread_id, timeline, draft));
         let thread_store = cx.new(|_| ThreadStore {
@@ -679,15 +687,23 @@ fn commenting_on_a_long_response_keeps_the_timeline_scroll_position(cx: &mut gpu
             comment_group_id: None,
             started_at: SystemTime::UNIX_EPOCH,
             comment_responses: Vec::new(),
-            thinking: String::new(),
+            prompt: 0,
+            pending_events: Vec::new(),
+            run: crate::protocol::AgentRun::Ended {
+                failure: None,
+                duration: std::time::Duration::ZERO,
+            },
+            output: crate::timeline::AgentOutput {
+                thinking_complete: true,
+                text: markdown.clone(),
+                ..Default::default()
+            },
+            committed: Default::default(),
+            comment_calls_checked: 0,
             thinking_view: cx.new(|cx| TextViewState::markdown("", cx)),
-            thinking_complete: true,
-            thinking_expanded: false,
-            text: markdown.clone(),
             text_view: cx.new(|cx| TextViewState::markdown(&markdown, cx)),
-            duration: None,
-            complete: true,
-            failed: false,
+            thinking_expanded: false,
+            tool_calls_expanded: false,
         })];
         let draft = ThreadDraft::new(ParticipantId::new());
         let thread = cx.new(|_| test_thread(thread_id, timeline, draft));

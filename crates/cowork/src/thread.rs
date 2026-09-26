@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use agent::{AgentEvent, TurnFold};
+use agent::TurnFold;
 use anyhow::Context as _;
 use draft::{AttachmentId, ItemId};
 use gpui::{App, AppContext, Entity, SharedString};
@@ -24,6 +24,7 @@ use crate::{
     protocol,
     thread_draft::ThreadDraft,
     timeline::{AgentMessage, TimelineMessage},
+    transcript::validate_agent_runs,
 };
 
 /// How many thread events a collaborator may fall behind before the host
@@ -144,10 +145,9 @@ pub(crate) struct Thread {
     /// `transcript.rs`.
     pub(crate) transcript: Vec<RigMessage>,
     /// Folds the running agent's events into the transcript's next message.
+    /// The events it has folded so far are the running message's pending
+    /// events.
     pub(crate) agent_turn: TurnFold,
-    /// The events `agent_turn` has folded since the transcript last grew,
-    /// which someone joining needs to fold the rest of the turn.
-    pub(crate) agent_events: Vec<protocol::Json<AgentEvent>>,
     /// The name each author is given in prompts, fixed when their first
     /// item is submitted so that renaming never changes the transcript and
     /// the agent knows everyone by one name. Mirrored like the transcript.
@@ -196,7 +196,6 @@ impl Thread {
             profiles: HashMap::new(),
             transcript: Vec::new(),
             agent_turn: TurnFold::default(),
-            agent_events: Vec::new(),
             prompt_names: HashMap::new(),
             tokens_used: 0,
             model: None,
@@ -213,20 +212,21 @@ impl Thread {
         thread
     }
 
-    /// Validates the nested Rig JSON in an untrusted host snapshot before an
-    /// entity is created or existing thread state is changed.
+    /// Validates the nested Rig JSON in an untrusted host snapshot, and that
+    /// its agent messages fit its transcript, before an entity is created or
+    /// existing thread state is changed.
     pub(crate) fn validate_welcome(welcome: &protocol::Welcome) -> anyhow::Result<()> {
-        for (index, message) in welcome.thread.transcript.iter().enumerate() {
-            message
-                .to_rig()
-                .with_context(|| format!("invalid transcript message {index} from host"))?;
-        }
-        for (index, event) in welcome.thread.agent_events.iter().enumerate() {
-            event
-                .to_agent()
-                .with_context(|| format!("invalid agent event {index} from host"))?;
-        }
-        Ok(())
+        let transcript = parse_transcript(&welcome.thread.transcript)?;
+        let agent_messages = welcome
+            .thread
+            .messages
+            .iter()
+            .filter_map(|message| match message {
+                protocol::TimelineMessage::Agent(message) => Some(message),
+                protocol::TimelineMessage::User(_) => None,
+            })
+            .collect::<Vec<_>>();
+        validate_agent_runs(&transcript, &agent_messages).context("invalid host snapshot")
     }
 
     /// Replaces everything the host is authoritative for with its snapshot.
@@ -252,16 +252,7 @@ impl Thread {
             presence,
             stored_attachments,
         } = welcome;
-        let transcript = thread
-            .transcript
-            .iter()
-            .enumerate()
-            .map(|(index, message)| {
-                message
-                    .to_rig()
-                    .with_context(|| format!("invalid transcript message {index} from host"))
-            })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+        let transcript = parse_transcript(&thread.transcript)?;
         self.draft.stored = stored_attachments
             .into_iter()
             .map(|id| AttachmentId::from_uuid(Uuid::from_bytes(id)))
@@ -304,11 +295,10 @@ impl Thread {
             .into_iter()
             .map(|(participant, name)| (ParticipantId::from_bytes(participant), name.into()))
             .collect();
-        let agent_events = std::mem::take(&mut thread.agent_events);
         let (summary, timeline) = thread.into_native(cx);
         self.summary = summary;
         self.set_timeline(timeline);
-        self.resume_agent_turn(agent_events)?;
+        self.restore_agent_output(cx);
         Ok(())
     }
 
@@ -342,7 +332,6 @@ impl Thread {
                 .iter()
                 .map(protocol::Json::from_rig)
                 .collect(),
-            agent_events: self.agent_events.clone(),
             prompt_names: self
                 .prompt_names
                 .iter()
@@ -668,7 +657,7 @@ impl Thread {
     /// The agent message currently being generated, if any.
     pub(crate) fn running_agent_message_id(&self) -> Option<Uuid> {
         self.timeline.iter().rev().find_map(|entry| match entry {
-            TimelineMessage::Agent(message) if !message.complete => Some(message.id),
+            TimelineMessage::Agent(message) if message.is_generating() => Some(message.id),
             _ => None,
         })
     }
@@ -805,11 +794,13 @@ impl Thread {
                     Uuid::from_bytes(id),
                     comment_group_id.map(Uuid::from_bytes),
                     started_at,
+                    self.transcript.len() - 1,
+                    protocol::AgentRun::Generating,
+                    Vec::new(),
                     cx,
                 )));
                 self.generating = true;
                 self.agent_turn = TurnFold::default();
-                self.agent_events.clear();
             }
             protocol::HostMessage::AgentEvent { id, event } => {
                 self.apply_agent_event(Uuid::from_bytes(id), event, cx)?;
@@ -822,30 +813,7 @@ impl Thread {
                 id,
                 failure,
                 duration,
-            } => {
-                self.generating = false;
-                // A request that was stopped or failed before it reported
-                // usage never adds its partial output to the transcript.
-                self.streamed_bytes = 0;
-                self.agent_turn = TurnFold::default();
-                self.agent_events.clear();
-                let Some(message) = self.agent_message_mut(id) else {
-                    return Ok(());
-                };
-                message.complete = true;
-                message.thinking_complete = true;
-                message.thinking_expanded = false;
-                message.failed = failure.is_some();
-                message.duration = Some(duration);
-                // Only surface the failure when the agent said nothing itself.
-                if let Some(failure) = failure
-                    && message.text.is_empty()
-                {
-                    let view = message.text_view.clone();
-                    view.update(cx, |view, cx| view.set_text(&failure, cx));
-                    message.text = failure;
-                }
-            }
+            } => self.end_agent_run(id, failure, duration, cx),
         }
         Ok(())
     }
@@ -855,7 +823,7 @@ impl Thread {
         self.timeline
             .iter()
             .filter_map(|message| match message {
-                TimelineMessage::Agent(message) => message.duration,
+                TimelineMessage::Agent(message) => message.run.duration(),
                 TimelineMessage::User(_) => None,
             })
             .sum()
@@ -895,8 +863,26 @@ impl Thread {
                 )
             })
             .collect();
+        let agent_output = self
+            .timeline
+            .iter()
+            .filter_map(|message| match message {
+                TimelineMessage::Agent(message) => Some(AgentShown {
+                    output: message.output.clone(),
+                    comment_responses: message
+                        .comment_responses
+                        .iter()
+                        .map(|response| {
+                            (response.id, response.comment_id, response.response.clone())
+                        })
+                        .collect(),
+                }),
+                TimelineMessage::User(_) => None,
+            })
+            .collect();
         Conversation {
             timeline: snapshot.messages,
+            agent_output,
             transcript: self.transcript.clone(),
             prompt_names: snapshot.prompt_names,
             files,
@@ -904,9 +890,9 @@ impl Thread {
     }
 
     fn set_timeline(&mut self, timeline: Vec<TimelineMessage>) {
-        self.generating = timeline
-            .iter()
-            .any(|message| matches!(message, TimelineMessage::Agent(message) if !message.complete));
+        self.generating = timeline.iter().any(
+            |message| matches!(message, TimelineMessage::Agent(message) if message.is_generating()),
+        );
         self.timeline = timeline;
     }
 
@@ -925,10 +911,32 @@ impl Thread {
 #[derive(Debug, PartialEq)]
 pub(crate) struct Conversation {
     pub(crate) timeline: Vec<protocol::TimelineMessage>,
+    /// What each agent message shows, which is derived rather than sent.
+    pub(crate) agent_output: Vec<AgentShown>,
     pub(crate) transcript: Vec<RigMessage>,
     pub(crate) prompt_names: Vec<(uuid::Bytes, String)>,
     /// The bytes of each file in the timeline, `None` while missing.
     pub(crate) files: Vec<(uuid::Bytes, Option<Vec<u8>>)>,
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(crate) struct AgentShown {
+    pub(crate) output: crate::timeline::AgentOutput,
+    /// Each reply's id, the comment it answers, and its text.
+    pub(crate) comment_responses: Vec<(Uuid, Uuid, String)>,
+}
+
+fn parse_transcript(transcript: &[protocol::Json<RigMessage>]) -> anyhow::Result<Vec<RigMessage>> {
+    transcript
+        .iter()
+        .enumerate()
+        .map(|(index, message)| {
+            message
+                .to_rig()
+                .with_context(|| format!("invalid transcript message {index} from host"))
+        })
+        .collect()
 }
 
 impl protocol::ThreadSnapshot {

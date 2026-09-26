@@ -155,7 +155,6 @@ impl Cowork {
             profiles: HashMap::new(),
             transcript: Vec::new(),
             agent_turn: Default::default(),
-            agent_events: Vec::new(),
             prompt_names: HashMap::new(),
             tokens_used: 0,
             model,

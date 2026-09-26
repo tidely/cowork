@@ -21,7 +21,7 @@ use rig::{
 };
 use serde_json::json;
 use tokio::sync::mpsc;
-use tools::{RespondToComment, TurnComments};
+use tools::{Calculate, RespondToComment, TurnComments};
 use uuid::Uuid;
 
 use crate::{
@@ -82,6 +82,7 @@ impl Cowork {
             };
             let mut tools = ToolSet::default();
             tools.add_tool(RespondToComment::new(turn_comments));
+            tools.add_tool(Calculate);
             StreamingAgent::new(model, tools)
                 .additional_params(json!({
                     "num_ctx": max_tokens,

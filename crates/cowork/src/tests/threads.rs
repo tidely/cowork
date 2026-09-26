@@ -191,12 +191,94 @@ fn agent_stream_events(message_id: Uuid) -> Vec<protocol::HostMessage> {
 /// it replays afterwards cover the rest.
 #[gpui::test]
 fn collaborators_joining_mid_stream_converge_on_the_host_timeline(cx: &mut gpui::TestAppContext) {
+    assert_joining_agent_timeline_converges(cx, JoinAt::Reasoning);
+}
+
+#[gpui::test]
+fn collaborators_joining_after_a_tool_call_receive_its_later_result(cx: &mut gpui::TestAppContext) {
+    assert_joining_agent_timeline_converges(cx, JoinAt::Call);
+}
+
+#[gpui::test]
+fn collaborators_joining_after_a_tool_result_read_it_from_rig_history(
+    cx: &mut gpui::TestAppContext,
+) {
+    assert_joining_agent_timeline_converges(cx, JoinAt::Result);
+}
+
+#[gpui::test]
+fn collaborators_joining_during_a_later_turn_restore_committed_and_streamed_text(
+    cx: &mut gpui::TestAppContext,
+) {
+    assert_joining_agent_timeline_converges(cx, JoinAt::SecondTurn);
+}
+
+#[gpui::test]
+fn collaborators_joining_after_a_run_read_tool_calls_from_rig_history(
+    cx: &mut gpui::TestAppContext,
+) {
+    assert_joining_agent_timeline_converges(cx, JoinAt::Finished);
+}
+
+#[derive(Clone, Copy)]
+enum JoinAt {
+    Reasoning,
+    Call,
+    Result,
+    SecondTurn,
+    Finished,
+}
+
+fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_at: JoinAt) {
+    use rig::streaming::{BlockClose, StreamEvent};
+
     cx.update(gpui_component::init);
     let message_id = Uuid::new_v4();
     let events = agent_stream_events(message_id);
-    // The collaborator joins once the agent has started reasoning, so it has
-    // to fold the rest of that turn from what it missed.
-    let joined_after = 4;
+    let joined_after = match join_at {
+        JoinAt::Reasoning => 4,
+        JoinAt::Call => {
+            events
+                .iter()
+                .position(|event| {
+                    matches!(event, protocol::HostMessage::AgentEvent { event, .. }
+                    if matches!(event.to_agent(), Ok(agent::AgentEvent::Model(
+                        StreamEvent::BlockEnd { end: BlockClose::ToolCall(_), .. }
+                    ))))
+                })
+                .expect("completed tool call")
+                + 1
+        }
+        JoinAt::Result => {
+            events
+                .iter()
+                .position(|event| {
+                    matches!(event, protocol::HostMessage::AgentEvent { event, .. }
+                if matches!(event.to_agent(), Ok(agent::AgentEvent::ToolResult { .. })))
+                })
+                .expect("tool result")
+                + 1
+        }
+        JoinAt::SecondTurn => events
+            .iter()
+            .position(|event| {
+                matches!(event,
+                    protocol::HostMessage::AgentEvent { event, .. }
+                    if matches!(event.to_agent(), Ok(agent::AgentEvent::Model(
+                        StreamEvent::BlockDelta { delta: rig::streaming::Delta::Text { text }, .. }
+                    )) if text == " Done.")
+                )
+            })
+            .expect("later turn's text")
+            + 1,
+        JoinAt::Finished => {
+            events
+                .iter()
+                .position(|event| matches!(event, protocol::HostMessage::AgentEnded { .. }))
+                .expect("agent ended")
+                + 1
+        }
+    };
 
     let host_participant = ParticipantId::new();
     let collaborator_participant = ParticipantId::new();
@@ -222,6 +304,20 @@ fn collaborators_joining_mid_stream_converge_on_the_host_timeline(cx: &mut gpui:
                     .update(cx, |thread, cx| thread.apply(event.clone(), cx));
             }
 
+            if matches!(
+                join_at,
+                JoinAt::Call | JoinAt::Result | JoinAt::SecondTurn | JoinAt::Finished
+            ) {
+                let host = view.host.read(cx);
+                let TimelineMessage::Agent(message) = &host.timeline[1] else {
+                    panic!("expected the agent message");
+                };
+                assert_eq!(message.output.tool_calls.len(), 1);
+                assert_eq!(
+                    message.output.tool_calls[0].result.is_some(),
+                    !matches!(join_at, JoinAt::Call)
+                );
+            }
             let welcome = protocol::Welcome {
                 participant_id: collaborator_participant.into_bytes(),
                 thread: view.host.read(cx).to_protocol(),
@@ -232,6 +328,12 @@ fn collaborators_joining_mid_stream_converge_on_the_host_timeline(cx: &mut gpui:
             let draft = ThreadDraft::new(ParticipantId::new());
             let collaborator =
                 cx.new(|cx| Thread::from_welcome(welcome, draft, ThreadSharing::NotShared, cx));
+            // What the host showed live, the collaborator derives from the
+            // snapshot's transcript and pending events.
+            assert_eq!(
+                collaborator.read(cx).conversation().agent_output,
+                view.host.read(cx).conversation().agent_output
+            );
 
             for event in events.iter().skip(joined_after) {
                 view.host
@@ -250,7 +352,7 @@ fn collaborators_joining_mid_stream_converge_on_the_host_timeline(cx: &mut gpui:
             .expect("collaborator should have joined")
             .read(cx);
 
-        assert_eq!(collaborator.to_protocol(), host.to_protocol());
+        assert_eq!(collaborator.conversation(), host.conversation());
         assert_eq!(collaborator.summary.id, host.summary.id);
         assert_ne!(collaborator.instance_id, host.instance_id);
         assert_eq!(collaborator.participant_id, collaborator_participant);
@@ -270,11 +372,19 @@ fn collaborators_joining_mid_stream_converge_on_the_host_timeline(cx: &mut gpui:
         let TimelineMessage::Agent(message) = &collaborator.timeline[1] else {
             panic!("expected the agent's reply");
         };
-        assert_eq!(message.thinking, "Weighing options.");
-        assert_eq!(message.text, "Here is the answer. Done.");
-        assert!(message.thinking_complete);
-        assert!(message.complete);
-        assert!(!message.failed);
+        assert_eq!(message.output.thinking, "Weighing options.");
+        assert_eq!(message.output.text, "Here is the answer. Done.");
+        let [call] = message.output.tool_calls.as_slice() else {
+            panic!("expected one tool call");
+        };
+        assert_eq!(call.call.function.name, "respond_to_comment");
+        assert!(call.arguments_text().contains("comment_1"));
+        assert_eq!(call.result_text().as_deref(), Some("Recorded"));
+        assert!(!message.tool_calls_expanded);
+        assert!(message.output.thinking_complete);
+        assert!(!message.is_generating());
+        assert_eq!(message.run.failure(), None);
+        assert!(message.pending_events.is_empty());
         let [response] = message.comment_responses.as_slice() else {
             panic!("expected the reply to the comment");
         };
@@ -300,6 +410,542 @@ fn collaborators_joining_mid_stream_converge_on_the_host_timeline(cx: &mut gpui:
                 rig::completion::AssistantContent::ToolCall(_),
             ]
         ));
+    });
+}
+
+#[gpui::test]
+fn failed_run_without_rig_output_shows_its_failure(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let message_id = Uuid::new_v4();
+    let (view, cx) = cx.add_window_view(|_, cx| ThreadMirrorTestView {
+        host: Cowork::new_empty_local_thread(
+            ThreadDraft::new(ParticipantId::new()),
+            ParticipantId::new(),
+            Arc::default(),
+            None,
+            cx,
+        ),
+        collaborator: None,
+    });
+    view.update(cx, |view, cx| {
+        view.host.update(cx, |thread, cx| {
+            thread.apply(agent_started(message_id, None, "Try this"), cx);
+            thread.apply(
+                protocol::HostMessage::AgentEnded {
+                    id: message_id.into_bytes(),
+                    failure: Some("Model unavailable".into()),
+                    duration: Duration::from_secs(1),
+                },
+                cx,
+            );
+        });
+        let host = view.host.read(cx);
+        let snapshot = host.to_protocol();
+        let protocol::TimelineMessage::Agent(message) = &snapshot.messages[0] else {
+            panic!("expected agent message");
+        };
+        assert!(message.pending_events.is_empty());
+        assert_eq!(message.run.failure(), Some("Model unavailable"));
+        let restored = Thread::from_welcome(
+            protocol::Welcome {
+                participant_id: ParticipantId::new().into_bytes(),
+                thread: snapshot,
+                draft: host.draft.doc.encode_state(),
+                presence: Vec::new(),
+                stored_attachments: Vec::new(),
+            },
+            ThreadDraft::new(ParticipantId::new()),
+            ThreadSharing::NotShared,
+            cx,
+        );
+        let TimelineMessage::Agent(message) = &restored.timeline[0] else {
+            panic!("expected agent message");
+        };
+        // The failure is not agent output, so it stays out of the text.
+        assert!(message.output.text.is_empty());
+        assert_eq!(message.run.failure(), Some("Model unavailable"));
+        assert_eq!(restored.conversation(), view.host.read(cx).conversation());
+    });
+}
+
+#[gpui::test]
+fn separate_runs_reconstruct_only_their_own_tool_calls(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    let (view, cx) = cx.add_window_view(|_, cx| ThreadMirrorTestView {
+        host: Cowork::new_empty_local_thread(
+            ThreadDraft::new(ParticipantId::new()),
+            ParticipantId::new(),
+            Arc::default(),
+            None,
+            cx,
+        ),
+        collaborator: None,
+    });
+    view.update(cx, |view, cx| {
+        view.host.update(cx, |thread, cx| {
+            for event in agent_stream_events(first_id) {
+                thread.apply(event, cx);
+            }
+            thread.apply(agent_started(second_id, None, "Calculate this"), cx);
+            let mut events = streamed_tool_call(
+                "call",
+                "calculate",
+                serde_json::json!({
+                    "operation": "add", "a": 2, "b": 3
+                }),
+            );
+            events.push(turn_ended(128));
+            let results = tool_results(&events, "5");
+            for event in events.into_iter().chain(results).chain([turn_ended(256)]) {
+                thread.apply(agent_event(second_id, event), cx);
+            }
+            thread.apply(
+                protocol::HostMessage::AgentEnded {
+                    id: second_id.into_bytes(),
+                    failure: None,
+                    duration: Duration::from_secs(1),
+                },
+                cx,
+            );
+        });
+        let host = view.host.read(cx);
+        let snapshot = host.to_protocol();
+        for entry in &snapshot.messages {
+            if let protocol::TimelineMessage::Agent(message) = entry {
+                assert!(message.pending_events.is_empty());
+            }
+        }
+        let welcome = protocol::Welcome {
+            participant_id: ParticipantId::new().into_bytes(),
+            thread: snapshot,
+            draft: host.draft.doc.encode_state(),
+            presence: Vec::new(),
+            stored_attachments: Vec::new(),
+        };
+        let restored = Thread::from_welcome(
+            welcome,
+            ThreadDraft::new(ParticipantId::new()),
+            ThreadSharing::NotShared,
+            cx,
+        );
+        let calls = restored
+            .timeline
+            .iter()
+            .filter_map(|entry| match entry {
+                TimelineMessage::Agent(message) => Some(&message.output.tool_calls),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].len(), 1);
+        assert_eq!(calls[0][0].call.function.name, "respond_to_comment");
+        assert_eq!(calls[1].len(), 1);
+        assert_eq!(calls[1][0].call.function.name, "calculate");
+        assert_eq!(calls[1][0].result_text().as_deref(), Some("5"));
+        assert_eq!(restored.conversation(), view.host.read(cx).conversation());
+    });
+}
+
+#[gpui::test]
+fn failed_run_keeps_output_the_transcript_never_got_for_joiners(cx: &mut gpui::TestAppContext) {
+    use rig::streaming::{BlockClose, StreamEvent};
+
+    cx.update(gpui_component::init);
+    let message_id = Uuid::new_v4();
+    let events = agent_stream_events(message_id);
+    let through_call = events
+        .iter()
+        .position(|event| {
+            matches!(event, protocol::HostMessage::AgentEvent { event, .. }
+            if matches!(event.to_agent(), Ok(agent::AgentEvent::Model(
+                StreamEvent::BlockEnd { end: BlockClose::ToolCall(_), .. }
+            ))))
+        })
+        .unwrap()
+        + 1;
+    let (view, cx) = cx.add_window_view(|_, cx| ThreadMirrorTestView {
+        host: Cowork::new_empty_local_thread(
+            ThreadDraft::new(ParticipantId::new()),
+            ParticipantId::new(),
+            Arc::default(),
+            None,
+            cx,
+        ),
+        collaborator: None,
+    });
+    view.update(cx, |view, cx| {
+        view.host.update(cx, |thread, cx| {
+            for event in events.iter().take(through_call) {
+                thread.apply(event.clone(), cx);
+            }
+            thread.apply(
+                protocol::HostMessage::AgentEnded {
+                    id: message_id.into_bytes(),
+                    failure: Some("stream failed".into()),
+                    duration: Duration::from_secs(1),
+                },
+                cx,
+            );
+        });
+        let host = view.host.read(cx);
+        let snapshot = host.to_protocol();
+        let protocol::TimelineMessage::Agent(message) = &snapshot.messages[1] else {
+            panic!("expected agent message");
+        };
+        // The turn never ended, so all of it is pending.
+        assert_eq!(
+            message.pending_events.len(),
+            events[..through_call]
+                .iter()
+                .filter(|event| matches!(event, protocol::HostMessage::AgentEvent { .. }))
+                .count()
+        );
+        let welcome = protocol::Welcome {
+            participant_id: ParticipantId::new().into_bytes(),
+            thread: snapshot,
+            draft: host.draft.doc.encode_state(),
+            presence: Vec::new(),
+            stored_attachments: Vec::new(),
+        };
+        let restored = Thread::from_welcome(
+            welcome,
+            ThreadDraft::new(ParticipantId::new()),
+            ThreadSharing::NotShared,
+            cx,
+        );
+        assert_eq!(restored.conversation(), view.host.read(cx).conversation());
+        let TimelineMessage::Agent(restored) = &restored.timeline[1] else {
+            panic!("expected agent message");
+        };
+        assert_eq!(
+            restored.output.tool_calls[0].call.function.name,
+            "respond_to_comment"
+        );
+        assert!(restored.output.tool_calls[0].result.is_none());
+        assert_eq!(restored.output.thinking, "Weighing options.");
+        assert_eq!(restored.output.text, "Here is ");
+        assert_eq!(restored.comment_responses.len(), 1);
+        assert_eq!(restored.comment_responses[0].response, "Because of this.");
+    });
+}
+
+/// The host shows each run's output incrementally, redoing only what follows
+/// the committed part. After every event, that is exactly what deriving it
+/// from scratch gives, which is what someone joining then does.
+#[gpui::test]
+fn incremental_output_matches_a_fresh_derivation_after_every_event(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let first_id = Uuid::new_v4();
+    let second_id = Uuid::new_v4();
+    let mut events = agent_stream_events(first_id);
+    // A second run whose turn calls two tools, answered one at a time, so
+    // results arrive for committed calls before they join the transcript.
+    events.push(agent_started(second_id, None, "Calculate both"));
+    let mut turn = vec![streamed_text("thinking", "Two sums.", true)];
+    turn.extend(streamed_tool_call(
+        "first",
+        "calculate",
+        serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+    ));
+    turn.extend(streamed_tool_call(
+        "second",
+        "calculate",
+        serde_json::json!({"operation": "add", "a": 3, "b": 4}),
+    ));
+    turn.push(turn_ended(300));
+    let results = tool_results(&turn, "sum");
+    assert_eq!(results.len(), 2);
+    turn.extend(results);
+    turn.extend([
+        streamed_text("answer", "3 and ", false),
+        streamed_text("answer", "7.", false),
+        turn_ended(400),
+    ]);
+    events.extend(turn.into_iter().map(|event| agent_event(second_id, event)));
+    events.push(protocol::HostMessage::AgentEnded {
+        id: second_id.into_bytes(),
+        failure: None,
+        duration: Duration::from_secs(2),
+    });
+
+    let (view, cx) = cx.add_window_view(|_, cx| ThreadMirrorTestView {
+        host: Cowork::new_empty_local_thread(
+            ThreadDraft::new(ParticipantId::new()),
+            ParticipantId::new(),
+            Arc::default(),
+            None,
+            cx,
+        ),
+        collaborator: None,
+    });
+    view.update(cx, |view, cx| {
+        for (index, event) in events.into_iter().enumerate() {
+            view.host.update(cx, |thread, cx| thread.apply(event, cx));
+            let host = view.host.read(cx);
+            let welcome = protocol::Welcome {
+                participant_id: ParticipantId::new().into_bytes(),
+                thread: host.to_protocol(),
+                draft: host.draft.doc.encode_state(),
+                presence: Vec::new(),
+                stored_attachments: Vec::new(),
+            };
+            let restored = Thread::from_welcome(
+                welcome,
+                ThreadDraft::new(ParticipantId::new()),
+                ThreadSharing::NotShared,
+                cx,
+            );
+            assert_eq!(
+                restored.conversation().agent_output,
+                view.host.read(cx).conversation().agent_output,
+                "after event {index}"
+            );
+        }
+        let host = view.host.read(cx);
+        let TimelineMessage::Agent(message) = &host.timeline[2] else {
+            panic!("expected the second run's message");
+        };
+        assert_eq!(message.output.thinking, "Two sums.");
+        assert_eq!(message.output.text, "3 and 7.");
+        assert!(
+            message
+                .output
+                .tool_calls
+                .iter()
+                .all(|call| call.result_text().as_deref() == Some("sum"))
+        );
+    });
+}
+
+/// A block's end may restate the whole block, superseding what streamed.
+/// What the message shows follows Rig's accumulation, so it shows the
+/// restatement, as the transcript records it, and so does someone joining.
+#[gpui::test]
+fn a_restated_block_shows_as_rig_accumulates_it(cx: &mut gpui::TestAppContext) {
+    use rig::streaming::{BlockClose, BlockKind, Delta};
+
+    cx.update(gpui_component::init);
+    let message_id = Uuid::new_v4();
+    let mut turn = streamed_block(
+        "thinking",
+        BlockKind::Reasoning { provider_id: None },
+        [Delta::Reasoning { text: "Hm".into() }],
+        BlockClose::Reasoning {
+            reasoning: Some(rig::message::Reasoning::new("Considered.")),
+            signature: None,
+            wire_sent: true,
+        },
+    );
+    turn.push(streamed_text("answer", "Yes.", false));
+    let (view, cx) = cx.add_window_view(|_, cx| ThreadMirrorTestView {
+        host: Cowork::new_empty_local_thread(
+            ThreadDraft::new(ParticipantId::new()),
+            ParticipantId::new(),
+            Arc::default(),
+            None,
+            cx,
+        ),
+        collaborator: None,
+    });
+    view.update(cx, |view, cx| {
+        view.host.update(cx, |thread, cx| {
+            thread.apply(agent_started(message_id, None, "Is it?"), cx);
+            for event in turn {
+                thread.apply(agent_event(message_id, event), cx);
+            }
+        });
+        let host = view.host.read(cx);
+        let TimelineMessage::Agent(message) = &host.timeline[0] else {
+            panic!("expected the agent message");
+        };
+        assert_eq!(message.output.thinking, "Considered.");
+        assert_eq!(message.output.text, "Yes.");
+        let welcome = protocol::Welcome {
+            participant_id: ParticipantId::new().into_bytes(),
+            thread: host.to_protocol(),
+            draft: host.draft.doc.encode_state(),
+            presence: Vec::new(),
+            stored_attachments: Vec::new(),
+        };
+        let restored = Thread::from_welcome(
+            welcome,
+            ThreadDraft::new(ParticipantId::new()),
+            ThreadSharing::NotShared,
+            cx,
+        );
+        assert_eq!(restored.conversation(), view.host.read(cx).conversation());
+
+        view.host.update(cx, |thread, cx| {
+            thread.apply(agent_event(message_id, turn_ended(64)), cx);
+        });
+        let host = view.host.read(cx);
+        let TimelineMessage::Agent(message) = &host.timeline[0] else {
+            panic!("expected the agent message");
+        };
+        assert_eq!(message.output.thinking, "Considered.");
+        let [_, RigMessage::Assistant { content, .. }] = host.transcript.as_slice() else {
+            panic!("expected the prompt and the reply");
+        };
+        assert!(matches!(
+            content.first(),
+            Some(rig::completion::AssistantContent::Reasoning(reasoning))
+                if reasoning.display_text() == "Considered."
+        ));
+    });
+}
+
+/// A snapshot whose agent messages do not fit its transcript is rejected
+/// before anything is derived from it.
+#[gpui::test]
+fn snapshots_with_agent_runs_the_transcript_cannot_hold_are_rejected(
+    cx: &mut gpui::TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let message_id = Uuid::new_v4();
+    let (view, cx) = cx.add_window_view(|_, cx| ThreadMirrorTestView {
+        host: Cowork::new_empty_local_thread(
+            ThreadDraft::new(ParticipantId::new()),
+            ParticipantId::new(),
+            Arc::default(),
+            None,
+            cx,
+        ),
+        collaborator: None,
+    });
+    view.update(cx, |view, cx| {
+        view.host.update(cx, |thread, cx| {
+            for event in agent_stream_events(message_id) {
+                thread.apply(event, cx);
+            }
+        });
+        let host = view.host.read(cx);
+        let welcome = protocol::Welcome {
+            participant_id: ParticipantId::new().into_bytes(),
+            thread: host.to_protocol(),
+            draft: host.draft.doc.encode_state(),
+            presence: Vec::new(),
+            stored_attachments: Vec::new(),
+        };
+        Thread::validate_welcome(&welcome).expect("the host's own snapshot");
+        let with_agent_message = |change: &dyn Fn(&mut protocol::AgentMessage)| {
+            let mut welcome = welcome.clone();
+            for message in &mut welcome.thread.messages {
+                if let protocol::TimelineMessage::Agent(message) = message {
+                    change(message);
+                }
+            }
+            Thread::validate_welcome(&welcome)
+        };
+
+        // The prompt must be a user message: here it is the agent's reply.
+        assert!(with_agent_message(&|message| message.prompt = 1).is_err());
+        assert!(with_agent_message(&|message| message.prompt = 99).is_err());
+        // Events completing a turn would have joined the transcript.
+        assert!(
+            with_agent_message(&|message| {
+                message.pending_events =
+                    vec![protocol::Json::shared(turn_ended(1)).expect("a folded event")];
+            })
+            .is_err()
+        );
+        assert!(
+            with_agent_message(&|message| {
+                message.pending_events =
+                    vec![protocol::Json::shared(streamed_text("answer", "More", false)).unwrap()];
+            })
+            .is_ok()
+        );
+
+        // Only the last run can still be generating.
+        let mut two_generating = welcome.clone();
+        let first = two_generating
+            .thread
+            .messages
+            .iter()
+            .find(|message| matches!(message, protocol::TimelineMessage::Agent(_)))
+            .cloned()
+            .expect("an agent message");
+        two_generating
+            .thread
+            .transcript
+            .push(protocol::Json::from_rig(&RigMessage::user("Next")));
+        let protocol::TimelineMessage::Agent(mut second) = first.clone() else {
+            unreachable!();
+        };
+        second.id = Uuid::new_v4().into_bytes();
+        second.prompt = two_generating.thread.transcript.len() - 1;
+        second.pending_events.clear();
+        let protocol::TimelineMessage::Agent(mut first) = first else {
+            unreachable!();
+        };
+        first.run = protocol::AgentRun::Generating;
+        two_generating
+            .thread
+            .messages
+            .retain(|message| !matches!(message, protocol::TimelineMessage::Agent(_)));
+        two_generating
+            .thread
+            .messages
+            .push(protocol::TimelineMessage::Agent(first));
+        two_generating
+            .thread
+            .messages
+            .push(protocol::TimelineMessage::Agent(second));
+        assert!(Thread::validate_welcome(&two_generating).is_err());
+    });
+}
+
+/// Thinking collapses when it completes, but once someone expands it again,
+/// later turns and the end of the run leave it open.
+#[gpui::test]
+fn expanded_thinking_stays_open_as_the_run_continues(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let message_id = Uuid::new_v4();
+    let events = agent_stream_events(message_id);
+    // Through the first answer token, which completes the thinking.
+    let thinking_done = events
+        .iter()
+        .position(|event| {
+            matches!(event, protocol::HostMessage::AgentEvent { event, .. }
+            if matches!(event.to_agent(), Ok(agent::AgentEvent::Model(
+                rig::streaming::StreamEvent::BlockDelta {
+                    delta: rig::streaming::Delta::Text { .. }, ..
+                }
+            ))))
+        })
+        .expect("an answer token")
+        + 1;
+    let (view, cx) = cx.add_window_view(|_, cx| ThreadMirrorTestView {
+        host: Cowork::new_empty_local_thread(
+            ThreadDraft::new(ParticipantId::new()),
+            ParticipantId::new(),
+            Arc::default(),
+            None,
+            cx,
+        ),
+        collaborator: None,
+    });
+    view.update(cx, |view, cx| {
+        view.host.update(cx, |thread, cx| {
+            for event in events.iter().take(thinking_done) {
+                thread.apply(event.clone(), cx);
+            }
+            let message = thread
+                .agent_message_mut(message_id.into_bytes())
+                .expect("the agent message");
+            assert!(message.output.thinking_complete);
+            assert!(!message.thinking_expanded);
+            message.thinking_expanded = true;
+            for event in events.iter().skip(thinking_done) {
+                thread.apply(event.clone(), cx);
+            }
+            let message = thread
+                .agent_message_mut(message_id.into_bytes())
+                .expect("the agent message");
+            assert!(message.thinking_expanded);
+        });
     });
 }
 

@@ -90,6 +90,23 @@ impl TurnFold {
         &self.calls
     }
 
+    /// The message being folded, as far as it has come: the reply streaming,
+    /// as Rig accumulates it, or once it has ended, the results of the tools
+    /// that have returned. `None` while there is neither.
+    ///
+    /// Folding the rest of its events completes exactly this message, with
+    /// more content, so the history followed by this is everything the run
+    /// has produced so far.
+    pub fn partial(&self) -> Option<Message> {
+        if !self.results.is_empty() {
+            return Some(Message::User {
+                content: self.results.clone(),
+            });
+        }
+        let content = self.reply.snapshot();
+        (!content.is_empty()).then_some(Message::Assistant { id: None, content })
+    }
+
     pub fn apply(&mut self, event: &AgentEvent) -> Folded {
         match event {
             AgentEvent::Model(event) => match self.reply.apply(event) {
@@ -355,6 +372,7 @@ mod tests {
         ));
 
         // Resuming after the reply, as someone joining now would.
+        assert_eq!(fold.partial(), None);
         let mut resumed = TurnFold::after(&messages[0]);
         let result = AgentEvent::ToolResult {
             call: call.id.clone(),
@@ -366,6 +384,39 @@ mod tests {
             expected,
             Message::User { content } if matches!(content.as_slice(), [UserContent::ToolResult(_)])
         ));
+    }
+
+    /// Mid-turn, the partial message is the reply so far, and just before
+    /// the turn ends it is the reply the turn adds.
+    #[test]
+    fn partial_messages_grow_into_the_messages_folded() {
+        let events = turn();
+        let (turn_ended, streamed) = events.split_last().expect("a turn");
+        let mut fold = TurnFold::default();
+        assert_eq!(fold.partial(), None);
+        fold.apply(&streamed[0]);
+        fold.apply(&streamed[1]);
+        let Some(Message::Assistant { content, .. }) = fold.partial() else {
+            panic!("expected the reply so far");
+        };
+        assert!(matches!(
+            content.as_slice(),
+            [AssistantContent::Reasoning(_)]
+        ));
+
+        for event in &streamed[2..] {
+            fold.apply(event);
+        }
+        let Some(Message::Assistant {
+            content: partial, ..
+        }) = fold.partial()
+        else {
+            panic!("expected the whole reply");
+        };
+        let Some(Message::Assistant { content, .. }) = fold.apply(turn_ended).message else {
+            panic!("expected the reply");
+        };
+        assert_eq!(partial, content);
     }
 
     /// What a run emits folds the same after crossing a JSON boundary.

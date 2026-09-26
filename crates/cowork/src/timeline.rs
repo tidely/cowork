@@ -1,20 +1,19 @@
 //! A thread's submitted messages and the agent's replies, and their wire
 //! form.
 
-use std::{
-    ops::Range,
-    time::{Duration, SystemTime},
-};
+use std::{ops::Range, time::SystemTime};
 
+use agent::AgentEvent;
 use draft::AttachmentRecord;
 use gpui::{AppContext, Entity, SharedString};
 use gpui_base::{TextViewState, input::TextareaState};
+use rig::{completion::message::ToolResultContent, message::ToolCall};
 use uuid::Uuid;
 
 use crate::{
     attachments::{record_from_protocol, record_to_protocol},
     participant::ParticipantId,
-    protocol,
+    protocol::{self, AgentRun},
     thread_draft::ItemPresence,
 };
 
@@ -24,6 +23,9 @@ pub(crate) enum MessageAuthor {
     Agent,
 }
 
+// A thread holds a handful of these, so boxing the larger variant would
+// only add an indirection.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub(crate) enum TimelineMessage {
     User(UserMessageGroup),
@@ -36,18 +38,58 @@ pub(crate) struct AgentMessage {
     pub(crate) comment_group_id: Option<Uuid>,
     /// When the host started generating this message.
     pub(crate) started_at: SystemTime,
-    pub(crate) comment_responses: Vec<AgentCommentResponse>,
-    pub(crate) thinking: String,
+    /// See [`protocol::AgentMessage::prompt`].
+    pub(crate) prompt: usize,
+    /// See [`protocol::AgentMessage::pending_events`].
+    pub(crate) pending_events: Vec<protocol::Json<AgentEvent>>,
+    pub(crate) run: AgentRun,
+
+    /// What the message shows, derived from its run's output as Rig has it;
+    /// see `transcript.rs`.
+    pub(crate) output: AgentOutput,
+    /// How much of `output` comes from the run's transcript entries, which
+    /// never change; the rest comes from the message the run is folding.
+    pub(crate) committed: OutputMark,
+    /// `output`'s thinking and text, kept in step with it.
     pub(crate) thinking_view: Entity<TextViewState>,
-    pub(crate) thinking_complete: bool,
-    pub(crate) thinking_expanded: bool,
-    pub(crate) text: String,
     pub(crate) text_view: Entity<TextViewState>,
-    pub(crate) complete: bool,
-    pub(crate) failed: bool,
-    /// How long the host spent generating this message, stopped and failed
-    /// runs included. `None` while generating.
-    pub(crate) duration: Option<Duration>,
+    /// The replies to comments among `output`'s tool calls. Kept rather than
+    /// derived each time, since comments on a reply refer to its view.
+    pub(crate) comment_responses: Vec<AgentCommentResponse>,
+    /// How many of `output`'s tool calls have been checked for replies to
+    /// comments.
+    pub(crate) comment_calls_checked: usize,
+
+    // Local view state.
+    /// Whether completed thinking is shown; thinking in progress always is.
+    pub(crate) thinking_expanded: bool,
+    pub(crate) tool_calls_expanded: bool,
+}
+
+/// What an agent message shows: a function of its run's output alone, the
+/// Rig messages it added to the transcript followed by the one it is
+/// folding, as far as it has come. Every copy of the thread derives the same
+/// from the same messages; see `AgentOutput::of`.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct AgentOutput {
+    pub(crate) thinking: String,
+    /// False only while the model is still reasoning: the run is generating
+    /// and reasoning is the last part of the reply streaming.
+    pub(crate) thinking_complete: bool,
+    pub(crate) text: String,
+    pub(crate) tool_calls: Vec<AgentToolCall>,
+}
+
+/// Where an [`AgentOutput`]'s committed part ends: the lengths of its
+/// thinking, text, and tool calls, and how many of those calls have their
+/// results. Committed calls are answered in order, a reply's results all at
+/// once, so the answered ones come first.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct OutputMark {
+    pub(crate) thinking: usize,
+    pub(crate) text: usize,
+    pub(crate) tool_calls: usize,
+    pub(crate) answered: usize,
 }
 
 #[derive(Clone)]
@@ -56,6 +98,41 @@ pub(crate) struct AgentCommentResponse {
     pub(crate) comment_id: Uuid,
     pub(crate) response: String,
     pub(crate) response_view: Entity<TextViewState>,
+}
+
+/// A tool call the agent made, and what the tool returned, as Rig has them.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct AgentToolCall {
+    pub(crate) call: ToolCall,
+    /// `None` until the tool returns. A run that ends first leaves it so.
+    pub(crate) result: Option<Vec<ToolResultContent>>,
+}
+
+impl AgentToolCall {
+    pub(crate) fn arguments_text(&self) -> String {
+        pretty_json(&self.call.function.arguments)
+    }
+
+    /// The result's content as text, one item per line.
+    pub(crate) fn result_text(&self) -> Option<String> {
+        let content = self.result.as_ref()?;
+        Some(
+            content
+                .iter()
+                .map(|item| match item {
+                    ToolResultContent::Text(text) => text.text.clone(),
+                    ToolResultContent::Json { value } => pretty_json(value),
+                    ToolResultContent::Image(_) => "[image]".to_owned(),
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+}
+
+fn pretty_json(value: &serde_json::Value) -> String {
+    // A `Value` always encodes.
+    serde_json::to_string_pretty(value).expect("a JSON value encodes")
 }
 
 /// A submitted user message: the comments and prompt blocks of one
@@ -215,28 +292,41 @@ impl protocol::UserMessage {
 }
 
 impl AgentMessage {
-    /// An empty message for an agent that has just started responding.
+    /// A message answering the prompt at `prompt` in the transcript. It
+    /// shows nothing until its output is shown.
     pub(crate) fn new(
         id: Uuid,
         comment_group_id: Option<Uuid>,
         started_at: SystemTime,
+        prompt: usize,
+        run: AgentRun,
+        pending_events: Vec<protocol::Json<AgentEvent>>,
         cx: &mut impl AppContext,
     ) -> Self {
         Self {
             id,
             comment_group_id,
             started_at,
-            comment_responses: Vec::new(),
-            thinking: String::new(),
+            prompt,
+            pending_events,
+            run,
+            // What an empty output shows: the model is not reasoning yet.
+            output: AgentOutput {
+                thinking_complete: true,
+                ..AgentOutput::default()
+            },
+            committed: OutputMark::default(),
+            comment_calls_checked: 0,
             thinking_view: cx.new(|cx| TextViewState::markdown("", cx)),
-            thinking_complete: false,
-            thinking_expanded: true,
-            text: String::new(),
             text_view: cx.new(|cx| TextViewState::markdown("", cx)),
-            complete: false,
-            failed: false,
-            duration: None,
+            comment_responses: Vec::new(),
+            thinking_expanded: false,
+            tool_calls_expanded: false,
         }
+    }
+
+    pub(crate) fn is_generating(&self) -> bool {
+        self.run.is_generating()
     }
 
     pub(crate) fn to_protocol(&self) -> protocol::AgentMessage {
@@ -244,53 +334,26 @@ impl AgentMessage {
             id: self.id.into_bytes(),
             comment_group_id: self.comment_group_id.map(Uuid::into_bytes),
             started_at: self.started_at,
-            comment_responses: self
-                .comment_responses
-                .iter()
-                .map(|response| protocol::AgentCommentResponse {
-                    id: response.id.into_bytes(),
-                    comment_id: response.comment_id.into_bytes(),
-                    response: response.response.clone(),
-                })
-                .collect(),
-            thinking: self.thinking.clone(),
-            thinking_complete: self.thinking_complete,
-            text: self.text.clone(),
-            complete: self.complete,
-            failed: self.failed,
-            duration: self.duration,
+            prompt: self.prompt,
+            pending_events: self.pending_events.clone(),
+            run: self.run.clone(),
         }
     }
 }
 
 impl protocol::AgentMessage {
+    /// The message, showing nothing until `Thread::restore_agent_output`
+    /// shows its output.
     pub(crate) fn into_native(self, cx: &mut impl AppContext) -> AgentMessage {
-        let thinking_view = cx.new(|cx| TextViewState::markdown(&self.thinking, cx));
-        let text_view = cx.new(|cx| TextViewState::markdown(&self.text, cx));
-        AgentMessage {
-            id: Uuid::from_bytes(self.id),
-            comment_group_id: self.comment_group_id.map(Uuid::from_bytes),
-            started_at: self.started_at,
-            comment_responses: self
-                .comment_responses
-                .into_iter()
-                .map(|response| AgentCommentResponse {
-                    id: Uuid::from_bytes(response.id),
-                    comment_id: Uuid::from_bytes(response.comment_id),
-                    response_view: cx.new(|cx| TextViewState::markdown(&response.response, cx)),
-                    response: response.response,
-                })
-                .collect(),
-            thinking: self.thinking,
-            thinking_view,
-            thinking_complete: self.thinking_complete,
-            thinking_expanded: !self.thinking_complete,
-            text: self.text,
-            text_view,
-            complete: self.complete,
-            failed: self.failed,
-            duration: self.duration,
-        }
+        AgentMessage::new(
+            Uuid::from_bytes(self.id),
+            self.comment_group_id.map(Uuid::from_bytes),
+            self.started_at,
+            self.prompt,
+            self.run,
+            self.pending_events,
+            cx,
+        )
     }
 }
 

@@ -34,7 +34,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 13;
+pub(crate) const PROTOCOL_VERSION: u32 = 14;
 
 /// A request from a collaborator to the host.
 ///
@@ -327,9 +327,6 @@ pub(crate) struct ThreadSnapshot {
     pub(crate) messages: Vec<TimelineMessage>,
     /// Rig messages need JSON's self-describing format; postcard alone cannot decode them.
     pub(crate) transcript: Vec<Json<rig::completion::Message>>,
-    /// The running agent's events since the transcript last grew, which the
-    /// transcript's next message is folded from.
-    pub(crate) agent_events: Vec<Json<agent::AgentEvent>>,
     /// Everyone's name in prompts, sorted by participant.
     pub(crate) prompt_names: Vec<(uuid::Bytes, String)>,
 }
@@ -389,21 +386,54 @@ pub(crate) struct AgentMessage {
     pub(crate) comment_group_id: Option<uuid::Bytes>,
     /// See [`HostMessage::AgentStarted`].
     pub(crate) started_at: SystemTime,
-    pub(crate) comment_responses: Vec<AgentCommentResponse>,
-    pub(crate) thinking: String,
-    pub(crate) thinking_complete: bool,
-    pub(crate) text: String,
-    pub(crate) complete: bool,
-    pub(crate) failed: bool,
-    /// See [`HostMessage::AgentEnded`]. `None` while generating.
-    pub(crate) duration: Option<Duration>,
+    /// Where the prompt this message answers is in the transcript. Each run
+    /// adds exactly its prompt there, with `AgentStarted`, so its output is
+    /// the entries after it, up to the next agent message's prompt.
+    pub(crate) prompt: usize,
+    /// The run's events since its output last joined the transcript, exactly
+    /// as the host folded them. While generating, they are the turn in
+    /// progress, which someone joining folds on from. Once a run is stopped
+    /// or fails mid-turn, they are output the transcript never gets. Empty
+    /// after a turn completes.
+    ///
+    /// What the message shows is derived from its transcript entries and
+    /// these, never sent separately; see `transcript.rs`.
+    pub(crate) pending_events: Vec<Json<agent::AgentEvent>>,
+    pub(crate) run: AgentRun,
 }
 
+/// Whether an agent message's run is still going.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct AgentCommentResponse {
-    pub(crate) id: uuid::Bytes,
-    pub(crate) comment_id: uuid::Bytes,
-    pub(crate) response: String,
+pub(crate) enum AgentRun {
+    Generating,
+    /// The run completed, was stopped, or failed. See
+    /// [`HostMessage::AgentEnded`] for `failure` and `duration`.
+    Ended {
+        failure: Option<String>,
+        duration: Duration,
+    },
+}
+
+impl AgentRun {
+    pub(crate) fn is_generating(&self) -> bool {
+        matches!(self, Self::Generating)
+    }
+
+    /// Why the run failed, if it did.
+    pub(crate) fn failure(&self) -> Option<&str> {
+        match self {
+            Self::Generating => None,
+            Self::Ended { failure, .. } => failure.as_deref(),
+        }
+    }
+
+    /// How long the host spent generating. `None` while it still is.
+    pub(crate) fn duration(&self) -> Option<Duration> {
+        match self {
+            Self::Generating => None,
+            Self::Ended { duration, .. } => Some(*duration),
+        }
+    }
 }
 
 fn codec() -> LengthDelimitedCodec {
@@ -749,21 +779,15 @@ mod tests {
                     id: [4; 16],
                     comment_group_id: Some([2; 16]),
                     started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-                    comment_responses: vec![AgentCommentResponse {
-                        id: [5; 16],
-                        comment_id: [3; 16],
-                        response: "Reply".into(),
-                    }],
-                    thinking: "Reasoning".into(),
-                    thinking_complete: true,
-                    text: "Answer".into(),
-                    complete: true,
-                    failed: false,
-                    duration: Some(Duration::from_millis(12_345)),
+                    prompt: 0,
+                    pending_events: vec![json("{}")],
+                    run: AgentRun::Ended {
+                        failure: Some("Failed".into()),
+                        duration: Duration::from_millis(12_345),
+                    },
                 }),
             ],
             transcript: vec![json(r#"{"role":"user"}"#), json(r#"{"role":"assistant"}"#)],
-            agent_events: vec![json("{}")],
             prompt_names: vec![([11; 16], "Ada".into())],
         };
         let message = HostMessage::Welcome(Box::new(Welcome {
