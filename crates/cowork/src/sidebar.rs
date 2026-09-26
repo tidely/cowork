@@ -14,7 +14,7 @@ use gpui_kit_assets::IconName as AssetIconName;
 use uuid::Uuid;
 
 use crate::{
-    Cowork,
+    Cowork, MainStage,
     thread::{ThreadSharing, ThreadSummary},
     thread_draft::ThreadDraft,
     top_bar::TOP_BAR_HEIGHT,
@@ -138,7 +138,7 @@ impl Cowork {
         let can_write = thread.read(cx).ownership.can_write();
         self.active_thread_id = Some(thread_id);
         self.selection_message_id = None;
-        self.profile_open = false;
+        self.main_stage = MainStage::Thread;
         self.follow_generation = true;
         self.timeline_scroll_handle.scroll_to_bottom();
         if can_write {
@@ -155,7 +155,9 @@ impl Cowork {
     ) -> SidebarMenuItem {
         SidebarMenuItem::new(thread.title.clone())
             .min_h(px(30.))
-            .active(!self.profile_open && self.active_thread_id == Some(thread_id))
+            .active(
+                self.main_stage == MainStage::Thread && self.active_thread_id == Some(thread_id),
+            )
             .on_click(cx.listener(move |this, _, window, cx| {
                 this.open_thread(thread_id, window, cx);
             }))
@@ -188,12 +190,14 @@ impl Cowork {
                                 .size_4()
                                 .text_color(rgb(0xe4e4e7)),
                         )
-                        .active(!self.profile_open && self.active_thread_id.is_none())
+                        .active(
+                            self.main_stage == MainStage::Thread && self.active_thread_id.is_none(),
+                        )
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.new_thread_draft = ThreadDraft::new(this.local_participant_id);
                             this.active_thread_id = None;
                             this.selection_message_id = None;
-                            this.profile_open = false;
+                            this.main_stage = MainStage::Thread;
                             this.focus_composer(window, cx);
                             cx.notify();
                         })),
@@ -339,7 +343,7 @@ impl Cowork {
                     .debug_selector(|| "identity-button".to_owned())
                     .flex_1()
                     .px_1p5()
-                    .selected(self.profile_open)
+                    .selected(self.main_stage == MainStage::Profile)
                     .accessibility_label("Open profile")
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_profile(window, cx);

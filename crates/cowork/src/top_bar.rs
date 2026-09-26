@@ -17,7 +17,7 @@ use gpui_component::{
 use gpui_kit_assets::IconName as AssetIconName;
 
 use crate::{
-    Cowork,
+    Cowork, MainStage,
     thread::{SharingStatus, Thread},
 };
 
@@ -104,7 +104,7 @@ impl Cowork {
     ) -> impl IntoElement {
         let active_thread = self
             .active_thread_id
-            .filter(|_| !self.profile_open)
+            .filter(|_| self.main_stage == MainStage::Thread)
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx));
         let sharing_status = active_thread
             .as_ref()
@@ -210,7 +210,7 @@ impl Cowork {
                     .when(sharing_status == SharingStatus::Shared, |this| {
                         this.child(copy_endpoint_button)
                     })
-                    .when(!self.profile_open, |this| {
+                    .when(self.main_stage == MainStage::Thread, |this| {
                         this.child(
                             div()
                                 .id("toggle-sharing")

@@ -26,7 +26,7 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::{
-    Cowork,
+    Cowork, MainStage,
     participant::ParticipantId,
     profile::validate_profile,
     protocol,
@@ -824,7 +824,7 @@ impl Cowork {
         });
         self.active_thread_id = Some(thread_id);
         self.selection_message_id = None;
-        self.profile_open = false;
+        self.main_stage = MainStage::Thread;
         self.follow_generation = true;
         self.timeline_scroll_handle.scroll_to_bottom();
         cx.notify();

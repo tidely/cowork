@@ -303,7 +303,10 @@ fn the_profile_button_opens_the_profile_page(cx: &mut gpui::TestAppContext) {
     cx.simulate_click(button.center(), gpui::Modifiers::default());
     cx.run_until_parked();
 
-    assert!(cowork.read_with(cx, |cowork, _| cowork.profile_open));
+    assert_eq!(
+        cowork.read_with(cx, |cowork, _| cowork.main_stage),
+        MainStage::Profile
+    );
     assert!(cx.debug_bounds("profile-page").is_some());
     assert!(cx.debug_bounds("profile-picture").is_some());
     assert!(cx.debug_bounds("usage-stats").is_some());

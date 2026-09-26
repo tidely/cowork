@@ -67,10 +67,18 @@ mod timeline_view;
 mod top_bar;
 mod transcript;
 mod usage;
+mod welcome;
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 actions!(cowork, [Quit, SubmitComposer, OpenSearchPalette]);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MainStage {
+    Welcome,
+    Thread,
+    Profile,
+}
 
 struct Cowork {
     sidebar_open: bool,
@@ -93,8 +101,8 @@ struct Cowork {
     titlebar_click_armed: bool,
     copied_endpoint_id: Option<Uuid>,
     join_dialog: Option<Entity<JoinDialog>>,
-    /// Whether the main stage shows the profile page instead of a thread.
-    profile_open: bool,
+    /// Which page occupies the center stage.
+    main_stage: MainStage,
     profile: Profile,
     /// Everyone's profile as the active thread shows them, refreshed at the
     /// start of every render; see [`Cowork::profiles_for`].
@@ -435,7 +443,7 @@ impl Render for Cowork {
                             .min_w_0()
                             .flex()
                             .flex_col()
-                            .when(can_write && !self.profile_open, |this| {
+                            .when(can_write && self.main_stage == MainStage::Thread, |this| {
                                 this.can_drop(|value, _, _| {
                                     value
                                         .downcast_ref::<ExternalPaths>()
@@ -443,24 +451,21 @@ impl Render for Cowork {
                                 })
                                 .on_drop(cx.listener(Self::drop_attachments))
                             })
-                            .map(|this| {
-                                if self.profile_open {
-                                    this.child(self.render_profile_page(cx))
-                                } else {
-                                    this.child(self.render_main_editor(
+                            .map(|this| match self.main_stage {
+                                MainStage::Profile => this.child(self.render_profile_page(cx)),
+                                MainStage::Welcome => this.child(self.render_welcome(cx)),
+                                MainStage::Thread => this
+                                    .child(self.render_main_editor(
                                         read_only_line_bounds.clone(),
                                         window,
                                         cx,
                                     ))
-                                    .child(
-                                        self.render_bottom_bar(
-                                            composer,
-                                            read_only_line_bounds,
-                                            window,
-                                            cx,
-                                        ),
-                                    )
-                                }
+                                    .child(self.render_bottom_bar(
+                                        composer,
+                                        read_only_line_bounds,
+                                        window,
+                                        cx,
+                                    )),
                             }),
                     ),
             )
@@ -559,7 +564,7 @@ fn main() -> anyhow::Result<()> {
                         titlebar_click_armed: false,
                         copied_endpoint_id: None,
                         join_dialog: None,
-                        profile_open: false,
+                        main_stage: MainStage::Welcome,
                         profile: Profile::local(local_participant_id),
                         shown_profiles: HashMap::new(),
                         profile_error: None,
@@ -584,7 +589,6 @@ fn main() -> anyhow::Result<()> {
                     }
                 });
                 cowork.update(cx, |cowork, cx| {
-                    cowork.focus_composer(window, cx);
                     cowork.discover_models(window, cx);
                 });
                 cx.new(|cx| Root::new(cowork, window, cx))

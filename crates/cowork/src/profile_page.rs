@@ -19,7 +19,7 @@ use gpui_kit_assets::IconName as AssetIconName;
 use itertools::Itertools;
 
 use crate::{
-    Cowork,
+    Cowork, MainStage,
     profile::{Profile, display_name_error, load_profile_picture, participant_name},
     protocol,
     thread::{Thread, ThreadOwnership, ThreadSharing},
@@ -40,7 +40,7 @@ impl Cowork {
     }
 
     pub(crate) fn open_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.profile_open = true;
+        self.main_stage = MainStage::Profile;
         self.profile_error = None;
         // The composer is hidden, so it must not keep taking keystrokes.
         window.blur(cx);

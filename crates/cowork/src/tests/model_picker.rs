@@ -2,6 +2,48 @@
 
 use super::*;
 
+#[gpui::test]
+fn welcome_cards_select_the_new_threads_model(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    cx.update(|_, cx| {
+        cowork.update(cx, |cowork, cx| {
+            cowork.main_stage = MainStage::Welcome;
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("welcome-stage").is_some());
+    assert!(cx.debug_bounds("bottom-bar").is_none());
+
+    let card = cx
+        .debug_bounds("welcome-model-Ollama-test-default")
+        .expect("the discovered model has a welcome card");
+    cx.simulate_click(card.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    cowork.read_with(cx, |cowork, cx| {
+        assert_eq!(cowork.new_thread_model, Some(recommended_qwen()));
+        assert_eq!(
+            cowork.model_picker.read(cx).selected_value(),
+            Some(recommended_qwen())
+        );
+    });
+
+    let continue_button = cx
+        .debug_bounds("welcome-continue")
+        .expect("continue follows the model cards");
+    cx.simulate_click(continue_button.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    cowork.read_with(cx, |cowork, cx| {
+        assert_eq!(cowork.main_stage, MainStage::Thread);
+        assert_eq!(cowork.active_thread_id, None);
+        assert_eq!(cowork.active_model(cx), Some(recommended_qwen()));
+    });
+    assert!(cx.debug_bounds("welcome-stage").is_none());
+    assert!(cx.debug_bounds("bottom-bar").is_some());
+}
+
 #[test]
 fn picker_lists_an_unavailable_selection_first_in_its_provider_group() {
     let catalog = catalog_of(&[ollama_model("b"), ollama_model("a")]);
