@@ -8,8 +8,8 @@ use std::{
 use gpui::{
     App, AppContext, Bounds, Context, Entity, EntityId, ExternalPaths, IntoElement, KeyBinding,
     MouseButton, MouseUpEvent, PlatformInput, QuitMode, Render, ScrollHandle, SharedString,
-    Subscription, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, canvas, div,
-    prelude::*, px, rgb, size,
+    Subscription, TextRun, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, canvas,
+    div, prelude::*, px, rgb, size,
 };
 use gpui_base::{
     TextViewDefaults,
@@ -242,12 +242,26 @@ impl Cowork {
         } else {
             px(0.)
         };
-        let available_width = window.viewport_size().width - sidebar_width - px(82.);
-        let wrap_width = if available_width > px(120.) {
-            available_width
-        } else {
-            px(120.)
+        // Measure a character in the timeline's 14 px font so the text column
+        // stays 120 characters wide when the available stage is wider.
+        let character = "0";
+        let run = TextRun {
+            len: character.len(),
+            font: window.text_style().font(),
+            color: rgb(0xd4d4d8).into(),
+            background_color: None,
+            underline: None,
+            strikethrough: None,
         };
+        let text_width = window
+            .text_system()
+            .shape_line(character.into(), px(14.), &[run], None)
+            .width()
+            * 120.;
+        // Message rows reserve 40 px for the avatar and 40 px on the right.
+        let row_width = text_width + px(80.);
+        let available_width = window.viewport_size().width - sidebar_width - px(82.);
+        let wrap_width = available_width.max(px(120.)).min(text_width);
         let mut timeline_messages = Vec::new();
         if let Some(thread_id) = active_thread_id {
             for (index, message) in messages.iter().enumerate() {
@@ -308,6 +322,8 @@ impl Cowork {
                     .child(
                         div()
                             .w_full()
+                            .max_w(row_width)
+                            .mx_auto()
                             .pt_6()
                             .min_h_full()
                             .flex()
