@@ -67,7 +67,7 @@ impl Cowork {
                     id: message_id.into_bytes(),
                     comment_group_id: comment_group_id.map(Uuid::into_bytes),
                     started_at,
-                    prompt: protocol::TranscriptMessage::from_rig(&prompt),
+                    prompt: protocol::Json::from_rig(&prompt),
                 },
                 cx,
             );
@@ -109,7 +109,7 @@ impl Cowork {
                 if let AgentEvent::TurnEnded { usage, .. } = &event {
                     turn_usage += *usage;
                 }
-                let Some(event) = protocol::AgentEventMessage::shared(event) else {
+                let Some(event) = protocol::Json::shared(event) else {
                     continue;
                 };
                 thread.update(cx, |thread, cx| {

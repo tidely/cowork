@@ -7,7 +7,7 @@ use std::{
     time::Duration,
 };
 
-use agent::TurnFold;
+use agent::{AgentEvent, TurnFold};
 use anyhow::Context as _;
 use draft::{AttachmentId, ItemId};
 use gpui::{App, AppContext, Entity, SharedString};
@@ -147,7 +147,7 @@ pub(crate) struct Thread {
     pub(crate) agent_turn: TurnFold,
     /// The events `agent_turn` has folded since the transcript last grew,
     /// which someone joining needs to fold the rest of the turn.
-    pub(crate) agent_events: Vec<protocol::AgentEventMessage>,
+    pub(crate) agent_events: Vec<protocol::Json<AgentEvent>>,
     /// The name each author is given in prompts, fixed when their first
     /// item is submitted so that renaming never changes the transcript and
     /// the agent knows everyone by one name. Mirrored like the transcript.
@@ -340,7 +340,7 @@ impl Thread {
             transcript: self
                 .transcript
                 .iter()
-                .map(protocol::TranscriptMessage::from_rig)
+                .map(protocol::Json::from_rig)
                 .collect(),
             agent_events: self.agent_events.clone(),
             prompt_names: self

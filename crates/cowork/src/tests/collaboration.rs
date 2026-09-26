@@ -435,7 +435,10 @@ fn a_joined_thread_closes_when_the_host_sends_invalid_json(cx: &mut gpui::TestAp
     session.host_thread.read_with(session.cx, |thread, _| {
         thread.publish(protocol::HostMessage::AgentEvent {
             id: Uuid::new_v4().into_bytes(),
-            event: protocol::AgentEventMessage("not json".into()),
+            event: postcard::from_bytes(
+                &postcard::to_stdvec("not json").expect("encode invalid JSON string"),
+            )
+            .expect("decode JSON wrapper"),
         });
     });
 

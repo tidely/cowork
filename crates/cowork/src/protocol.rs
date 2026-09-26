@@ -1,4 +1,7 @@
-use std::time::{Duration, SystemTime};
+use std::{
+    marker::PhantomData,
+    time::{Duration, SystemTime},
+};
 
 use anyhow::Context as _;
 use futures::{SinkExt as _, StreamExt as _};
@@ -210,7 +213,7 @@ pub(crate) enum HostMessage {
         id: uuid::Bytes,
         comment_group_id: Option<uuid::Bytes>,
         started_at: SystemTime,
-        prompt: TranscriptMessage,
+        prompt: Json<rig::completion::Message>,
     },
     /// Something the agent did while producing message `id`, exactly as the
     /// host's agent loop reported it. Every participant, the host included,
@@ -218,7 +221,7 @@ pub(crate) enum HostMessage {
     /// `transcript.rs`.
     AgentEvent {
         id: uuid::Bytes,
-        event: AgentEventMessage,
+        event: Json<agent::AgentEvent>,
     },
     /// The agent finished. `failure` carries a message to display when the
     /// agent produced no output of its own. `duration` is how long the host
@@ -236,16 +239,59 @@ pub(crate) enum HostMessage {
     },
 }
 
-/// One message of a thread's transcript, exactly as the agent was sent it or
-/// replied, as the JSON of a Rig message: Rig's message types rely on
-/// self-describing formats, which postcard is not. See `transcript.rs`.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct TranscriptMessage(pub(crate) String);
+/// A typed value encoded as a JSON string on the wire. This lets types that
+/// need a self-describing format travel through postcard without changing the
+/// string's wire representation. Decoding the JSON is deferred to `parse`, so
+/// a malformed value from a peer can be reported by its caller.
+#[derive(Serialize, Deserialize)]
+#[serde(transparent, bound(serialize = "", deserialize = ""))]
+pub(crate) struct Json<T> {
+    raw: String,
+    #[serde(skip)]
+    marker: PhantomData<fn() -> T>,
+}
 
-/// An `agent::AgentEvent`, as JSON for the same reason as
-/// [`TranscriptMessage`].
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct AgentEventMessage(pub(crate) String);
+impl<T> Json<T> {
+    pub(crate) fn from_value(value: &T) -> serde_json::Result<Self>
+    where
+        T: Serialize,
+    {
+        Ok(Self {
+            raw: serde_json::to_string(value)?,
+            marker: PhantomData,
+        })
+    }
+
+    pub(crate) fn parse(&self) -> serde_json::Result<T>
+    where
+        T: DeserializeOwned,
+    {
+        serde_json::from_str(&self.raw)
+    }
+}
+
+impl<T> Clone for Json<T> {
+    fn clone(&self) -> Self {
+        Self {
+            raw: self.raw.clone(),
+            marker: PhantomData,
+        }
+    }
+}
+
+impl<T> std::fmt::Debug for Json<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("Json").field(&self.raw).finish()
+    }
+}
+
+impl<T> PartialEq for Json<T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.raw == other.raw
+    }
+}
+
+impl<T> Eq for Json<T> {}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Welcome {
@@ -279,10 +325,11 @@ pub(crate) struct ThreadSnapshot {
     /// Bytes of agent output streamed since `context_tokens` was measured.
     pub(crate) streamed_bytes: u64,
     pub(crate) messages: Vec<TimelineMessage>,
-    pub(crate) transcript: Vec<TranscriptMessage>,
+    /// Rig messages need JSON's self-describing format; postcard alone cannot decode them.
+    pub(crate) transcript: Vec<Json<rig::completion::Message>>,
     /// The running agent's events since the transcript last grew, which the
     /// transcript's next message is folded from.
-    pub(crate) agent_events: Vec<AgentEventMessage>,
+    pub(crate) agent_events: Vec<Json<agent::AgentEvent>>,
     /// Everyone's name in prompts, sorted by participant.
     pub(crate) prompt_names: Vec<(uuid::Bytes, String)>,
 }
@@ -640,6 +687,22 @@ mod tests {
         );
     }
 
+    fn json<T>(raw: &str) -> Json<T> {
+        let encoded = postcard::to_stdvec(raw).expect("encode JSON string");
+        postcard::from_bytes(&encoded).expect("decode typed JSON string")
+    }
+
+    #[test]
+    fn typed_json_uses_string_wire_encoding() {
+        let value = Json::from_value(&vec![1, 2, 3]).expect("encode JSON");
+        assert_eq!(value.parse().expect("decode JSON"), vec![1, 2, 3]);
+        assert_eq!(
+            postcard::to_stdvec(&value).unwrap(),
+            postcard::to_stdvec(&"[1,2,3]").unwrap()
+        );
+        assert!(json::<Vec<u8>>("not json").parse().is_err());
+    }
+
     fn round_trip(message: &HostMessage) -> HostMessage {
         let encoded = postcard::to_stdvec(message).expect("encode protocol message");
         postcard::from_bytes(&encoded).expect("decode protocol message")
@@ -699,11 +762,8 @@ mod tests {
                     duration: Some(Duration::from_millis(12_345)),
                 }),
             ],
-            transcript: vec![
-                TranscriptMessage(r#"{"role":"user"}"#.into()),
-                TranscriptMessage(r#"{"role":"assistant"}"#.into()),
-            ],
-            agent_events: vec![AgentEventMessage("{}".into())],
+            transcript: vec![json(r#"{"role":"user"}"#), json(r#"{"role":"assistant"}"#)],
+            agent_events: vec![json("{}")],
             prompt_names: vec![([11; 16], "Ada".into())],
         };
         let message = HostMessage::Welcome(Box::new(Welcome {
@@ -791,11 +851,11 @@ mod tests {
                 id: [7; 16],
                 comment_group_id: Some([8; 16]),
                 started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-                prompt: TranscriptMessage(r#"{"role":"user"}"#.into()),
+                prompt: json(r#"{"role":"user"}"#),
             },
             HostMessage::AgentEvent {
                 id: [7; 16],
-                event: AgentEventMessage(r#"{"Model":{}}"#.into()),
+                event: json(r#"{"Model":{}}"#),
             },
             HostMessage::AgentEnded {
                 id: [7; 16],

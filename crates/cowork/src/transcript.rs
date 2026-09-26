@@ -25,24 +25,25 @@ use tools::{RespondToComment, RespondToCommentArgs, TurnComments};
 use uuid::Uuid;
 
 use crate::{
-    protocol::{AgentEventMessage, TranscriptMessage},
+    protocol::Json,
     thread::Thread,
     timeline::{AgentCommentResponse, TimelineMessage},
     usage::usage_tokens,
 };
 
-impl TranscriptMessage {
+impl Json<RigMessage> {
     pub(crate) fn from_rig(message: &RigMessage) -> Self {
         // Rig's messages are plain data, which always encodes.
-        Self(serde_json::to_string(message).expect("a Rig message encodes as JSON"))
+        Self::from_value(message).expect("a Rig message encodes as JSON")
     }
 
     pub(crate) fn to_rig(&self) -> anyhow::Result<RigMessage> {
-        serde_json::from_str(&self.0).context("failed to decode a transcript message")
+        self.parse()
+            .context("failed to decode a transcript message")
     }
 }
 
-impl AgentEventMessage {
+impl Json<AgentEvent> {
     /// The event as it is folded, or `None` when folding ignores it: the
     /// stream's terminal record, whose usage and message id `TurnEnded`
     /// carries, and provider payloads Rig does not model. A block's end
@@ -61,18 +62,16 @@ impl AgentEventMessage {
             event => event,
         };
         // Rig's events are plain data, which always encodes.
-        Some(Self(
-            serde_json::to_string(&event).expect("an agent event encodes as JSON"),
-        ))
+        Some(Self::from_value(&event).expect("an agent event encodes as JSON"))
     }
 
     pub(crate) fn to_agent(&self) -> anyhow::Result<AgentEvent> {
-        serde_json::from_str(&self.0).context("failed to decode an agent event")
+        self.parse().context("failed to decode an agent event")
     }
 }
 
 impl Thread {
-    pub(crate) fn push_transcript(&mut self, message: &TranscriptMessage) -> anyhow::Result<()> {
+    pub(crate) fn push_transcript(&mut self, message: &Json<RigMessage>) -> anyhow::Result<()> {
         self.transcript.push(message.to_rig()?);
         Ok(())
     }
@@ -82,7 +81,7 @@ impl Thread {
     pub(crate) fn apply_agent_event(
         &mut self,
         message_id: Uuid,
-        event: AgentEventMessage,
+        event: Json<AgentEvent>,
         cx: &mut impl AppContext,
     ) -> anyhow::Result<()> {
         let decoded = event.to_agent()?;
@@ -96,7 +95,7 @@ impl Thread {
     /// and the events since the transcript last grew.
     pub(crate) fn resume_agent_turn(
         &mut self,
-        events: Vec<AgentEventMessage>,
+        events: Vec<Json<AgentEvent>>,
     ) -> anyhow::Result<()> {
         self.agent_turn = self
             .transcript
@@ -283,8 +282,8 @@ mod tests {
             RigMessage::tool_result("call_1", "respond_to_comment", "Recorded"),
         ];
         for message in messages {
-            let wire = postcard::to_stdvec(&TranscriptMessage::from_rig(&message)).expect("encode");
-            let received: TranscriptMessage = postcard::from_bytes(&wire).expect("decode");
+            let wire = postcard::to_stdvec(&Json::from_rig(&message)).expect("encode");
+            let received: Json<RigMessage> = postcard::from_bytes(&wire).expect("decode");
             assert_eq!(received.to_rig().expect("a message"), message);
         }
     }

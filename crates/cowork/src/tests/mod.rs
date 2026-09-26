@@ -203,7 +203,7 @@ fn agent_started(
         id: id.into_bytes(),
         comment_group_id,
         started_at: SystemTime::UNIX_EPOCH,
-        prompt: protocol::TranscriptMessage::from_rig(&RigMessage::user(prompt)),
+        prompt: protocol::Json::from_rig(&RigMessage::user(prompt)),
     }
 }
 
@@ -211,7 +211,7 @@ fn agent_started(
 fn agent_event(id: Uuid, event: agent::AgentEvent) -> protocol::HostMessage {
     protocol::HostMessage::AgentEvent {
         id: id.into_bytes(),
-        event: protocol::AgentEventMessage::shared(event).expect("an event that is folded"),
+        event: protocol::Json::shared(event).expect("an event that is folded"),
     }
 }
 
