@@ -213,13 +213,10 @@ impl Cowork {
         let id = match &event {
             AttachmentReadEvent::Progress(id, _) | AttachmentReadEvent::Finished(id, _) => *id,
         };
-        let Some(index) = self
+        let index = self
             .pending_attachments
             .iter()
-            .position(|pending| pending.id == id)
-        else {
-            return None;
-        };
+            .position(|pending| pending.id == id)?;
         let mut new_block = None;
         match event {
             AttachmentReadEvent::Progress(_, progress) => {

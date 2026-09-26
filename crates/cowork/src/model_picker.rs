@@ -155,14 +155,13 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) -> (Entity<ModelPickerState>, Subscription) {
         let picker = cx.new(|cx| {
-            let picker = ComboboxState::new(
+            ComboboxState::new(
                 language_model_groups(&ModelCatalog::default(), None),
                 Vec::new(),
                 window,
                 cx,
             )
-            .searchable(true);
-            picker
+            .searchable(true)
         });
         let subscription = cx.subscribe(&picker, Self::model_picker_event);
         (picker, subscription)

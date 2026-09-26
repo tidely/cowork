@@ -167,10 +167,10 @@ impl Cowork {
                     this.record_turn_usage(&thread, turn_usage, started_at, duration, cx);
                     // The profile page's statistics may be showing.
                     cx.notify();
-                    if let Entry::Occupied(entry) = this.active_generations.entry(thread_id) {
-                        if entry.get().message_id == message_id {
-                            entry.remove();
-                        }
+                    if let Entry::Occupied(entry) = this.active_generations.entry(thread_id)
+                        && entry.get().message_id == message_id
+                    {
+                        entry.remove();
                     }
                     this.thread_updated(thread_id, cx);
                 });
