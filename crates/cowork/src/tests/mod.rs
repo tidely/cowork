@@ -70,6 +70,7 @@ mod composer;
 mod file_transfer;
 mod layout;
 mod model_picker;
+mod search_palette;
 mod threads;
 
 fn ollama_model(id: &str) -> ModelRef {

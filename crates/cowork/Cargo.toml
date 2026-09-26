@@ -22,6 +22,7 @@ gpui_platform.workspace = true
 image.workspace = true
 iroh.workspace = true
 itertools.workspace = true
+nucleo-matcher.workspace = true
 postcard.workspace = true
 rig.workspace = true
 serde.workspace = true
@@ -30,6 +31,7 @@ syntect.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
 tools.workspace = true
+unicode-segmentation.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]

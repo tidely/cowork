@@ -6,8 +6,8 @@ use gpui::{
     App, Context, FontWeight, IntoElement, SharedString, Window, div, prelude::*, px, rems, rgb,
 };
 use gpui_component::{
-    Collapsible, Icon, Selectable as _,
-    button::{Button, ButtonVariants as _},
+    Collapsible, Icon, Selectable as _, Sizable as _,
+    button::{Button, ButtonCustomVariant, ButtonVariants as _},
     sidebar::{Sidebar, SidebarCollapsible, SidebarItem, SidebarMenu, SidebarMenuItem},
 };
 use gpui_kit_assets::IconName as AssetIconName;
@@ -122,7 +122,12 @@ impl SidebarItem for CoworkSidebarSection {
 }
 
 impl Cowork {
-    fn open_thread(&mut self, thread_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_thread(
+        &mut self,
+        thread_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.thread_store.read(cx).thread(thread_id, cx).is_none() {
             return;
         }
@@ -248,14 +253,42 @@ impl Cowork {
             .collapsible(SidebarCollapsible::Offcanvas)
             .collapsed(!self.sidebar_open)
             .header(
+                // `Sidebar` puts its header in a row, so fill it for the
+                // search button to reach the right edge.
                 div()
+                    .flex_1()
                     .h(px(42.))
                     .flex()
                     .items_center()
+                    .justify_between()
                     .px_2()
-                    .text_size(px(18.))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .child("Cowork"),
+                    .child(
+                        div()
+                            .text_size(px(18.))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("Cowork"),
+                    )
+                    .child(
+                        Button::new("search-chats")
+                            .icon(
+                                Icon::new(AssetIconName::Search)
+                                    .size_4()
+                                    .text_color(rgb(0xa1a1aa)),
+                            )
+                            .custom(
+                                ButtonCustomVariant::new(cx)
+                                    .hover(rgb(0x2d2d30).into())
+                                    .active(rgb(0x3f3f46).into()),
+                            )
+                            .small()
+                            .size(px(28.))
+                            .debug_selector(|| "search-chats".to_owned())
+                            .accessibility_label("Search chats")
+                            .tooltip("Search chats")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_search_palette(window, cx);
+                            })),
+                    ),
             )
             .footer(self.render_sidebar_bottom_bar(cx))
             .child(actions);

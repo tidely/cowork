@@ -16,6 +16,7 @@ gpui_kit_assets::icon_assets!(
         Link,
         PanelLeftClose,
         PanelLeftOpen,
+        Search,
         SendHorizontal,
         Square,
         SquarePen,

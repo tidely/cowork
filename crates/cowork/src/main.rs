@@ -54,6 +54,7 @@ mod profile;
 mod profile_page;
 mod prompt;
 mod protocol;
+mod search_palette;
 mod sharing;
 mod sidebar;
 mod submission;
@@ -69,7 +70,7 @@ mod usage;
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
-actions!(cowork, [Quit, SubmitComposer]);
+actions!(cowork, [Quit, SubmitComposer, OpenSearchPalette]);
 
 struct Cowork {
     sidebar_open: bool,
@@ -374,6 +375,9 @@ impl Render for Cowork {
             .overflow_hidden()
             .bg(rgb(0x1c1c1f))
             .on_action(cx.listener(Self::submit_composer_action))
+            .on_action(cx.listener(|this, _: &OpenSearchPalette, window, cx| {
+                this.open_search_palette(window, cx);
+            }))
             .on_key_down(cx.listener(Self::begin_inline_comment))
             // Run before the focused editor's own handling, which they
             // extend to the composer as a whole.
@@ -477,6 +481,15 @@ fn main() -> anyhow::Result<()> {
             cx.bind_keys([
                 KeyBinding::new("ctrl-enter", SubmitComposer, None),
                 KeyBinding::new("cmd-enter", SubmitComposer, None),
+                KeyBinding::new(
+                    if cfg!(target_os = "macos") {
+                        "cmd-k"
+                    } else {
+                        "ctrl-k"
+                    },
+                    OpenSearchPalette,
+                    None,
+                ),
             ]);
             #[cfg(target_os = "macos")]
             {
