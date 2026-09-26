@@ -196,7 +196,11 @@ impl Tool for RespondToComment {
     type Output = CommentResponseRecorded;
 
     fn description(&self) -> String {
-        "Record a response to a user comment from the current turn. Call this once for each comment, using the comment_id shown in the prompt.".into()
+        "Reply to an inline comment: a note a participant attached to an excerpt of an earlier assistant message. \
+         Inline comments only exist when the current user message begins with a list of them, each with a comment_id such as comment_1. \
+         Call this once for each listed comment_id, and never otherwise. \
+         Ordinary messages from participants, including questions and requests, are not comments: answer them in your normal reply."
+            .into()
     }
 
     fn parameters(&self) -> serde_json::Value {
@@ -205,11 +209,11 @@ impl Tool for RespondToComment {
             "properties": {
                 "comment_id": {
                     "type": "string",
-                    "description": "The turn-local comment identifier, for example comment_1"
+                    "description": "One of the comment_ids listed with the inline comments, for example comment_1. Never invent one."
                 },
                 "response": {
                     "type": "string",
-                    "description": "The response to the comment"
+                    "description": "Your reply to that comment, shown beside it"
                 }
             },
             "required": ["comment_id", "response"],

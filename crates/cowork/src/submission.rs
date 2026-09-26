@@ -326,7 +326,7 @@ impl Cowork {
         }
 
         let mut result = String::from(
-            "Participants attached the following inline comments to immutable excerpts from the conversation. You MUST call `respond_to_comment` exactly once for every comment_id before finishing your response. Put the direct reply to that comment in the tool's `response` argument; do not repeat these replies in your final prose.\n",
+            "Participants attached the following inline comments to immutable excerpts from the conversation. You MUST call `respond_to_comment` exactly once for every comment_id listed here before finishing your response. Put the direct reply to that comment in the tool's `response` argument; do not repeat these replies in your final prose. Any messages after this list are ordinary messages, not comments: answer those in your normal reply.\n",
         );
         for (index, (comment, comment_id)) in comments.iter().zip(comment_ids.iter()).enumerate() {
             let UserCommentBody::Submitted(body) = &comment.body else {

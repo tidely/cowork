@@ -7,7 +7,7 @@ Cowork is a GPUI desktop app for collaborating on LLM agent threads (Ollama via 
 - `crates/cowork` — the app binary. `src/main.rs` holds the `Cowork` view struct, app startup, and top-level rendering; the rest of `Cowork`'s methods are `impl Cowork` blocks in the module for their area.
   - State: `thread.rs` (`Thread`, sharing state, applying host events), `thread_draft.rs` (the draft, its editors, and presence), `timeline.rs` (messages and their wire form), `transcript.rs` (the transcript and agent events on the wire, and folding them into a thread), `models.rs` (providers and model catalogs).
   - Sharing: `protocol.rs` (wire messages; postcard, length-delimited frames, control vs. bulk queues), `sharing.rs` (hosting, joining, and handling collaborators' requests), `participant.rs` (`ParticipantId` and derived names/colors), `profile.rs`.
-  - Agent runs: `submission.rs` (which submission wins, and the prompt), `generation.rs` (running the agent), `prompt.rs`.
+  - Agent runs: `submission.rs` (which submission wins, and the prompt), `generation.rs` (running the agent), `prompt.rs`. The system prompt is `prompts/system.md`, compiled in with `include_str!`.
   - UI: `composer.rs`, `draft_editing.rs`, `composer_attachments.rs`, `timeline_view.rs`, `model_picker.rs`, `top_bar.rs`, `sidebar.rs`, `profile_page.rs`, `avatars.rs`, `caret.rs`, `highlight.rs`, `assets.rs`.
   - Other: `attachments.rs` (reading and classifying files), `usage.rs` (token usage and the activity chart).
 - `crates/draft` — the collaborative draft as a Yrs CRDT document (prompt blocks, comments, attachment records) plus `verify_change` validation. No GPUI or networking dependencies; keep it that way.

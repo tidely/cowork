@@ -32,6 +32,10 @@ use crate::{
     usage::{TokenActivity, usage_tokens},
 };
 
+/// The system prompt every run starts with. Kept in its own file so it reads
+/// and diffs as prose; it is static, so it needs no templating.
+const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
+
 pub(crate) struct ActiveGeneration {
     pub(crate) message_id: Uuid,
     pub(crate) abort_handle: tokio::task::AbortHandle,
@@ -80,10 +84,14 @@ impl Cowork {
             let model = match selected_model.provider {
                 ModelProvider::Ollama => Ollama::new().bound()?.completion(selected_model.id),
             };
+            // The same tools on every run, whether or not a turn has comments:
+            // the definitions are part of the prompt prefix, so changing them
+            // would invalidate the model's prompt cache.
             let mut tools = ToolSet::default();
             tools.add_tool(RespondToComment::new(turn_comments));
             tools.add_tool(Calculate);
             StreamingAgent::new(model, tools)
+                .preamble(SYSTEM_PROMPT)
                 .additional_params(json!({
                     "num_ctx": max_tokens,
                     "think": "medium"
