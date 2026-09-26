@@ -3,7 +3,7 @@
 use super::*;
 
 #[gpui::test]
-fn welcome_cards_select_the_new_threads_model(cx: &mut gpui::TestAppContext) {
+fn provider_setup_selects_the_new_threads_model(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     cx.update(|_, cx| {
         cowork.update(cx, |cowork, cx| {
@@ -16,8 +16,26 @@ fn welcome_cards_select_the_new_threads_model(cx: &mut gpui::TestAppContext) {
     assert!(cx.debug_bounds("bottom-bar").is_none());
 
     let card = cx
-        .debug_bounds("welcome-model-Ollama-test-default")
-        .expect("the discovered model has a welcome card");
+        .debug_bounds("welcome-provider-Ollama")
+        .expect("Ollama is offered even before model setup");
+    cx.simulate_click(card.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let continue_button = cx
+        .debug_bounds("welcome-continue")
+        .expect("continue follows the provider card");
+    cx.simulate_click(continue_button.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    cowork.read_with(cx, |cowork, _| {
+        assert_eq!(
+            cowork.main_stage,
+            MainStage::ProviderSetup(ProviderSetupStage::Ollama)
+        );
+    });
+    let card = cx
+        .debug_bounds("setup-model-Ollama-test-default")
+        .expect("the discovered model has a setup card");
     cx.simulate_click(card.center(), gpui::Modifiers::default());
     cx.run_until_parked();
 
@@ -30,7 +48,7 @@ fn welcome_cards_select_the_new_threads_model(cx: &mut gpui::TestAppContext) {
     });
 
     let continue_button = cx
-        .debug_bounds("welcome-continue")
+        .debug_bounds("setup-continue")
         .expect("continue follows the model cards");
     cx.simulate_click(continue_button.center(), gpui::Modifiers::default());
     cx.run_until_parked();
@@ -42,6 +60,45 @@ fn welcome_cards_select_the_new_threads_model(cx: &mut gpui::TestAppContext) {
     });
     assert!(cx.debug_bounds("welcome-stage").is_none());
     assert!(cx.debug_bounds("bottom-bar").is_some());
+}
+
+#[gpui::test]
+fn provider_can_be_set_up_without_discovered_models(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    cx.update(|_, cx| {
+        cowork.update(cx, |cowork, cx| {
+            cowork.set_models(ModelCatalog::default(), cx);
+            cowork.main_stage = MainStage::Welcome;
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+
+    let card = cx
+        .debug_bounds("welcome-provider-Ollama")
+        .expect("provider remains available without models");
+    cx.simulate_click(card.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    let continue_button = cx.debug_bounds("welcome-continue").unwrap();
+    cx.simulate_click(continue_button.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    assert!(cx.debug_bounds("provider-setup-stage").is_some());
+    assert!(cx.debug_bounds("setup-retry").is_some());
+    let continue_button = cx.debug_bounds("setup-continue").unwrap();
+    cx.simulate_click(continue_button.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cowork.read_with(cx, |cowork, _| {
+        assert_eq!(
+            cowork.main_stage,
+            MainStage::ProviderSetup(ProviderSetupStage::Ollama)
+        );
+    });
+
+    let back = cx.debug_bounds("setup-back").unwrap();
+    cx.simulate_click(back.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("welcome-stage").is_some());
 }
 
 #[test]

@@ -76,8 +76,15 @@ actions!(cowork, [Quit, SubmitComposer, OpenSearchPalette]);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MainStage {
     Welcome,
+    ProviderSetup(ProviderSetupStage),
     Thread,
     Profile,
+}
+
+/// The provider whose setup page occupies the main stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderSetupStage {
+    Ollama,
 }
 
 struct Cowork {
@@ -103,6 +110,7 @@ struct Cowork {
     join_dialog: Option<Entity<JoinDialog>>,
     /// Which page occupies the center stage.
     main_stage: MainStage,
+    selected_welcome_provider: Option<models::ModelProvider>,
     profile: Profile,
     /// Everyone's profile as the active thread shows them, refreshed at the
     /// start of every render; see [`Cowork::profiles_for`].
@@ -454,6 +462,9 @@ impl Render for Cowork {
                             .map(|this| match self.main_stage {
                                 MainStage::Profile => this.child(self.render_profile_page(cx)),
                                 MainStage::Welcome => this.child(self.render_welcome(cx)),
+                                MainStage::ProviderSetup(provider) => {
+                                    this.child(self.render_provider_setup(provider, cx))
+                                }
                                 MainStage::Thread => this
                                     .child(self.render_main_editor(
                                         read_only_line_bounds.clone(),
@@ -565,6 +576,7 @@ fn main() -> anyhow::Result<()> {
                         copied_endpoint_id: None,
                         join_dialog: None,
                         main_stage: MainStage::Welcome,
+                        selected_welcome_provider: None,
                         profile: Profile::local(local_participant_id),
                         shown_profiles: HashMap::new(),
                         profile_error: None,
@@ -587,9 +599,6 @@ fn main() -> anyhow::Result<()> {
                         _model_picker_subscription: model_picker_subscription,
                         _window_activation_subscription: window_activation_subscription,
                     }
-                });
-                cowork.update(cx, |cowork, cx| {
-                    cowork.discover_models(window, cx);
                 });
                 cx.new(|cx| Root::new(cowork, window, cx))
             }) {

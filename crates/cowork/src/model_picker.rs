@@ -16,7 +16,7 @@ use gpui_component::{
 use rig::{model::ModelLister, prelude::*, providers::ollama::wire::Ollama};
 
 use crate::{
-    Cowork,
+    Cowork, MainStage, ProviderSetupStage,
     assets::OLLAMA_AVATAR_PATH,
     models::{ModelCatalog, ModelInfo, ModelProvider, ModelRef},
     protocol,
@@ -168,6 +168,9 @@ impl Cowork {
     }
 
     pub(crate) fn discover_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.main_stage != MainStage::ProviderSetup(ProviderSetupStage::Ollama) {
+            return;
+        }
         let task = self.tokio_handle.spawn(async {
             Ollama::new()
                 .bound()?

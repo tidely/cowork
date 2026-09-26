@@ -19,6 +19,11 @@ pub(crate) enum ModelProvider {
     Ollama,
 }
 
+impl ModelProvider {
+    /// Providers offered during setup, including those with no discovered models.
+    pub(crate) const ALL: [Self; 1] = [Self::Ollama];
+}
+
 /// Identifies a model: its provider, and the id that provider knows it by.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct ModelRef {

@@ -172,6 +172,7 @@ fn test_cowork(
         copied_endpoint_id: None,
         join_dialog: None,
         main_stage: MainStage::Thread,
+        selected_welcome_provider: None,
         profile: Profile::local(local_participant_id),
         shown_profiles: HashMap::new(),
         profile_error: None,
