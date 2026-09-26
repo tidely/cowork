@@ -198,6 +198,86 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
     assert_eq!(expanded(cx), vec![1]);
 }
 
+/// Text selected in a submitted user message copies while the composer
+/// still has focus, as agent text does.
+#[gpui::test]
+fn selected_user_message_text_copies(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let thread_id = Uuid::new_v4();
+    let block_id = Uuid::new_v4();
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let timeline = vec![TimelineMessage::User(UserMessageGroup {
+            id: Uuid::new_v4(),
+            comments: Vec::new(),
+            blocks: vec![PromptBlock {
+                id: block_id,
+                author: ParticipantId::new(),
+                text: "Copy these words".into(),
+                attachments: Vec::new(),
+            }],
+            comments_folded: false,
+        })];
+        let thread =
+            cx.new(|_| test_thread(thread_id, timeline, ThreadDraft::new(ParticipantId::new())));
+        let thread_store = cx.new(|_| ThreadStore {
+            threads: VecDeque::from([thread]),
+        });
+        Root::new(
+            cx.new(|cx| {
+                test_cowork(
+                    thread_store,
+                    Some(thread_id),
+                    runtime.handle().clone(),
+                    window,
+                    cx,
+                )
+            }),
+            window,
+            cx,
+        )
+    });
+    let cowork = root.read_with(cx, |root, _| {
+        root.view().clone().downcast::<Cowork>().unwrap()
+    });
+    cx.update(|window, _| window.activate_window());
+    cx.update(|window, cx| cowork.update(cx, |cowork, cx| cowork.focus_composer(window, cx)));
+    cx.run_until_parked();
+
+    let selector: &'static str =
+        Box::leak(format!("timeline-user-text-{block_id}").into_boxed_str());
+    let text = cx.debug_bounds(selector).expect("the user message text");
+    let y = text.center().y;
+    cx.simulate_mouse_down(
+        point(text.left() + px(1.), y),
+        MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_move(
+        point(text.right() - px(1.), y),
+        Some(MouseButton::Left),
+        gpui::Modifiers::default(),
+    );
+    cx.simulate_mouse_up(
+        point(text.right() - px(1.), y),
+        MouseButton::Left,
+        gpui::Modifiers::default(),
+    );
+    cx.run_until_parked();
+
+    cx.simulate_keystrokes("cmd-c");
+    cx.run_until_parked();
+
+    assert_eq!(
+        cx.read_from_clipboard()
+            .and_then(|item| item.text())
+            .as_deref(),
+        Some("Copy these words")
+    );
+}
+
 #[gpui::test]
 fn context_indicator_sits_left_of_the_model_picker(cx: &mut gpui::TestAppContext) {
     let (_cowork, _runtime, cx) = composer_test_cowork(cx);

@@ -78,6 +78,10 @@ struct Cowork {
     attachment_errors: Vec<AttachmentError>,
     pending_attachments: Vec<PendingAttachment>,
     timeline_scroll_handle: ScrollHandle,
+    /// Taken when someone presses on a user message, as agent text takes
+    /// focus itself, so that Copy reaches the window's text selection
+    /// instead of an editor with nothing selected.
+    timeline_focus_handle: gpui::FocusHandle,
     follow_generation: bool,
     thread_store: Entity<ThreadStore>,
     active_thread_id: Option<Uuid>,
@@ -295,6 +299,7 @@ impl Cowork {
             .child(
                 div()
                     .id("timeline-scroll")
+                    .track_focus(&self.timeline_focus_handle)
                     .size_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.timeline_scroll_handle)
@@ -514,6 +519,7 @@ fn main() -> anyhow::Result<()> {
                         attachment_errors: Vec::new(),
                         pending_attachments: Vec::new(),
                         timeline_scroll_handle: ScrollHandle::new(),
+                        timeline_focus_handle: cx.focus_handle(),
                         follow_generation: true,
                         thread_store,
                         active_thread_id: None,

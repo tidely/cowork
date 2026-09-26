@@ -510,13 +510,18 @@ impl Cowork {
                 );
             }
             if !block.text.trim().is_empty() {
+                let block_id = block.id;
                 content.push(
-                    SelectableText::new(
-                        format!("timeline-user-text-{}", block.id),
-                        block.text.clone(),
-                    )
-                    .document_order((index * 1_000 + block_index) as u64)
-                    .into_any_element(),
+                    div()
+                        .debug_selector(move || format!("timeline-user-text-{block_id}"))
+                        .child(
+                            SelectableText::new(
+                                format!("timeline-user-text-{block_id}"),
+                                block.text.clone(),
+                            )
+                            .document_order((index * 1_000 + block_index) as u64),
+                        )
+                        .into_any_element(),
                 );
             }
             rows.push(self.render_message_row(Some(MessageAuthor::User(block.author)), content));
@@ -526,8 +531,9 @@ impl Cowork {
             .id(("timeline-message", index))
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(|this, _, _, _| {
+                cx.listener(|this, _, window, cx| {
                     this.selection_message_id = None;
+                    this.timeline_focus_handle.focus(window, cx);
                 }),
             )
             .w_full()
