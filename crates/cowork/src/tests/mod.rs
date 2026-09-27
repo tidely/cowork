@@ -290,11 +290,13 @@ fn turn_ended(total: u64) -> agent::AgentEvent {
             total_tokens: Some(total),
             ..Default::default()
         },
+        reasoning_issuer: None,
     }
 }
 
 /// The results of every tool the turn in `events` called, as the agent
-/// loop would report them.
+/// loop would report them. `events` must be canonical: see
+/// [`agent::test_support::canonical`].
 fn tool_results(events: &[agent::AgentEvent], output: &str) -> Vec<agent::AgentEvent> {
     let mut fold = agent::TurnFold::default();
     for event in events {

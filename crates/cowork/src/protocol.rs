@@ -34,7 +34,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 15;
+pub(crate) const PROTOCOL_VERSION: u32 = 17;
 
 /// A request from a collaborator to the host.
 ///

@@ -8,15 +8,17 @@
 //! The host forwards what its agent loop reports ([`AgentEvent`]s) as it
 //! happens, and every participant, the host included, folds them with the
 //! agent crate's [`TurnFold`] into the transcript, which ends up exactly as
-//! the loop recorded it.
+//! the loop recorded it: each reply is the blocks Rig finalized, which the
+//! block ends carry.
 //!
 //! What an agent message shows ([`AgentOutput`]) is never sent. It is a
 //! function of Rig messages alone: the ones its run added to the transcript,
 //! followed by the message it is folding, as far as it has come
-//! ([`TurnFold::partial`], Rig's own accumulation of the stream). That
-//! message is the fold of the run's pending events, the events since its
-//! output last joined the transcript, which a snapshot carries raw. So
-//! someone joining rebuilds it exactly, and every copy shows the same.
+//! ([`TurnFold::partial`]: the blocks Rig has finalized, and a preview of
+//! the ones still streaming). That message is the fold of the run's pending
+//! events, the events since its output last joined the transcript, which a
+//! snapshot carries raw. So someone joining rebuilds it exactly, and every
+//! copy shows the same.
 //!
 //! Live, the transcript part never changes, so only the rest is redone per
 //! event: a message rewinds its output to where the committed part ends,
@@ -65,22 +67,18 @@ impl Json<RigMessage> {
 
 impl Json<AgentEvent> {
     /// The event as it is folded, or `None` when folding ignores it: the
-    /// stream's terminal record, whose usage and message id `TurnEnded`
-    /// carries, and provider payloads Rig does not model. A block's end
-    /// loses the block it completed, which folding rebuilds from what
-    /// streamed before, rather than sending its content again.
+    /// stream's terminal record, whose usage, message id and reasoning
+    /// issuer `TurnEnded` carries, and provider payloads Rig does not model.
+    /// A block's end keeps the block Rig finalized, which is what the reply
+    /// is made of, even though its deltas already streamed: rebuilding it
+    /// from them would be a second accumulation that could disagree.
     pub(crate) fn shared(event: AgentEvent) -> Option<Self> {
-        let event = match event {
-            AgentEvent::Model(StreamEvent::Final(_) | StreamEvent::Unknown(_)) => return None,
-            AgentEvent::Model(StreamEvent::BlockEnd { id, end, .. }) => {
-                AgentEvent::Model(StreamEvent::BlockEnd {
-                    id,
-                    end,
-                    block: None,
-                })
-            }
-            event => event,
-        };
+        if matches!(
+            event,
+            AgentEvent::Model(StreamEvent::Final(_) | StreamEvent::Unknown(_))
+        ) {
+            return None;
+        }
         // Rig's events are plain data, which always encodes.
         Some(Self::from_value(&event).expect("an agent event encodes as JSON"))
     }

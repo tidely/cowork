@@ -348,12 +348,14 @@ A single-block submission looks like the current user message.
 - Every participant mirrors the transcript and the prompt names. The
   host forwards what its agent loop reports, as it happens, in
   `AgentEvent`: Rig's stream events (deltas and block boundaries), the end
-  of each model turn with its usage, and each tool's result. Everyone, the
-  host included, folds them the same way (the agent crate's `TurnFold`)
-  into the transcript, which comes out exactly as the agent loop recorded
-  it. Each piece of output travels once: the stream's terminal record and
-  provider payloads Rig does not model are not forwarded, and a block's end
-  drops the completed block, which folding rebuilds.
+  of each model turn with its usage and reasoning issuer, and each tool's
+  result. Everyone, the host included, folds them the same way (the agent
+  crate's `TurnFold`) into the transcript, which comes out exactly as the
+  agent loop recorded it. Each reply is the blocks Rig finalized, which
+  every block end carries, so no participant accumulates the stream itself;
+  deltas only feed a preview of the blocks still streaming. The stream's
+  terminal record and provider payloads Rig does not model are not
+  forwarded.
 - What an agent message shows (its thinking, text, tool calls with their
   results, and replies to comments, in the order the agent produced them)
   is never sent. It is a function of Rig

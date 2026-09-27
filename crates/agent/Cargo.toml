@@ -6,6 +6,10 @@ edition.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Helpers for tests that script a run's events by hand.
+test-support = []
+
 [dependencies]
 anyhow.workspace = true
 futures.workspace = true
@@ -14,5 +18,6 @@ serde.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+rig = { workspace = true, features = ["test-utils"] }
 tokio.workspace = true
 tools.workspace = true

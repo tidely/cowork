@@ -35,4 +35,5 @@ unicode-segmentation.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+agent = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }

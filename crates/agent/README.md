@@ -1,7 +1,7 @@
 # agent
 
 A deliberately small multi-turn agent loop built on Rig's low-level
-`CompletionModel` stream.
+completion operation stream.
 
 The important distinction from Rig's standard multi-turn stream is that
 everything is observable as it streams, including a completed tool call:
@@ -22,19 +22,29 @@ A run is fully described by its events. `TurnFold` folds them into the
 messages they add to the history, and the loop records its own history by
 folding them, so anyone folding the same events, in this process or after
 sending them elsewhere (they are serializable), ends up with exactly the same
-history. Mid-turn, `TurnFold::partial` is the message being folded as far as
-it has come, as Rig accumulates it, so the history followed by it is
-everything the run has produced so far.
+history.
+
+That history is Rig's own. Rig's stream is canonical: each block end carries
+the block Rig finalized. A reply is exactly those blocks, collected by Rig's
+`CompletionFold` and stamped as Rig stamps its response, so it is the
+response Rig returns for the turn (the loop asserts this in debug builds).
+Nothing re-accumulates the stream. Deltas only feed `TurnFold::partial`, a
+preview of the message being folded: finished blocks as Rig finalized them,
+and open ones as their deltas so far, each where the reply will have it. The
+preview never joins the history.
+
+Events scripted by hand must be canonical too; with the `test-support`
+feature, `agent::test_support::canonical` makes them so.
 
 ## Sketch
 
 ```rust,no_run
 use agent::{Agent, AgentEvent, TurnFold};
-use rig::{completion::Message, prelude::*, providers::ollama::wire::Ollama, tool::ToolSet};
+use rig::{completion::Message, providers::ollama::Ollama, tool::ToolSet};
 use tools::{Calculate, RespondToComment, TurnComments};
 
 # async fn example() -> anyhow::Result<()> {
-let client = Ollama::new().bound()?;
+let client = Ollama::new();
 let model = client.completion("qwen3.8:27b");
 
 let comments = std::sync::Arc::new(TurnComments::new(2));
@@ -44,7 +54,7 @@ tools.add_tool(Calculate);
 
 let mut history = Vec::new();
 let mut fold = TurnFold::default();
-Agent::new(model, tools)
+Agent::new(model.erase(), tools)
     .additional_params(serde_json::json!({
         "num_ctx": 131_072,
         "think": "medium"

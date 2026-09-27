@@ -118,6 +118,7 @@ fn agent_stream_events(message_id: Uuid) -> Vec<protocol::HostMessage> {
         streamed_text("answer", "the answer.", false),
         turn_ended(1_024),
     ]);
+    let first_turn = agent::test_support::canonical(first_turn);
     let results = tool_results(&first_turn, "Recorded");
     let mut second_turn = streamed_block(
         "second",
@@ -130,6 +131,7 @@ fn agent_stream_events(message_id: Uuid) -> Vec<protocol::HostMessage> {
         BlockClose::Text,
     );
     second_turn.push(turn_ended(2_048));
+    let second_turn = agent::test_support::canonical(second_turn);
     let agent = first_turn
         .into_iter()
         .chain(results)
@@ -507,6 +509,7 @@ fn separate_runs_reconstruct_only_their_own_tool_calls(cx: &mut gpui::TestAppCon
                 }),
             );
             events.push(turn_ended(128));
+            let events = agent::test_support::canonical(events);
             let results = tool_results(&events, "5");
             for event in events.into_iter().chain(results).chain([turn_ended(256)]) {
                 thread.apply(agent_event(second_id, event), cx);
@@ -673,14 +676,15 @@ fn incremental_output_matches_a_fresh_derivation_after_every_event(cx: &mut gpui
         serde_json::json!({"operation": "add", "a": 3, "b": 4}),
     ));
     turn.push(turn_ended(300));
+    let mut turn = agent::test_support::canonical(turn);
     let results = tool_results(&turn, "sum");
     assert_eq!(results.len(), 2);
     turn.extend(results);
-    turn.extend([
+    turn.extend(agent::test_support::canonical([
         streamed_text("answer", "3 and ", false),
         streamed_text("answer", "7.", false),
         turn_ended(400),
-    ]);
+    ]));
     events.extend(turn.into_iter().map(|event| agent_event(second_id, event)));
     events.push(protocol::HostMessage::AgentEnded {
         id: second_id.into_bytes(),
@@ -755,7 +759,9 @@ fn a_restated_block_shows_as_rig_accumulates_it(cx: &mut gpui::TestAppContext) {
             wire_sent: true,
         },
     );
-    turn.push(streamed_text("answer", "Yes.", false));
+    turn.extend([streamed_text("answer", "Yes.", false), turn_ended(64)]);
+    let mut turn = agent::test_support::canonical(turn);
+    let ended = turn.pop().expect("the turn's end");
     let (view, cx) = cx.add_window_view(|_, cx| ThreadMirrorTestView {
         host: Cowork::new_empty_local_thread(
             ThreadDraft::new(ParticipantId::new()),
@@ -798,7 +804,7 @@ fn a_restated_block_shows_as_rig_accumulates_it(cx: &mut gpui::TestAppContext) {
         assert_eq!(restored.conversation(), view.host.read(cx).conversation());
 
         view.host.update(cx, |thread, cx| {
-            thread.apply(agent_event(message_id, turn_ended(64)), cx);
+            thread.apply(agent_event(message_id, ended), cx);
         });
         let host = view.host.read(cx);
         let TimelineMessage::Agent(message) = &host.timeline[0] else {
@@ -987,14 +993,16 @@ fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
         serde_json::json!({"operation": "add", "a": 1, "b": 2}),
     ));
     turn.push(turn_ended(100));
+    let mut turn = agent::test_support::canonical(turn);
     turn.extend(tool_results(&turn, "3"));
-    turn.push(streamed_text("second-thinking", "Now ", true));
-    let second_thinking_started = turn.len();
-    turn.extend([
+    // Through the first fragment of the second thinking.
+    let second_thinking_started = turn.len() + 1;
+    turn.extend(agent::test_support::canonical([
+        streamed_text("second-thinking", "Now ", true),
         streamed_text("second-thinking", "answer.", true),
         streamed_text("answer", "It is 3.", false),
         turn_ended(200),
-    ]);
+    ]));
     let (view, cx) = cx.add_window_view(|_, cx| ThreadMirrorTestView {
         host: Cowork::new_empty_local_thread(
             ThreadDraft::new(ParticipantId::new()),
@@ -1466,6 +1474,7 @@ fn a_stopped_run_keeps_its_outcome_and_collapses_its_work(cx: &mut gpui::TestApp
         "calculate",
         serde_json::json!({"operation": "add", "a": 1, "b": 2}),
     ));
+    let turn = agent::test_support::canonical(turn);
     let (view, cx) = cx.add_window_view(|_, cx| ThreadMirrorTestView {
         host: Cowork::new_empty_local_thread(
             ThreadDraft::new(ParticipantId::new()),

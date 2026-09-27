@@ -15,8 +15,7 @@ use anyhow::Context as _;
 use gpui::{App, Context, Entity};
 use rig::{
     completion::{Message as RigMessage, Usage},
-    prelude::*,
-    providers::ollama::wire::Ollama,
+    providers::ollama::Ollama,
     tool::ToolSet,
 };
 use serde_json::json;
@@ -82,7 +81,7 @@ impl Cowork {
             let (selected_model, max_tokens) =
                 selected_model.context("No available model selected")?;
             let model = match selected_model.provider {
-                ModelProvider::Ollama => Ollama::new().bound()?.completion(selected_model.id),
+                ModelProvider::Ollama => Ollama::new().completion(selected_model.id),
             };
             // The same tools on every run, whether or not a turn has comments:
             // the definitions are part of the prompt prefix, so changing them
@@ -90,7 +89,7 @@ impl Cowork {
             let mut tools = ToolSet::default();
             tools.add_tool(RespondToComment::new(turn_comments));
             tools.add_tool(Calculate);
-            StreamingAgent::new(model, tools)
+            StreamingAgent::new(model.erase(), tools)
                 .preamble(SYSTEM_PROMPT)
                 .additional_params(json!({
                     "num_ctx": max_tokens,

@@ -13,7 +13,7 @@ use gpui_component::{
     searchable_list::{SearchableGroup, SearchableListItem, SearchableVec},
     tooltip::Tooltip,
 };
-use rig::{model::ModelLister, prelude::*, providers::ollama::wire::Ollama};
+use rig::providers::ollama::Ollama;
 
 use crate::{
     Cowork, MainStage, ProviderSetupStage,
@@ -173,9 +173,7 @@ impl Cowork {
         }
         let task = self.tokio_handle.spawn(async {
             Ollama::new()
-                .bound()?
-                .models()
-                .list_all()
+                .list_models()
                 .await
                 .map_err(anyhow::Error::from)
         });
