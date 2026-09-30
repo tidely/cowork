@@ -8,8 +8,8 @@ use std::{
 use gpui::{
     App, AppContext, Bounds, Context, Entity, EntityId, ExternalPaths, IntoElement, KeyBinding,
     MouseButton, MouseUpEvent, PlatformInput, QuitMode, Render, ScrollHandle, SharedString,
-    Subscription, TextRun, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, canvas,
-    div, prelude::*, px, rgb, size,
+    Subscription, TextRun, TitlebarOptions, Window, WindowBounds, WindowDecorations, WindowOptions,
+    actions, canvas, div, prelude::*, px, rgb, size,
 };
 use gpui_base::{
     TextViewDefaults,
@@ -539,6 +539,7 @@ fn main() -> anyhow::Result<()> {
                     appears_transparent: true,
                     traffic_light_position: Some(macos_traffic_light_position()),
                 }),
+                window_decorations: Some(WindowDecorations::Client),
                 app_owns_titlebar_drag: cfg!(target_os = "macos"),
                 ..Default::default()
             };

@@ -4,8 +4,8 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt, Context, IntoElement, MouseButton, MouseDownEvent, SharedString,
-    Window, WindowControlArea, div, point, prelude::*, px, rgb,
+    Animation, AnimationExt, Context, Decorations, IntoElement, MouseButton, MouseDownEvent,
+    SharedString, Window, WindowControlArea, div, point, prelude::*, px, rgb,
 };
 use gpui_base::GlobalState;
 use gpui_component::{
@@ -53,7 +53,7 @@ fn macos_sidebar_toggle_margin() -> gpui::Pixels {
 impl Cowork {
     fn render_caption_button(
         id: &'static str,
-        icon: &'static str,
+        icon: AssetIconName,
         control_area: WindowControlArea,
         is_close: bool,
     ) -> impl IntoElement {
@@ -65,12 +65,26 @@ impl Cowork {
             .items_center()
             .justify_center()
             .occlude()
-            .text_size(px(10.))
             .text_color(rgb(0xd4d4d8))
             .window_control_area(control_area)
             .when(is_close, |this| this.hover(|this| this.bg(rgb(0xe81123))))
             .when(!is_close, |this| this.hover(|this| this.bg(rgb(0x2d2d30))))
-            .child(icon)
+            .when(cfg!(target_os = "linux"), |this| {
+                this.on_mouse_down(MouseButton::Left, |_, window, cx| {
+                    window.prevent_default();
+                    cx.stop_propagation();
+                })
+                .on_click(move |_, window, cx| {
+                    cx.stop_propagation();
+                    match control_area {
+                        WindowControlArea::Min => window.minimize_window(),
+                        WindowControlArea::Max => window.zoom_window(),
+                        WindowControlArea::Close => window.remove_window(),
+                        _ => {}
+                    }
+                })
+            })
+            .child(Icon::new(icon).size(px(12.)))
     }
 
     fn render_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -102,6 +116,10 @@ impl Cowork {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
+        let show_controls =
+            !cfg!(target_os = "macos") && (!cfg!(target_os = "linux") || client_decorated);
+        let supported_controls = window.window_controls();
         let active_thread = self
             .active_thread_id
             .filter(|_| self.main_stage == MainStage::Thread)
@@ -193,9 +211,23 @@ impl Cowork {
                         } else {
                             window.start_window_move();
                         }
+                    } else if cfg!(target_os = "linux")
+                        && matches!(window.window_decorations(), Decorations::Client { .. })
+                    {
+                        cx.stop_propagation();
+                        if event.click_count == 2 {
+                            window.zoom_window();
+                        } else {
+                            window.start_window_move();
+                        }
                     }
                 }),
             )
+            .when(cfg!(target_os = "linux") && client_decorated, |this| {
+                this.on_mouse_down(MouseButton::Right, |event, window, _| {
+                    window.show_window_menu(event.position);
+                })
+            })
             .child(self.render_sidebar_toggle(cx))
             .child(
                 div()
@@ -245,31 +277,34 @@ impl Cowork {
                                 .child(share_label),
                         )
                     })
-                    .when(!cfg!(target_os = "macos"), |this| {
+                    .when(show_controls, |this| {
                         this.child(
                             div()
                                 .h_full()
                                 .flex()
-                                .font_family("Segoe Fluent Icons")
-                                .child(Self::render_caption_button(
-                                    "minimize-window",
-                                    "\u{e921}",
-                                    WindowControlArea::Min,
-                                    false,
-                                ))
-                                .child(Self::render_caption_button(
-                                    "maximize-window",
-                                    if window.is_maximized() {
-                                        "\u{e923}"
-                                    } else {
-                                        "\u{e922}"
-                                    },
-                                    WindowControlArea::Max,
-                                    false,
-                                ))
+                                .when(supported_controls.minimize, |this| {
+                                    this.child(Self::render_caption_button(
+                                        "minimize-window",
+                                        AssetIconName::WindowMinimize,
+                                        WindowControlArea::Min,
+                                        false,
+                                    ))
+                                })
+                                .when(supported_controls.maximize, |this| {
+                                    this.child(Self::render_caption_button(
+                                        "maximize-window",
+                                        if window.is_maximized() {
+                                            AssetIconName::WindowRestore
+                                        } else {
+                                            AssetIconName::WindowMaximize
+                                        },
+                                        WindowControlArea::Max,
+                                        false,
+                                    ))
+                                })
                                 .child(Self::render_caption_button(
                                     "close-window",
-                                    "\u{e8bb}",
+                                    AssetIconName::WindowClose,
                                     WindowControlArea::Close,
                                     true,
                                 )),

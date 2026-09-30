@@ -26,6 +26,10 @@ gpui_kit_assets::icon_assets!(
         Image,
         Pen,
         X,
+        WindowMinimize,
+        WindowMaximize,
+        WindowRestore,
+        WindowClose,
     ]
 );
 
@@ -47,5 +51,26 @@ impl AssetSource for Assets {
             assets.push(OLLAMA_AVATAR_PATH.into());
         }
         Ok(assets)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use gpui_kit_assets::IconName;
+
+    use super::*;
+
+    #[test]
+    fn window_control_icons_are_bundled() {
+        for icon in [
+            IconName::WindowMinimize,
+            IconName::WindowMaximize,
+            IconName::WindowRestore,
+            IconName::WindowClose,
+        ] {
+            let path = icon.path();
+            let bytes = Assets.load(&path).unwrap().expect("bundled window icon");
+            assert!(!bytes.is_empty(), "empty window icon: {path}");
+        }
     }
 }
