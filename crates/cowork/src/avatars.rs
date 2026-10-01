@@ -2,7 +2,8 @@
 
 use std::collections::HashMap;
 
-use gpui::{FontWeight, SharedString, div, img, prelude::*, px, rgb};
+use gpui::{App, FontWeight, SharedString, div, img, prelude::*, px, rgb};
+use gpui_component::ActiveTheme;
 
 use crate::{
     Cowork,
@@ -69,7 +70,8 @@ impl Cowork {
             .bg(rgb(appearance.color()))
             .text_size(px(9.))
             .font_weight(FontWeight::SEMIBOLD)
-            .text_color(rgb(0xf4f4f5))
+            // Identity colors are independent of the theme; keep contrasting white initials.
+            .text_color(rgb(0xffffff))
             .child(appearance.initials())
     }
 
@@ -94,6 +96,7 @@ impl Cowork {
         &self,
         primary: ParticipantId,
         others: &[ParticipantId],
+        cx: &App,
     ) -> gpui::Div {
         const MAX_OTHERS: usize = 2;
         const SMALL: gpui::Pixels = px(14.);
@@ -107,7 +110,7 @@ impl Cowork {
                 self.render_participant_avatar(participant, SMALL)
                     .text_size(px(6.))
                     .border_1()
-                    .border_color(rgb(0x18181b))
+                    .border_color(cx.theme().background)
             })
             .collect::<Vec<_>>();
         if hidden > 0 {
@@ -120,10 +123,10 @@ impl Cowork {
                     .justify_center()
                     .rounded_full()
                     .border_1()
-                    .border_color(rgb(0x18181b))
-                    .bg(rgb(0x3f3f46))
+                    .border_color(cx.theme().background)
+                    .bg(cx.theme().secondary_active)
                     .text_size(px(7.))
-                    .text_color(rgb(0xf4f4f5))
+                    .text_color(cx.theme().secondary_foreground)
                     .child(format!("+{hidden}")),
             );
         }

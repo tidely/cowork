@@ -8,9 +8,10 @@ use std::{
 
 use draft::{ItemId, TextEdit};
 use gpui::{
-    App, AppContext, Context, Entity, EntityInputHandler as _, Focusable, SharedString, Window, rgb,
+    App, AppContext, Context, Entity, EntityInputHandler as _, Focusable, SharedString, Window,
 };
 use gpui_base::input::{InputEditorStyle, InputEvent, TextareaState};
+use gpui_component::ActiveTheme;
 use uuid::Uuid;
 
 use crate::{
@@ -31,7 +32,7 @@ impl Cowork {
         cx.new(|cx| {
             let mut editor = TextareaState::new(window, cx).auto_grow(1, usize::MAX);
             editor.set_editor_style(InputEditorStyle {
-                caret: rgb(0xffffff).into(),
+                caret: cx.theme().caret,
                 ..Default::default()
             });
             if !text.is_empty() {
@@ -77,7 +78,7 @@ impl Cowork {
                     && window.focused(cx).is_none_or(|focused| focused == *focus)
             })
             .map(|(_, editor, _)| *editor);
-        let Some((missing, needs_draft_position, shown, lost_focus)) =
+        let Some((missing, draft_position, shown, lost_focus)) =
             self.update_draft(draft_id, cx, |draft| {
                 let items = draft.doc.items();
                 draft
@@ -99,13 +100,27 @@ impl Cowork {
                         None => missing.push(item),
                     }
                 }
-                (missing, draft.draft_position.is_none(), shown, lost_focus)
+                (missing, draft.draft_position.clone(), shown, lost_focus)
             })
         else {
             return;
         };
         if lost_focus {
             self.typing_in = None;
+        }
+
+        // Existing editors outlive theme changes; refresh their projected
+        // caret style without touching text, selection, or collaboration state.
+        let style = InputEditorStyle {
+            caret: cx.theme().caret,
+            ..Default::default()
+        };
+        for editor in shown
+            .iter()
+            .map(|(editor, _)| editor)
+            .chain(draft_position.iter())
+        {
+            editor.update(cx, |editor, _| editor.set_editor_style(style.clone()));
         }
 
         let synced = shown
@@ -129,8 +144,9 @@ impl Cowork {
                 (item.id, editors)
             })
             .collect::<Vec<_>>();
-        let draft_position =
-            needs_draft_position.then(|| Self::new_routed_draft_editor(draft_id, "", window, cx));
+        let draft_position = draft_position
+            .is_none()
+            .then(|| Self::new_routed_draft_editor(draft_id, "", window, cx));
         self.update_draft(draft_id, cx, |draft| {
             draft.synced_text.extend(synced);
             for (id, editors) in created {

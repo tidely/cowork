@@ -1,7 +1,11 @@
 //! Provider selection and provider-specific setup before the first chat.
 
-use gpui::{Context, IntoElement, div, img, prelude::*, px, rgb};
-use gpui_component::tooltip::Tooltip;
+use gpui::{Context, IntoElement, div, img, prelude::*, px};
+use gpui_component::{
+    ActiveTheme as _, Disableable as _,
+    button::{Button, ButtonVariants as _},
+    tooltip::Tooltip,
+};
 
 use crate::{
     Cowork, MainStage, ProviderSetupStage,
@@ -49,8 +53,8 @@ impl Cowork {
             .rounded_tl(px(12.))
             .border_t_1()
             .border_l_1()
-            .border_color(rgb(0x2d2d30))
-            .bg(rgb(0x18181b))
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
             .px_6()
             .py_8()
             .flex()
@@ -68,14 +72,14 @@ impl Cowork {
                     .child(
                         div()
                             .text_2xl()
-                            .text_color(rgb(0xf4f4f5))
+                            .text_color(cx.theme().secondary_foreground)
                             .child(format!("Set up {}", provider_id.label())),
                     )
                     .child(
                         div()
                             .mt_2()
                             .text_sm()
-                            .text_color(rgb(0xa1a1aa))
+                            .text_color(cx.theme().muted_foreground)
                             .child("Choose a model to start your first chat."),
                     )
                     .child(
@@ -84,7 +88,7 @@ impl Cowork {
                             .mb_3()
                             .w_full()
                             .text_xs()
-                            .text_color(rgb(0x71717a))
+                            .text_color(cx.theme().muted_foreground)
                             .child("AVAILABLE MODELS"),
                     )
                     .child(
@@ -110,17 +114,17 @@ impl Cowork {
                                     .rounded_lg()
                                     .border_1()
                                     .border_color(if is_selected {
-                                        rgb(0x8b8bf0)
+                                        cx.theme().primary
                                     } else {
-                                        rgb(0x3f3f46)
+                                        cx.theme().border
                                     })
                                     .bg(if is_selected {
-                                        rgb(0x272738)
+                                        cx.theme().accent
                                     } else {
-                                        rgb(0x202023)
+                                        cx.theme().secondary
                                     })
                                     .cursor_pointer()
-                                    .hover(|this| this.bg(rgb(0x303036)))
+                                    .hover(|this| this.bg(cx.theme().secondary_hover))
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.select_model(model.clone(), cx);
                                     }))
@@ -143,7 +147,7 @@ impl Cowork {
                                                     .min_w_0()
                                                     .flex_1()
                                                     .truncate()
-                                                    .text_color(rgb(0xe4e4e7))
+                                                    .text_color(cx.theme().secondary_foreground)
                                                     .child(name),
                                             ),
                                     )
@@ -151,7 +155,7 @@ impl Cowork {
                                         div()
                                             .mt_3()
                                             .text_xs()
-                                            .text_color(rgb(0x8b8b94))
+                                            .text_color(cx.theme().muted_foreground)
                                             .child(context),
                                     )
                             }))
@@ -162,8 +166,8 @@ impl Cowork {
                                         .p_5()
                                         .rounded_lg()
                                         .border_1()
-                                        .border_color(rgb(0x3f3f46))
-                                        .text_color(rgb(0xa1a1aa))
+                                        .border_color(cx.theme().border)
+                                        .text_color(cx.theme().muted_foreground)
                                         .child(
                                             "No Ollama models found. Start Ollama, then try again.",
                                         ),
@@ -176,60 +180,44 @@ impl Cowork {
                             .flex()
                             .gap_4()
                             .child(
-                                div()
-                                    .id("setup-back")
+                                Button::new("setup-back")
+                                    .ghost()
+                                    .label("Back")
                                     .debug_selector(|| "setup-back".to_owned())
-                                    .cursor_pointer()
-                                    .text_color(rgb(0xa1a1aa))
                                     .on_click(cx.listener(|this, _, _, cx| {
                                         this.main_stage = MainStage::Welcome;
                                         cx.notify();
-                                    }))
-                                    .child("Back"),
+                                    })),
                             )
                             .when(!has_models, |this| {
                                 this.child(
-                                    div()
-                                        .id("setup-retry")
+                                    Button::new("setup-retry")
+                                        .secondary()
+                                        .label("Try again")
                                         .debug_selector(|| "setup-retry".to_owned())
-                                        .cursor_pointer()
-                                        .text_color(rgb(0xe4e4e7))
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.discover_models(window, cx);
-                                        }))
-                                        .child("Try again"),
+                                        })),
                                 )
                             }),
                     )
                     .child(
-                        div()
-                            .id("setup-continue")
+                        Button::new("setup-continue")
+                            .primary()
+                            .label("Continue")
+                            .disabled(!can_continue)
                             .debug_selector(|| "setup-continue".to_owned())
                             .mt_8()
                             .px_6()
-                            .py_3()
+                            .h_11()
                             .rounded_lg()
-                            .bg(if can_continue {
-                                rgb(0xe4e4e7)
-                            } else {
-                                rgb(0x3f3f46)
-                            })
-                            .text_color(if can_continue {
-                                rgb(0x18181b)
-                            } else {
-                                rgb(0x8b8b94)
-                            })
-                            .when(can_continue, |this| {
-                                this.cursor_pointer().hover(|this| this.bg(rgb(0xffffff)))
-                            })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if this.active_model_is_runnable(cx) {
                                     this.main_stage = MainStage::Thread;
                                     this.focus_composer(window, cx);
                                     cx.notify();
                                 }
-                            }))
-                            .child("Continue"),
+                            })),
                     ),
             )
     }
@@ -253,8 +241,8 @@ impl Cowork {
             .rounded_tl(px(12.))
             .border_t_1()
             .border_l_1()
-            .border_color(rgb(0x2d2d30))
-            .bg(rgb(0x18181b))
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
             .px_6()
             .py_8()
             .flex()
@@ -269,12 +257,17 @@ impl Cowork {
                     .flex()
                     .flex_col()
                     .items_center()
-                    .child(div().text_2xl().text_color(rgb(0xf4f4f5)).child(greeting))
+                    .child(
+                        div()
+                            .text_2xl()
+                            .text_color(cx.theme().secondary_foreground)
+                            .child(greeting),
+                    )
                     .child(
                         div()
                             .mt_2()
                             .text_sm()
-                            .text_color(rgb(0xa1a1aa))
+                            .text_color(cx.theme().muted_foreground)
                             .child("Choose a provider to start your first chat."),
                     )
                     .child(
@@ -283,7 +276,7 @@ impl Cowork {
                             .mb_3()
                             .w_full()
                             .text_xs()
-                            .text_color(rgb(0x71717a))
+                            .text_color(cx.theme().muted_foreground)
                             .child("AVAILABLE PROVIDERS"),
                     )
                     .child(div().w_full().flex().flex_wrap().gap_3().children(
@@ -299,17 +292,17 @@ impl Cowork {
                                 .rounded_lg()
                                 .border_1()
                                 .border_color(if is_selected {
-                                    rgb(0x8b8bf0)
+                                    cx.theme().primary
                                 } else {
-                                    rgb(0x3f3f46)
+                                    cx.theme().border
                                 })
                                 .bg(if is_selected {
-                                    rgb(0x272738)
+                                    cx.theme().accent
                                 } else {
-                                    rgb(0x202023)
+                                    cx.theme().secondary
                                 })
                                 .cursor_pointer()
-                                .hover(|this| this.bg(rgb(0x303036)))
+                                .hover(|this| this.bg(cx.theme().secondary_hover))
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.selected_welcome_provider = Some(provider);
                                     cx.notify();
@@ -326,39 +319,30 @@ impl Cowork {
                                                 .rounded(px(5.)),
                                         )
                                         .child(
-                                            div().text_color(rgb(0xe4e4e7)).child(provider.label()),
+                                            div()
+                                                .text_color(cx.theme().secondary_foreground)
+                                                .child(provider.label()),
                                         ),
                                 )
                                 .child(
                                     div()
                                         .mt_3()
                                         .text_xs()
-                                        .text_color(rgb(0x8b8b94))
+                                        .text_color(cx.theme().muted_foreground)
                                         .child("Run models locally"),
                                 )
                         }),
                     ))
                     .child(
-                        div()
-                            .id("welcome-continue")
+                        Button::new("welcome-continue")
+                            .primary()
+                            .label("Continue")
+                            .disabled(selected.is_none())
                             .debug_selector(|| "welcome-continue".to_owned())
                             .mt_8()
                             .px_6()
-                            .py_3()
+                            .h_11()
                             .rounded_lg()
-                            .bg(if selected.is_some() {
-                                rgb(0xe4e4e7)
-                            } else {
-                                rgb(0x3f3f46)
-                            })
-                            .text_color(if selected.is_some() {
-                                rgb(0x18181b)
-                            } else {
-                                rgb(0x8b8b94)
-                            })
-                            .when(selected.is_some(), |this| {
-                                this.cursor_pointer().hover(|this| this.bg(rgb(0xffffff)))
-                            })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if let Some(ModelProvider::Ollama) = this.selected_welcome_provider
                                 {
@@ -367,8 +351,7 @@ impl Cowork {
                                     this.discover_models(window, cx);
                                     cx.notify();
                                 }
-                            }))
-                            .child("Continue"),
+                            })),
                     ),
             )
     }

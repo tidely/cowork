@@ -3,11 +3,11 @@
 use std::rc::Rc;
 
 use gpui::{
-    App, Context, FontWeight, IntoElement, SharedString, Window, div, prelude::*, px, rems, rgb,
+    App, Context, FontWeight, IntoElement, SharedString, Window, div, prelude::*, px, rems,
 };
 use gpui_component::{
-    Collapsible, Icon, Selectable as _, Sizable as _,
-    button::{Button, ButtonCustomVariant, ButtonVariants as _},
+    ActiveTheme, Collapsible, Icon, Selectable as _, Sizable as _,
+    button::{Button, ButtonVariants as _},
     sidebar::{Sidebar, SidebarCollapsible, SidebarItem, SidebarMenu, SidebarMenuItem},
 };
 use gpui_kit_assets::IconName as AssetIconName;
@@ -89,11 +89,11 @@ impl SidebarItem for CoworkSidebarSection {
                         .px_2()
                         .pb_2()
                         .text_sm()
-                        .text_color(rgb(0x71717a))
+                        .text_color(cx.theme().muted_foreground.opacity(0.7))
                         .child(label)
                         .when_some(on_label_click, |this, on_click| {
                             this.cursor_pointer()
-                                .hover(|this| this.text_color(rgb(0xa1a1aa)))
+                                .hover(|this| this.text_color(cx.theme().muted_foreground))
                                 .on_click(move |event, window, cx| on_click(event, window, cx))
                                 .child(
                                     Icon::new(if open {
@@ -102,7 +102,7 @@ impl SidebarItem for CoworkSidebarSection {
                                         AssetIconName::ChevronRight
                                     })
                                     .size_4()
-                                    .text_color(rgb(0xa1a1aa)),
+                                    .text_color(cx.theme().muted_foreground),
                                 )
                         }),
                 )
@@ -188,7 +188,7 @@ impl Cowork {
                         .icon(
                             Icon::new(AssetIconName::SquarePen)
                                 .size_4()
-                                .text_color(rgb(0xe4e4e7)),
+                                .text_color(cx.theme().secondary_foreground),
                         )
                         .active(
                             self.main_stage == MainStage::Thread && self.active_thread_id.is_none(),
@@ -208,7 +208,7 @@ impl Cowork {
                         .icon(
                             Icon::new(AssetIconName::UsersRound)
                                 .size_4()
-                                .text_color(rgb(0xe4e4e7)),
+                                .text_color(cx.theme().secondary_foreground),
                         )
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.open_join_dialog(window, cx);
@@ -252,7 +252,7 @@ impl Cowork {
 
         let sidebar = Sidebar::new("cowork-sidebar")
             .w(SIDEBAR_WIDTH)
-            .bg(rgb(0x1c1c1f))
+            .bg(cx.theme().sidebar)
             .border_r_0()
             .collapsible(SidebarCollapsible::Offcanvas)
             .collapsed(!self.sidebar_open)
@@ -277,13 +277,9 @@ impl Cowork {
                             .icon(
                                 Icon::new(AssetIconName::Search)
                                     .size_4()
-                                    .text_color(rgb(0xa1a1aa)),
+                                    .text_color(cx.theme().muted_foreground),
                             )
-                            .custom(
-                                ButtonCustomVariant::new(cx)
-                                    .hover(rgb(0x2d2d30).into())
-                                    .active(rgb(0x3f3f46).into()),
-                            )
+                            .ghost()
                             .small()
                             .size(px(28.))
                             .debug_selector(|| "search-chats".to_owned())
@@ -335,7 +331,7 @@ impl Cowork {
                     .left_0()
                     .right_0()
                     .h(px(1.))
-                    .bg(rgb(0x2d2d30)),
+                    .bg(cx.theme().border),
             )
             .child(
                 Button::new("identity")

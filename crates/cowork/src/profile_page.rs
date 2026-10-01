@@ -6,14 +6,15 @@ use std::{sync::Arc, time::Duration};
 use chrono::Local;
 use gpui::{
     App, AppContext, Context, Entity, Focusable, FontWeight, IntoElement, PathPromptOptions,
-    SharedString, WeakEntity, Window, div, prelude::*, px, rgb, rgba,
+    SharedString, WeakEntity, Window, div, prelude::*, px, rgb,
 };
-use gpui_base::input::{Input, InputEditorStyle, InputEvent, InputState};
+use gpui_base::input::{InputEvent, InputState};
 use gpui_component::{
-    Disableable as _, Icon, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     chart::LineChart,
     dialog::{DialogDescription, DialogFooter, DialogHeader, DialogTitle},
+    input::Input,
 };
 use gpui_kit_assets::IconName as AssetIconName;
 use itertools::Itertools;
@@ -68,10 +69,12 @@ impl Cowork {
                     .items_center()
                     .justify_center()
                     .rounded_full()
-                    .bg(rgba(0x00000080))
+                    .bg(cx.theme().overlay)
                     .opacity(0.)
                     .group_hover("profile-picture", |this| this.opacity(1.))
                     .child(
+                        // White ink contrasts with the dark scrim over arbitrary
+                        // photos and participant colors in either theme mode.
                         Icon::new(AssetIconName::Pen)
                             .size_6()
                             .text_color(rgb(0xffffff)),
@@ -92,8 +95,8 @@ impl Cowork {
             .rounded_tl(px(12.))
             .border_t_1()
             .border_l_1()
-            .border_color(rgb(0x2d2d30))
-            .bg(rgb(0x18181b))
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
             .child(
                 div()
                     .id("profile-scroll")
@@ -116,11 +119,11 @@ impl Cowork {
                                     .text_ellipsis()
                                     .text_size(px(20.))
                                     .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(rgb(0xe4e4e7))
+                                    .text_color(cx.theme().secondary_foreground)
                                     .child(self.profile_name()),
                             )
                             .children(self.profile_error.clone().map(|error| {
-                                div().text_sm().text_color(rgb(0xf87171)).child(error)
+                                div().text_sm().text_color(cx.theme().danger).child(error)
                             }))
                             .child(self.render_usage_stats(cx))
                             .child(self.render_token_activity(cx)),
@@ -170,7 +173,7 @@ impl Cowork {
             (self.total_chats(cx).to_string(), "Total chats"),
             (format_stat_duration(self.longest_chat(cx)), "Longest chat"),
         ];
-        let divider = || div().flex_none().w(px(1.)).h(px(36.)).bg(rgb(0x27272a));
+        let divider = || div().flex_none().w(px(1.)).h(px(36.)).bg(cx.theme().muted);
         let stat = |(value, label): (String, &'static str)| {
             div()
                 .flex_1()
@@ -182,10 +185,14 @@ impl Cowork {
                 .child(
                     div()
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(rgb(0xffffff))
+                        .text_color(cx.theme().foreground)
                         .child(value),
                 )
-                .child(div().text_color(rgba(0xffffff99)).child(label))
+                .child(
+                    div()
+                        .text_color(cx.theme().foreground.opacity(0.6))
+                        .child(label),
+                )
         };
 
         div()
@@ -198,8 +205,8 @@ impl Cowork {
             .items_center()
             .rounded(px(14.))
             .border_1()
-            .border_color(rgb(0x27272a))
-            .bg(rgb(0x1b1b1e))
+            .border_color(cx.theme().muted)
+            .bg(cx.theme().secondary)
             .children(Itertools::intersperse_with(
                 stats
                     .into_iter()
@@ -261,9 +268,9 @@ impl Cowork {
                 .debug_selector(move || format!("activity-range-{}", range.label()))
                 .cursor_pointer()
                 .text_color(if selected {
-                    rgb(0xffffff)
+                    cx.theme().foreground
                 } else {
-                    rgba(0xffffff99)
+                    cx.theme().foreground.opacity(0.6)
                 })
                 .child(range.label())
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -290,7 +297,7 @@ impl Cowork {
                         div()
                             .debug_selector(|| "token-activity-title".to_owned())
                             .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(rgb(0xffffff))
+                            .text_color(cx.theme().foreground)
                             .child("Token activity"),
                     )
                     .child(div().flex().items_center().gap_3().children(ranges)),
@@ -310,7 +317,7 @@ impl Cowork {
                                 .right_0()
                                 .border_t_1()
                                 .border_dashed()
-                                .border_color(rgba(0xffffff1f)),
+                                .border_color(cx.theme().chart_grid),
                         )
                         .child(
                             div()
@@ -326,7 +333,7 @@ impl Cowork {
                                 })
                                 .text_xs()
                                 .line_height(px(LABEL_LINE_HEIGHT))
-                                .text_color(rgba(0xffffff80))
+                                .text_color(cx.theme().foreground.opacity(0.5))
                                 .child(text),
                         )
                     })
@@ -339,7 +346,7 @@ impl Cowork {
                                 LineChart::new(chart.buckets)
                                     .x(|bucket: &ActivityBucket| bucket.label.clone())
                                     .y(|bucket: &ActivityBucket| bucket.tokens)
-                                    .stroke(rgb(0x3b82f6))
+                                    .stroke(cx.theme().chart_1)
                                     .linear()
                                     .grid(false)
                                     .x_axis(false)
@@ -354,7 +361,7 @@ impl Cowork {
                                         .flex()
                                         .items_center()
                                         .justify_center()
-                                        .text_color(rgba(0xffffff66))
+                                        .text_color(cx.theme().foreground.opacity(0.4))
                                         .child("No tokens used in this period"),
                                 )
                             }),
@@ -367,7 +374,7 @@ impl Cowork {
                             .h(px(LABEL_LINE_HEIGHT))
                             .text_xs()
                             .line_height(px(LABEL_LINE_HEIGHT))
-                            .text_color(rgba(0xffffff80))
+                            .text_color(cx.theme().foreground.opacity(0.5))
                             .children(axis),
                     ),
             )
@@ -424,14 +431,7 @@ impl Cowork {
 
     fn open_profile_name_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current_name = self.profile_name();
-        let name = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder(current_name);
-            input.set_editor_style(InputEditorStyle {
-                caret: rgb(0xffffff).into(),
-                ..Default::default()
-            });
-            input
-        });
+        let name = cx.new(|cx| InputState::new(window, cx).placeholder(current_name));
         let input_subscription = cx.subscribe_in(
             &name,
             window,
@@ -458,32 +458,20 @@ impl Cowork {
             let save_cowork = cowork.clone();
             dialog
                 .w(px(440.))
-                .bg(rgb(0x1c1c1f))
+                .bg(cx.theme().popover)
                 .on_cancel(move |_, _, cx| Self::dismiss_profile_name_dialog(&dismiss_cowork, cx))
-                .content(move |content, _, _| {
+                .content(move |content, _, cx| {
                     content
                         .child(
                             DialogHeader::new()
                                 .child(DialogTitle::new().child("Edit profile"))
                                 .child(DialogDescription::new().child("Change your display name.")),
                         )
-                        .child(
-                            div()
-                                .id("profile-name-input")
-                                .h(px(38.))
-                                .px_3()
-                                .flex()
-                                .items_center()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(rgb(0x52525b))
-                                .bg(rgb(0x18181b))
-                                .child(Input::new(&name)),
-                        )
+                        .child(Input::new(&name).id("profile-name-input").h(px(38.)))
                         .children(
                             shown_error
                                 .clone()
-                                .map(|error| div().text_color(rgb(0xf87171)).child(error)),
+                                .map(|error| div().text_color(cx.theme().danger).child(error)),
                         )
                         .child(
                             DialogFooter::new()

@@ -5,12 +5,12 @@ use std::time::Duration;
 
 use gpui::{
     Animation, AnimationExt, Context, IntoElement, MouseButton, SharedString, Window, div, point,
-    prelude::*, px, rgb,
+    prelude::*, px,
 };
 use gpui_base::GlobalState;
 use gpui_component::{
-    Icon, Sizable as _, TitleBar,
-    button::{Button, ButtonCustomVariant, ButtonVariants as _},
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, TitleBar,
+    button::{Button, ButtonVariants as _},
     sidebar::SidebarToggleButton,
     tooltip::Tooltip,
 };
@@ -83,11 +83,7 @@ impl Cowork {
             } else {
                 AssetIconName::Link
             }))
-            .custom(
-                ButtonCustomVariant::new(cx)
-                    .hover(rgb(0x2d2d30).into())
-                    .active(rgb(0x3f3f46).into()),
-            )
+            .ghost()
             .small()
             .size(px(28.))
             .mr_1()
@@ -122,7 +118,7 @@ impl Cowork {
 
         TitleBar::new()
             .h(TOP_BAR_HEIGHT)
-            .bg(rgb(0x1c1c1f))
+            .bg(cx.theme().title_bar)
             .border_0()
             .when(!cfg!(target_os = "macos"), |this| {
                 this.pl(SIDEBAR_TOGGLE_INSET)
@@ -146,42 +142,34 @@ impl Cowork {
                             .flex()
                             .items_center()
                             .children(
-                                active_thread
-                                    .as_ref()
-                                    .and_then(|thread| self.render_participants(thread.read(cx))),
+                                active_thread.as_ref().and_then(|thread| {
+                                    self.render_participants(thread.read(cx), cx)
+                                }),
                             )
                             .when(sharing_status == SharingStatus::Shared, |this| {
                                 this.child(copy_endpoint_button)
                             })
                             .when(self.main_stage == MainStage::Thread, |this| {
                                 this.child(
-                                    div()
-                                        .id("toggle-sharing")
+                                    Button::new("toggle-sharing")
+                                        .ghost()
+                                        .small()
+                                        .label(share_label)
+                                        .disabled(!sharing_enabled)
+                                        .loading(sharing_status == SharingStatus::Sharing)
                                         .h(px(28.))
                                         .px_3()
                                         .mr_2()
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .rounded_md()
                                         .occlude()
-                                        .text_sm()
-                                        .text_color(rgb(0x71717a))
-                                        .when(sharing_enabled, |this| {
-                                            this.cursor_pointer()
-                                                .text_color(rgb(0xd4d4d8))
-                                                .hover(|this| this.bg(rgb(0x2d2d30)))
-                                        })
                                         .when(sharing_status == SharingStatus::Failed, |this| {
-                                            this.text_color(rgb(0xf87171))
+                                            this.danger()
                                         })
                                         .on_mouse_down(MouseButton::Left, |_, _, cx| {
                                             cx.stop_propagation();
                                         })
                                         .on_click(cx.listener(|this, _, window, cx| {
                                             this.toggle_sharing(window, cx);
-                                        }))
-                                        .child(share_label),
+                                        })),
                                 )
                             }),
                     ),
@@ -190,7 +178,7 @@ impl Cowork {
 
     /// The connected participants of a shared thread as overlapping avatars,
     /// in join order, each naming its participant on hover.
-    fn render_participants(&self, thread: &Thread) -> Option<gpui::AnyElement> {
+    fn render_participants(&self, thread: &Thread, cx: &Context<Self>) -> Option<gpui::AnyElement> {
         const MAX_VISIBLE: usize = 5;
         const AVATAR_SIZE: f32 = 24.;
         const AVATAR_OVERLAP: f32 = 6.;
@@ -214,7 +202,7 @@ impl Cowork {
                 self.render_participant_avatar(participant, px(AVATAR_SIZE))
                     // Separates overlapping avatars from each other.
                     .border_2()
-                    .border_color(rgb(0x1c1c1f))
+                    .border_color(cx.theme().title_bar)
                     .id(("participant", index))
                     .when(index > 0, |this| this.ml(px(-AVATAR_OVERLAP)))
                     .tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx))
@@ -246,7 +234,7 @@ impl Cowork {
                         div()
                             .ml_1()
                             .text_xs()
-                            .text_color(rgb(0xa1a1aa))
+                            .text_color(cx.theme().muted_foreground)
                             .child(format!("+{hidden}")),
                     )
                 })

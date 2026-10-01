@@ -9,13 +9,10 @@ use gpui::{
     App, AppContext, Bounds, Context, Entity, EntityId, ExternalPaths, IntoElement, KeyBinding,
     MouseButton, MouseUpEvent, PlatformInput, QuitMode, Render, ScrollHandle, SharedString,
     Subscription, TextRun, TitlebarOptions, Window, WindowBounds, WindowDecorations, WindowOptions,
-    actions, canvas, div, prelude::*, px, rgb, size,
+    actions, canvas, div, prelude::*, px, size,
 };
-use gpui_base::{
-    TextViewDefaults,
-    input::{Backspace, Escape, MoveDown, MoveUp},
-};
-use gpui_component::{Root, ThemeMode, TitleBar};
+use gpui_base::input::{Backspace, Escape, MoveDown, MoveUp};
+use gpui_component::{ActiveTheme as _, Root, TitleBar};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
@@ -23,7 +20,6 @@ use crate::{
     assets::Assets,
     composer_attachments::{AttachmentError, PendingAttachment},
     generation::ActiveGeneration,
-    highlight::highlight_code_block,
     model_picker::ModelPickerState,
     models::{ModelCatalog, ModelRef},
     participant::ParticipantId,
@@ -60,6 +56,7 @@ mod sidebar;
 mod submission;
 #[cfg(test)]
 mod test_support;
+mod theme;
 mod thread;
 mod thread_draft;
 mod timeline;
@@ -263,7 +260,7 @@ impl Cowork {
         let run = TextRun {
             len: character.len(),
             font: window.text_style().font(),
-            color: rgb(0xd4d4d8).into(),
+            color: cx.theme().foreground,
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -324,8 +321,8 @@ impl Cowork {
             .rounded_tl(px(12.))
             .border_t_1()
             .border_l_1()
-            .border_color(rgb(0x2d2d30))
-            .bg(rgb(0x18181b))
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
             .child(
                 div()
                     .id("timeline-scroll")
@@ -344,7 +341,7 @@ impl Cowork {
                             .flex()
                             .flex_col()
                             .text_sm()
-                            .text_color(rgb(0xd4d4d8))
+                            .text_color(cx.theme().foreground)
                             .children(timeline_messages.into_iter().enumerate().map(
                                 |(index, message)| {
                                     div().when(index != 0, |this| this.mt_6()).child(message)
@@ -363,7 +360,7 @@ impl Cowork {
                                         .flex()
                                         .justify_center()
                                         .text_xs()
-                                        .text_color(rgb(0x71717a))
+                                        .text_color(cx.theme().muted_foreground.opacity(0.7))
                                         .child("Read-only thread")
                                         .child(
                                             canvas(
@@ -404,7 +401,8 @@ impl Render for Cowork {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .bg(rgb(0x1c1c1f))
+            .bg(cx.theme().sidebar)
+            .text_color(cx.theme().foreground)
             .on_action(cx.listener(Self::submit_composer_action))
             .on_action(cx.listener(|this, _: &OpenSearchPalette, window, cx| {
                 this.open_search_palette(window, cx);
@@ -502,13 +500,7 @@ fn main() -> anyhow::Result<()> {
         .with_assets(Assets)
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
-            gpui_component::Theme::change(ThemeMode::Dark, None, cx);
-            gpui_component::Theme::update(cx, |theme| {
-                theme.popover = rgb(0x1c1c1f).into();
-            });
-            TextViewDefaults::new()
-                .with_code_block_highlighter(highlight_code_block)
-                .install(cx);
+            theme::init(cx);
             cx.bind_keys([
                 KeyBinding::new("ctrl-enter", SubmitComposer, None),
                 KeyBinding::new("cmd-enter", SubmitComposer, None),

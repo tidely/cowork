@@ -10,7 +10,7 @@ use gpui::{
 };
 use gpui_base::{GlobalState, Textarea, input::TextareaState};
 use gpui_component::{
-    Disableable as _, Icon, Sizable as _,
+    ActiveTheme, Disableable as _, Icon, Sizable as _,
     attachment::Attachment,
     button::{Button, ButtonVariants as _},
     combobox::Combobox,
@@ -58,11 +58,15 @@ pub(crate) struct ComposerBlock {
 }
 
 impl Cowork {
-    pub(crate) fn render_composer_comment(&self, comment: &UserComment) -> gpui::AnyElement {
+    pub(crate) fn render_composer_comment(
+        &self,
+        comment: &UserComment,
+        cx: &App,
+    ) -> gpui::AnyElement {
         let body = match &comment.body {
             UserCommentBody::Submitted(body) => div()
                 .w_full()
-                .text_color(rgb(0xe4e4e7))
+                .text_color(cx.theme().secondary_foreground)
                 .child(body.clone())
                 .into_any_element(),
             UserCommentBody::Editing { composer, .. } => div()
@@ -83,15 +87,15 @@ impl Cowork {
             .overflow_hidden()
             .rounded_lg()
             .border_1()
-            .border_color(rgb(0x303036))
-            .bg(rgb(0x202023))
+            .border_color(cx.theme().border)
+            .bg(cx.theme().secondary)
             .child(
                 div()
                     .w_full()
                     .px_3()
                     .pt_3()
                     .pb_2()
-                    .text_color(rgb(0xd4d4d8))
+                    .text_color(cx.theme().foreground)
                     .line_clamp(2)
                     .child(comment.reference.quote.clone()),
             )
@@ -101,9 +105,9 @@ impl Cowork {
                         .w_full()
                         .overflow_hidden()
                         .border_1()
-                        .border_color(rgb(0x303036))
+                        .border_color(cx.theme().border)
                         .rounded_md()
-                        .bg(rgb(0x1d1d20))
+                        .bg(cx.theme().popover)
                         .child(
                             div()
                                 .w_full()
@@ -117,6 +121,7 @@ impl Cowork {
                                 .child(self.render_layered_avatars(
                                     comment.author,
                                     &comment.presence.editors,
+                                    cx,
                                 ))
                                 .child(body),
                         ),
@@ -165,7 +170,7 @@ impl Cowork {
         let title_run = TextRun {
             len: selected_model_title.len(),
             font: window.text_style().font(),
-            color: rgb(0xd4d4d8).into(),
+            color: cx.theme().foreground,
             background_color: None,
             underline: None,
             strikethrough: None,
@@ -204,7 +209,7 @@ impl Cowork {
                     .appearance(false)
                     .small()
                     .p_0()
-                    .render_trigger(move |trigger, _, _| {
+                    .render_trigger(move |trigger, _, cx| {
                         let selected_model = trigger.selection().first().map(|(_, model)| model);
                         let title = selected_model
                             .map(LanguageModel::title)
@@ -231,12 +236,14 @@ impl Cowork {
                                     .gap_1()
                                     .rounded_md()
                                     .cursor_pointer()
-                                    .when(model_picker_hovered, |this| this.bg(rgb(0x2d2d30)))
+                                    .when(model_picker_hovered, |this| {
+                                        this.bg(cx.theme().secondary_hover)
+                                    })
                                     .text_sm()
                                     .text_color(if unavailable {
-                                        rgb(0x71717a)
+                                        cx.theme().muted_foreground.opacity(0.7)
                                     } else {
-                                        rgb(0xd4d4d8)
+                                        cx.theme().foreground
                                     })
                                     .when(unavailable, |this| {
                                         this.tooltip(|window, cx| {
@@ -262,7 +269,7 @@ impl Cowork {
                                         })
                                         .size_4()
                                         .flex_none()
-                                        .text_color(rgb(0xa1a1aa)),
+                                        .text_color(cx.theme().muted_foreground),
                                     ),
                             )
                     }),
@@ -317,8 +324,8 @@ impl Cowork {
             .w_full()
             .flex_none()
             .border_l_1()
-            .border_color(rgb(0x2d2d30))
-            .bg(rgb(0x18181b))
+            .border_color(cx.theme().border)
+            .bg(cx.theme().background)
             .flex()
             .items_center()
             .justify_end()
@@ -348,7 +355,7 @@ impl Cowork {
                             && content_bottom >= bounds.top() - BOTTOM_BAR_DIVIDER_THRESHOLD;
 
                         if divider_visible {
-                            window.paint_quad(gpui::fill(bounds, rgb(0x2d2d30)));
+                            window.paint_quad(gpui::fill(bounds, cx.theme().border));
                         }
                     },
                 )
@@ -616,11 +623,11 @@ impl Cowork {
                 content.extend(
                     comments
                         .iter()
-                        .map(|comment| self.render_composer_comment(comment)),
+                        .map(|comment| self.render_composer_comment(comment, cx)),
                 );
             }
             rows.push(
-                self.render_comment_group_row(&comments, content)
+                self.render_comment_group_row(&comments, content, cx)
                     .into_any_element(),
             );
         }
@@ -659,7 +666,7 @@ impl Cowork {
             );
             let block_id = block.id;
             rows.push(
-                self.render_presence_row(block.creator, &block.presence.editors, content)
+                self.render_presence_row(block.creator, &block.presence.editors, content, cx)
                     .can_drop(|value, _, _| {
                         value
                             .downcast_ref::<ExternalPaths>()
@@ -686,7 +693,7 @@ impl Cowork {
             .map(|error| {
                 div()
                     .text_xs()
-                    .text_color(rgb(0xf87171))
+                    .text_color(cx.theme().danger)
                     .child(error.message.clone())
                     .into_any_element()
             })
@@ -713,7 +720,7 @@ impl Cowork {
             }));
             let (primary, others) = draft_position_people;
             rows.push(
-                self.render_presence_row(primary, &others, content)
+                self.render_presence_row(primary, &others, content, cx)
                     .into_any_element(),
             );
         } else if !errors.is_empty() {

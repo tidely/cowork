@@ -10,13 +10,14 @@ use anyhow::Context as _;
 use draft::AttachmentId;
 use gpui::{
     App, AppContext, AsyncApp, ClipboardItem, Context, Entity, Focusable, FutureExt, Subscription,
-    WeakEntity, Window, div, prelude::*, px, rgb,
+    WeakEntity, Window, div, prelude::*, px,
 };
-use gpui_base::input::{Input, InputEditorStyle, InputEvent, InputState};
+use gpui_base::input::{InputEvent, InputState};
 use gpui_component::{
-    Disableable as _, WindowExt as _,
+    ActiveTheme as _, Disableable as _, WindowExt as _,
     button::{Button, ButtonVariants as _},
     dialog::{DialogDescription, DialogFooter, DialogHeader, DialogTitle},
+    input::Input,
 };
 use iroh::{
     Endpoint, EndpointId,
@@ -531,14 +532,8 @@ impl Cowork {
     }
 
     pub(crate) fn open_join_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let endpoint_token = cx.new(|cx| {
-            let mut input = InputState::new(window, cx).placeholder("Paste endpoint token");
-            input.set_editor_style(InputEditorStyle {
-                caret: rgb(0xffffff).into(),
-                ..Default::default()
-            });
-            input
-        });
+        let endpoint_token =
+            cx.new(|cx| InputState::new(window, cx).placeholder("Paste endpoint token"));
         let join_dialog = cx.new(|_| JoinDialog {
             endpoint_token: endpoint_token.clone(),
             status: JoinStatus::Idle,
@@ -581,14 +576,14 @@ impl Cowork {
             let endpoint_token = join_state.endpoint_token.clone();
             dialog
                 .w(px(440.))
-                .bg(rgb(0x1c1c1f))
+                .bg(cx.theme().popover)
                 .keyboard(!joining)
                 .overlay_closable(!joining)
                 .close_button(!joining)
                 .on_cancel(move |_, _, cx| {
                     Self::dismiss_join_dialog(&dismiss_cowork, &dismiss_dialog, cx)
                 })
-                .content(move |content, _, _| {
+                .content(move |content, _, cx| {
                     content
                         .child(
                             DialogHeader::new()
@@ -599,22 +594,14 @@ impl Cowork {
                                 ),
                         )
                         .child(
-                            div()
+                            Input::new(&endpoint_token)
                                 .id("endpoint-token-input")
-                                .h(px(38.))
-                                .px_3()
-                                .flex()
-                                .items_center()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(rgb(0x52525b))
-                                .bg(rgb(0x18181b))
-                                .child(Input::new(&endpoint_token)),
+                                .h(px(38.)),
                         )
                         .children(
-                            error
-                                .as_ref()
-                                .map(|error| div().text_color(rgb(0xf87171)).child(error.clone())),
+                            error.as_ref().map(|error| {
+                                div().text_color(cx.theme().danger).child(error.clone())
+                            }),
                         )
                         .child(
                             DialogFooter::new()

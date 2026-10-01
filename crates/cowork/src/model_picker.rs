@@ -5,9 +5,10 @@ use std::{collections::BTreeMap, sync::Arc};
 
 use gpui::{
     App, AppContext, Context, Entity, IntoElement, SharedString, Subscription, WeakEntity, Window,
-    div, img, prelude::*, px, rgb,
+    div, img, prelude::*, px,
 };
 use gpui_component::{
+    ActiveTheme,
     combobox::{ComboboxEvent, ComboboxState},
     progress::ProgressCircle,
     searchable_list::{SearchableGroup, SearchableListItem, SearchableVec},
@@ -340,7 +341,7 @@ impl Cowork {
             .child(
                 ProgressCircle::new("context-ring")
                     .value(usage.percent())
-                    .color(usage.color())
+                    .color(usage.color(cx.theme()))
                     .accessibility_label(format!("Context window {:.0}% full", usage.percent()))
                     .size(px(16.)),
             )
@@ -354,7 +355,7 @@ impl Cowork {
                         thread.as_ref().map(|thread| thread.read(cx)),
                         new_thread_max_tokens,
                     );
-                    Self::render_context_details(usage)
+                    Self::render_context_details(usage, cx)
                 })
                 .py_2()
                 .px_3()
@@ -362,19 +363,23 @@ impl Cowork {
             })
     }
 
-    fn render_context_details(usage: ContextUsage) -> impl IntoElement {
-        let muted = rgb(0x71717a);
+    fn render_context_details(usage: ContextUsage, cx: &App) -> impl IntoElement + use<> {
+        let muted = cx.theme().muted_foreground.opacity(0.7);
         div()
             .flex()
             .flex_col()
             .gap_1()
-            .child(div().text_color(rgb(0xa1a1aa)).child("Context"))
+            .child(
+                div()
+                    .text_color(cx.theme().muted_foreground)
+                    .child("Context"),
+            )
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_1p5()
-                    .text_color(rgb(0xe4e4e7))
+                    .text_color(cx.theme().secondary_foreground)
                     .child(format!("{:.0}%", usage.percent()))
                     .child(div().text_color(muted).child("·"))
                     .child(format_token_count(usage.tokens))

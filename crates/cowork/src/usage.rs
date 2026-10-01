@@ -4,7 +4,8 @@
 use std::time::{Duration, SystemTime};
 
 use chrono::{DateTime, Datelike as _, Days, Local, Months, NaiveTime, TimeDelta, Timelike as _};
-use gpui::{SharedString, rgb};
+use gpui::{Hsla, SharedString};
+use gpui_component::Theme;
 use rig::completion::Usage;
 
 use crate::Thread;
@@ -48,12 +49,12 @@ impl ContextUsage {
         self.tokens as f32 * 100. / self.max_tokens as f32
     }
 
-    /// Grey until the window is nearly full, then amber, then red.
-    pub(crate) fn color(self) -> gpui::Rgba {
+    /// Muted until the window is nearly full, then warning, then danger.
+    pub(crate) fn color(self, theme: &Theme) -> Hsla {
         match self.percent() {
-            percent if percent >= 95. => rgb(0xf87171),
-            percent if percent >= 80. => rgb(0xfbbf24),
-            _ => rgb(0xa1a1aa),
+            percent if percent >= 95. => theme.danger,
+            percent if percent >= 80. => theme.warning,
+            _ => theme.muted_foreground,
         }
     }
 }
@@ -698,15 +699,20 @@ mod tests {
             tokens,
             max_tokens: 1_000,
         };
+        let theme = Theme::default();
         assert_eq!(usage(130).percent(), 13.);
-        assert_eq!(usage(130).color(), rgb(0xa1a1aa));
-        assert_eq!(usage(800).color(), rgb(0xfbbf24));
-        assert_eq!(usage(1_200).color(), rgb(0xf87171));
+        assert_eq!(usage(130).color(&theme), theme.muted_foreground);
+        assert_eq!(usage(799).color(&theme), theme.muted_foreground);
+        assert_eq!(usage(800).color(&theme), theme.warning);
+        assert_eq!(usage(949).color(&theme), theme.warning);
+        assert_eq!(usage(950).color(&theme), theme.danger);
+        assert_eq!(usage(1_200).color(&theme), theme.danger);
         let unknown = ContextUsage {
             tokens: 5,
             max_tokens: 0,
         };
         assert_eq!(unknown.percent(), 0.);
+        assert_eq!(unknown.color(&theme), theme.muted_foreground);
     }
 
     #[test]

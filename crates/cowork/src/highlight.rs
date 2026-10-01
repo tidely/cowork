@@ -6,25 +6,29 @@ use gpui::{FontStyle, FontWeight, HighlightStyle, rgba};
 use gpui_base::text::CodeBlock;
 use syntect::{
     easy::HighlightLines,
-    highlighting::{FontStyle as SyntectFontStyle, Theme, ThemeSet},
+    highlighting::{FontStyle as SyntectFontStyle, ThemeSet},
     parsing::SyntaxSet,
     util::LinesWithEndings,
 };
 
 static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
-static SYNTAX_THEME: OnceLock<Option<Theme>> = OnceLock::new();
+static SYNTAX_THEMES: OnceLock<ThemeSet> = OnceLock::new();
 
-pub(crate) fn highlight_code_block(block: &CodeBlock) -> Vec<(Range<usize>, HighlightStyle)> {
+/// GPUI Base's callback receives no block style or app context. The caller
+/// supplies the mode and replaces the registered callback when it changes,
+/// which also invalidates Base's cache keyed by callback identity.
+pub(crate) fn highlight_code_block_in_mode(
+    block: &CodeBlock,
+    is_dark: bool,
+) -> Vec<(Range<usize>, HighlightStyle)> {
     let syntax_set = SYNTAX_SET.get_or_init(SyntaxSet::load_defaults_newlines);
-    let theme = SYNTAX_THEME.get_or_init(|| {
-        let themes = ThemeSet::load_defaults();
-        themes
-            .themes
-            .get("base16-ocean.dark")
-            .cloned()
-            .or_else(|| themes.themes.values().next().cloned())
-    });
-    let Some(theme) = theme else {
+    let themes = SYNTAX_THEMES.get_or_init(ThemeSet::load_defaults);
+    let name = if is_dark {
+        "base16-ocean.dark"
+    } else {
+        "base16-ocean.light"
+    };
+    let Some(theme) = themes.themes.get(name) else {
         return Vec::new();
     };
 
@@ -101,13 +105,23 @@ mod tests {
     fn highlights_fenced_rust_code() {
         let code = "fn main() { println!(\"hello\"); }\n";
         let block = CodeBlock::from_code(code, Some("rust"));
-        let highlights = highlight_code_block(&block);
+        for is_dark in [false, true] {
+            let highlights = highlight_code_block_in_mode(&block, is_dark);
+            assert!(!highlights.is_empty());
+            assert!(
+                highlights
+                    .iter()
+                    .all(|(range, _)| range.start < range.end && range.end <= code.len())
+            );
+        }
+    }
 
-        assert!(!highlights.is_empty());
-        assert!(
-            highlights
-                .iter()
-                .all(|(range, _)| range.start < range.end && range.end <= code.len())
-        );
+    #[test]
+    fn highlighting_tracks_theme_mode() {
+        let block = CodeBlock::from_code("fn main() {}\n", Some("rust"));
+        let dark = highlight_code_block_in_mode(&block, true);
+        let light = highlight_code_block_in_mode(&block, false);
+        assert_ne!(dark, light);
+        assert_eq!(highlight_code_block_in_mode(&block, true), dark);
     }
 }

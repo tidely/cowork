@@ -17,7 +17,7 @@ use gpui_base::{
     RangeHighlight, RenderedText, SelectableText, TextSelection, TextView, TextViewState,
     TextViewStyle, Textarea, input::TextareaState, text::SelectionFormat,
 };
-use gpui_component::{Icon, shimmer::ShimmerText};
+use gpui_component::{ActiveTheme, Icon, shimmer::ShimmerText};
 use gpui_kit_assets::IconName as AssetIconName;
 use uuid::Uuid;
 
@@ -243,8 +243,8 @@ impl Cowork {
             .items_center()
             .gap_2()
             .cursor_pointer()
-            .text_color(rgb(0xa1a1aa))
-            .hover(|this| this.text_color(rgb(0xe4e4e7)))
+            .text_color(cx.theme().muted_foreground)
+            .hover(|this| this.text_color(cx.theme().secondary_foreground))
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.toggle_comment_group(group_id, cx);
             }))
@@ -252,11 +252,11 @@ impl Cowork {
             .child(if collapsed { "›" } else { "⌄" })
     }
 
-    fn render_inline_comment(&self, comment: &UserComment) -> gpui::AnyElement {
+    fn render_inline_comment(&self, comment: &UserComment, cx: &App) -> gpui::AnyElement {
         let body = match &comment.body {
             UserCommentBody::Submitted(body) => div()
                 .w_full()
-                .text_color(rgb(0xe4e4e7))
+                .text_color(cx.theme().secondary_foreground)
                 .child(body.clone())
                 .into_any_element(),
             UserCommentBody::Editing { inline, .. } => div()
@@ -277,8 +277,8 @@ impl Cowork {
             .overflow_hidden()
             .rounded_md()
             .border_1()
-            .border_color(rgb(0x303036))
-            .bg(rgb(0x1d1d20))
+            .border_color(cx.theme().border)
+            .bg(cx.theme().secondary)
             .child(
                 div()
                     .w_full()
@@ -289,45 +289,49 @@ impl Cowork {
                     .py_2()
                     .border_l_2()
                     .border_color(rgb(self.color_of(comment.author)))
-                    .child(self.render_layered_avatars(comment.author, &comment.presence.editors))
+                    .child(self.render_layered_avatars(
+                        comment.author,
+                        &comment.presence.editors,
+                        cx,
+                    ))
                     .child(body),
             )
             .into_any_element()
     }
 
-    fn markdown_style() -> TextViewStyle {
-        let code_background = rgb(0x27272a);
+    fn markdown_style(cx: &App) -> TextViewStyle {
+        let code_background = cx.theme().muted;
 
         TextViewStyle::default()
-            .with_foreground(rgb(0xd4d4d8).into())
-            .with_muted_foreground(rgb(0x8b8b95).into())
-            .with_link(rgb(0x60a5fa).into())
-            .with_selection(rgba(0xe26d5a40).into())
-            .with_code_background(code_background.into())
-            .with_border(rgb(0x3f3f46).into())
+            .with_foreground(cx.theme().foreground)
+            .with_muted_foreground(cx.theme().muted_foreground)
+            .with_link(cx.theme().link)
+            .with_selection(cx.theme().selection)
+            .with_code_background(code_background)
+            .with_border(cx.theme().border)
             .with_paragraph_gap(rems(0.75))
             .with_code_block(
                 gpui::StyleRefinement::default()
                     .bg(code_background)
-                    .text_color(rgb(0xd4d4d8)),
+                    .text_color(cx.theme().foreground),
             )
             .with_inline_code(HighlightStyle {
-                color: Some(rgb(0xe4e4e7).into()),
-                background_color: Some(code_background.into()),
+                color: Some(cx.theme().secondary_foreground),
+                background_color: Some(code_background),
                 ..Default::default()
             })
             .with_table(
                 gpui::StyleRefinement::default()
-                    .bg(rgb(0x18181b))
-                    .text_color(rgb(0xd4d4d8)),
+                    .bg(cx.theme().background)
+                    .text_color(cx.theme().foreground),
             )
             .with_table_head(
                 gpui::StyleRefinement::default()
                     .bg(code_background)
-                    .text_color(rgb(0xe4e4e7)),
+                    .text_color(cx.theme().secondary_foreground),
             )
-            .with_table_cell(gpui::StyleRefinement::default().text_color(rgb(0xd4d4d8)))
-            .with_dark(true)
+            .with_table_cell(gpui::StyleRefinement::default().text_color(cx.theme().foreground))
+            .with_dark(cx.theme().is_dark())
     }
 
     /// The background of the text a comment by `author` is on.
@@ -393,10 +397,10 @@ impl Cowork {
         }
     }
 
-    fn render_message_segment(segment: &MessageSegment) -> gpui::AnyElement {
+    fn render_message_segment(segment: &MessageSegment, cx: &App) -> gpui::AnyElement {
         TextView::new(&segment.state)
             .selection_format(SelectionFormat::Plain)
-            .style(Self::markdown_style())
+            .style(Self::markdown_style(cx))
             .w_full()
             .into_any_element()
     }
@@ -408,15 +412,16 @@ impl Cowork {
         segments: &[MessageSegment],
         comments: &[&UserComment],
         required: &[Uuid],
+        cx: &App,
     ) -> Vec<gpui::AnyElement> {
         let mut content = Vec::new();
         let mut placed = HashSet::new();
         for segment in segments {
-            content.push(Self::render_message_segment(segment));
+            content.push(Self::render_message_segment(segment, cx));
             for id in &segment.comments {
                 if let Some(comment) = comments.iter().find(|comment| comment.id == *id) {
                     placed.insert(*id);
-                    content.push(self.render_inline_comment(comment));
+                    content.push(self.render_inline_comment(comment, cx));
                 }
             }
         }
@@ -424,7 +429,7 @@ impl Cowork {
             comments
                 .iter()
                 .filter(|comment| required.contains(&comment.id) && !placed.contains(&comment.id))
-                .map(|comment| self.render_inline_comment(comment)),
+                .map(|comment| self.render_inline_comment(comment, cx)),
         );
         content
     }
@@ -487,10 +492,10 @@ impl Cowork {
                     group
                         .comments
                         .iter()
-                        .map(|comment| self.render_composer_comment(comment)),
+                        .map(|comment| self.render_composer_comment(comment, cx)),
                 );
             }
-            rows.push(self.render_comment_group_row(&group.comments, content));
+            rows.push(self.render_comment_group_row(&group.comments, content, cx));
         }
         for (block_index, (block, cards)) in group.blocks.iter().zip(cards).enumerate() {
             let mut content = Vec::new();
@@ -550,10 +555,11 @@ impl Cowork {
         &self,
         comments: &[UserComment],
         content: impl IntoIterator<Item = gpui::AnyElement>,
+        cx: &App,
     ) -> gpui::Div {
         let authors = Self::comment_authors(comments);
         match authors.split_first() {
-            Some((first, rest)) => self.render_presence_row(*first, rest, content),
+            Some((first, rest)) => self.render_presence_row(*first, rest, content, cx),
             None => self.render_message_row(None, content),
         }
     }
@@ -575,6 +581,7 @@ impl Cowork {
         primary: ParticipantId,
         others: &[ParticipantId],
         content: impl IntoIterator<Item = gpui::AnyElement>,
+        cx: &App,
     ) -> gpui::Div {
         self.render_message_row(None, content)
             .child(
@@ -585,7 +592,7 @@ impl Cowork {
                     .w(px(40.))
                     .flex()
                     .justify_center()
-                    .child(self.render_layered_avatars(primary, others)),
+                    .child(self.render_layered_avatars(primary, others, cx)),
             )
             .relative()
     }
@@ -746,9 +753,9 @@ impl Cowork {
                     .items_center()
                     .cursor_pointer()
                     .text_sm()
-                    .text_color(rgb(0x71717a))
+                    .text_color(cx.theme().muted_foreground.opacity(0.7))
                     .when(!in_progress, |this| {
-                        this.hover(|this| this.text_color(rgb(0xa1a1aa)))
+                        this.hover(|this| this.text_color(cx.theme().muted_foreground))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 this.toggle_step(thread_id, message_id, step_index, cx);
                             }))
@@ -765,12 +772,12 @@ impl Cowork {
                         .debug_selector(move || format!("thinking-{message_id}-{step_index}"))
                         .pl_3()
                         .border_l_1()
-                        .border_color(rgb(0x3f3f46))
+                        .border_color(cx.theme().border)
                         .opacity(0.7)
                         .child(
                             TextView::new(view)
                                 .selection_format(SelectionFormat::Plain)
-                                .style(Self::markdown_style())
+                                .style(Self::markdown_style(cx))
                                 .w_full(),
                         ),
                 )
@@ -790,7 +797,12 @@ impl Cowork {
     ) -> gpui::AnyElement {
         let message_id = message.id;
         let running = call.result.is_none() && message.is_generating();
-        let label = |text: &'static str| div().text_xs().text_color(rgb(0x71717a)).child(text);
+        let label = |text: &'static str| {
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground.opacity(0.7))
+                .child(text)
+        };
         div()
             .w_full()
             .flex()
@@ -807,8 +819,8 @@ impl Cowork {
                     .gap_1()
                     .cursor_pointer()
                     .text_xs()
-                    .text_color(rgb(0x71717a))
-                    .hover(|this| this.text_color(rgb(0xa1a1aa)))
+                    .text_color(cx.theme().muted_foreground.opacity(0.7))
+                    .hover(|this| this.text_color(cx.theme().muted_foreground))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_step(thread_id, message_id, step_index, cx);
                     }))
@@ -846,7 +858,7 @@ impl Cowork {
                         .mb_2()
                         .pl_3()
                         .border_l_1()
-                        .border_color(rgb(0x3f3f46))
+                        .border_color(cx.theme().border)
                         .opacity(0.7)
                         .flex()
                         .flex_col()
@@ -916,7 +928,7 @@ impl Cowork {
                     rendered.push(
                         TextView::new(view)
                             .selection_format(SelectionFormat::Plain)
-                            .style(Self::markdown_style())
+                            .style(Self::markdown_style(cx))
                             .w_full()
                             .into_any_element(),
                     );
@@ -953,15 +965,17 @@ impl Cowork {
             }
         };
         let outcome = match message.run.outcome() {
-            Some(RunOutcome::Stopped) => Some(("Stopped", rgb(0x71717a))),
-            Some(RunOutcome::Failed(_)) => Some(("Failed", rgb(0xf87171))),
+            Some(RunOutcome::Stopped) => {
+                Some(("Stopped", cx.theme().muted_foreground.opacity(0.7)))
+            }
+            Some(RunOutcome::Failed(_)) => Some(("Failed", cx.theme().danger)),
             Some(RunOutcome::Completed) | None => None,
         };
         div()
             .w_full()
             .pb_2()
             .border_b_1()
-            .border_color(rgb(0x2e2e33))
+            .border_color(cx.theme().border)
             .flex()
             .child(
                 div()
@@ -972,8 +986,8 @@ impl Cowork {
                     .gap_1()
                     .cursor_pointer()
                     .text_sm()
-                    .text_color(rgb(0x71717a))
-                    .hover(|this| this.text_color(rgb(0xa1a1aa)))
+                    .text_color(cx.theme().muted_foreground.opacity(0.7))
+                    .hover(|this| this.text_color(cx.theme().muted_foreground))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_work(thread_id, message_id, cx);
                     }))
@@ -1056,18 +1070,18 @@ impl Cowork {
             .collect::<Vec<_>>();
         anchored_comments.sort_by_key(|comment| comment.reference.range.start);
 
-        let whole = || {
+        let whole = |cx: &App| {
             (!text.is_empty()).then(|| {
                 TextView::new(text_view)
                     .selection_format(SelectionFormat::Plain)
-                    .style(Self::markdown_style())
+                    .style(Self::markdown_style(cx))
                     .w_full()
                     .into_any_element()
             })
         };
         if anchored_comments.is_empty() {
             self.shown_segments.remove(&thread_message_id);
-            return whole().into_iter().collect();
+            return whole(cx).into_iter().collect();
         }
 
         // Each comment's range, in the segments it falls in, with its
@@ -1155,7 +1169,7 @@ impl Cowork {
             .pending_since
             .is_some_and(|since| since.elapsed() >= SEGMENT_PARSE_TIMEOUT);
         if parsed || timed_out {
-            let content = self.render_segments(&segments, &anchored_comments, &placed_comments);
+            let content = self.render_segments(&segments, &anchored_comments, &placed_comments, cx);
             let shown = self
                 .shown_segments
                 .get_mut(&thread_message_id)
@@ -1174,8 +1188,8 @@ impl Cowork {
         // append its focused editor after the whole response while parsing:
         // that would scroll the timeline away from the quoted text.
         match previous {
-            Some(previous) => self.render_segments(&previous, &anchored_comments, &[]),
-            None => whole().into_iter().collect(),
+            Some(previous) => self.render_segments(&previous, &anchored_comments, &[], cx),
+            None => whole(cx).into_iter().collect(),
         }
     }
 
@@ -1195,7 +1209,7 @@ impl Cowork {
             && message.output.text.is_empty();
         let mut submitted_comment_content = Vec::new();
         for comment in submitted_comments {
-            submitted_comment_content.push(self.render_composer_comment(comment));
+            submitted_comment_content.push(self.render_composer_comment(comment, cx));
             if let Some(response) = message
                 .comment_responses
                 .iter()
@@ -1221,7 +1235,7 @@ impl Cowork {
                         .px_3()
                         .py_2()
                         .rounded_md()
-                        .bg(rgb(0x242428))
+                        .bg(cx.theme().muted)
                         .flex()
                         .flex_col()
                         .gap_3()
@@ -1256,7 +1270,11 @@ impl Cowork {
             .run
             .failure()
             .filter(|_| message.output.text.is_empty())
-            .map(|failure| div().child(failure.to_owned()));
+            .map(|failure| {
+                div()
+                    .text_color(cx.theme().danger)
+                    .child(failure.to_owned())
+            });
         // A plain reply that completed needs no summary.
         let summarized = message.is_generating()
             || message.output.work().next().is_some()
@@ -1294,7 +1312,7 @@ impl Cowork {
                     .flex_col()
                     .gap_3()
                     .when(message.run.failure().is_some(), |this| {
-                        this.text_color(rgb(0xf87171))
+                        this.text_color(cx.theme().danger)
                     })
                     .children(submitted_comment_content)
                     .children(summary)
@@ -1302,7 +1320,7 @@ impl Cowork {
                         this.child(
                             ShimmerText::new("Thinking\u{2026}")
                                 .id(("agent-waiting", index))
-                                .text_color(rgb(0x8b8b95)),
+                                .text_color(cx.theme().muted_foreground),
                         )
                     })
                     .children(work)

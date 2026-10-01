@@ -14,6 +14,30 @@ impl Render for MouseDragTestView {
 }
 
 #[gpui::test]
+fn continue_buttons_have_room_for_their_labels(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+
+    for (stage, selector) in [
+        (MainStage::Welcome, "welcome-continue"),
+        (
+            MainStage::ProviderSetup(ProviderSetupStage::Ollama),
+            "setup-continue",
+        ),
+    ] {
+        cx.update(|_, cx| {
+            cowork.update(cx, |cowork, cx| {
+                cowork.main_stage = stage;
+                cowork.selected_welcome_provider = Some(ModelProvider::Ollama);
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+        let button = cx.debug_bounds(selector).expect("Continue is rendered");
+        assert_eq!(button.size.height, px(44.), "{selector}");
+    }
+}
+
+#[gpui::test]
 fn title_bar_preserves_layout_and_the_sidebar_toggle(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     let content = cx
@@ -41,6 +65,44 @@ fn title_bar_preserves_layout_and_the_sidebar_toggle(cx: &mut gpui::TestAppConte
     cx.simulate_click(toggle.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     assert!(cowork.read_with(cx, |cowork, _| cowork.sidebar_open));
+}
+
+#[gpui::test]
+fn switching_theme_preserves_draft_identity_and_layout(cx: &mut gpui::TestAppContext) {
+    use gpui_component::{Theme, ThemeMode};
+
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    cx.simulate_input("A theme-independent draft");
+    cx.run_until_parked();
+    let items = new_thread_items(&cowork, cx);
+    let focused = focused_slot(&cowork, cx);
+    let content = cx.debug_bounds("top-bar-content").unwrap();
+    let bottom_bar = cx.debug_bounds("bottom-bar").unwrap();
+    let identity_color =
+        cowork.read_with(cx, |cowork, _| cowork.color_of(cowork.local_participant_id));
+
+    for mode in [ThemeMode::Light, ThemeMode::Dark] {
+        cx.update(|_, cx| Theme::change(mode, None, cx));
+        cx.run_until_parked();
+
+        assert_eq!(new_thread_items(&cowork, cx), items);
+        assert_eq!(focused_slot(&cowork, cx), focused);
+        assert_eq!(cx.debug_bounds("top-bar-content").unwrap(), content);
+        assert_eq!(cx.debug_bounds("bottom-bar").unwrap(), bottom_bar);
+        assert_eq!(
+            cowork.read_with(cx, |cowork, _| cowork.color_of(cowork.local_participant_id)),
+            identity_color,
+        );
+        cx.update(|_, cx| {
+            assert_eq!(cx.theme().is_dark(), mode.is_dark());
+            assert!(gpui_base::TextViewDefaults::global(cx).has_code_block_highlighter());
+        });
+    }
+
+    let toggle = cx.debug_bounds("top-bar-sidebar-toggle").unwrap();
+    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(!cowork.read_with(cx, |cowork, _| cowork.sidebar_open));
 }
 
 #[gpui::test]

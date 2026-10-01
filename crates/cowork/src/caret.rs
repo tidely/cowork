@@ -136,7 +136,8 @@ pub(crate) fn paint_caret_label(
     let run = TextRun {
         len: name.len(),
         font: window.text_style().font(),
-        color: rgb(0xf4f4f5).into(),
+        // The label sits on a participant identity color, not a themed surface.
+        color: rgb(0xffffff).into(),
         background_color: None,
         underline: None,
         strikethrough: None,

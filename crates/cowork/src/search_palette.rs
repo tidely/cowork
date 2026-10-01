@@ -12,10 +12,10 @@ use std::{cell::Cell, cmp::Reverse, iter, ops::Range, rc::Rc};
 
 use gpui::{
     App, AppContext as _, Context, Focusable as _, FontWeight, HighlightStyle, Hsla, SharedString,
-    StyledText, Window, div, prelude::*, px, rgb,
+    StyledText, Window, div, prelude::*, px,
 };
 use gpui_component::{
-    IndexPath, WindowExt as _,
+    ActiveTheme, IndexPath, WindowExt as _,
     command::{Command, CommandGroup, CommandItem, CommandState},
     h_flex, v_flex,
 };
@@ -309,7 +309,7 @@ impl PaletteSection {
                 let excerpt = row.excerpt.clone();
                 CommandItem::new()
                     .label(row.label.clone())
-                    .child(move |_, _| {
+                    .child(move |_, cx| {
                         v_flex()
                             .w_full()
                             .min_w_0()
@@ -323,13 +323,15 @@ impl PaletteSection {
                                     .child(div().flex_1().min_w_0().truncate().child(highlighted(
                                         label.clone(),
                                         &matched,
-                                        rgb(0xfafafa),
+                                        cx.theme().secondary_foreground,
                                     )))
                                     .when_some(detail.clone(), |this, detail| {
                                         this.child(
                                             div()
                                                 .flex_none()
-                                                .text_color(rgb(0x71717a))
+                                                .text_color(
+                                                    cx.theme().muted_foreground.opacity(0.7),
+                                                )
                                                 .child(detail),
                                         )
                                     }),
@@ -341,11 +343,11 @@ impl PaletteSection {
                                         .min_w_0()
                                         .truncate()
                                         .text_xs()
-                                        .text_color(rgb(0x71717a))
+                                        .text_color(cx.theme().muted_foreground.opacity(0.7))
                                         .child(highlighted(
                                             excerpt.text,
                                             &[excerpt.matched],
-                                            rgb(0xd4d4d8),
+                                            cx.theme().foreground,
                                         )),
                                 )
                             })
@@ -406,7 +408,7 @@ impl Cowork {
         let state = cx.new(|cx| CommandState::new(window, cx));
         let cowork = cx.entity().downgrade();
         let focus_on_mount = Rc::new(Cell::new(true));
-        window.open_dialog(cx, move |dialog, _, _| {
+        window.open_dialog(cx, move |dialog, _, cx| {
             let state = state.clone();
             let cowork = cowork.clone();
             let focus_on_mount = focus_on_mount.clone();
@@ -414,7 +416,7 @@ impl Cowork {
                 .w(px(560.))
                 .margin_top(px(120.))
                 .p_0()
-                .bg(rgb(0x1c1c1f))
+                .bg(cx.theme().popover)
                 .close_button(false)
                 .content(move |content, window, cx| {
                     // The dialog takes focus as it opens; hand it to the
@@ -439,13 +441,13 @@ impl Cowork {
                         .filterable(false)
                         .placeholder("Search chats")
                         .max_h(px(360.))
-                        .empty(|_, _, _| {
+                        .empty(|_, _, cx| {
                             div()
                                 .py_6()
                                 .w_full()
                                 .text_center()
                                 .text_sm()
-                                .text_color(rgb(0x71717a))
+                                .text_color(cx.theme().muted_foreground.opacity(0.7))
                                 .child("No chats found")
                         })
                         // The rows are ranked while the dialog renders, so a

@@ -402,7 +402,10 @@ fn composer_test_cowork(
     tokio::runtime::Runtime,
     &mut gpui::VisualTestContext,
 ) {
-    cx.update(gpui_component::init);
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        theme::init(cx);
+    });
     let runtime = tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("test runtime");
