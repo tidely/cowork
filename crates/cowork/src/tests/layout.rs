@@ -14,6 +14,36 @@ impl Render for MouseDragTestView {
 }
 
 #[gpui::test]
+fn title_bar_preserves_layout_and_the_sidebar_toggle(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let content = cx
+        .debug_bounds("top-bar-content")
+        .expect("title bar content should be rendered");
+    let toggle = cx
+        .debug_bounds("top-bar-sidebar-toggle")
+        .expect("sidebar toggle should be rendered");
+
+    assert_eq!(content.top(), px(0.));
+    assert_eq!(content.size.height, crate::top_bar::TOP_BAR_HEIGHT);
+    assert_eq!(toggle.left(), content.left());
+    assert_eq!(toggle.center().y, content.center().y);
+    assert_eq!(
+        content.left(),
+        px(if cfg!(target_os = "macos") { 80. } else { 8. })
+    );
+    assert!(cowork.read_with(cx, |cowork, _| cowork.sidebar_open));
+
+    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(!cowork.read_with(cx, |cowork, _| cowork.sidebar_open));
+
+    let toggle = cx.debug_bounds("top-bar-sidebar-toggle").unwrap();
+    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cowork.read_with(cx, |cowork, _| cowork.sidebar_open));
+}
+
+#[gpui::test]
 fn sidebar_bottom_bar_lines_up_with_the_main_bottom_bar(cx: &mut gpui::TestAppContext) {
     let (_cowork, _runtime, cx) = composer_test_cowork(cx);
 

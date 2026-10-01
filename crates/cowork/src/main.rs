@@ -15,7 +15,7 @@ use gpui_base::{
     TextViewDefaults,
     input::{Backspace, Escape, MoveDown, MoveUp},
 };
-use gpui_component::{Root, ThemeMode};
+use gpui_component::{Root, ThemeMode, TitleBar};
 use tokio::runtime::Runtime;
 use uuid::Uuid;
 
@@ -105,7 +105,6 @@ struct Cowork {
     segment_text_views: HashMap<(ThreadMessageId, usize), SegmentTextView>,
     shown_segments: HashMap<ThreadMessageId, ShownSegments>,
     render_generation: u64,
-    titlebar_click_armed: bool,
     copied_endpoint_id: Option<Uuid>,
     join_dialog: Option<Entity<JoinDialog>>,
     /// Which page occupies the center stage.
@@ -535,12 +534,11 @@ fn main() -> anyhow::Result<()> {
                 ))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Cowork".into()),
-                    appears_transparent: true,
                     traffic_light_position: Some(macos_traffic_light_position()),
+                    ..TitleBar::title_bar_options()
                 }),
                 window_decorations: Some(WindowDecorations::Client),
-                app_owns_titlebar_drag: cfg!(target_os = "macos"),
-                ..Default::default()
+                ..TitleBar::window_options()
             };
 
             if let Err(error) = cx.open_window(window_options, move |window, cx| {
@@ -572,7 +570,6 @@ fn main() -> anyhow::Result<()> {
                         segment_text_views: HashMap::new(),
                         shown_segments: HashMap::new(),
                         render_generation: 0,
-                        titlebar_click_armed: false,
                         copied_endpoint_id: None,
                         join_dialog: None,
                         main_stage: MainStage::Welcome,

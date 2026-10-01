@@ -168,7 +168,6 @@ fn test_cowork(
         segment_text_views: HashMap::new(),
         shown_segments: HashMap::new(),
         render_generation: 0,
-        titlebar_click_armed: false,
         copied_endpoint_id: None,
         join_dialog: None,
         main_stage: MainStage::Thread,

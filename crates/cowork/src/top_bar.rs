@@ -4,12 +4,12 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt, Context, Decorations, IntoElement, MouseButton, MouseDownEvent,
-    SharedString, Window, WindowControlArea, div, point, prelude::*, px, rgb,
+    Animation, AnimationExt, Context, IntoElement, MouseButton, SharedString, Window, div, point,
+    prelude::*, px, rgb,
 };
 use gpui_base::GlobalState;
 use gpui_component::{
-    Icon, Sizable as _,
+    Icon, Sizable as _, TitleBar,
     button::{Button, ButtonCustomVariant, ButtonVariants as _},
     sidebar::SidebarToggleButton,
     tooltip::Tooltip,
@@ -32,10 +32,6 @@ const MACOS_TRAFFIC_LIGHT_X_INSET: gpui::Pixels = px(12.);
 
 const MACOS_TRAFFIC_LIGHT_SIZE: gpui::Pixels = px(14.);
 
-const MACOS_TRAFFIC_LIGHT_SPACING: gpui::Pixels = px(6.);
-
-const MACOS_TRAFFIC_LIGHT_TRAILING_GAP: gpui::Pixels = px(12.);
-
 pub(crate) fn macos_traffic_light_position() -> gpui::Point<gpui::Pixels> {
     point(
         MACOS_TRAFFIC_LIGHT_X_INSET,
@@ -43,67 +39,12 @@ pub(crate) fn macos_traffic_light_position() -> gpui::Point<gpui::Pixels> {
     )
 }
 
-fn macos_sidebar_toggle_margin() -> gpui::Pixels {
-    MACOS_TRAFFIC_LIGHT_X_INSET
-        + MACOS_TRAFFIC_LIGHT_SIZE * 3.
-        + MACOS_TRAFFIC_LIGHT_SPACING * 2.
-        + MACOS_TRAFFIC_LIGHT_TRAILING_GAP
-}
-
 impl Cowork {
-    fn render_caption_button(
-        id: &'static str,
-        icon: AssetIconName,
-        control_area: WindowControlArea,
-        is_close: bool,
-    ) -> impl IntoElement {
-        div()
-            .id(id)
-            .h_full()
-            .w(px(46.))
-            .flex()
-            .items_center()
-            .justify_center()
-            .occlude()
-            .text_color(rgb(0xd4d4d8))
-            .window_control_area(control_area)
-            .when_else(
-                is_close,
-                |this| this.hover(|this| this.bg(rgb(0xe81123))),
-                |this| this.hover(|this| this.bg(rgb(0x2d2d30))),
-            )
-            .when(cfg!(target_os = "linux"), |this| {
-                this.on_mouse_down(MouseButton::Left, |_, window, cx| {
-                    window.prevent_default();
-                    cx.stop_propagation();
-                })
-                .on_click(move |_, window, cx| {
-                    cx.stop_propagation();
-                    match control_area {
-                        WindowControlArea::Min => window.minimize_window(),
-                        WindowControlArea::Max => window.zoom_window(),
-                        WindowControlArea::Close => window.remove_window(),
-                        _ => {}
-                    }
-                })
-            })
-            .child(Icon::new(icon).size(px(12.)))
-    }
-
     fn render_sidebar_toggle(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .ml(if cfg!(target_os = "macos") {
-                macos_sidebar_toggle_margin()
-            } else {
-                SIDEBAR_TOGGLE_INSET
-            })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.titlebar_click_armed = false;
-                    cx.stop_propagation();
-                }),
-            )
+            .id("top-bar-sidebar-toggle")
+            .debug_selector(|| "top-bar-sidebar-toggle".to_owned())
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(
                 SidebarToggleButton::new()
                     .collapsed(!self.sidebar_open)
@@ -116,13 +57,9 @@ impl Cowork {
 
     pub(crate) fn render_top_bar(
         &self,
-        window: &Window,
+        _window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
-        let client_decorated = matches!(window.window_decorations(), Decorations::Client { .. });
-        let show_controls =
-            !cfg!(target_os = "macos") && (!cfg!(target_os = "linux") || client_decorated);
-        let supported_controls = window.window_controls();
         let active_thread = self
             .active_thread_id
             .filter(|_| self.main_stage == MainStage::Thread)
@@ -165,13 +102,7 @@ impl Cowork {
             } else {
                 "Copy endpoint link"
             })
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, _, cx| {
-                    this.titlebar_click_armed = false;
-                    cx.stop_propagation();
-                }),
-            )
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .when(!endpoint_copied, |this| {
                 this.on_click(cx.listener(|this, _, _, cx| {
                     this.copy_endpoint_id(cx);
@@ -189,130 +120,71 @@ impl Cowork {
             )
             .into_any_element();
 
-        div()
+        TitleBar::new()
             .h(TOP_BAR_HEIGHT)
-            .w_full()
-            .flex_none()
-            .flex()
-            .items_center()
-            .justify_between()
             .bg(rgb(0x1c1c1f))
-            .window_control_area(WindowControlArea::Drag)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, event: &MouseDownEvent, window, cx| {
-                    GlobalState::suppress_text_selection(cx);
-
-                    if cfg!(target_os = "macos") {
-                        cx.stop_propagation();
-                        let is_titlebar_double_click =
-                            event.click_count == 2 && this.titlebar_click_armed;
-                        this.titlebar_click_armed = event.click_count == 1;
-
-                        if is_titlebar_double_click {
-                            window.titlebar_double_click();
-                        } else {
-                            window.start_window_move();
-                        }
-                    } else if cfg!(target_os = "linux")
-                        && matches!(window.window_decorations(), Decorations::Client { .. })
-                    {
-                        cx.stop_propagation();
-                        if event.click_count == 2 {
-                            window.zoom_window();
-                        } else {
-                            window.start_window_move();
-                        }
-                    }
-                }),
-            )
-            .when(cfg!(target_os = "linux") && client_decorated, |this| {
-                this.on_mouse_down(MouseButton::Right, |event, window, _| {
-                    window.show_window_menu(event.position);
-                })
+            .border_0()
+            .when(!cfg!(target_os = "macos"), |this| {
+                this.pl(SIDEBAR_TOGGLE_INSET)
             })
-            .child(self.render_sidebar_toggle(cx))
             .child(
                 div()
+                    .id("top-bar-content")
+                    .debug_selector(|| "top-bar-content".to_owned())
                     .h_full()
+                    .w_full()
                     .flex()
                     .items_center()
-                    .children(
-                        active_thread
-                            .as_ref()
-                            .and_then(|thread| self.render_participants(thread.read(cx))),
-                    )
-                    .when(sharing_status == SharingStatus::Shared, |this| {
-                        this.child(copy_endpoint_button)
+                    .justify_between()
+                    .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                        GlobalState::suppress_text_selection(cx);
                     })
-                    .when(self.main_stage == MainStage::Thread, |this| {
-                        this.child(
-                            div()
-                                .id("toggle-sharing")
-                                .h(px(28.))
-                                .px_3()
-                                .mr_2()
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .rounded_md()
-                                .occlude()
-                                .text_sm()
-                                .text_color(rgb(0x71717a))
-                                .when(sharing_enabled, |this| {
-                                    this.cursor_pointer()
-                                        .text_color(rgb(0xd4d4d8))
-                                        .hover(|this| this.bg(rgb(0x2d2d30)))
-                                })
-                                .when(sharing_status == SharingStatus::Failed, |this| {
-                                    this.text_color(rgb(0xf87171))
-                                })
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _, _, cx| {
-                                        this.titlebar_click_armed = false;
-                                        cx.stop_propagation();
-                                    }),
+                    .child(self.render_sidebar_toggle(cx))
+                    .child(
+                        div()
+                            .h_full()
+                            .flex()
+                            .items_center()
+                            .children(
+                                active_thread
+                                    .as_ref()
+                                    .and_then(|thread| self.render_participants(thread.read(cx))),
+                            )
+                            .when(sharing_status == SharingStatus::Shared, |this| {
+                                this.child(copy_endpoint_button)
+                            })
+                            .when(self.main_stage == MainStage::Thread, |this| {
+                                this.child(
+                                    div()
+                                        .id("toggle-sharing")
+                                        .h(px(28.))
+                                        .px_3()
+                                        .mr_2()
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .occlude()
+                                        .text_sm()
+                                        .text_color(rgb(0x71717a))
+                                        .when(sharing_enabled, |this| {
+                                            this.cursor_pointer()
+                                                .text_color(rgb(0xd4d4d8))
+                                                .hover(|this| this.bg(rgb(0x2d2d30)))
+                                        })
+                                        .when(sharing_status == SharingStatus::Failed, |this| {
+                                            this.text_color(rgb(0xf87171))
+                                        })
+                                        .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                            cx.stop_propagation();
+                                        })
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            this.toggle_sharing(window, cx);
+                                        }))
+                                        .child(share_label),
                                 )
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    this.toggle_sharing(window, cx);
-                                }))
-                                .child(share_label),
-                        )
-                    })
-                    .when(show_controls, |this| {
-                        this.child(
-                            div()
-                                .h_full()
-                                .flex()
-                                .when(supported_controls.minimize, |this| {
-                                    this.child(Self::render_caption_button(
-                                        "minimize-window",
-                                        AssetIconName::WindowMinimize,
-                                        WindowControlArea::Min,
-                                        false,
-                                    ))
-                                })
-                                .when(supported_controls.maximize, |this| {
-                                    this.child(Self::render_caption_button(
-                                        "maximize-window",
-                                        if window.is_maximized() {
-                                            AssetIconName::WindowRestore
-                                        } else {
-                                            AssetIconName::WindowMaximize
-                                        },
-                                        WindowControlArea::Max,
-                                        false,
-                                    ))
-                                })
-                                .child(Self::render_caption_button(
-                                    "close-window",
-                                    AssetIconName::WindowClose,
-                                    WindowControlArea::Close,
-                                    true,
-                                )),
-                        )
-                    }),
+                            }),
+                    ),
             )
     }
 
