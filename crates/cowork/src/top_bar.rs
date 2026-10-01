@@ -67,8 +67,11 @@ impl Cowork {
             .occlude()
             .text_color(rgb(0xd4d4d8))
             .window_control_area(control_area)
-            .when(is_close, |this| this.hover(|this| this.bg(rgb(0xe81123))))
-            .when(!is_close, |this| this.hover(|this| this.bg(rgb(0x2d2d30))))
+            .when_else(
+                is_close,
+                |this| this.hover(|this| this.bg(rgb(0xe81123))),
+                |this| this.hover(|this| this.bg(rgb(0x2d2d30))),
+            )
             .when(cfg!(target_os = "linux"), |this| {
                 this.on_mouse_down(MouseButton::Left, |_, window, cx| {
                     window.prevent_default();

@@ -514,10 +514,9 @@ fn main() -> anyhow::Result<()> {
                 KeyBinding::new("ctrl-enter", SubmitComposer, None),
                 KeyBinding::new("cmd-enter", SubmitComposer, None),
                 KeyBinding::new(
-                    if cfg!(target_os = "macos") {
-                        "cmd-k"
-                    } else {
-                        "ctrl-k"
+                    cfg_select! {
+                        target_os = "macos" => "cmd-k",
+                        _ => "ctrl-k",
                     },
                     OpenSearchPalette,
                     None,

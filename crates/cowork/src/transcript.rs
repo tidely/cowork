@@ -417,11 +417,10 @@ impl AgentOutput {
     fn record_tool_result(&mut self, call: &ToolCallId, content: &[ToolResultContent]) {
         if let Some(tool_call) = self
             .tool_calls_mut()
-            .rev()
-            .find(|tool_call| tool_call.call.id == *call)
+            .rfind(|tool_call| tool_call.call.id == *call)
         {
             tool_call.result = Some(content.to_vec());
-        }
+        };
     }
 
     /// Where the output ends now, as its committed part.

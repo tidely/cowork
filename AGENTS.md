@@ -46,7 +46,7 @@ For Python scripting, use the `uv` package manager.
 ## Making Changes
 
 - **Protocol**: bump `PROTOCOL_VERSION` in `crates/cowork/src/protocol.rs` on any change to wire messages or to model identifier semantics, and on every Rig upgrade: transcript messages and agent events travel in Rig's serde encoding. Never change the encoding of `CollaboratorMessage::Join` or `HostMessage::Rejected`: keep their variant index, and keep `Join`'s version as its only field. `version_handshake_encoding_is_stable` checks this. Nothing is persisted, so there's no backward compatibility to maintain beyond that.
-- **GPUI pins**: `gpui`/`gpui_platform` are pinned `=0.3.6` to match the snapshot the gpui-kit fork (`tidely/gpui-kit`, branch `text-view-source-range-highlights`) uses. Upgrade them together, never one alone.
+- **GPUI pins**: `gpui`/`gpui_platform` are pinned `=0.3.7` to match the snapshot the upstream gpui-kit (`longbridge/gpui-kit`) revision uses. Upgrade them together, never one alone.
 
 ## Testing
 
