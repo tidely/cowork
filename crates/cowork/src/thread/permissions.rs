@@ -16,9 +16,8 @@ use crate::{models::ModelRef, participant::ParticipantId, protocol};
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum PeerMode {
     ReadOnly,
-    Write,
-    /// Preserves the behavior of threads created before access controls.
     #[default]
+    Write,
     Admin,
 }
 

@@ -131,7 +131,7 @@ impl Cowork {
                 };
                 let default = state
                     .map(|state| state.peer_permissions().default_mode())
-                    .unwrap_or(PeerMode::Admin);
+                    .unwrap_or_default();
                 content = content.child(access_row(
                     "default",
                     "Default".into(),
