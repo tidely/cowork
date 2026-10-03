@@ -13,9 +13,10 @@ use crate::Thread;
 /// The tokens `usage` counts: the provider's total, or the sum of its input
 /// and output counts when it reports no total.
 pub(crate) fn usage_tokens(usage: Usage) -> u64 {
-    usage
-        .total_tokens
-        .unwrap_or_else(|| usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0))
+    match usage.total_tokens {
+        Some(tokens) => tokens,
+        None => usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0),
+    }
 }
 
 /// How much of a thread's context window is in use.

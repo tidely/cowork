@@ -2,6 +2,7 @@
 //! handling that depends on layout.
 
 use super::*;
+use gpui_component::WindowExt as _;
 
 struct MouseDragTestView {
     editor: Entity<TextareaState>,
@@ -11,6 +12,24 @@ impl Render for MouseDragTestView {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         div().size_full().child(Textarea::new(&self.editor))
     }
+}
+
+fn thread_menu_gateway(cx: &mut gpui::VisualTestContext) -> gpui::Bounds<gpui::Pixels> {
+    let content = cx
+        .debug_bounds("top-bar-content")
+        .expect("titlebar content");
+    let gateway = cx
+        .debug_bounds("thread-menu-trigger")
+        .expect("titlebar thread menu gateway");
+    assert_eq!(content.size.height, px(40.));
+    assert_eq!(gateway.size.height, px(28.));
+    assert_eq!(gateway.top(), content.top() + px(6.));
+    assert!(
+        gateway.right() <= content.right() && gateway.right() >= content.right() - px(12.),
+        "the gateway {gateway:?} must sit at the right of the titlebar"
+    );
+    assert!(cx.debug_bounds("peer-access-settings").is_none());
+    gateway
 }
 
 #[gpui::test]
@@ -47,6 +66,9 @@ fn title_bar_preserves_layout_and_the_sidebar_toggle(cx: &mut gpui::TestAppConte
         .debug_bounds("top-bar-sidebar-toggle")
         .expect("sidebar toggle should be rendered");
 
+    thread_menu_gateway(cx);
+    assert!(cx.debug_bounds("toggle-sharing").is_none());
+    assert!(cx.debug_bounds("copy-endpoint-id").is_none());
     assert_eq!(content.top(), px(0.));
     assert_eq!(content.size.height, crate::top_bar::TOP_BAR_HEIGHT);
     assert_eq!(toggle.left(), content.left());
@@ -60,6 +82,7 @@ fn title_bar_preserves_layout_and_the_sidebar_toggle(cx: &mut gpui::TestAppConte
     cx.simulate_click(toggle.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     assert!(!cowork.read_with(cx, |cowork, _| cowork.sidebar_open));
+    thread_menu_gateway(cx);
 
     let toggle = cx.debug_bounds("top-bar-sidebar-toggle").unwrap();
     cx.simulate_click(toggle.center(), gpui::Modifiers::default());
@@ -456,7 +479,9 @@ fn the_profile_button_opens_the_profile_page(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
-fn participants_sit_beside_the_copy_link_button(cx: &mut gpui::TestAppContext) {
+fn participants_sit_beside_the_right_aligned_thread_menu_without_an_extra_access_row(
+    cx: &mut gpui::TestAppContext,
+) {
     cx.update(gpui_component::init);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -470,15 +495,9 @@ fn participants_sit_beside_the_copy_link_button(cx: &mut gpui::TestAppContext) {
     let (_, cx) = cx.add_window_view(|window, cx| {
         let draft = ThreadDraft::new(ParticipantId::new());
         let mut thread = test_thread(thread_id, Vec::new(), draft);
-        thread.participants = vec![
-            thread.participant_id,
-            ParticipantId::new(),
-            ParticipantId::new(),
-        ];
-        thread.sharing = ThreadSharing::Shared {
-            endpoint,
-            events: broadcast::channel(THREAD_EVENT_CAPACITY).0,
-        };
+        assert!(thread.start_hosting(endpoint));
+        thread.apply_for_test(joined(ParticipantId::new()), cx);
+        thread.apply_for_test(joined(ParticipantId::new()), cx);
         let thread = cx.new(|_| thread);
         let thread_store = cx.new(|_| ThreadStore {
             threads: VecDeque::from([thread]),
@@ -487,23 +506,159 @@ fn participants_sit_beside_the_copy_link_button(cx: &mut gpui::TestAppContext) {
             cx.new(|cx| test_cowork(thread_store, Some(thread_id), tokio_handle, window, cx));
         Root::new(cowork, window, cx)
     });
+    cx.update(|window, _| window.activate_window());
     cx.update(|window, cx| window.draw(cx).clear(cx));
 
     let participants = cx
         .debug_bounds("participants")
         .expect("participants should be rendered");
-    let copy_button = cx
-        .debug_bounds("copy-endpoint-id")
-        .expect("copy link button should be rendered");
+    let gateway = thread_menu_gateway(cx);
+    let content = cx.debug_bounds("top-bar-content").unwrap();
+    let bottom_bar = cx.debug_bounds("bottom-bar").expect("main bottom bar");
+    let composer = cx.debug_bounds("composer").expect("shared thread composer");
+    assert!(cx.debug_bounds("copy-endpoint-id").is_none());
+    assert!(cx.debug_bounds("toggle-sharing").is_none());
+    assert!(cx.debug_bounds("thread-sharing-menu").is_none());
 
     assert!(
         participants.size.width >= px(24. * 3. - 6. * 2.),
         "three overlapping avatars need room, got {participants:?}"
     );
     assert!(
-        participants.right() <= copy_button.left(),
-        "participants {participants:?} overlap the copy link button {copy_button:?}"
+        participants.right() <= gateway.left(),
+        "participants {participants:?} overlap the gateway {gateway:?}"
     );
+    assert!(participants.right() <= content.right());
+    assert_eq!(participants.center().y, content.center().y);
+
+    cx.simulate_click(gateway.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let panel = cx
+        .debug_bounds("thread-sharing-menu")
+        .expect("thread sharing popover");
+    assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    assert!(cx.debug_bounds("close-peer-access").is_none());
+    assert!(
+        panel.size.width >= px(280.) && panel.size.width <= px(320.),
+        "compact panel: {panel:?}"
+    );
+    assert!(
+        panel.top() >= gateway.bottom(),
+        "the panel opens below its titlebar anchor"
+    );
+    assert!(panel.top() <= content.bottom() + px(16.));
+    let viewport = cx.update(|window, _| window.viewport_size());
+    assert!(panel.left() >= px(0.) && panel.top() >= px(0.));
+    assert!(panel.right() <= viewport.width && panel.bottom() <= viewport.height);
+    for selector in ["copy-endpoint-id", "toggle-sharing"] {
+        let action = cx
+            .debug_bounds(selector)
+            .expect("sharing action belongs in the menu");
+        assert!(action.left() >= panel.left() && action.right() <= panel.right());
+        assert!(action.top() >= panel.top() && action.bottom() <= panel.bottom());
+    }
+    assert_eq!(cx.debug_bounds("top-bar-content").unwrap(), content);
+    assert_eq!(thread_menu_gateway(cx), gateway);
+    assert_eq!(cx.debug_bounds("participants").unwrap(), participants);
+    assert_eq!(cx.debug_bounds("bottom-bar").unwrap(), bottom_bar);
+    assert_eq!(cx.debug_bounds("composer").unwrap(), composer);
+
+    // Returning to a local thread must not remove a permissions row and move
+    // the editor: sharing and permissions live entirely in the popover.
+    let stop_sharing = cx.debug_bounds("toggle-sharing").unwrap();
+    cx.simulate_click(stop_sharing.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("participants").is_none());
+    assert!(cx.debug_bounds("copy-endpoint-id").is_none());
+    assert_eq!(cx.debug_bounds("top-bar-content").unwrap(), content);
+    assert_eq!(cx.debug_bounds("bottom-bar").unwrap(), bottom_bar);
+    assert_eq!(cx.debug_bounds("composer").unwrap(), composer);
+
+    let gateway = thread_menu_gateway(cx);
+    cx.simulate_click(gateway.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    let local_panel = cx.debug_bounds("thread-sharing-menu").unwrap();
+    assert_eq!(local_panel.size.width, panel.size.width);
+    for selector in ["copy-endpoint-id", "default-mode-track", "toggle-sharing"] {
+        assert!(cx.debug_bounds(selector).is_some(), "missing {selector}");
+    }
+}
+
+#[gpui::test]
+fn unshared_menu_can_configure_access_before_starting_sharing(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let draft_id = cowork.read_with(cx, |cowork, _| cowork.new_thread_draft.id);
+    let gateway = thread_menu_gateway(cx);
+    cx.simulate_click(gateway.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    for selector in ["copy-endpoint-id", "default-mode-track", "toggle-sharing"] {
+        assert!(cx.debug_bounds(selector).is_some(), "missing {selector}");
+    }
+    let read_only = cx.debug_bounds("default-Read only").unwrap();
+    cx.simulate_click(read_only.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cowork.read_with(cx, |cowork, cx| {
+        let thread = cowork.active_thread(cx).expect("configured local thread");
+        let thread = thread.read(cx);
+        assert_eq!(thread.draft().id, draft_id);
+        assert_eq!(
+            thread.peer_permissions().default_mode(),
+            crate::thread::PeerMode::ReadOnly
+        );
+        assert!(matches!(
+            thread.sharing.status(),
+            crate::thread::SharingStatus::NotShared
+        ));
+    });
+}
+
+#[gpui::test]
+fn starting_sharing_keeps_the_menu_open_for_new_and_existing_threads(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    for existing_thread in [false, true] {
+        cx.update(|_, cx| {
+            cowork.update(cx, |cowork, cx| {
+                if existing_thread {
+                    cowork.prepare_thread_for_sharing(cx);
+                }
+            });
+        });
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let gateway = thread_menu_gateway(cx);
+        cx.simulate_click(gateway.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        let share = cx.debug_bounds("toggle-sharing").unwrap();
+        cx.simulate_click(share.center(), gpui::Modifiers::default());
+        cx.run_until_parked();
+        cx.update(|window, cx| window.draw(cx).clear(cx));
+        assert!(cx.debug_bounds("thread-sharing-menu").is_some());
+        assert!(cx.debug_bounds("copy-endpoint-id").is_some());
+        cowork.read_with(cx, |cowork, cx| {
+            let thread = cowork.active_thread(cx).unwrap();
+            assert!(matches!(
+                thread.read(cx).sharing.status(),
+                crate::thread::SharingStatus::Sharing
+            ));
+        });
+        // Close the popover and return to an unshared thread for the next case.
+        cx.simulate_click(gateway.center(), gpui::Modifiers::default());
+        cx.update(|_, cx| {
+            cowork.update(cx, |cowork, cx| {
+                cowork.active_thread(cx).unwrap().update(cx, |thread, _| {
+                    thread.sharing = crate::thread::ThreadSharing::NotShared;
+                });
+                cx.notify();
+            });
+        });
+        cx.run_until_parked();
+    }
 }
 
 #[gpui::test]

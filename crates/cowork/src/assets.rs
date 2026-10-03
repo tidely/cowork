@@ -21,6 +21,14 @@ gpui_kit_assets::icon_assets!(
         Square,
         SquarePen,
         UsersRound,
+        Users,
+        Share2,
+        Unlink,
+        LogOut,
+        Eye,
+        Pencil,
+        Shield,
+        RotateCcw,
         Paperclip,
         FileText,
         Image,
@@ -59,6 +67,26 @@ mod tests {
     use gpui_kit_assets::IconName;
 
     use super::*;
+
+    #[test]
+    fn sharing_and_permission_icons_are_bundled() {
+        for icon in [
+            IconName::Users,
+            IconName::Share2,
+            IconName::Unlink,
+            IconName::LogOut,
+            IconName::Eye,
+            IconName::Pencil,
+            IconName::Shield,
+            IconName::RotateCcw,
+            IconName::Check,
+            IconName::Link,
+        ] {
+            let path = icon.path();
+            let bytes = Assets.load(&path).unwrap().expect("bundled sharing icon");
+            assert!(!bytes.is_empty(), "empty sharing icon: {path}");
+        }
+    }
 
     #[test]
     fn window_control_icons_are_bundled() {

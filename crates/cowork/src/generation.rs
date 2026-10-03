@@ -13,21 +13,20 @@ use std::{
 use agent::{Agent as StreamingAgent, AgentEvent};
 use anyhow::Context as _;
 use gpui::{App, Context, Entity};
-use rig::{
-    completion::{Message as RigMessage, Usage},
-    providers::ollama::Ollama,
-    tool::ToolSet,
-};
+use rig::{completion::Usage, providers::ollama::Ollama, tool::ToolSet};
 use serde_json::json;
 use tokio::sync::mpsc;
-use tools::{Calculate, RespondToComment, TurnComments};
+use tools::{Calculate, RespondToComment};
+
+use super::GenerationPlan;
 use uuid::Uuid;
 
 use crate::{
     Cowork,
     models::ModelProvider,
+    participant::ParticipantId,
     protocol,
-    thread::{Thread, ThreadOwnership, ThreadSharing},
+    thread::{ControlGeneration, Thread, ThreadOwnership, ThreadSharing},
     usage::{TokenActivity, usage_tokens},
 };
 
@@ -36,21 +35,35 @@ use crate::{
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 
 pub(crate) struct ActiveGeneration {
-    pub(crate) message_id: Uuid,
-    pub(crate) abort_handle: tokio::task::AbortHandle,
-    pub(crate) cancelled: Arc<AtomicBool>,
+    message_id: Uuid,
+    abort_handle: tokio::task::AbortHandle,
+    cancelled: Arc<AtomicBool>,
+}
+
+#[cfg(test)]
+impl ActiveGeneration {
+    pub(crate) fn for_test(
+        message_id: Uuid,
+        abort_handle: tokio::task::AbortHandle,
+        cancelled: Arc<AtomicBool>,
+    ) -> Self {
+        Self {
+            message_id,
+            abort_handle,
+            cancelled,
+        }
+    }
 }
 
 impl Cowork {
-    pub(crate) fn start_generation(
-        &mut self,
-        thread_id: Uuid,
-        prompt: RigMessage,
-        mut history: Vec<RigMessage>,
-        comment_group_id: Option<Uuid>,
-        turn_comments: Arc<TurnComments>,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn start_generation(&mut self, plan: GenerationPlan, cx: &mut Context<Self>) {
+        let GenerationPlan {
+            thread_id,
+            prompt,
+            mut history,
+            comment_group_id,
+            turn_comments,
+        } = plan;
         let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
             return;
         };
@@ -193,7 +206,7 @@ impl Cowork {
         let tokens = usage_tokens(usage);
         let ownership = thread.update(cx, |thread, _| {
             thread.tokens_used += tokens;
-            thread.ownership
+            thread.ownership()
         });
         if ownership == ThreadOwnership::Local {
             self.tokens_used += tokens;
@@ -225,17 +238,21 @@ impl Cowork {
         let Some(thread) = self.active_thread(cx) else {
             return;
         };
-        let thread = thread.read(cx);
-        if matches!(thread.sharing, ThreadSharing::Connected { .. }) {
-            if let Some(message_id) = thread.running_agent_message_id() {
-                thread.request(protocol::CollaboratorMessage::Stop {
-                    message_id: message_id.into_bytes(),
+        let state = thread.read(cx);
+        let actor = state.participant_id();
+        if matches!(state.sharing, ThreadSharing::Connected { .. }) {
+            let message_id = state.running_agent_message_id();
+            if let Some(message_id) = message_id {
+                _ = thread.update(cx, |thread, _| {
+                    thread.with_authorized::<ControlGeneration, _>(actor, |auth| {
+                        auth.request_stop(message_id)
+                    })
                 });
             }
             return;
         }
-        let thread_id = thread.instance_id;
-        self.cancel_generation(thread_id, None, cx);
+        let thread_id = state.instance_id;
+        self.cancel_generation(thread_id, actor, None, cx);
     }
 
     /// Cancels the agent run of a local or hosted thread. With `message_id`,
@@ -244,6 +261,7 @@ impl Cowork {
     pub(crate) fn cancel_generation(
         &mut self,
         thread_id: Uuid,
+        actor: ParticipantId,
         message_id: Option<Uuid>,
         cx: &mut Context<Self>,
     ) {
@@ -253,8 +271,24 @@ impl Cowork {
         if message_id.is_some_and(|message_id| message_id != generation.message_id) {
             return;
         }
-        generation.cancelled.store(true, Ordering::Release);
-        generation.abort_handle.abort();
-        cx.notify();
+        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+            return;
+        };
+        if !thread.read(cx).is_host() {
+            return;
+        }
+        // Abort within the current-policy guard. No detached authorization can
+        // survive revocation and later stop a different run.
+        if thread
+            .update(cx, |thread, _| {
+                thread.with_authorized::<ControlGeneration, _>(actor, |_| {
+                    generation.cancelled.store(true, Ordering::Release);
+                    generation.abort_handle.abort();
+                })
+            })
+            .is_ok()
+        {
+            cx.notify();
+        }
     }
 }

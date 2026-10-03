@@ -110,7 +110,7 @@ impl Cowork {
         if self
             .active_thread_id
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
-            .is_some_and(|thread| !thread.read(cx).ownership.can_write())
+            .is_some_and(|thread| !thread.read(cx).can_edit_draft())
         {
             return;
         }
@@ -171,21 +171,19 @@ impl Cowork {
             target
         };
 
-        let (draft_id, comment_id) = thread.update(cx, |thread, _| {
+        let draft_id = thread.read(cx).draft().id;
+        let Some(comment_id) = self.update_draft(draft_id, cx, |draft| {
             let target = CommentTarget {
                 message_id,
                 range: source_range,
                 quote,
             };
-            let draft = &mut thread.draft;
-            let comment_id = draft
-                .doc
-                .create_comment(draft.author.as_uuid(), target, initial_text);
-            draft.comments_folded = false;
-            let draft_id = draft.id;
-            thread.flush_draft();
-            (draft_id, comment_id)
-        });
+            let comment_id = draft.create_comment(draft.author.as_uuid(), target, initial_text);
+            draft.update_draft_editors(|_, state| state.comments_folded = false);
+            comment_id
+        }) else {
+            return;
+        };
         TextSelection::clear(window, cx);
         self.focus_draft_editor(
             draft_id,
@@ -199,8 +197,12 @@ impl Cowork {
     }
 
     fn toggle_comment_group(&mut self, group_id: Uuid, cx: &mut Context<Self>) {
-        if self.new_thread_draft.id == group_id {
-            self.new_thread_draft.comments_folded = !self.new_thread_draft.comments_folded;
+        if self
+            .update_draft_editors(group_id, cx, |_, state| {
+                state.comments_folded = !state.comments_folded;
+            })
+            .is_some()
+        {
             cx.notify();
             return;
         }
@@ -208,10 +210,6 @@ impl Cowork {
         let threads = self.thread_store.read(cx).threads.clone();
         for thread in threads {
             let toggled = thread.update(cx, |thread, _| {
-                if thread.draft.id == group_id {
-                    thread.draft.comments_folded = !thread.draft.comments_folded;
-                    return true;
-                }
                 for entry in &mut thread.timeline {
                     if let TimelineMessage::User(group) = entry
                         && group.id == group_id
@@ -1349,7 +1347,7 @@ impl Cowork {
                     .read(cx)
                     .thread(thread_id, cx)
                     .map(|thread| {
-                        let draft = &thread.read(cx).draft;
+                        let draft = thread.read(cx).draft();
                         group
                             .blocks
                             .iter()

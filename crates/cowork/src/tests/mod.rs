@@ -32,7 +32,6 @@ use gpui_component::Root;
 use iroh::{Endpoint, EndpointId, endpoint::presets};
 use itertools::Itertools;
 use rig::completion::{Message as RigMessage, Usage, message::UserContent};
-use tokio::sync::broadcast;
 use tools::TurnComments;
 use uuid::Uuid;
 
@@ -42,7 +41,6 @@ use crate::{
         AttachmentSource, FileAttachment, FileAttachmentContent, MAX_TEXT_ATTACHMENT_BYTES,
     },
     composer_attachments::PendingAttachment,
-    generation::ActiveGeneration,
     model_picker::{ModelPickerItems, OLLAMA_CONTEXT_TOKENS, language_model_groups},
     models::{ModelCatalog, ModelInfo, ModelProvider, ModelRef},
     participant::ParticipantId,
@@ -50,10 +48,11 @@ use crate::{
     prompt::agent_message,
     sharing::endpoint_id_input_is_complete,
     sidebar::SIDEBAR_WIDTH,
+    submission::ActiveGeneration,
     test_support::*,
     thread::{
-        HostPeer, THREAD_EVENT_CAPACITY, Thread, ThreadHost, ThreadOwnership, ThreadSharing,
-        ThreadStore, ThreadSummary,
+        ControlGeneration, EditDraft, HostPeer, ManageAccess, PeerMode, PeerPermissions, Thread,
+        ThreadHost, ThreadOwnership, ThreadSharing, ThreadStore,
     },
     thread_draft::{AttachmentTarget, EditorSlot, ItemPresence, RemoteCaret, ThreadDraft},
     timeline::{
@@ -70,6 +69,7 @@ mod composer;
 mod file_transfer;
 mod layout;
 mod model_picker;
+mod permissions;
 mod search_palette;
 mod threads;
 
@@ -93,7 +93,7 @@ impl Thread {
     }
 
     fn rebase(&mut self, welcome: protocol::Welcome, cx: &mut impl AppContext) {
-        self.try_rebase(welcome, cx)
+        self.try_apply_for_test(protocol::HostMessage::Welcome(Box::new(welcome)), cx)
             .expect("a valid thread snapshot");
     }
 }
@@ -177,7 +177,12 @@ fn test_cowork(
     cx: &mut Context<Cowork>,
 ) -> Cowork {
     let (model_picker, model_picker_subscription) = Cowork::new_model_picker(window, cx);
-    let local_participant_id = ParticipantId::new();
+    let local_participant_id = active_thread_id
+        .and_then(|id| thread_store.read(cx).thread(id, cx))
+        .filter(|thread| thread.read(cx).is_host())
+        .map_or_else(ParticipantId::new, |thread| {
+            thread.read(cx).participant_id()
+        });
     Cowork {
         sidebar_open: true,
         recents_open: true,
@@ -344,29 +349,12 @@ fn joined(participant: ParticipantId) -> protocol::HostMessage {
 }
 
 fn test_thread(thread_id: Uuid, timeline: Vec<TimelineMessage>, draft: ThreadDraft) -> Thread {
-    Thread {
-        instance_id: thread_id,
-        summary: ThreadSummary {
-            id: thread_id,
-            title: "Test".into(),
-        },
-        participant_id: ParticipantId::new(),
-        participants: Vec::new(),
-        profiles: HashMap::new(),
-        transcript: Vec::new(),
-        agent_turn: Default::default(),
-        prompt_names: HashMap::new(),
-        tokens_used: 0,
-        model: None,
-        models: Arc::default(),
-        context_tokens: None,
-        streamed_bytes: 0,
-        timeline,
-        draft,
-        generating: false,
-        sharing: ThreadSharing::NotShared,
-        ownership: ThreadOwnership::Local,
-    }
+    let author = draft.author;
+    let mut thread =
+        Thread::new_local("Test".into(), timeline, draft, author, Arc::default(), None);
+    thread.instance_id = thread_id;
+    thread.summary.id = thread_id;
+    thread
 }
 
 fn attachment_test_cowork(
@@ -391,7 +379,6 @@ fn attachment_test_cowork(
 
 fn draft_attachments(draft: &ThreadDraft) -> Vec<FileAttachment> {
     draft
-        .doc
         .items()
         .into_iter()
         .flat_map(|item| match item.kind {
@@ -460,7 +447,7 @@ fn composer_test_cowork(
 }
 
 fn new_thread_items(cowork: &Entity<Cowork>, cx: &mut gpui::VisualTestContext) -> Vec<DraftItem> {
-    cowork.read_with(cx, |cowork, _| cowork.new_thread_draft.doc.items())
+    cowork.read_with(cx, |cowork, _| cowork.new_thread_draft.items())
 }
 
 fn prompt_bodies(cowork: &Entity<Cowork>, cx: &mut gpui::VisualTestContext) -> Vec<String> {
@@ -572,10 +559,8 @@ impl<'a> Collaboration<'a> {
         let tokio_handle = runtime.handle().clone();
         let thread_id = Uuid::new_v4();
         let (root, cx) = cx.add_window_view(|window, cx| {
-            let draft = ThreadDraft::new(ParticipantId::new());
-            draft
-                .doc
-                .create_prompt(draft.author.as_uuid(), "from the host");
+            let mut draft = ThreadDraft::new(ParticipantId::new());
+            draft.create_prompt(draft.author.as_uuid(), "from the host");
             let timeline = if long_history {
                 let text = (0..60)
                     .map(|index| format!("Paragraph {index}: a response to scroll past.\n\n"))
@@ -616,14 +601,11 @@ impl<'a> Collaboration<'a> {
                     .transcript
                     .extend([RigMessage::user("Long history prompt"), reply]);
             }
-            thread.models = Arc::new(test_catalog());
-            thread.model = Some(ollama_qwen());
-            thread.participant_id = thread.draft.author;
-            thread.participants = vec![thread.participant_id];
-            thread.sharing = ThreadSharing::Shared {
-                endpoint,
-                events: broadcast::channel(THREAD_EVENT_CAPACITY).0,
-            };
+            assert!(thread.set_model_catalog(test_catalog(), cx));
+            thread
+                .select_model(ollama_qwen(), cx)
+                .expect("local host can select a model");
+            assert!(thread.start_hosting(endpoint));
             let thread = cx.new(|_| thread);
             let host_store = cx.new(|_| ThreadStore {
                 threads: VecDeque::from([thread]),
@@ -739,7 +721,7 @@ impl<'a> Collaboration<'a> {
     }
 
     fn items(&mut self, thread: &Entity<Thread>) -> Vec<DraftItem> {
-        thread.read_with(self.cx, |thread, _| thread.draft.doc.items())
+        thread.read_with(self.cx, |thread, _| thread.draft().items())
     }
 
     fn bodies(&mut self, thread: &Entity<Thread>) -> Vec<String> {

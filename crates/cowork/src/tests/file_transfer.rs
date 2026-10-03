@@ -9,7 +9,7 @@ fn files_the_host_is_reading_hold_back_everyones_submission(cx: &mut gpui::TestA
     let host_thread = session.host_thread.clone();
     let host = session.host.clone();
     host.update(session.cx, |host, cx| {
-        let draft_id = host_thread.read(cx).draft.id;
+        let draft_id = host_thread.read(cx).draft().id;
         host.pending_attachments.push(PendingAttachment {
             id: Uuid::new_v4(),
             draft_id,
@@ -23,12 +23,12 @@ fn files_the_host_is_reading_hold_back_everyones_submission(cx: &mut gpui::TestA
     let collaborator = session.collaborator.clone();
     session.wait_until("the collaborator sees the pending read", |this| {
         collaborator.read_with(this.cx, |collaborator, cx| {
-            let draft_id = collaborator_thread.read(cx).draft.id;
+            let draft_id = collaborator_thread.read(cx).draft().id;
             collaborator.draft_is_loading_attachments(draft_id, cx)
         })
     });
     let pending = collaborator.read_with(session.cx, |collaborator, cx| {
-        collaborator.pending_reads(&collaborator_thread.read(cx).draft)
+        collaborator.pending_reads(collaborator_thread.read(cx).draft())
     });
     assert!(matches!(
         pending.as_slice(),
@@ -42,7 +42,7 @@ fn files_the_host_is_reading_hold_back_everyones_submission(cx: &mut gpui::TestA
     });
     session.wait_until("the collaborator sees the read finish", |this| {
         !collaborator.read_with(this.cx, |collaborator, cx| {
-            let draft_id = collaborator_thread.read(cx).draft.id;
+            let draft_id = collaborator_thread.read(cx).draft().id;
             collaborator.draft_is_loading_attachments(draft_id, cx)
         })
     });
@@ -74,7 +74,7 @@ fn a_collaborators_file_is_uploaded_and_stored(cx: &mut gpui::TestAppContext) {
 
     let collaborator = session.collaborator.clone();
     collaborator.update(session.cx, |collaborator, cx| {
-        let draft_id = collaborator_thread.read(cx).draft.id;
+        let draft_id = collaborator_thread.read(cx).draft().id;
         collaborator.add_attachments(
             draft_id,
             AttachmentTarget::Block(block),
@@ -85,29 +85,29 @@ fn a_collaborators_file_is_uploaded_and_stored(cx: &mut gpui::TestAppContext) {
     });
     session.wait_until("the host stores the upload", |this| {
         collaborator_thread.read_with(this.cx, |thread, _| {
-            thread.draft.uploads.is_empty() && thread.draft.stored.len() == 1
+            thread.draft().uploads.is_empty() && thread.draft().stored.len() == 1
         })
     });
     std::fs::remove_file(&path).expect("remove test attachment");
 
     let record = host_thread.read_with(session.cx, |thread, _| {
-        let records = thread.draft.attachment_records();
+        let records = thread.draft().attachment_records();
         assert_eq!(records.len(), 1);
         let record = records[0].clone();
-        assert!(thread.draft.stored.contains(&record.id));
+        assert!(thread.draft().stored.contains(&record.id));
         assert_eq!(
-            file_text(&thread.draft, record.id).as_deref(),
+            file_text(thread.draft(), record.id).as_deref(),
             Some(text.as_str())
         );
-        assert!(thread.draft.incoming.is_empty());
+        assert!(thread.draft().incoming.is_empty());
         record
     });
     let collaborator_id =
-        collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id);
+        collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id());
     assert_eq!(record.creator, collaborator_id.as_uuid());
     // Nothing holds the collaborator's submission back anymore.
     collaborator.read_with(session.cx, |collaborator, cx| {
-        let draft_id = collaborator_thread.read(cx).draft.id;
+        let draft_id = collaborator_thread.read(cx).draft().id;
         assert!(!collaborator.draft_is_loading_attachments(draft_id, cx));
     });
 
@@ -123,10 +123,10 @@ fn a_collaborators_file_is_uploaded_and_stored(cx: &mut gpui::TestAppContext) {
             panic!("expected the submitted message first");
         };
         assert_eq!(message.blocks[0].attachments, std::slice::from_ref(&record));
-        assert!(thread.draft.files.contains_key(&record.id));
+        assert!(thread.draft().files.contains_key(&record.id));
     });
     host_thread.read_with(session.cx, |thread, _| {
-        let files = &thread.draft.files;
+        let files = &thread.draft().files;
         let [TimelineMessage::User(message), ..] = thread.timeline.as_slice() else {
             panic!("expected the submitted message first");
         };
@@ -160,7 +160,7 @@ fn the_hosts_files_are_downloaded_by_collaborators(cx: &mut gpui::TestAppContext
 
     let host = session.host.clone();
     host.update(session.cx, |host, cx| {
-        let draft_id = host_thread.read(cx).draft.id;
+        let draft_id = host_thread.read(cx).draft().id;
         host.add_attachments(
             draft_id,
             AttachmentTarget::Block(block),
@@ -170,14 +170,14 @@ fn the_hosts_files_are_downloaded_by_collaborators(cx: &mut gpui::TestAppContext
         );
     });
     session.wait_until("the collaborator has the file", |this| {
-        collaborator_thread.read_with(this.cx, |thread, _| thread.draft.files.len() == 1)
+        collaborator_thread.read_with(this.cx, |thread, _| thread.draft().files.len() == 1)
     });
     std::fs::remove_file(&path).expect("remove test attachment");
     collaborator_thread.read_with(session.cx, |thread, _| {
-        let record = &thread.draft.attachment_records()[0];
-        assert!(thread.draft.stored.contains(&record.id));
+        let record = &thread.draft().attachment_records()[0];
+        assert!(thread.draft().stored.contains(&record.id));
         assert_eq!(
-            file_text(&thread.draft, record.id).as_deref(),
+            file_text(thread.draft(), record.id).as_deref(),
             Some(text.as_str())
         );
     });
@@ -192,9 +192,9 @@ fn files_left_unfinished_by_a_leaving_collaborator_are_removed(cx: &mut gpui::Te
     // A record whose bytes never come.
     let collaborator = session.collaborator.clone();
     collaborator.update(session.cx, |collaborator, cx| {
-        let draft_id = collaborator_thread.read(cx).draft.id;
+        let draft_id = collaborator_thread.read(cx).draft().id;
         collaborator.update_draft(draft_id, cx, |draft| {
-            draft.doc.add_attachment(
+            draft.add_attachment(
                 block,
                 AttachmentRecord {
                     id: AttachmentId::new(),
@@ -208,13 +208,13 @@ fn files_left_unfinished_by_a_leaving_collaborator_are_removed(cx: &mut gpui::Te
     });
     session.wait_until("the host sees the record", |this| {
         host_thread.read_with(this.cx, |thread, _| {
-            thread.draft.attachment_records().len() == 1
+            thread.draft().attachment_records().len() == 1
         })
     });
     // Nobody can submit it while its bytes are missing.
     let host = session.host.clone();
     host.read_with(session.cx, |host, cx| {
-        let draft_id = host_thread.read(cx).draft.id;
+        let draft_id = host_thread.read(cx).draft().id;
         assert!(host.draft_is_loading_attachments(draft_id, cx));
     });
 
@@ -223,7 +223,7 @@ fn files_left_unfinished_by_a_leaving_collaborator_are_removed(cx: &mut gpui::Te
     });
     session.wait_until("the host removes the record", |this| {
         host_thread.read_with(this.cx, |thread, _| {
-            thread.participants.len() == 1 && thread.draft.attachment_records().is_empty()
+            thread.participants().len() == 1 && thread.draft().attachment_records().is_empty()
         })
     });
     assert_eq!(session.bodies(&host_thread), ["from the host"]);
@@ -231,6 +231,134 @@ fn files_left_unfinished_by_a_leaving_collaborator_are_removed(cx: &mut gpui::Te
 
 /// Bytes and the record announcing them travel separately, so the bytes
 /// can come first.
+#[gpui::test]
+fn stopping_host_sharing_cleans_unfinished_uploads_before_peer_tasks_exit(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut session = Collaboration::start(cx);
+    let mirror = session.collaborator_thread().expect("joined");
+    let host_thread = session.host_thread.clone();
+    let host = session.host.clone();
+    let actor = mirror.read_with(session.cx, |thread, _| thread.participant_id());
+    let block = session.items(&host_thread)[0].id;
+    let host_file = text_attachment("host notes.txt", "keep this complete file");
+    let host_record = host_thread.read_with(session.cx, |thread, _| AttachmentRecord {
+        id: AttachmentId::new(),
+        name: host_file.name.clone(),
+        kind: host_file.kind(),
+        size: host_file.len(),
+        creator: thread.participant_id().as_uuid(),
+    });
+    host_thread.update(session.cx, |thread, _| {
+        thread
+            .with_authorized::<EditDraft, _>(thread.participant_id(), |auth| {
+                auth.edit(|draft| {
+                    assert!(draft.add_attachment(block, host_record.clone()));
+                    draft.files.insert(host_record.id, host_file);
+                    draft.stored.insert(host_record.id);
+                })
+            })
+            .expect("host retains a complete local attachment");
+    });
+
+    let mut upload = ThreadDraft::new(actor);
+    let file = text_attachment(
+        "unfinished.txt",
+        &"x".repeat(protocol::ATTACHMENT_CHUNK_SIZE + 1),
+    );
+    let record = AttachmentRecord {
+        id: AttachmentId::new(),
+        name: file.name.clone(),
+        kind: file.kind(),
+        size: file.len(),
+        creator: actor.as_uuid(),
+    };
+    upload.files.insert(record.id, file);
+    let first = upload.chunk(record.id, 0).expect("first chunk");
+    let last = upload
+        .chunk(record.id, protocol::ATTACHMENT_CHUNK_SIZE as u64)
+        .expect("last chunk");
+    mirror.update(session.cx, |thread, _| {
+        thread
+            .with_authorized::<EditDraft, _>(actor, |auth| {
+                auth.edit(|draft| assert!(draft.add_attachment(block, record.clone())))
+            })
+            .expect("announce the collaborator upload");
+        assert!(thread.request(protocol::CollaboratorMessage::AttachmentData(first)));
+    });
+    session.wait_until("the host holds a partial announced upload", |this| {
+        host_thread.read_with(this.cx, |thread, _| {
+            thread.draft().incoming.contains_key(&record.id)
+                && thread
+                    .draft()
+                    .attachment_records()
+                    .iter()
+                    .any(|item| item.id == record.id)
+                && !thread.draft().stored.contains(&record.id)
+        })
+    });
+    host_thread.update(session.cx, |thread, cx| {
+        thread
+            .with_authorized::<ManageAccess, _>(thread.participant_id(), |mut auth| {
+                auth.set_override(actor, Some(PeerMode::ReadOnly), cx);
+            })
+            .expect("an unfinished accepted upload survives a downgrade");
+        assert!(thread.draft().incoming.contains_key(&record.id));
+    });
+
+    session.cx.update(|window, cx| {
+        host.update(cx, |cowork, cx| {
+            cowork.toggle_sharing(window, cx);
+            // Check before the foreground executor can unwind serve_peer.
+            let thread = host_thread.read(cx);
+            assert!(matches!(thread.sharing, ThreadSharing::NotShared));
+            assert!(thread.participants().is_empty());
+            assert!(thread.draft().presence.is_empty());
+            assert!(thread.peer_permissions().override_for(actor).is_none());
+            assert!(!thread.draft().incoming.contains_key(&record.id));
+            assert!(!thread.draft().files.contains_key(&record.id));
+            assert!(!thread.draft().stored.contains(&record.id));
+            assert_eq!(
+                thread.draft().attachment_records().as_slice(),
+                std::slice::from_ref(&host_record)
+            );
+            assert!(thread.draft().stored.contains(&host_record.id));
+            assert_eq!(
+                file_text(thread.draft(), host_record.id).as_deref(),
+                Some("keep this complete file")
+            );
+            assert_eq!(thread.ownership(), ThreadOwnership::Local);
+            assert!(thread.can_control_generation());
+            let draft_id = thread.draft().id;
+            assert!(!cowork.draft_is_loading_attachments(draft_id, cx));
+            let denied = cowork
+                .collaborator_request(
+                    &host_thread,
+                    actor,
+                    protocol::CollaboratorMessage::AttachmentData(last),
+                    cx,
+                )
+                .expect_err("late chunks cannot revive a departed upload");
+            assert_eq!(
+                denied
+                    .downcast_ref::<crate::thread::PermissionDenied>()
+                    .unwrap()
+                    .reason,
+                crate::thread::DenialReason::NotParticipant
+            );
+        });
+    });
+    session.wait_until(
+        "the collaborator is disconnected after host cleanup",
+        |this| this.collaborator_thread().is_none(),
+    );
+    assert_eq!(session.bodies(&host_thread), ["from the host"]);
+    host_thread.read_with(session.cx, |thread, _| {
+        assert!(thread.draft().incoming.is_empty());
+        assert_eq!(thread.draft().attachment_records(), [host_record]);
+    });
+}
+
 #[gpui::test]
 fn uploads_wait_for_their_record(cx: &mut gpui::TestAppContext) {
     cx.update(gpui_component::init);
@@ -244,7 +372,7 @@ fn uploads_wait_for_their_record(cx: &mut gpui::TestAppContext) {
     let uploader = ParticipantId::new();
     let file = text_attachment("notes.txt", "some notes");
     let mut sender = ThreadDraft::new(uploader);
-    let block = sender.doc.create_prompt(uploader.as_uuid(), "");
+    let block = sender.create_prompt(uploader.as_uuid(), "");
     let record = AttachmentRecord {
         id: AttachmentId::new(),
         name: file.name.clone(),
@@ -253,34 +381,43 @@ fn uploads_wait_for_their_record(cx: &mut gpui::TestAppContext) {
         creator: uploader.as_uuid(),
     };
     sender.files.insert(record.id, file);
-    sender.doc.add_attachment(block, record.clone());
-    let update = sender.doc.take_local_update().expect("an update");
+    sender.add_attachment(block, record.clone());
+    let update = sender.encode_state();
     let chunk = sender.chunk(record.id, 0).expect("a chunk");
 
-    host.update(cx, |host, _| {
+    host.update(cx, |host, cx| {
+        host.apply_for_test(joined(uploader), cx);
         host.receive_upload(uploader, chunk).expect("valid data");
-        assert!(!host.draft.stored.contains(&record.id));
-        host.apply_collaborator_update(uploader, update)
-            .expect("valid update");
-        assert!(host.draft.stored.contains(&record.id));
+        assert!(!host.draft().stored.contains(&record.id));
+        host.apply_collaborator_update_for_test(
+            uploader,
+            host.draft_generation_for(uploader),
+            update,
+        )
+        .expect("valid update");
+        assert!(host.draft().stored.contains(&record.id));
         assert_eq!(
-            file_text(&host.draft, record.id).as_deref(),
+            file_text(host.draft(), record.id).as_deref(),
             Some("some notes")
         );
         // Removing the record discards the file.
         let removal = Draft::new();
         removal
-            .apply_update(&host.draft.doc.encode_state())
+            .apply_update(&host.draft().encode_state())
             .expect("copy the draft");
         removal.remove_attachment(record.id);
         let update = removal.take_local_update().expect("an update");
-        host.apply_collaborator_update(uploader, update)
-            .expect("valid update");
-        assert!(!host.draft.files.contains_key(&record.id));
+        host.apply_collaborator_update_for_test(
+            uploader,
+            host.draft_generation_for(uploader),
+            update,
+        )
+        .expect("valid update");
+        assert!(!host.draft().files.contains_key(&record.id));
         // A piece still in flight is ignored rather than started over.
         let late = sender.chunk(record.id, 0).expect("a chunk");
         host.receive_upload(uploader, late).expect("ignored");
-        assert!(host.draft.incoming.is_empty());
+        assert!(host.draft().incoming.is_empty());
     });
 }
 
@@ -302,6 +439,7 @@ fn a_cancelled_upload_is_discarded(cx: &mut gpui::TestAppContext) {
 
     cowork.update(cx, |cowork, cx| {
         let thread = cowork.active_thread(cx).expect("thread");
+        thread.update(cx, |thread, cx| thread.apply_for_test(joined(uploader), cx));
         for request in [
             protocol::CollaboratorMessage::AttachmentData(first),
             protocol::CollaboratorMessage::AttachmentCancelled(id.as_uuid().into_bytes()),
@@ -311,7 +449,7 @@ fn a_cancelled_upload_is_discarded(cx: &mut gpui::TestAppContext) {
                 .collaborator_request(&thread, uploader, request, cx)
                 .expect("valid request");
         }
-        let draft = &thread.read(cx).draft;
+        let draft = thread.read(cx).draft();
         assert!(draft.incoming.is_empty());
         assert!(!draft.files.contains_key(&id));
     });
@@ -335,7 +473,7 @@ fn joining_peers_are_sent_the_files_they_do_not_have(cx: &mut gpui::TestAppConte
     })];
     let thread = cx.new(|_| {
         let mut draft = ThreadDraft::new(ParticipantId::new());
-        let block = draft.doc.create_prompt(draft.author.as_uuid(), "");
+        let block = draft.create_prompt(draft.author.as_uuid(), "");
         let mut own = timeline_files;
         for (creator, name) in [
             (Uuid::new_v4(), "new.txt"),
@@ -349,7 +487,7 @@ fn joining_peers_are_sent_the_files_they_do_not_have(cx: &mut gpui::TestAppConte
                 size: file.len(),
                 creator,
             };
-            draft.doc.add_attachment(block, record.clone());
+            draft.add_attachment(block, record.clone());
             own.insert(record.id, file);
         }
         draft.stored = own.keys().copied().collect();
@@ -361,7 +499,7 @@ fn joining_peers_are_sent_the_files_they_do_not_have(cx: &mut gpui::TestAppConte
         let names = thread
             .files_for(joiner)
             .into_iter()
-            .map(|id| thread.draft.files[&id].name.clone())
+            .map(|id| thread.draft().files[&id].name.clone())
             .collect::<Vec<_>>();
         assert_eq!(names, ["old.txt", "new.txt"]);
     });

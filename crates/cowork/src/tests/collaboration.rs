@@ -19,7 +19,7 @@ fn collaborators_receive_the_draft_and_edit_it_live(cx: &mut gpui::TestAppContex
     let host_thread = session.host_thread.clone();
     assert_eq!(session.bodies(&collaborator_thread), ["from the host"]);
     let collaborator_id =
-        collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id);
+        collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id());
 
     // The collaborator continues the host's block.
     let collaborator = session.collaborator.clone();
@@ -43,9 +43,9 @@ fn collaborators_receive_the_draft_and_edit_it_live(cx: &mut gpui::TestAppContex
     let host = session.host.clone();
     let block = items[1].id;
     host.update(session.cx, |host, cx| {
-        let draft_id = host_thread.read(cx).draft.id;
+        let draft_id = host_thread.read(cx).draft().id;
         host.update_draft(draft_id, cx, |draft| {
-            draft.doc.set_body(block, "mine, and the host's");
+            draft.set_body(block, "mine, and the host's");
         });
     });
     session.wait_until("the collaborator's editor shows the host's edit", |this| {
@@ -53,7 +53,7 @@ fn collaborators_receive_the_draft_and_edit_it_live(cx: &mut gpui::TestAppContex
             let thread = collaborator.active_thread(cx).expect("joined");
             thread
                 .read(cx)
-                .draft
+                .draft()
                 .editor(EditorSlot::Prompt(block))
                 .is_some_and(|editor| editor.read(cx).value() == "mine, and the host's")
         })
@@ -91,7 +91,7 @@ fn the_host_accepts_one_submission_per_sequence(cx: &mut gpui::TestAppContext) {
     // The test's agent never answers, so end its run by hand.
     host_thread.update(session.cx, |thread, cx| {
         let id = thread.running_agent_message_id().expect("a running agent");
-        thread.emit(
+        thread.emit_for_test(
             protocol::HostMessage::AgentEnded {
                 id: id.into_bytes(),
                 outcome: crate::protocol::RunOutcome::Completed,
@@ -105,9 +105,9 @@ fn the_host_accepts_one_submission_per_sequence(cx: &mut gpui::TestAppContext) {
     // though the draft has new content by now.
     let host = session.host.clone();
     host.update(session.cx, |host, cx| {
-        let draft_id = host_thread.read(cx).draft.id;
+        let draft_id = host_thread.read(cx).draft().id;
         host.update_draft(draft_id, cx, |draft| {
-            draft.doc.create_prompt(draft.author.as_uuid(), "later");
+            draft.create_prompt(draft.author.as_uuid(), "later");
         });
     });
     session.wait_until("the collaborator sees the new block", |this| {
@@ -142,18 +142,16 @@ fn concurrent_blocks_converge_to_one_order(cx: &mut gpui::TestAppContext) {
     // Both append before either hears of the other's block.
     let host = session.host.clone();
     host.update(session.cx, |host, cx| {
-        let draft_id = host_thread.read(cx).draft.id;
+        let draft_id = host_thread.read(cx).draft().id;
         host.update_draft(draft_id, cx, |draft| {
-            draft.doc.create_prompt(draft.author.as_uuid(), "host");
+            draft.create_prompt(draft.author.as_uuid(), "host");
         });
     });
     let collaborator = session.collaborator.clone();
     collaborator.update(session.cx, |collaborator, cx| {
-        let draft_id = collaborator_thread.read(cx).draft.id;
+        let draft_id = collaborator_thread.read(cx).draft().id;
         collaborator.update_draft(draft_id, cx, |draft| {
-            draft
-                .doc
-                .create_prompt(draft.author.as_uuid(), "collaborator");
+            draft.create_prompt(draft.author.as_uuid(), "collaborator");
         });
     });
 
@@ -222,8 +220,8 @@ fn caret_labels_only_reappear_when_the_caret_moves() {
 #[test]
 fn empty_items_someone_else_is_in_are_kept() {
     let mut draft = ThreadDraft::new(ParticipantId::new());
-    let attended = draft.doc.create_prompt(Uuid::new_v4(), "");
-    let unattended = draft.doc.create_prompt(Uuid::new_v4(), "");
+    let attended = draft.create_prompt(Uuid::new_v4(), "");
+    let unattended = draft.create_prompt(Uuid::new_v4(), "");
     let in_item = |id: ItemId| protocol::Presence {
         focus: Some(protocol::PresenceFocus::Item(id.as_uuid().into_bytes())),
         ..Default::default()
@@ -236,7 +234,6 @@ fn empty_items_someone_else_is_in_are_kept() {
     assert!(draft.remove_if_unattended(unattended));
     assert_eq!(
         draft
-            .doc
             .items()
             .into_iter()
             .map(|item| item.id)
@@ -251,12 +248,14 @@ fn rebasing_keeps_local_edits_the_host_has_not_seen(cx: &mut gpui::TestAppContex
     let host_draft = Draft::new();
     host_draft.create_prompt(Uuid::new_v4(), "host");
     let welcome = |host_draft: &Draft| protocol::Welcome {
+        draft_generation: 0,
         participant_id: [3; 16],
         thread: protocol::ThreadSnapshot {
             id: [1; 16],
             title: "Shared".into(),
-            participants: Vec::new(),
+            participants: vec![[2; 16], [3; 16]],
             profiles: Vec::new(),
+            peer_permissions: PeerPermissions::default(),
             models: ModelCatalog::default(),
             model: None,
             context_tokens: None,
@@ -279,15 +278,18 @@ fn rebasing_keeps_local_edits_the_host_has_not_seen(cx: &mut gpui::TestAppContex
         )
     });
     thread.update(cx, |thread, cx| {
-        let author = thread.draft.author.as_uuid();
-        thread.draft.doc.create_prompt(author, "unsent");
-        thread.apply(
+        let author = thread.draft().author.as_uuid();
+        thread
+            .with_authorized::<EditDraft, _>(thread.participant_id(), |auth| {
+                auth.edit(|draft| draft.create_prompt(author, "unsent"))
+            })
+            .expect("default Admin can edit");
+        thread.apply_for_test(
             protocol::HostMessage::Welcome(Box::new(welcome(&host_draft))),
             cx,
         );
         let bodies = thread
-            .draft
-            .doc
+            .draft()
             .items()
             .into_iter()
             .map(|item| item.body)
@@ -310,12 +312,10 @@ fn keystrokes_merge_with_edits_the_editor_does_not_show_yet(cx: &mut gpui::TestA
 
     // The collaborator's edit, as the host receives it.
     let collaborator_id =
-        collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id);
+        collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id());
     let remote = Draft::new();
     remote
-        .apply_update(
-            &host_thread.read_with(session.cx, |thread, _| thread.draft.doc.encode_state()),
-        )
+        .apply_update(&host_thread.read_with(session.cx, |thread, _| thread.draft().encode_state()))
         .expect("copy the draft");
     remote.edit_body(
         block,
@@ -328,7 +328,7 @@ fn keystrokes_merge_with_edits_the_editor_does_not_show_yet(cx: &mut gpui::TestA
     let editor = host.read_with(session.cx, |_, cx| {
         host_thread
             .read(cx)
-            .draft
+            .draft()
             .editor(EditorSlot::Prompt(block))
             .expect("host editor")
     });
@@ -341,7 +341,10 @@ fn keystrokes_merge_with_edits_the_editor_does_not_show_yet(cx: &mut gpui::TestA
             host.collaborator_request(
                 &host_thread,
                 collaborator_id,
-                protocol::CollaboratorMessage::DraftUpdate(update),
+                protocol::CollaboratorMessage::DraftUpdate {
+                    generation: collaborator_thread.read(cx).draft_generation(),
+                    update,
+                },
                 cx,
             )
             .expect("a valid update");
@@ -358,7 +361,7 @@ fn keystrokes_merge_with_edits_the_editor_does_not_show_yet(cx: &mut gpui::TestA
     host.read_with(session.cx, |host, cx| {
         let editor = host_thread
             .read(cx)
-            .draft
+            .draft()
             .editor(EditorSlot::Prompt(block))
             .expect("host editor");
         assert_eq!(editor.read(cx).value(), "Xfrom the host!");
@@ -416,9 +419,8 @@ fn joining_a_thread_scrolls_to_the_bottom(cx: &mut gpui::TestAppContext) {
 fn a_joined_thread_closes_when_the_host_stops_sharing(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
     let host_thread = session.host_thread.clone();
-    host_thread.update(session.cx, |thread, _| {
-        thread.sharing = ThreadSharing::NotShared;
-        thread.participants.clear();
+    host_thread.update(session.cx, |thread, cx| {
+        assert!(thread.stop_hosting(cx).is_some());
     });
     session.wait_until("the collaborator's thread closes", |this| {
         this.collaborator.read_with(this.cx, |collaborator, cx| {
@@ -432,7 +434,7 @@ fn a_joined_thread_closes_when_the_host_stops_sharing(cx: &mut gpui::TestAppCont
 fn a_joined_thread_closes_when_the_host_sends_invalid_json(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
     session.host_thread.read_with(session.cx, |thread, _| {
-        thread.publish(protocol::HostMessage::AgentEvent {
+        thread.publish_for_test(protocol::HostMessage::AgentEvent {
             id: Uuid::new_v4().into_bytes(),
             event: postcard::from_bytes(
                 &postcard::to_stdvec("not json").expect("encode invalid JSON string"),
@@ -461,18 +463,18 @@ fn the_host_sees_where_the_collaborator_is_typing(cx: &mut gpui::TestAppContext)
     let collaborator_thread = session.collaborator_thread().expect("joined");
     let host_thread = session.host_thread.clone();
     let collaborator_id =
-        collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id);
+        collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id());
     let block = session.items(&host_thread)[0].id;
 
     let collaborator = session.collaborator.clone();
     session.focus(&collaborator);
     session.wait_until("the host sees the collaborator in the block", |this| {
         host_thread.read_with(this.cx, |thread, _| {
-            thread.draft.editors_of(block, &thread.participants) == [collaborator_id]
+            thread.draft().editors_of(block, thread.participants()) == [collaborator_id]
         })
     });
     let caret = host_thread.read_with(session.cx, |thread, _| {
-        thread.draft.remote_carets(block, &thread.participants)
+        thread.draft().remote_carets(block, thread.participants())
     });
     let end = "from the host".len();
     assert!(matches!(
@@ -487,8 +489,8 @@ fn the_host_sees_where_the_collaborator_is_typing(cx: &mut gpui::TestAppContext)
     session.wait_until("the caret moves along", |this| {
         host_thread.read_with(this.cx, |thread, _| {
             thread
-                .draft
-                .remote_carets(block, &thread.participants)
+                .draft()
+                .remote_carets(block, thread.participants())
                 .first()
                 .is_some_and(|caret| caret.head == end + 2)
         })
@@ -496,7 +498,7 @@ fn the_host_sees_where_the_collaborator_is_typing(cx: &mut gpui::TestAppContext)
     let host = session.host.clone();
     let editors = session.cx.update(|window, cx| {
         let host = host.read(cx);
-        let draft_id = host_thread.read(cx).draft.id;
+        let draft_id = host_thread.read(cx).draft().id;
         let model = host.composer_model(draft_id, window, cx).expect("composer");
         model.blocks[0].presence.editors.clone()
     });
@@ -510,8 +512,8 @@ fn the_host_sees_where_the_collaborator_is_typing(cx: &mut gpui::TestAppContext)
     session.wait_until("the host sees the collaborator leave the block", |this| {
         host_thread.read_with(this.cx, |thread, _| {
             thread
-                .draft
-                .editors_of(block, &thread.participants)
+                .draft()
+                .editors_of(block, thread.participants())
                 .is_empty()
         })
     });
@@ -532,8 +534,8 @@ fn the_host_sees_the_collaborators_selection(cx: &mut gpui::TestAppContext) {
     session.wait_until("the host sees the selection", |this| {
         host_thread.read_with(this.cx, |thread, _| {
             thread
-                .draft
-                .remote_carets(block, &thread.participants)
+                .draft()
+                .remote_carets(block, thread.participants())
                 .first()
                 .is_some_and(|caret| caret.selection == (end - 4..end) && caret.head == end - 4)
         })
@@ -569,27 +571,31 @@ fn an_empty_block_stays_while_someone_else_is_in_it(cx: &mut gpui::TestAppContex
     let block = session.items(&host_thread)[0].id;
     let host = session.host.clone();
     host.update(session.cx, |host, cx| {
-        let draft_id = host_thread.read(cx).draft.id;
+        let draft_id = host_thread.read(cx).draft().id;
         host.update_draft(draft_id, cx, |draft| {
-            draft.doc.set_body(block, "");
+            draft.set_body(block, "");
         });
     });
     let collaborator = session.collaborator.clone();
     session.focus(&collaborator);
     session.wait_until("the host sees the collaborator in the block", |this| {
-        host_thread.read_with(this.cx, |thread, _| thread.draft.is_attended(block, None))
+        host_thread.read_with(this.cx, |thread, _| thread.draft().is_attended(block, None))
     });
 
     // The host cannot remove it while the collaborator is in it.
     let removed = host_thread.update(session.cx, |thread, _| {
-        thread.draft.remove_if_unattended(block)
+        thread
+            .with_authorized::<EditDraft, _>(thread.participant_id(), |auth| {
+                auth.edit(|draft| draft.remove_if_unattended(block))
+            })
+            .expect("host edit")
     });
     assert!(!removed);
 
     // The collaborator, although not its creator, removes it on leaving.
     session.cx.update(|window, cx| {
         collaborator.update(cx, |collaborator, cx| {
-            let draft_id = collaborator_thread.read(cx).draft.id;
+            let draft_id = collaborator_thread.read(cx).draft().id;
             collaborator.focus_draft_editor(draft_id, EditorSlot::DraftPosition, None, window, cx);
         });
     });
@@ -605,21 +611,21 @@ fn the_host_removes_the_empty_block_a_leaving_collaborator_was_in(cx: &mut gpui:
     let host_thread = session.host_thread.clone();
     let collaborator = session.collaborator.clone();
     let block = collaborator.update(session.cx, |collaborator, cx| {
-        let draft_id = collaborator_thread.read(cx).draft.id;
+        let draft_id = collaborator_thread.read(cx).draft().id;
         collaborator
             .update_draft(draft_id, cx, |draft| {
-                draft.doc.create_prompt(draft.author.as_uuid(), "")
+                draft.create_prompt(draft.author.as_uuid(), "")
             })
             .expect("draft")
     });
     session.cx.update(|window, cx| {
         collaborator.update(cx, |collaborator, cx| {
-            let draft_id = collaborator_thread.read(cx).draft.id;
+            let draft_id = collaborator_thread.read(cx).draft().id;
             collaborator.focus_draft_editor(draft_id, EditorSlot::Prompt(block), None, window, cx);
         });
     });
     session.wait_until("the host sees the collaborator in the block", |this| {
-        host_thread.read_with(this.cx, |thread, _| thread.draft.is_attended(block, None))
+        host_thread.read_with(this.cx, |thread, _| thread.draft().is_attended(block, None))
     });
 
     // Closing the collaborator's end disconnects it.
@@ -628,7 +634,7 @@ fn the_host_removes_the_empty_block_a_leaving_collaborator_was_in(cx: &mut gpui:
     });
     session.wait_until("the host drops the collaborator and the block", |this| {
         host_thread.read_with(this.cx, |thread, _| {
-            thread.participants.len() == 1 && !thread.draft.doc.contains(block)
+            thread.participants().len() == 1 && !thread.draft().contains(block)
         })
     });
     assert_eq!(session.bodies(&host_thread), ["from the host"]);
@@ -643,27 +649,27 @@ fn the_host_removes_an_empty_block_everyone_left(cx: &mut gpui::TestAppContext) 
     let host_thread = session.host_thread.clone();
     let block = session.items(&host_thread)[0].id;
     let collaborator_id =
-        collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id);
+        collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id());
     let host = session.host.clone();
     host.update(session.cx, |host, cx| {
-        let draft_id = host_thread.read(cx).draft.id;
+        let draft_id = host_thread.read(cx).draft().id;
         host.update_draft(draft_id, cx, |draft| {
-            draft.doc.set_body(block, "");
+            draft.set_body(block, "");
         });
     });
     let in_block = protocol::Presence {
         focus: Some(protocol::PresenceFocus::Item(block.as_uuid().into_bytes())),
         ..Default::default()
     };
-    let host_id = host_thread.read_with(session.cx, |thread, _| thread.participant_id);
+    let host_id = host_thread.read_with(session.cx, |thread, _| thread.participant_id());
     host_thread.update(session.cx, |thread, cx| {
         thread.host_presence(host_id, in_block.clone(), cx);
         thread.host_presence(collaborator_id, in_block, cx);
         // The host leaves first: the collaborator is still there.
         thread.host_presence(host_id, protocol::Presence::default(), cx);
-        assert!(thread.draft.doc.contains(block));
+        assert!(thread.draft().contains(block));
         thread.host_presence(collaborator_id, protocol::Presence::default(), cx);
-        assert!(!thread.draft.doc.contains(block));
+        assert!(!thread.draft().contains(block));
     });
     session.wait_until("the collaborator sees the block go", |this| {
         this.items(&collaborator_thread).is_empty()
@@ -677,17 +683,16 @@ fn sharing_again_announces_the_hosts_presence_again(cx: &mut gpui::TestAppContex
     let host = session.host.clone();
     session.focus(&host);
     session.settle();
-    let host_id = host_thread.read_with(session.cx, |thread, _| thread.participant_id);
+    let host_id = host_thread.read_with(session.cx, |thread, _| thread.participant_id());
     let announced = |session: &mut Collaboration| {
         host_thread.read_with(session.cx, |thread, _| {
-            thread.draft.presence.contains_key(&host_id)
+            thread.draft().presence.contains_key(&host_id)
         })
     };
     assert!(announced(&mut session));
 
-    host_thread.update(session.cx, |thread, _| {
-        thread.draft.presence.clear();
-        thread.sharing = ThreadSharing::NotShared;
+    host_thread.update(session.cx, |thread, cx| {
+        assert!(thread.stop_hosting(cx).is_some());
     });
     session.settle();
     let endpoint = session
@@ -695,10 +700,7 @@ fn sharing_again_announces_the_hosts_presence_again(cx: &mut gpui::TestAppContex
         .block_on(Endpoint::builder(presets::Minimal).bind())
         .expect("bind endpoint");
     host_thread.update(session.cx, |thread, _| {
-        thread.sharing = ThreadSharing::Shared {
-            endpoint,
-            events: broadcast::channel(THREAD_EVENT_CAPACITY).0,
-        };
+        assert!(thread.start_hosting(endpoint));
     });
     session.settle();
     assert!(announced(&mut session));
@@ -710,7 +712,7 @@ fn profiles_reach_everyone_in_the_thread(cx: &mut gpui::TestAppContext) {
     let collaborator_thread = session.collaborator_thread().expect("joined");
     let host_thread = session.host_thread.clone();
     let (collaborator_id, host_id) = collaborator_thread.read_with(session.cx, |thread, _| {
-        (thread.participant_id, thread.participants[0])
+        (thread.participant_id(), thread.participants()[0])
     });
     let shown_name = |thread: &Thread, participant| {
         participant_name(participant, thread.profiles.get(&participant)).to_string()
@@ -790,7 +792,7 @@ fn generated_profiles_look_the_same_in_every_thread(cx: &mut gpui::TestAppContex
     let mut session = Collaboration::start(cx);
     let collaborator_thread = session.collaborator_thread().expect("joined");
     let collaborator_id =
-        collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id);
+        collaborator_thread.read_with(session.cx, |thread, _| thread.participant_id());
     let (host, collaborator) = (session.host.clone(), session.collaborator.clone());
     session.settle();
 
@@ -831,7 +833,7 @@ fn invalid_profiles_disconnect_the_collaborator(cx: &mut gpui::TestAppContext) {
         }));
     });
     session.wait_until("the host drops the collaborator", |this| {
-        host_thread.read_with(this.cx, |thread, _| thread.participants.len() == 1)
+        host_thread.read_with(this.cx, |thread, _| thread.participants().len() == 1)
     });
 }
 
@@ -841,7 +843,7 @@ fn misattributed_draft_updates_disconnect_the_collaborator(cx: &mut gpui::TestAp
     let collaborator_thread = session.collaborator_thread().expect("joined");
     let host_thread = session.host_thread.clone();
     assert_eq!(
-        host_thread.read_with(session.cx, |thread, _| thread.participants.len()),
+        host_thread.read_with(session.cx, |thread, _| thread.participants().len()),
         2
     );
 
@@ -849,9 +851,12 @@ fn misattributed_draft_updates_disconnect_the_collaborator(cx: &mut gpui::TestAp
     forged.create_prompt(Uuid::new_v4(), "not mine");
     let update = forged.take_local_update().expect("an update");
     collaborator_thread.read_with(session.cx, |thread, _| {
-        thread.request(protocol::CollaboratorMessage::DraftUpdate(update));
+        thread.request(protocol::CollaboratorMessage::DraftUpdate {
+            generation: thread.draft_generation(),
+            update,
+        });
     });
     session.wait_until("the host drops the collaborator", |this| {
-        host_thread.read_with(this.cx, |thread, _| thread.participants.len() == 1)
+        host_thread.read_with(this.cx, |thread, _| thread.participants().len() == 1)
     });
 }

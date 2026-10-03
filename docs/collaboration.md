@@ -8,20 +8,31 @@ Yrs document, and the protocol between host and collaborators.
 
 All five steps of the [implementation order](#implementation-order) are done:
 participant identity, the protocol version handshake, shared model selection
-from the host's catalog (grouped by provider), stopping from any participant,
+from the host's catalog (grouped by provider), shared stopping,
 Yrs drafts with prompt blocks, comments as items, per-block attachments,
 navigation, and empty-item removal, the draft
 synced through the host with host-coordinated submission, presence, and
-attachment transfer.
+attachment transfer. Peer permissions are also implemented: `ReadOnly`, `Write`,
+and `Admin`, initially defaulting to `Admin` to preserve the old behavior.
+The right-aligned titlebar gateway opens a nonmodal sharing popover with sharing
+and link actions; the host also manages live defaults before sharing and per-connection
+overrides there. Snapshots and host events sync the unchanged policy.
+Permission denials keep the session open. Per-peer draft generations fence rejected optimistic history,
+including after regrant; snapshots and resets merge only at a matching epoch.
+The host sanitizes read-only presence and clears stale announcements on
+downgrade. Stopping sharing cleans peers and unfinished uploads before
+clearing membership. Denial feedback is routed to the originating thread.
+The protocol version is **19**.
 
 Not yet implemented:
 
-- telling a collaborator why the host rejected their submission (generating,
-  attachments loading, size limit); the request is currently dropped
-  silently;
+- explaining non-permission submission refusals to collaborators (generating,
+  empty draft, unavailable model, attachments loading, size limit); these
+  requests are still dropped silently;
 - showing names when hovering a remote caret or an avatar (names show only
   briefly after a caret moves, and on the top bar's avatars);
-- validating collaborators' presence at the host (e.g. announced file reads);
+- fully validating writable peers' presence at the host (e.g. focus,
+  selections, and announced file reads); read-only presence is sanitized;
 - showing others' selections in agent messages, which needs a gpui-kit
   addition; see [gpui-kit-text-view-highlights.md](gpui-kit-text-view-highlights.md).
 
@@ -32,7 +43,8 @@ Implementation notes on presence:
 - Besides each participant removing an empty item they leave while nobody
   else is in it, the host removes an empty item as soon as presence shows
   everyone has left it, since two people leaving at once would each still see
-  the other there.
+  the other there. Read-only sanitization and downgrade cleanup do not trigger
+  this empty-item removal path.
 
 Implementation notes on attachment transfer:
 
@@ -61,14 +73,18 @@ Implementation notes on attachment transfer:
   thread is shared.
 - The draft is an ordered collection of **items**: prompt blocks and comments.
   Prompt blocks carry their own attachments.
-- Every participant can create, edit, and remove every item. The creator is
-  attribution, not a permission.
+- `Write` and `Admin` participants can create, edit, and remove every item
+  and every prompt block's attachments. The creator is attribution, not a
+  permission.
 - Participants write independent prompt blocks by default and co-edit a block
   by deliberately moving into it.
 - Live cursors, selections, focus, and attachment reads are shared as
   ephemeral presence, outside the document.
-- Anyone can submit, stop the agent, or change the model. The host
-  coordinates so each submission happens exactly once.
+- `Admin` participants can submit, stop the agent, and change the model;
+  submit and stop share one permission. Only the host manages peer access.
+  The host coordinates so each submission happens exactly once.
+- `ReadOnly` peers still receive the live draft, attachments, presence,
+  models, and agent output. Permissions restrict actions, not visibility.
 
 ## Terminology
 
@@ -112,7 +128,63 @@ Implementation notes on attachment transfer:
   authenticated identity to a participant UUID at the host. Nothing in the
   document depends on how identity is established.
 
+### Peer permissions
+
+The host owns the per-thread policy. The host is always `Admin`, independent
+of the peer default, and only the host can manage access; an `Admin` peer
+cannot delegate it.
+
+| Peer action                                           | `ReadOnly` | `Write` | `Admin` |
+| ----------------------------------------------------- | ---------- | ------- | ------- |
+| Receive live draft, attachments, models, agent output | Yes        | Yes     | Yes     |
+| Create, edit, remove any draft item or attachment     | No         | Yes     | Yes     |
+| Submit the whole draft or stop generation             | No         | No      | Yes     |
+| Change the selected model                             | No         | No      | Yes     |
+| Manage default access or individual overrides         | No         | No      | No      |
+
+The default starts as `Admin`. Overrides are sparse and keyed by the
+host-assigned participant UUID for this connection. No override means
+inherit the **current** default, so changing it immediately affects existing
+inheriting peers as well as future joins. An explicit override remains
+explicit even when it equals the default. Removing it resumes inheritance.
+Leaving removes the override; reconnecting gets a new UUID and inherits the
+then-current default. Profiles and creators do not grant authority.
+
+`peer_access.rs` renders a nonmodal `gpui_component::Popover`, approximately
+300 px wide, below the right-aligned titlebar gateway beside the participant avatars.
+The 28 px button sits in the existing 40 px header; there is no extra access bar.
+The host menu has the same sharing header, copy-link control, default access track,
+and sharing action before and after sharing. Copy link is disabled until shared;
+Share thread becomes Stop sharing, and starting or retrying sharing keeps the
+menu open so the link is immediately accessible. Defaults can be configured before sharing,
+materializing a local thread if necessary while preserving its draft.
+Connected peers add override rows. Share, copy link, and stop sharing use this
+same menu rather than separate titlebar buttons. Collaborators see **Your access** with their mode icon and Disconnect,
+never the host's permission controls.
+
+For the host, **Default** and connected peer names label fixed-width,
+three-mode icon tracks: Eye (`ReadOnly`), Pencil (`Write`), and Shield (`Admin`).
+Hover tooltips explain each mode, and the selected pill shows the effective
+mode, including for inheriting peers. Each peer has a separate RotateCcw reset
+outside the track. Its tooltip describes inheritance of the current default;
+it is disabled when already inherited. Resetting removes the override, while
+choosing a mode explicitly creates one even if it equals the default. No
+long, changing inheritance label widens the controls.
+
+Changes apply immediately and keep the popover open; policy changes and peer
+joins/leaves redraw it live. Escape or an outside click dismisses it without a
+modal backdrop or moving the page. The popover's element identity is scoped
+to the active draft, so switching threads closes any stale menu while materializing
+a new thread for sharing preserves the open menu. Read-only
+editors stay live and selectable, editing and attachment actions are gated,
+Send/Stop are hidden without `Admin`, and the model picker is disabled without
+`Admin`.
+
 ## The draft
+
+The editing behavior below requires `Write` or `Admin`. Read-only peers can
+view the same live items without mutating them; host cleanup still removes
+unattended empty items.
 
 ### Composer layout
 
@@ -144,7 +216,8 @@ Each prompt block has an avatar gutter, like timeline messages:
 - Hovering an avatar shows the participant's name.
 
 The draft position row shows the avatars of participants who are at it. When
-the draft is empty, everyone's avatar is layered on that single row.
+the draft is empty, all editing participants' avatars are layered on that
+single row.
 
 Comment cards show their creator's avatar inside the card, as today, with
 editors layered beside it. Ownership of every comment must be clear.
@@ -153,8 +226,8 @@ editors layered beside it. Ownership of every comment must be clear.
 
 Independent prompts are the default.
 
-1. When the draft is empty, every participant's caret sits at the same draft
-   position. Overlapping carets use participant colors and never create
+1. When the draft is empty, every editing participant's caret sits at the
+   same draft position. Overlapping carets use participant colors and never create
    separate rows.
 2. Typing at the draft position creates a prompt block. The typist becomes
    its creator and stays in it.
@@ -225,9 +298,9 @@ edits are lost. This is accepted.
 
 ### Attachments
 
-Attachments belong to a prompt block. Anybody can add or remove any
-attachment. File bytes are sent over the protocol, never stored in the
-document.
+Attachments belong to a prompt block. `Write` and `Admin` participants can
+add or remove any attachment, regardless of creator. File bytes are sent
+over the protocol, never stored in the document.
 
 **Choosing the target block**:
 
@@ -249,8 +322,8 @@ document.
    participant's chip shows a progress bar until the bytes are available
    locally.
 
-Only the host needs the bytes to send. A participant can submit as soon as
-the host has stored every attachment, even if other participants are still
+Only the host needs the bytes to send. An `Admin` participant can submit
+once the host has stored every attachment, even if others are still
 downloading.
 
 **Failure and removal**:
@@ -262,6 +335,15 @@ downloading.
 - Removing an attachment while it uploads cancels the upload. The host
   discards bytes for attachments no longer referenced by the draft or the
   timeline.
+- Losing draft-write permission cancels pending local reads and removes
+  their placeholders. Disk I/O may finish, but late callbacks cannot attach
+  the result, even if access is restored meanwhile.
+- An upload whose record the host accepted while the uploader could write
+  may finish after revocation. This grant is limited to that connected
+  uploader and the record's ID, name, kind, and size; removal or disconnect
+  ends it. Pre-record buffers are discarded on revocation and new uploads
+  are denied. Cancelling one's accepted transfer remains allowed, without
+  granting permission to remove its draft record.
 - Existing size limits apply: per file when adding, and the per-message total
   across all submitted blocks when submitting.
 
@@ -284,16 +366,27 @@ Presence
 - Remote carets and selections are painted in the participant's color and
   never move local focus. A caret shows the participant's name when hovered
   or briefly after it moves.
-- Presence is never stored in the document.
+- Presence is never stored in the document. The host checks membership and
+  replaces read-only peers' presence with an empty state before storing and
+  rebroadcasting it. Readers cannot announce work that blocks submission or
+  trigger empty-item deletion by reporting that they left an item.
+- On downgrade, the host clears and rebroadcasts stale focus, selection, and
+  pending reads without waiting for peer cooperation. Mirrors also clear
+  them when applying the policy. This cleanup does not remove empty items.
+- Writable peers' focus, selections, and read announcements still need full
+  host validation; sanitizing read-only presence is not that validation.
 
 ## Thread controls
 
 ### Submission
 
 Pressing Ctrl-Enter (Cmd-Enter on macOS) in any composer editor or at the
-draft position, or clicking Send, submits the whole draft for everyone.
+draft position, or clicking Send, submits the whole draft for everyone,
+provided the submitter is `Admin`. `Write` permits editing, not consuming
+anyone's draft. The host checks the requester's current permission, not the
+local viewer's mode.
 
-Send is enabled for everyone when:
+Send is available only to the host and `Admin` peers, and requires:
 
 - the agent is not generating;
 - the draft contains at least one non-empty item;
@@ -304,7 +397,8 @@ The host accepts a submission as follows:
 
 1. The submitter sends `Submit` with the submission sequence it has seen. It
    sends all its pending draft updates first, on the same ordered stream, so
-   its own edits are always included.
+   its own accepted edits are included. The host checks `ControlGeneration`
+   before considering the submission.
 2. The host ignores a stale sequence: someone else's submission was already
    accepted and everyone sees it.
 3. From its replica, the host snapshots every non-empty comment and every
@@ -318,8 +412,11 @@ The host accepts a submission as follows:
 6. Edits that arrive for removed items are discarded. Participants whose
    focused item was submitted move to the draft position.
 
-Other rejections (generating, empty, attachments not stored, size limit) are
-reported only to the submitter.
+A permission rejection is reported only to the submitter as
+`PermissionDenied`. Feedback uses the originating local `thread_id` and its
+draft, not the currently active thread, including after switching threads.
+Other refusals (generating, empty, unavailable model, attachments not stored,
+size limit) still lack collaborator feedback, as noted in Status.
 
 **Published user message**: one timeline entry, rendered like today:
 
@@ -413,14 +510,16 @@ Also check the attached log.
 The host titles a new thread from the first prompt block, or from the first
 comment when a submission has only comments.
 
-Submitting while the agent is generating is rejected. Participants can keep
-editing the draft during generation.
+Submitting while the agent is generating is rejected. `Write` and `Admin`
+participants can keep editing the draft during generation.
 
 ### Stopping
 
-Everyone sees the Stop button while the agent is generating. `Stop` names
-the running agent message. The host cancels that run if it is still active
-and ignores the request otherwise. The run then ends with `AgentEnded`
+The host and `Admin` peers see the Stop button while the agent is generating.
+Submit and stop use the same `ControlGeneration` permission; there is no
+separate stop setting. `Stop` names the running agent message. The host
+checks current permission, cancels that run if it is still active, and
+ignores an authorized request otherwise. The run then ends with `AgentEnded`
 marked as stopped, so everyone can tell it apart from one that completed.
 
 ### Model selection
@@ -437,9 +536,10 @@ marked as stopped, so everyone can tell it apart from one that completed.
   of a model's identity (`ModelRef` is a provider and the provider's model
   ID). The catalog is keyed by provider and then by model ID, so neither can
   repeat. Provider names and icons are fixed per provider and never sent.
-- Anyone can pick a model the thread's catalog offers. The client sends
-  `SelectModel`. The host applies it in arrival order if its catalog offers
-  the model, ignores it otherwise, and broadcasts `ModelSelected`. A peer
+- The host and `Admin` peers can pick a model the thread's catalog offers.
+  The client sends `SelectModel`. The host checks `ChangeModel`, then applies
+  it in arrival order if its catalog offers the model, ignores it otherwise,
+  and broadcasts `ModelSelected`. A peer
   waits for that confirmation before showing the new selection, since the
   host's catalog may have changed. Picking a host model does not change the
   default for new local threads.
@@ -464,15 +564,28 @@ This is independent of the draft document and is the first feature to build.
   (see [Protocol](#protocol)), then streams the bytes of every attachment
   in the thread.
 - **Falling behind**: a collaborator that lags the host's event buffer
-  receives a new `Welcome`. It **merges** the draft state into its existing
-  replica instead of replacing it, so its unsent local edits survive.
-- **Collaborator disconnects**: its presence disappears. The host applies the
-  empty-item and incomplete-upload cleanup described above.
+  receives a new `Welcome` with its per-peer `draft_generation`. A matching
+  generation merges draft state, preserving unsent edits; a newer one
+  replaces the replica with a fresh Yrs client ID.
+- **Denied optimistic edits**: rejecting a peer's current epoch for revoked
+  edit permission advances only that peer's generation. Queued updates from
+  that rejected epoch stay denied after regrant. `DraftReset` installs the
+  assigned generation and authoritative state; repeated resets at that same
+  epoch merge, preserving fresh authorized edits instead of erasing them.
+- **Collaborator disconnects**: its presence and permission override disappear.
+  The host applies the empty-item and incomplete-upload cleanup described above.
+- **Host stops sharing**: while membership and the broadcast channel still
+  exist, the host runs departure cleanup for every peer, removing unfinished
+  upload records and buffers, presence, overrides, and unattended empty items.
+  It then clears membership and draft generations and ends hosting. Repeated
+  serving-task departure cleanup is harmless; accepted content remains local.
 - **Host disconnects**: the session ends and collaborators' copies of the
   thread are removed, as today. Host migration is out of scope.
-- **Invalid host data**: if a transcript message or agent event from the host
-  is not valid Rig JSON, the collaborator treats it as a protocol error and
-  removes its mirrored thread. The application stays open.
+- **Invalid host data**: invalid draft snapshots, inconsistent transcript/run
+  snapshots, or invalid Rig JSON in transcript messages or agent events are
+  protocol errors. The collaborator removes its mirrored thread; the
+  application stays open. `Welcome` validates draft and transcript/run state
+  before installation.
 
 Nothing is persisted. A draft lives as long as its thread exists in the
 host's app.
@@ -508,9 +621,15 @@ AttachmentRecord (atomic value)
 
 CommentTarget (atomic value)
 ├── message_id                      agent message or comment reply
-├── range                           byte range in the message's markdown source
+├── start                           inclusive UTF-8 byte offset
+├── end                             exclusive UTF-8 byte offset
 └── quote                           display text captured at creation
 ```
+
+The stored comment target's keys are `message_id`, `start`, `end`, and
+`quote`; the Rust `CommentTarget` API exposes `start..end` as `range`.
+Attachment metadata uses `id`, `name`, `kind`, `size`, and `creator`.
+Both are atomic Yrs `Any` values, not nested collaborative maps.
 
 Design decisions:
 
@@ -525,8 +644,8 @@ Design decisions:
   duplicate submissions.
 - **Creator in the item.** It arrives atomically with the item, so no item is
   ever shown without a creator. Clients never write it after creation. The
-  host enforces this. Future authentication is enforced at the host, not in
-  the document.
+  host checks this through the applies-first structural validation below.
+  Future authentication belongs at the host, not in the document.
 - **Atomic targets and attachment records.** Their fields describe one
   coherent value and must never merge field by field.
 - **Bodies are Yrs `Text`.** Version 1 writes plain unformatted text. The
@@ -540,64 +659,101 @@ Design decisions:
 
 ### State outside the document
 
-| State                               | Where it lives                                           |
-| ----------------------------------- | -------------------------------------------------------- |
-| Participants and profiles           | Host session, synced by protocol; colors from UUIDs      |
-| Prompt names and agent transcript   | Thread state at the host, mirrored by protocol           |
-| Presence                            | Host-relayed protocol messages                           |
-| Selected model                      | Thread state at the host, synced by protocol             |
-| Submission sequence                 | Thread state at the host                                 |
-| Attachment bytes and stored status  | Host byte store keyed by attachment ID, relayed to peers |
-| Published timeline, agent runs      | Thread state, synced by the existing host events         |
-| Folding, scroll, local errors, etc. | Local UI state                                           |
+| State                               | Where it lives                                                           |
+| ----------------------------------- | ------------------------------------------------------------------------ |
+| Participants and profiles           | Host session, synced by protocol; colors from UUIDs                      |
+| Prompt names and agent transcript   | Thread state at the host, mirrored by protocol                           |
+| Presence                            | Host-relayed protocol messages                                           |
+| Selected model                      | Thread state at the host, synced by protocol                             |
+| Peer default and sparse overrides   | Host-owned thread state, mirrored by snapshots and events                |
+| Per-peer draft generation           | Host session per connection; receiving peer's `Welcome` and `DraftReset` |
+| Submission sequence                 | Thread state at the host                                                 |
+| Attachment bytes and stored status  | Host byte store keyed by attachment ID, relayed to peers                 |
+| Published timeline, agent runs      | Thread state, synced by the existing host events                         |
+| Folding, scroll, local errors, etc. | Local UI state                                                           |
 
 ## Protocol
 
 All traffic goes through the host. Collaborators never talk to each other.
-The messages below are conceptual. Names and shapes will follow the existing
-`protocol.rs` style.
+`protocol.rs` defines the wire messages; the current version is **19** and
+versions must match exactly. `Join` keeps its variant index and version as
+its only field; `Rejected` keeps its variant index and string payload so a
+version mismatch can still be reported. Runtime permission denials use the
+separate `PermissionDenied`, never this stable handshake rejection.
 
 **Collaborator to host**
 
-| Message          | Purpose                                                |
-| ---------------- | ------------------------------------------------------ |
-| `Join`           | First message; carries the protocol version            |
-| `Profile`        | Second message, and again whenever the profile changes |
-| `DraftUpdate`    | Encoded Yrs update from a local transaction            |
-| `Presence`       | Replaces this participant's presence state             |
-| `AttachmentData` | Bytes of an attachment this participant added          |
-| `Submit`         | Requests a submission at the given sequence            |
-| `Stop`           | Stops the named agent run                              |
-| `SelectModel`    | Selects a model by provider and model ID               |
+| Message               | Purpose                                                                                                |
+| --------------------- | ------------------------------------------------------------------------------------------------------ |
+| `Join`                | First message; carries the protocol version                                                            |
+| `Profile`             | Second message, and again whenever the profile changes                                                 |
+| `DraftUpdate`         | `{ generation, update }`: encoded Yrs update; requires the peer's current epoch and `Write` or `Admin` |
+| `Presence`            | Replaces this participant's presence; host sanitizes readers to empty                                  |
+| `AttachmentData`      | Upload chunks; requires draft-write access or an already accepted record                               |
+| `AttachmentCancelled` | Cancels this peer's upload, including after revocation                                                 |
+| `Submit`              | Requests a submission at the given sequence; requires `Admin`                                          |
+| `Stop`                | Stops the named agent run; same permission as `Submit`                                                 |
+| `SelectModel`         | Selects a model by provider and model ID; requires `Admin`                                             |
 
 **Host to collaborators**
 
-| Message                                      | Purpose                                                                                                                                                                                                                                                                                    |
-| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `Welcome`                                    | Participant UUID, timeline snapshot (including the model catalog and selected model, transcript, each agent message's prompt position, pending events and run state, and prompt names), draft state, participants, their profiles and presence, submission sequence, stored attachment IDs |
-| `Rejected`                                   | Join refused (e.g. protocol version) or a request refused; peer-specific                                                                                                                                                                                                                   |
-| `DraftUpdate`                                | Yrs update from another participant or the host                                                                                                                                                                                                                                            |
-| `ParticipantJoined` / `Left`                 | Membership changes; joining carries the participant's profile                                                                                                                                                                                                                              |
-| `ProfileChanged`                             | A participant's new profile                                                                                                                                                                                                                                                                |
-| `Presence`                                   | A participant's latest presence                                                                                                                                                                                                                                                            |
-| `AttachmentData`                             | Relayed attachment bytes                                                                                                                                                                                                                                                                   |
-| `AttachmentStored`                           | The host holds every byte of an attachment                                                                                                                                                                                                                                                 |
-| `ModelSelected`                              | The thread's model changed                                                                                                                                                                                                                                                                 |
-| `ModelCatalogChanged`                        | Replaces the thread's model catalog (including with an empty one)                                                                                                                                                                                                                          |
-| `UserMessage`                                | An accepted submission, now carrying its sequence, creators, and attachment references instead of bytes                                                                                                                                                                                    |
-| `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and whether it completed, was stopped, or failed (with a message)                                                                                                                                                |
-| `AgentEvent`                                 | What the host's agent loop reported during a run, which everyone folds into the agent message and transcript                                                                                                                                                                               |
-| `PromptNamed`                                | A participant's prompt name, fixed on their first submitted item                                                                                                                                                                                                                           |
+| Message                                      | Purpose                                                                                                                                                                                                                                                                     |
+| -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `Welcome`                                    | Participant UUID, timeline and transcript snapshot (models, run state, prompt names), draft and receiving peer's `draft_generation`, participants, profiles, presence, stored attachment IDs, and peer permissions; submission count comes from the timeline; peer-specific |
+| `Rejected`                                   | Join refused (e.g. protocol version); stable handshake encoding, then disconnect; peer-specific                                                                                                                                                                             |
+| `PermissionDenied`                           | Runtime denial with participant UUID, operation, and reason (`NotParticipant`, `InsufficientMode`, `HostOnly`, or `StaleDraftGeneration`); peer-specific, connection stays open                                                                                             |
+| `DraftReset`                                 | `{ generation, state }`: peer-specific authoritative draft; matching epoch merges, newer epoch replaces, older epoch is ignored                                                                                                                                             |
+| `DefaultPeerModeChanged`                     | Host-owned live default changed; inheriting peers immediately follow it                                                                                                                                                                                                     |
+| `PeerModeOverrideChanged`                    | Host-owned per-connection override changed; `None` resumes inheritance                                                                                                                                                                                                      |
+| `DraftUpdate`                                | Untagged Yrs update from another participant or the host; per-peer generations tag only collaborator requests                                                                                                                                                               |
+| `ParticipantJoined` / `ParticipantLeft`      | Membership changes; joining carries the participant's profile                                                                                                                                                                                                               |
+| `ProfileChanged`                             | A participant's new profile                                                                                                                                                                                                                                                 |
+| `Presence`                                   | A participant's latest presence                                                                                                                                                                                                                                             |
+| `AttachmentData`                             | Relayed attachment bytes                                                                                                                                                                                                                                                    |
+| `AttachmentStored`                           | The host holds every byte of an attachment                                                                                                                                                                                                                                  |
+| `ModelSelected`                              | The thread's model changed                                                                                                                                                                                                                                                  |
+| `ModelCatalogChanged`                        | Replaces the thread's model catalog (including with an empty one)                                                                                                                                                                                                           |
+| `UserMessage`                                | An accepted submission with creators and attachment references instead of bytes; advances the submission count                                                                                                                                                              |
+| `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and whether it completed, was stopped, or failed (with a message)                                                                                                                                 |
+| `AgentEvent`                                 | What the host's agent loop reported during a run, which everyone folds into the agent message and transcript                                                                                                                                                                |
+| `PromptNamed`                                | A participant's prompt name, fixed on their first submitted item                                                                                                                                                                                                            |
 
 The host is itself a participant. Its local edits, submissions, stops, and
-model changes go through the same logic as a collaborator's.
+model changes go through the same authorization paths as a collaborator's,
+with the host always authorized. Permission defaults and overrides are
+host-authoritative state in `ThreadSnapshot`; the host applies and broadcasts
+their change events, and `ParticipantLeft` removes the departing override.
+There is no collaborator command to manage access.
 
 Attachment bytes travel in bounded chunks, or on their own stream, so a
 large file never delays draft updates or presence.
 
 ## Validation
 
-After applying a collaborator's `DraftUpdate`, the host checks:
+Authorization and structural validation are separate. For a collaborator's
+`DraftUpdate { generation, update }`, the host checks membership, the peer's
+current generation, and `EditDraft` permission **before decoding, applying,
+or broadcasting** bytes. A denial sends `PermissionDenied` followed by
+`DraftReset { generation, state }` only to that peer, without changing the
+host draft or disconnecting it.
+
+Each connection starts at generation 0. Rejecting its **current** epoch for
+revoked edit permission advances only that peer's epoch once. A mismatched
+epoch is denied as `StaleDraftGeneration`, even after regrant, without
+advancing again. Constructing or repeating a reset never advances the epoch.
+The generation is a replica fence, not a thread-wide revision, submission
+sequence, or counter of permission changes.
+
+`Welcome` and `DraftReset` use the same installation rules: older draft
+generations are ignored; matching generations merge, retaining fresh unsent
+edits; only a newer generation replaces the document with a fresh Yrs client
+ID. Replacement invalidates item and draft-position editor handles and sync
+baselines, retaining comment folding and pruning obsolete upload bookkeeping.
+Queued events from old editors therefore cannot replay rejected input after
+regrant.
+
+For an **authorized** update, the existing structural path still applies and
+broadcasts it first, then checks:
 
 - the document has only the `order` and `items` roots;
 - every `order` entry is unique and has an item, and every item is in
@@ -608,11 +764,13 @@ After applying a collaborator's `DraftUpdate`, the host checks:
 - bodies contain only version-1 content;
 - attachment records are well-formed, unique by ID, and within size limits.
 
-Any violation is a protocol error, and the host disconnects the peer. The
-update has already been applied by then. With no authentication this is a
-defensive check, not a security boundary. If authentication makes this
-insufficient, the host can validate each update against a scratch copy
-before applying it.
+Any structural violation is a protocol error, and the host disconnects the
+peer. The update has already been applied and broadcast, with no rollback.
+Permission enforcement prevents unauthorized draft writes; it does **not**
+make malicious writes by authorized peers safe. Structural validation is
+still a defensive check, not a security boundary. Validating against a
+scratch copy before applying and broadcasting would be needed to isolate
+such writes.
 
 Protocol versions must match exactly and nothing is persisted, so the
 document needs no schema version or compatibility with older clients.
@@ -624,8 +782,30 @@ document needs no schema version or compatibility with older clients.
 - **Threading.** Each client's replica lives in its GPUI `Thread` entity.
   Transactions are synchronous and never cross an `await`. The Tokio side
   moves only encoded bytes. The host's replica is authoritative.
-- **Optimistic local edits.** Local edits never wait for the network. Queued
-  outgoing updates may be merged while the channel is busy.
+- **Authorization.** `thread/permissions.rs` checks current actor membership
+  and policy on each operation. Sealed operation types (`EditDraft`,
+  `ControlGeneration`, `ChangeModel`, `ManageAccess`) select closure-scoped
+  `Authorized` guards. Callers cannot construct or retain guards, and guards
+  expose neither raw `Thread` nor Yrs `Doc` access.
+- **Thread subtree.** `ThreadDraft`, sharing, and submission are nested as
+  `thread::draft`, `thread::sharing`, and `thread::submission`; generation is
+  under `thread::submission::generation`. Their files remain at their original
+  paths. Participant identity/membership, model catalog, and ownership are
+  private, as are general host-event `apply`/`try_apply`, `emit`, and `publish`.
+  Outside callers use read accessors, authorized operations, and narrow
+  maintenance APIs for hosting, catalogs, profiles, and locally stored files,
+  not arbitrary event injection. Test-only helpers provide trusted setup.
+- **Editor cache.** `DraftEditorState` is separate from the canonical draft.
+  Rendering can update editor caches without edit permission. Policy changes
+  reconcile read-only inputs, typing presence, and pending reads immediately;
+  rendering reconciles text and IME with a window. Mutations and asynchronous
+  attachment callbacks recheck the destination draft's access, not whichever
+  thread is currently active.
+- **Optimistic local edits.** Authorized local edits never wait for the
+  network. Queued outgoing updates may be merged while the channel is busy;
+  if the host rejects their epoch, a newer-generation `DraftReset` discards
+  the optimistic history. Updates from that epoch stay fenced after regrant;
+  matching-generation resets merge fresh edits.
 - **Offsets.** Application-facing text offsets are UTF-8 bytes, converted to
   Yrs offsets at the boundary. Carets and selections that must survive
   concurrent edits use sticky indices.
@@ -667,9 +847,6 @@ These fit the design without changing the document layout:
   already separate from starting a run. Queueing means accepting while
   generating, showing the accepted message as pending, and running it after
   the current run.
-- **Permissions**: binary edit/view. The host drops draft updates, presence
-  edits, `Submit`, `Stop`, and `SelectModel` from viewers. Viewers get the
-  current read-only rendering. Nothing changes in the document.
 - **Authentication**: the host maps authenticated identities to participant
   UUIDs and enforces `creator`.
 - **Contributor history**: the host can derive which items each participant's
@@ -684,6 +861,8 @@ reconnects, collaborative undo semantics beyond undoing local changes, and an
 invitation format beyond today's endpoint ID.
 
 ## Acceptance scenarios
+
+Unless stated otherwise, peers inherit the initial `Admin` default.
 
 **Two participants start from empty**
 
@@ -745,6 +924,24 @@ invitation format beyond today's endpoint ID.
 1. Carol, a collaborator, changes the model. Every picker updates, and the
    next run uses it.
 2. During the run, Bob presses Stop. The host cancels the run for everyone.
+
+**Live peer access**
+
+1. The host changes the default from `Admin` to `Write`. Inheriting peers
+   keep editing everyone's items and attachments but cannot submit, stop, or
+   change the model. An explicit `Admin` override stays unchanged.
+2. Downgrading a peer to `ReadOnly` cancels pending reads, not uploads whose
+   records were already accepted. The host clears and rebroadcasts stale
+   editing presence. Draft, model, and agent updates stay live.
+3. An edit racing revocation is denied before host apply/broadcast; only its
+   sender's epoch advances, and it receives `PermissionDenied` and `DraftReset`.
+   Old-epoch updates remain denied after restoring `Write`, without advancing
+   again. Fresh-epoch edits converge; repeated same-epoch resets preserve them.
+4. A same-epoch `Welcome` preserves unsent edits; a newer-epoch snapshot or
+   reset invalidates old editor caches and rejected history.
+5. Leaving removes the override; a rejoin inherits the current default.
+   Stopping sharing cleans every peer's unfinished uploads before membership
+   is cleared, leaving the host's draft usable locally.
 
 **Late join**
 

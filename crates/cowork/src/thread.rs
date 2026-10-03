@@ -7,9 +7,23 @@ use std::{
     time::Duration,
 };
 
+use ::draft::{AttachmentId, DraftItem, ItemId};
 use agent::TurnFold;
 use anyhow::Context as _;
-use draft::{AttachmentId, ItemId};
+
+#[path = "thread_draft.rs"]
+pub(crate) mod draft;
+mod permissions;
+#[path = "sharing.rs"]
+pub(crate) mod sharing;
+#[path = "submission.rs"]
+pub(crate) mod submission;
+pub(crate) use permissions::{
+    ChangeModel, ControlGeneration, DenialReason, EditDraft, ManageAccess, PeerMode,
+    PeerPermissions, PermissionDenied, PermissionOperation,
+};
+
+use self::draft::{DraftEditorState, ThreadDraft};
 use gpui::{App, AppContext, Entity, SharedString};
 use iroh::{Endpoint, endpoint::Connection};
 use itertools::Itertools;
@@ -22,7 +36,6 @@ use crate::{
     participant::ParticipantId,
     profile::Profile,
     protocol,
-    thread_draft::ThreadDraft,
     timeline::{AgentMessage, TimelineMessage},
     transcript::validate_agent_runs,
 };
@@ -97,13 +110,6 @@ impl ThreadSharing {
             Self::Failed => SharingStatus::Failed,
         }
     }
-
-    pub(crate) fn is_collaborating(&self) -> bool {
-        matches!(
-            self,
-            Self::Sharing | Self::Shared { .. } | Self::Connected { .. }
-        )
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,12 +119,6 @@ pub(crate) enum ThreadOwnership {
 }
 
 impl ThreadOwnership {
-    /// Every participant edits the draft. Read-only viewers will come with
-    /// sharing permissions, which the read-only rendering is kept for.
-    pub(crate) fn can_write(self) -> bool {
-        true
-    }
-
     pub(crate) fn remove_on_disconnect(self) -> bool {
         matches!(self, Self::Remote)
     }
@@ -131,10 +131,10 @@ pub(crate) struct Thread {
     pub(crate) summary: ThreadSummary,
     /// Who the local user is in this thread: the app's own id for local and
     /// hosted threads, the id the host assigned for mirrored ones.
-    pub(crate) participant_id: ParticipantId,
+    participant_id: ParticipantId,
     /// Connected participants in join order, starting with the host. Empty
     /// while the thread is not shared.
-    pub(crate) participants: Vec<ParticipantId>,
+    participants: Vec<ParticipantId>,
     /// The profile of everyone who has joined while shared, kept after they
     /// leave so their messages still name them. Includes the local user's,
     /// although [`Cowork::profile`] is what shows for them.
@@ -158,10 +158,10 @@ pub(crate) struct Thread {
     pub(crate) tokens_used: u64,
     /// The selected model. It may be missing from `models`, in which case it
     /// cannot run until another is picked; see [`Thread::runnable_model`].
-    pub(crate) model: Option<ModelRef>,
+    model: Option<ModelRef>,
     /// The models this thread can run: the catalog of whoever runs its agent,
     /// which is this app's own unless the thread is mirrored.
-    pub(crate) models: Arc<ModelCatalog>,
+    models: Arc<ModelCatalog>,
     /// How much of the context window the thread fills, as the provider
     /// reported at the end of the last agent request that reported usage.
     /// `None` until one has; see [`Thread::live_context_tokens`].
@@ -171,10 +171,17 @@ pub(crate) struct Thread {
     /// estimates agree.
     pub(crate) streamed_bytes: u64,
     pub(crate) timeline: Vec<TimelineMessage>,
-    pub(crate) draft: ThreadDraft,
+    draft: ThreadDraft,
+    peer_permissions: PeerPermissions,
+    /// A peer's epoch advances only when its current replica is rejected.
+    /// Keeping this independent of policy prevents queued updates from becoming
+    /// valid merely because Write was regranted.
+    peer_draft_generations: HashMap<ParticipantId, u64>,
+    /// The local mirror's epoch, installed only with authoritative draft state.
+    draft_generation: u64,
     pub(crate) generating: bool,
     pub(crate) sharing: ThreadSharing,
-    pub(crate) ownership: ThreadOwnership,
+    ownership: ThreadOwnership,
 }
 
 /// A host snapshot whose transcript and agent runs have been checked before
@@ -186,6 +193,226 @@ pub(crate) struct PreparedWelcome {
 }
 
 impl Thread {
+    pub(crate) fn new_local(
+        title: String,
+        timeline: Vec<TimelineMessage>,
+        mut draft: ThreadDraft,
+        participant_id: ParticipantId,
+        models: Arc<ModelCatalog>,
+        model: Option<ModelRef>,
+    ) -> Self {
+        // A draft prepared before the thread existed is already in its initial
+        // snapshot; do not later publish its old edits as new local updates.
+        draft.take_local_update();
+        let id = Uuid::new_v4();
+        Self {
+            instance_id: id,
+            summary: ThreadSummary { id, title },
+            participant_id,
+            participants: Vec::new(),
+            profiles: HashMap::new(),
+            transcript: Vec::new(),
+            agent_turn: TurnFold::default(),
+            prompt_names: HashMap::new(),
+            tokens_used: 0,
+            model,
+            models,
+            context_tokens: None,
+            streamed_bytes: 0,
+            timeline,
+            draft,
+            peer_permissions: PeerPermissions::default(),
+            peer_draft_generations: HashMap::new(),
+            draft_generation: 0,
+            generating: false,
+            sharing: ThreadSharing::NotShared,
+            ownership: ThreadOwnership::Local,
+        }
+    }
+
+    pub(crate) fn participant_id(&self) -> ParticipantId {
+        self.participant_id
+    }
+    pub(crate) fn participants(&self) -> &[ParticipantId] {
+        &self.participants
+    }
+    pub(crate) fn ownership(&self) -> ThreadOwnership {
+        self.ownership
+    }
+    pub(crate) fn models(&self) -> &Arc<ModelCatalog> {
+        &self.models
+    }
+    pub(crate) fn draft_generation(&self) -> u64 {
+        self.draft_generation
+    }
+
+    /// The epoch to include in this peer's Welcome, captured together with its
+    /// draft snapshot and event subscription on the foreground thread.
+    pub(crate) fn draft_generation_for(&self, actor: ParticipantId) -> u64 {
+        self.peer_draft_generations
+            .get(&actor)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    pub(crate) fn draft(&self) -> &ThreadDraft {
+        &self.draft
+    }
+    pub(crate) fn model(&self) -> Option<&ModelRef> {
+        self.model.as_ref()
+    }
+
+    pub(crate) fn update_draft_editors<R>(
+        &mut self,
+        f: impl FnOnce(&[DraftItem], &mut DraftEditorState) -> R,
+    ) -> R {
+        self.draft.update_draft_editors(f)
+    }
+
+    /// Full authoritative state and the already assigned epoch for one peer.
+    /// Reading another reset for stale queued bytes never advances the epoch.
+    pub(crate) fn draft_reset_for(&self, actor: ParticipantId) -> protocol::HostMessage {
+        protocol::HostMessage::DraftReset {
+            generation: self.draft_generation_for(actor),
+            state: self.draft.encode_state(),
+        }
+    }
+
+    /// Registers hosting without exposing mutable membership or deriving the
+    /// authority role from transport state. Mirrors cannot become hosts here.
+    pub(crate) fn start_hosting(&mut self, endpoint: Endpoint) -> bool {
+        if !self.is_host()
+            || matches!(
+                self.sharing,
+                ThreadSharing::Shared { .. } | ThreadSharing::Connected { .. }
+            )
+        {
+            return false;
+        }
+        let (events, _) = broadcast::channel(THREAD_EVENT_CAPACITY);
+        self.participants.clear();
+        self.participants.push(self.participant_id);
+        self.peer_draft_generations.clear();
+        self.draft.presence.clear();
+        self.sharing = ThreadSharing::Shared { endpoint, events };
+        true
+    }
+
+    /// Cleans departing peers while membership and the broadcast channel still
+    /// exist. Later serving-task teardown can safely repeat participant_left.
+    pub(crate) fn stop_hosting(&mut self, cx: &mut impl AppContext) -> Option<Endpoint> {
+        if !self.is_host() || !matches!(self.sharing, ThreadSharing::Shared { .. }) {
+            return None;
+        }
+        self.cleanup_hosted_participants(cx);
+        let ThreadSharing::Shared { endpoint, .. } =
+            std::mem::replace(&mut self.sharing, ThreadSharing::NotShared)
+        else {
+            unreachable!()
+        };
+        Some(endpoint)
+    }
+
+    fn cleanup_hosted_participants(&mut self, cx: &mut impl AppContext) {
+        let peers = self
+            .participants
+            .iter()
+            .copied()
+            .filter(|actor| *actor != self.participant_id)
+            .collect::<Vec<_>>();
+        for actor in peers {
+            self.participant_left(actor, cx);
+        }
+        self.participants.clear();
+        self.peer_draft_generations.clear();
+        self.draft.presence.clear();
+    }
+
+    /// Source catalogs are host maintenance, not an Admin peer model command.
+    pub(crate) fn set_model_catalog(
+        &mut self,
+        catalog: ModelCatalog,
+        cx: &mut impl AppContext,
+    ) -> bool {
+        if !self.is_host() {
+            return false;
+        }
+        if *self.models != catalog {
+            self.emit(protocol::HostMessage::ModelCatalogChanged(catalog), cx);
+        }
+        true
+    }
+
+    /// Cosmetic profile changes are allowed for every connected member.
+    pub(crate) fn host_profile(
+        &mut self,
+        actor: ParticipantId,
+        profile: protocol::Profile,
+        cx: &mut impl AppContext,
+    ) -> bool {
+        if !self.is_host() || (actor != self.participant_id && !self.participants.contains(&actor))
+        {
+            return false;
+        }
+        self.emit(
+            protocol::HostMessage::ProfileChanged {
+                participant: actor.into_bytes(),
+                profile,
+            },
+            cx,
+        );
+        true
+    }
+
+    pub(crate) fn update_local_profile(
+        &mut self,
+        profile: &Profile,
+        cx: &mut impl AppContext,
+    ) -> bool {
+        if self.is_host() {
+            return self.host_profile(self.participant_id, profile.to_protocol(), cx);
+        }
+        if !self.participants.contains(&self.participant_id) {
+            return false;
+        }
+        self.request(protocol::CollaboratorMessage::Profile(
+            profile.to_protocol(),
+        ))
+    }
+
+    /// Marks only a matching locally authored file the host already has in full.
+    /// Remote uploads use receive_upload's accepted-transfer path instead.
+    pub(crate) fn mark_local_attachment_stored(
+        &mut self,
+        id: AttachmentId,
+        cx: &mut impl AppContext,
+    ) -> bool {
+        if !self.is_host() {
+            return false;
+        }
+        let Some(file) = self.draft.files.get(&id) else {
+            return false;
+        };
+        let accepted = self.draft.attachment_records().iter().any(|record| {
+            record.id == id
+                && record.creator == self.participant_id.as_uuid()
+                && record.name == file.name
+                && record.kind == file.kind()
+                && record.size == file.len()
+        });
+        if !accepted {
+            return false;
+        }
+        self.emit(
+            protocol::HostMessage::AttachmentStored {
+                id: id.as_uuid().into_bytes(),
+                uploader: self.participant_id.into_bytes(),
+            },
+            cx,
+        );
+        true
+    }
+
     /// Builds the local mirror of a thread hosted by someone else.
     pub(crate) fn from_prepared_welcome(
         prepared: PreparedWelcome,
@@ -213,18 +440,30 @@ impl Thread {
             streamed_bytes: 0,
             timeline: Vec::new(),
             draft,
+            peer_permissions: PeerPermissions::default(),
+            peer_draft_generations: HashMap::new(),
+            draft_generation: 0,
             generating: false,
             sharing,
             ownership: ThreadOwnership::Remote,
         };
-        thread.apply_welcome(prepared, cx);
+        thread
+            .apply_welcome(prepared, cx)
+            .expect("a prepared welcome installs checked draft state");
         thread
     }
 
-    /// Validates the nested Rig JSON in an untrusted host snapshot, and that
-    /// its agent messages fit its transcript, before an entity is created or
-    /// existing thread state is changed.
+    /// Validates a host's draft snapshot and nested Rig JSON, including that
+    /// agent messages fit the transcript, before creating a mirror or installing
+    /// a replacement epoch into an existing one.
     pub(crate) fn prepare_welcome(welcome: protocol::Welcome) -> anyhow::Result<PreparedWelcome> {
+        // Epoch changes install a fresh document, so check its state before
+        // constructing a mirror or changing any existing thread state.
+        let snapshot = ::draft::Draft::new();
+        snapshot
+            .apply_update(&welcome.draft)
+            .context("invalid host draft snapshot")?;
+        snapshot.validate().context("invalid host draft snapshot")?;
         let transcript = parse_transcript(&welcome.thread.transcript)?;
         let agent_messages = welcome
             .thread
@@ -242,20 +481,23 @@ impl Thread {
         })
     }
 
-    /// Applies a snapshot received from the host, replacing authoritative
-    /// state but merging the draft so unsent local edits survive.
-    pub(crate) fn try_rebase(
+    /// Replaces authoritative state, retaining unsent edits only when the
+    /// host's peer epoch still matches the local replica's epoch.
+    fn try_rebase(
         &mut self,
         welcome: protocol::Welcome,
         cx: &mut impl AppContext,
     ) -> anyhow::Result<()> {
         let prepared = Self::prepare_welcome(welcome)?;
-        self.apply_welcome(prepared, cx);
-        Ok(())
+        self.apply_welcome(prepared, cx)
     }
 
-    /// Installs a checked snapshot, merging the draft to retain unsent edits.
-    fn apply_welcome(&mut self, prepared: PreparedWelcome, cx: &mut impl AppContext) {
+    /// Installs a checked snapshot with epoch-aware draft replacement.
+    fn apply_welcome(
+        &mut self,
+        prepared: PreparedWelcome,
+        cx: &mut impl AppContext,
+    ) -> anyhow::Result<()> {
         let PreparedWelcome {
             welcome,
             transcript,
@@ -264,9 +506,11 @@ impl Thread {
             participant_id,
             mut thread,
             draft,
+            draft_generation,
             presence,
             stored_attachments,
         } = welcome;
+        self.install_draft_state(draft_generation, &draft)?;
         self.draft.stored = stored_attachments
             .into_iter()
             .map(|id| AttachmentId::from_uuid(Uuid::from_bytes(id)))
@@ -276,9 +520,7 @@ impl Thread {
         self.draft.keeps_removed_files = true;
         self.participant_id = ParticipantId::from_bytes(participant_id);
         self.draft.author = self.participant_id;
-        if let Err(error) = self.draft.doc.apply_update(&draft) {
-            eprintln!("failed to merge the host's draft: {error:#}");
-        }
+
         self.draft.presence.clear();
         for (participant, presence) in presence {
             self.draft
@@ -300,6 +542,8 @@ impl Thread {
                 )
             })
             .collect();
+        self.peer_permissions = std::mem::take(&mut thread.peer_permissions);
+        self.clear_read_only_presence(cx);
         self.models = Arc::new(std::mem::take(&mut thread.models));
         self.model = thread.model.take();
         self.context_tokens = thread.context_tokens;
@@ -313,6 +557,23 @@ impl Thread {
         self.summary = summary;
         self.set_timeline(timeline);
         self.restore_agent_output(cx);
+        Ok(())
+    }
+
+    /// A repeated reset for stale queued bytes must not erase edits made from
+    /// the already fresh replica. Matching epochs merge; only a newer epoch
+    /// replaces the document and invalidates editor handles.
+    fn install_draft_state(&mut self, generation: u64, state: &[u8]) -> anyhow::Result<()> {
+        if generation < self.draft_generation {
+            return Ok(());
+        }
+        if generation == self.draft_generation {
+            self.draft.doc.apply_update(state)?;
+        } else {
+            self.draft.reset(state)?;
+            self.draft_generation = generation;
+        }
+        Ok(())
     }
 
     pub(crate) fn to_protocol(&self) -> protocol::ThreadSnapshot {
@@ -333,6 +594,7 @@ impl Thread {
                 .collect(),
             models: (*self.models).clone(),
             model: self.model.clone(),
+            peer_permissions: self.peer_permissions.clone(),
             context_tokens: self.context_tokens,
             streamed_bytes: self.streamed_bytes,
             messages: self
@@ -381,7 +643,7 @@ impl Thread {
     /// Sends the draft's local changes to whoever else has a copy: every
     /// collaborator when hosting, the host when mirroring.
     pub(crate) fn flush_draft(&mut self) {
-        let Some(update) = self.draft.doc.take_local_update() else {
+        let Some(update) = self.draft.take_local_update() else {
             return;
         };
         match &self.sharing {
@@ -389,7 +651,10 @@ impl Thread {
                 self.publish(protocol::HostMessage::DraftUpdate(update));
             }
             ThreadSharing::Connected { .. } => {
-                self.request(protocol::CollaboratorMessage::DraftUpdate(update));
+                self.request(protocol::CollaboratorMessage::DraftUpdate {
+                    generation: self.draft_generation,
+                    update,
+                });
             }
             // Whoever joins later receives the whole draft with their welcome.
             ThreadSharing::NotShared | ThreadSharing::Sharing | ThreadSharing::Failed => {}
@@ -398,11 +663,54 @@ impl Thread {
 
     /// Applies a collaborator's draft update and forwards it to everyone.
     ///
-    /// Fails when the update breaks the draft's invariants or changes what
-    /// `author` may not change, such as attributing an item to someone else.
-    /// It has been applied by then; failing only tells the caller to
-    /// disconnect the collaborator.
-    pub(crate) fn apply_collaborator_update(
+    /// Membership, epoch, and EditDraft permission are checked before decoding,
+    /// applying, or broadcasting bytes. Rejecting the current epoch for revoked
+    /// permissions advances only this peer's epoch; stale queued bytes never
+    /// advance it again. The caller sends the denial and draft_reset_for(author)
+    /// to that peer only, including after Write has already been regranted.
+    ///
+    /// Structural validation remains separate: an authorized update that
+    /// breaks invariants has already been applied, and requires disconnecting
+    /// the collaborator under the existing protocol validation policy.
+    fn apply_collaborator_update(
+        &mut self,
+        author: ParticipantId,
+        generation: u64,
+        update: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.is_host(), "only the host accepts collaborator updates");
+        if author != self.participant_id && !self.participants.contains(&author) {
+            return Err(PermissionDenied {
+                participant: author.into_bytes(),
+                operation: PermissionOperation::EditDraft,
+                reason: DenialReason::NotParticipant,
+            }
+            .into());
+        }
+        let expected = self.draft_generation_for(author);
+        if generation != expected {
+            return Err(PermissionDenied {
+                participant: author.into_bytes(),
+                operation: PermissionOperation::EditDraft,
+                reason: DenialReason::StaleDraftGeneration,
+            }
+            .into());
+        }
+        match self.with_authorized::<EditDraft, _>(author, |auth| {
+            auth.apply_collaborator_update(generation, update)
+        }) {
+            Ok(result) => result,
+            Err(denied) => {
+                let next = expected
+                    .checked_add(1)
+                    .context("draft generation exhausted")?;
+                self.peer_draft_generations.insert(author, next);
+                Err(denied.into())
+            }
+        }
+    }
+
+    fn apply_collaborator_update_authorized(
         &mut self,
         author: ParticipantId,
         update: Vec<u8>,
@@ -412,7 +720,7 @@ impl Thread {
         self.draft.doc.apply_update(&update)?;
         self.publish(protocol::HostMessage::DraftUpdate(update));
         self.draft.doc.validate()?;
-        draft::verify_change(&before, &self.draft.doc.items(), author.as_uuid())?;
+        ::draft::verify_change(&before, &self.draft.doc.items(), author.as_uuid())?;
 
         // The host keeps only the bytes of files still attached; submitted
         // ones leave the draft through the host's own submission instead.
@@ -445,8 +753,109 @@ impl Thread {
         uploader: ParticipantId,
         chunk: protocol::AttachmentChunk,
     ) -> anyhow::Result<()> {
+        anyhow::ensure!(self.is_host(), "only the host accepts uploads");
+        let id = AttachmentId::from_uuid(Uuid::from_bytes(chunk.id));
+        let member = uploader == self.participant_id || self.participants.contains(&uploader);
+        if !member {
+            return Err(PermissionDenied {
+                participant: uploader.into_bytes(),
+                operation: PermissionOperation::UploadAttachment,
+                reason: DenialReason::NotParticipant,
+            }
+            .into());
+        }
+        if self
+            .draft
+            .incoming
+            .get(&id)
+            .is_some_and(|file| file.uploader != Some(uploader))
+        {
+            return Err(PermissionDenied {
+                participant: uploader.into_bytes(),
+                operation: PermissionOperation::UploadAttachment,
+                reason: DenialReason::InsufficientMode,
+            }
+            .into());
+        }
+        // A record accepted while the uploader could write remains a bounded
+        // transfer grant after downgrade. Pre-record bytes are never such a grant.
+        if self
+            .check_permission(uploader, PermissionOperation::UploadAttachment)
+            .is_err()
+        {
+            let accepted = self.accepted_upload(uploader, &chunk);
+            if !accepted {
+                return Err(PermissionDenied {
+                    participant: uploader.into_bytes(),
+                    operation: PermissionOperation::UploadAttachment,
+                    reason: DenialReason::InsufficientMode,
+                }
+                .into());
+            }
+        }
         if let Some(id) = self.draft.receive_chunk(chunk, Some(uploader))? {
             self.store_upload(uploader, id)?;
+        }
+        Ok(())
+    }
+
+    fn accepted_upload(&self, uploader: ParticipantId, chunk: &protocol::AttachmentChunk) -> bool {
+        let id = AttachmentId::from_uuid(Uuid::from_bytes(chunk.id));
+        self.draft.attachment_records().iter().any(|record| {
+            record.id == id
+                && record.creator == uploader.as_uuid()
+                && record.name == chunk.name
+                && record.size == chunk.total
+                && record.kind == crate::attachments::kind_from_protocol(chunk.kind)
+        })
+    }
+
+    /// Advances the local sender's bookkeeping without granting draft-edit
+    /// access. An already announced local file may finish after downgrade.
+    pub(crate) fn mark_upload_progress(&mut self, id: AttachmentId, offset: u64) -> bool {
+        if (!self.is_host() && !self.participants.contains(&self.participant_id))
+            || self.draft.stored.contains(&id)
+            || !self
+                .draft
+                .attachment_records()
+                .iter()
+                .any(|record| record.id == id && record.creator == self.participant_id.as_uuid())
+            || !self
+                .draft
+                .files
+                .get(&id)
+                .is_some_and(|file| offset <= file.bytes().len() as u64)
+        {
+            return false;
+        }
+        self.draft.uploads.insert(id, offset);
+        true
+    }
+
+    /// Cancelling an accepted transfer remains allowed after downgrade, but
+    /// cannot discard another participant's bytes or remove a canonical record.
+    pub(crate) fn cancel_upload(
+        &mut self,
+        uploader: ParticipantId,
+        id: AttachmentId,
+    ) -> Result<(), PermissionDenied> {
+        if !self.is_host()
+            || (uploader != self.participant_id && !self.participants.contains(&uploader))
+        {
+            return Err(PermissionDenied {
+                participant: uploader.into_bytes(),
+                operation: PermissionOperation::UploadAttachment,
+                reason: DenialReason::NotParticipant,
+            });
+        }
+        if self
+            .draft
+            .incoming
+            .get(&id)
+            .is_some_and(|file| file.uploader == Some(uploader))
+        {
+            self.draft.incoming.remove(&id);
+            self.draft.discarded.insert(id);
         }
         Ok(())
     }
@@ -480,7 +889,7 @@ impl Thread {
     /// The stored files `participant` needs the bytes of: all but the ones
     /// they attached themselves. Timeline files come first, in order.
     pub(crate) fn files_for(&self, participant: ParticipantId) -> Vec<AttachmentId> {
-        let eligible = |record: &draft::AttachmentRecord| {
+        let eligible = |record: &::draft::AttachmentRecord| {
             record.creator != participant.as_uuid()
                 && self.draft.stored.contains(&record.id)
                 && self.draft.files.contains_key(&record.id)
@@ -543,6 +952,26 @@ impl Thread {
         presence: protocol::Presence,
         cx: &mut impl AppContext,
     ) {
+        if !self.is_host()
+            || (participant != self.participant_id && !self.participants.contains(&participant))
+        {
+            return;
+        }
+        if self
+            .check_permission(participant, PermissionOperation::EditDraft)
+            .is_err()
+        {
+            // Readers may neither announce work that blocks submission nor
+            // nominate an empty canonical item for deletion by leaving it.
+            self.emit(
+                protocol::HostMessage::Presence {
+                    participant: participant.into_bytes(),
+                    presence: protocol::Presence::default(),
+                },
+                cx,
+            );
+            return;
+        }
         let left = self
             .draft
             .presence
@@ -580,6 +1009,12 @@ impl Thread {
         participant: ParticipantId,
         cx: &mut impl AppContext,
     ) {
+        if !self.is_host()
+            || participant == self.participant_id
+            || !self.participants.contains(&participant)
+        {
+            return;
+        }
         // Files they had not finished uploading can never be submitted.
         let unfinished = self
             .draft
@@ -624,6 +1059,32 @@ impl Thread {
     /// Sends a request to the host of a mirrored thread. Returns `false` when
     /// this thread is not mirrored or its connection has closed.
     pub(crate) fn request(&self, request: protocol::CollaboratorMessage) -> bool {
+        let operation = match &request {
+            protocol::CollaboratorMessage::DraftUpdate { generation, .. } => {
+                if *generation != self.draft_generation {
+                    return false;
+                }
+                Some(PermissionOperation::EditDraft)
+            }
+            protocol::CollaboratorMessage::Submit { .. }
+            | protocol::CollaboratorMessage::Stop { .. } => {
+                Some(PermissionOperation::ControlGeneration)
+            }
+            protocol::CollaboratorMessage::SelectModel(_) => Some(PermissionOperation::ChangeModel),
+            protocol::CollaboratorMessage::AttachmentData(_) => {
+                Some(PermissionOperation::UploadAttachment)
+            }
+            _ => None,
+        };
+        if operation.is_some_and(|operation| {
+            self.check_permission(self.participant_id, operation)
+                .is_err()
+                && !matches!(&request, protocol::CollaboratorMessage::AttachmentData(chunk)
+                    if self.participants.contains(&self.participant_id)
+                        && self.accepted_upload(self.participant_id, chunk))
+        }) {
+            return false;
+        }
         let ThreadSharing::Connected { host, .. } = &self.sharing else {
             return false;
         };
@@ -640,7 +1101,17 @@ impl Thread {
     ///
     /// A mirrored thread asks the host to apply the choice; only the host's
     /// broadcast confirms it, since its catalog may have changed meanwhile.
-    pub(crate) fn select_model(&mut self, model: ModelRef, cx: &mut impl AppContext) {
+    pub(crate) fn select_model(
+        &mut self,
+        model: ModelRef,
+        cx: &mut impl AppContext,
+    ) -> Result<(), PermissionDenied> {
+        self.with_authorized::<ChangeModel, _>(self.participant_id, |authorized| {
+            authorized.select_model(model, cx)
+        })
+    }
+
+    fn select_model_authorized(&mut self, model: ModelRef, cx: &mut impl AppContext) {
         if self.model.as_ref() == Some(&model) {
             return;
         }
@@ -654,7 +1125,7 @@ impl Thread {
     /// Selects the thread's model as the host, for the local user and
     /// collaborators alike. Only a model the thread's catalog offers can be
     /// selected.
-    pub(crate) fn host_select_model(&mut self, model: ModelRef, cx: &mut impl AppContext) {
+    fn host_select_model(&mut self, model: ModelRef, cx: &mut impl AppContext) {
         if self.models.contains(&model) {
             self.emit(protocol::HostMessage::ModelSelected(model), cx);
         }
@@ -700,7 +1171,10 @@ impl Thread {
     /// Needed for the changes whose local representation carries more than the
     /// wire form does, such as a user message that also remembers the prompt
     /// the agent was given and whether its comments are folded.
-    pub(crate) fn publish(&self, event: protocol::HostMessage) {
+    fn publish(&self, event: protocol::HostMessage) {
+        if !self.is_host() {
+            return;
+        }
         if let ThreadSharing::Shared { events, .. } = &self.sharing {
             // An error here only means nobody has joined yet.
             _ = events.send(event);
@@ -712,7 +1186,13 @@ impl Thread {
     /// Host and collaborators then run the same [`Thread::apply`] over the same
     /// events, so their timelines stay identical by construction. Only use this
     /// for events that fully describe the change they make.
-    pub(crate) fn emit(&mut self, event: protocol::HostMessage, cx: &mut impl AppContext) {
+    fn emit(&mut self, event: protocol::HostMessage, cx: &mut impl AppContext) {
+        // This is the authoritative host event path, never a way for a mirror
+        // to optimistically change its model or delegate access to itself.
+        if !self.is_host() {
+            eprintln!("only the host can emit thread events");
+            return;
+        }
         // Checked up front so that an unshared thread, which is the common
         // case, never pays to clone a streamed chunk.
         if matches!(self.sharing, ThreadSharing::Shared { .. }) {
@@ -721,13 +1201,53 @@ impl Thread {
         self.apply(event, cx);
     }
 
+    /// Deliberate trusted host setup for tests outside the thread subtree.
+    #[cfg(test)]
+    pub(crate) fn emit_for_test(&mut self, event: protocol::HostMessage, cx: &mut impl AppContext) {
+        self.emit(event, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish_for_test(&self, event: protocol::HostMessage) {
+        self.publish(event);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn apply_for_test(
+        &mut self,
+        event: protocol::HostMessage,
+        cx: &mut impl AppContext,
+    ) {
+        self.apply(event, cx);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn try_apply_for_test(
+        &mut self,
+        event: protocol::HostMessage,
+        cx: &mut impl AppContext,
+    ) -> anyhow::Result<()> {
+        self.try_apply(event, cx)
+    }
+
+    /// Keeps epoch and permission checks in external regression harnesses.
+    #[cfg(test)]
+    pub(crate) fn apply_collaborator_update_for_test(
+        &mut self,
+        actor: ParticipantId,
+        generation: u64,
+        update: Vec<u8>,
+    ) -> anyhow::Result<()> {
+        self.apply_collaborator_update(actor, generation, update)
+    }
+
     /// Folds a thread event into the timeline.
-    pub(crate) fn apply(&mut self, event: protocol::HostMessage, cx: &mut impl AppContext) {
+    fn apply(&mut self, event: protocol::HostMessage, cx: &mut impl AppContext) {
         self.try_apply(event, cx).expect("a valid thread event");
     }
 
     /// Applies an event received from an untrusted host.
-    pub(crate) fn try_apply(
+    fn try_apply(
         &mut self,
         event: protocol::HostMessage,
         cx: &mut impl AppContext,
@@ -737,6 +1257,23 @@ impl Thread {
             // Only ever sent in place of the first `Welcome`, which the join
             // handshake consumes.
             protocol::HostMessage::Rejected(_) => {}
+            protocol::HostMessage::PermissionDenied(denied) => {
+                eprintln!("{denied}");
+            }
+            protocol::HostMessage::DraftReset { generation, state } => {
+                self.install_draft_state(generation, &state)?
+            }
+            protocol::HostMessage::DefaultPeerModeChanged(mode) => {
+                self.peer_permissions.set_default_mode(mode);
+                self.prune_unaccepted_uploads();
+                self.clear_read_only_presence(cx);
+            }
+            protocol::HostMessage::PeerModeOverrideChanged { participant, mode } => {
+                self.peer_permissions
+                    .set_override(ParticipantId::from_bytes(participant), mode);
+                self.prune_unaccepted_uploads();
+                self.clear_read_only_presence(cx);
+            }
             protocol::HostMessage::ParticipantJoined {
                 participant,
                 profile,
@@ -744,6 +1281,9 @@ impl Thread {
                 let participant = ParticipantId::from_bytes(participant);
                 if !self.participants.contains(&participant) {
                     self.participants.push(participant);
+                }
+                if self.is_host() && participant != self.participant_id {
+                    self.peer_draft_generations.entry(participant).or_insert(0);
                 }
                 self.profiles
                     .insert(participant, Profile::from_protocol(profile));
@@ -762,6 +1302,8 @@ impl Thread {
                 self.participants
                     .retain(|existing| *existing != participant);
                 self.draft.presence.remove(&participant);
+                self.peer_permissions.set_override(participant, None);
+                self.peer_draft_generations.remove(&participant);
             }
             protocol::HostMessage::Presence {
                 participant,
@@ -835,6 +1377,60 @@ impl Thread {
             } => self.end_agent_run(id, outcome, duration, cx),
         }
         Ok(())
+    }
+
+    /// Revocation clears attendance and pending work without routing the
+    /// cleanup through host_presence: no reader-controlled empty-item deletion.
+    /// The host rebroadcasts this cleanup, while mirrors also clear immediately
+    /// when applying policy so submission gating never waits for peer cooperation.
+    fn clear_read_only_presence(&mut self, cx: &mut impl AppContext) {
+        let host = self.host_id();
+        let cleared = self
+            .draft
+            .presence
+            .iter()
+            .filter_map(|(actor, (presence, _))| {
+                (Some(*actor) != host
+                    && !self.peer_permissions.mode_for(*actor).can_edit_draft()
+                    && *presence != protocol::Presence::default())
+                .then_some(*actor)
+            })
+            .sorted_by_key(|actor| actor.into_bytes())
+            .collect::<Vec<_>>();
+        for actor in cleared {
+            let presence = protocol::Presence::default();
+            if self.is_host() {
+                self.emit(
+                    protocol::HostMessage::Presence {
+                        participant: actor.into_bytes(),
+                        presence,
+                    },
+                    cx,
+                );
+            } else {
+                self.draft.set_presence(actor, presence);
+            }
+        }
+    }
+
+    /// Discard unannounced buffers as soon as their uploader loses Write.
+    /// Announced records remain transfer grants until removed or disconnected.
+    fn prune_unaccepted_uploads(&mut self) {
+        if !self.is_host() {
+            return;
+        }
+        let records = self.draft.attachment_records();
+        let permissions = &self.peer_permissions;
+        let host = self.participant_id;
+        self.draft.incoming.retain(|id, file| {
+            file.uploader.is_none_or(|uploader| {
+                uploader == host
+                    || permissions.mode_for(uploader).can_edit_draft()
+                    || records
+                        .iter()
+                        .any(|record| record.id == *id && record.creator == uploader.as_uuid())
+            })
+        });
     }
 
     /// How long the agent has spent generating in this thread.
@@ -1002,6 +1598,11 @@ impl protocol::ThreadSnapshot {
 pub(crate) struct ThreadStore {
     pub(crate) threads: VecDeque<Entity<Thread>>,
 }
+
+#[cfg(test)]
+mod review_tests;
+#[cfg(test)]
+mod tests;
 
 impl ThreadStore {
     pub(crate) fn thread(&self, thread_id: Uuid, cx: &App) -> Option<Entity<Thread>> {

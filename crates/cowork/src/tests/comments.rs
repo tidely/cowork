@@ -51,9 +51,9 @@ fn highlighted_segments(
             thread_id: Uuid::new_v4(),
             message_id: Uuid::new_v4(),
         };
-        let draft = ThreadDraft::new(ParticipantId::new());
+        let mut draft = ThreadDraft::new(ParticipantId::new());
         for range in ranges {
-            draft.doc.create_comment(
+            draft.create_comment(
                 draft.author.as_uuid(),
                 CommentTarget {
                     message_id: id.message_id,
@@ -341,9 +341,9 @@ fn assert_backslash_selection_creates_comment(
             text_view.clone()
         };
         let thread_id = Uuid::new_v4();
-        let draft = ThreadDraft::new(ParticipantId::new());
+        let mut draft = ThreadDraft::new(ParticipantId::new());
         if let Some(range) = existing_comment_range.clone() {
-            draft.doc.create_comment(
+            draft.create_comment(
                 draft.author.as_uuid(),
                 CommentTarget {
                     message_id,
@@ -465,7 +465,7 @@ fn assert_backslash_selection_creates_comment(
         let thread = thread.read(cx);
         // New comments are appended after any existing one.
         let Some(comment) = thread
-            .draft
+            .draft()
             .comment_views(&[])
             .into_iter()
             .last()
@@ -475,7 +475,7 @@ fn assert_backslash_selection_creates_comment(
         };
         assert_eq!(comment.reference.quote, expected_quote);
         assert_eq!(comment.reference.range, expected_range);
-        assert_eq!(comment.author, thread.draft.author);
+        assert_eq!(comment.author, thread.draft().author);
         let UserCommentBody::Editing { inline, composer } = &comment.body else {
             unreachable!();
         };
@@ -499,7 +499,7 @@ fn assert_backslash_selection_creates_comment(
                 .thread(cowork.active_thread_id.expect("active thread"), cx)
                 .expect("thread")
                 .read(cx)
-                .draft
+                .draft()
                 .comment_views(&[])
         });
         view.update(cx, |view, cx| {
@@ -753,19 +753,24 @@ fn commenting_on_a_long_response_keeps_the_timeline_scroll_position(cx: &mut gpu
                 .thread(thread_id, cx)
                 .expect("thread");
             let comment_id = thread.update(cx, |thread, _| {
-                let draft = &mut thread.draft;
-                draft.doc.create_comment(
-                    draft.author.as_uuid(),
-                    CommentTarget {
-                        message_id,
-                        range: quote_start..quote_start + quote.len(),
-                        quote: quote.into(),
-                    },
-                    "x",
-                )
+                thread
+                    .with_authorized::<EditDraft, _>(thread.participant_id(), |auth| {
+                        auth.edit(|draft| {
+                            draft.create_comment(
+                                draft.author.as_uuid(),
+                                CommentTarget {
+                                    message_id,
+                                    range: quote_start..quote_start + quote.len(),
+                                    quote: quote.into(),
+                                },
+                                "x",
+                            )
+                        })
+                    })
+                    .expect("host edit")
             });
             cowork.focus_draft_editor(
-                thread.read(cx).draft.id,
+                thread.read(cx).draft().id,
                 EditorSlot::CommentInline(comment_id),
                 None,
                 window,

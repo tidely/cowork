@@ -19,14 +19,14 @@ use uuid::Uuid;
 use crate::{
     assets::Assets,
     composer_attachments::{AttachmentError, PendingAttachment},
-    generation::ActiveGeneration,
     model_picker::ModelPickerState,
     models::{ModelCatalog, ModelRef},
     participant::ParticipantId,
     profile::Profile,
     sharing::JoinDialog,
     sidebar::SIDEBAR_WIDTH,
-    thread::{Thread, ThreadOwnership, ThreadSharing, ThreadStore, ThreadSummary},
+    submission::ActiveGeneration,
+    thread::{Thread, ThreadStore},
     thread_draft::ThreadDraft,
     timeline::{PromptBlock, ThreadMessageId, TimelineMessage},
     timeline_view::{SegmentTextView, ShownSegments},
@@ -41,24 +41,25 @@ mod caret;
 mod composer;
 mod composer_attachments;
 mod draft_editing;
-mod generation;
+
 mod highlight;
 mod model_picker;
 mod models;
 mod participant;
+mod peer_access;
 mod profile;
 mod profile_page;
 mod prompt;
 mod protocol;
 mod search_palette;
-mod sharing;
+
 mod sidebar;
-mod submission;
+
 #[cfg(test)]
 mod test_support;
 mod theme;
 mod thread;
-mod thread_draft;
+use thread::{draft as thread_draft, sharing, submission};
 mod timeline;
 mod timeline_view;
 mod top_bar;
@@ -162,30 +163,7 @@ impl Cowork {
         model: Option<ModelRef>,
         cx: &mut App,
     ) -> Entity<Thread> {
-        let thread_id = Uuid::new_v4();
-        cx.new(|_| Thread {
-            instance_id: thread_id,
-            summary: ThreadSummary {
-                id: thread_id,
-                title,
-            },
-            participant_id,
-            participants: Vec::new(),
-            profiles: HashMap::new(),
-            transcript: Vec::new(),
-            agent_turn: Default::default(),
-            prompt_names: HashMap::new(),
-            tokens_used: 0,
-            model,
-            models,
-            context_tokens: None,
-            streamed_bytes: 0,
-            timeline,
-            draft,
-            generating: false,
-            sharing: ThreadSharing::NotShared,
-            ownership: ThreadOwnership::Local,
-        })
+        cx.new(|_| Thread::new_local(title, timeline, draft, participant_id, models, model))
     }
 
     fn new_empty_local_thread(
@@ -232,12 +210,12 @@ impl Cowork {
                 let thread = thread.read(cx);
                 (
                     thread.timeline.clone(),
-                    thread.draft.comment_views(&thread.participants),
+                    thread.draft().comment_views(thread.participants()),
                 )
             })
             .unwrap_or_else(|| (Vec::new(), self.new_thread_draft.comment_views(&[])));
         let composer = self
-            .writable_draft_id(cx)
+            .readable_draft_id(cx)
             .and_then(|draft_id| self.composer_model(draft_id, window, cx));
         let comments = messages
             .iter()
@@ -385,7 +363,7 @@ impl Render for Cowork {
         let active_thread = self.active_thread(cx);
         self.shown_profiles =
             self.profiles_for(active_thread.as_ref().map(|thread| thread.read(cx)));
-        if let Some(draft_id) = self.writable_draft_id(cx) {
+        if let Some(draft_id) = self.readable_draft_id(cx) {
             self.prepare_draft(draft_id, window, cx);
         }
         self.publish_presence(cx);

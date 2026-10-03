@@ -3,11 +3,14 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    ops::Range,
+    ops::{Deref, Range},
     time::{Duration, Instant},
 };
 
-use draft::{AttachmentId, AttachmentRecord, Draft, DraftItemKind, ItemId, TextEdit};
+use ::draft::{
+    AttachmentId, AttachmentRecord, CommentTarget, Draft, DraftItem, DraftItemKind, ItemId,
+    TextEdit,
+};
 use gpui::{Entity, EntityId};
 use gpui_base::input::TextareaState;
 use uuid::Uuid;
@@ -33,7 +36,7 @@ pub(crate) struct ThreadDraft {
     pub(crate) id: Uuid,
     /// Who the local user is in this draft.
     pub(crate) author: ParticipantId,
-    pub(crate) doc: Draft,
+    pub(super) doc: Draft,
     /// The bytes of every file this participant has of the thread: the
     /// draft's, and those of messages submitted from it. Kept with the draft
     /// because a new thread's draft becomes its thread's.
@@ -52,21 +55,32 @@ pub(crate) struct ThreadDraft {
     /// threads do: a removal can race a submission that includes the file,
     /// and the host sends every file only once.
     pub(crate) keeps_removed_files: bool,
-    pub(crate) editors: HashMap<ItemId, ItemEditors>,
-    /// The text each item editor last agreed on with the document. An editor
-    /// catches up with others' edits only when it is next drawn, so a
-    /// keystroke can arrive first; the change it makes is then its difference
-    /// from this text, not from the document, which would revert those edits.
-    pub(crate) synced_text: HashMap<EntityId, String>,
-    /// The empty spot below the prompt blocks; typing there creates a block.
-    pub(crate) draft_position: Option<Entity<TextareaState>>,
+    editor_state: DraftEditorState,
 
     /// Blocks created for attachments picked together, so they share one.
     attachment_batches: HashMap<Uuid, ItemId>,
-    pub(crate) comments_folded: bool,
     /// Every participant's presence in this draft, including the host's echo
     /// of the local user's own, with when it last changed.
     pub(crate) presence: HashMap<ParticipantId, (protocol::Presence, Instant)>,
+}
+
+/// Local presentation caches, writable even when the canonical draft is read-only.
+#[derive(Default)]
+pub(crate) struct DraftEditorState {
+    pub(crate) editors: HashMap<ItemId, ItemEditors>,
+    /// The text an editor last agreed on with the document, used as the base
+    /// for typing so a delayed editor never reverts another participant's edit.
+    pub(crate) synced_text: HashMap<EntityId, String>,
+    pub(crate) draft_position: Option<Entity<TextareaState>>,
+    pub(crate) comments_folded: bool,
+}
+
+impl Deref for ThreadDraft {
+    type Target = DraftEditorState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.editor_state
+    }
 }
 
 pub(crate) enum ItemEditors {
@@ -117,13 +131,98 @@ impl ThreadDraft {
             uploads: HashMap::new(),
             discarded: HashSet::new(),
             keeps_removed_files: false,
-            editors: HashMap::new(),
-            synced_text: HashMap::new(),
-            draft_position: None,
+            editor_state: DraftEditorState::default(),
             attachment_batches: HashMap::new(),
-            comments_folded: false,
             presence: HashMap::new(),
         }
+    }
+
+    pub(crate) fn items(&self) -> Vec<DraftItem> {
+        self.doc.items()
+    }
+    pub(crate) fn item(&self, id: ItemId) -> Option<DraftItem> {
+        self.doc.item(id)
+    }
+    pub(crate) fn body(&self, id: ItemId) -> Option<String> {
+        self.doc.body(id)
+    }
+    pub(crate) fn contains(&self, id: ItemId) -> bool {
+        self.doc.contains(id)
+    }
+    pub(crate) fn anchor(&self, item: ItemId, offset: usize) -> Option<Vec<u8>> {
+        self.doc.anchor(item, offset)
+    }
+    pub(crate) fn resolve_anchor(&self, item: ItemId, anchor: &[u8]) -> Option<usize> {
+        self.doc.resolve_anchor(item, anchor)
+    }
+    pub(crate) fn encode_state(&self) -> Vec<u8> {
+        self.doc.encode_state()
+    }
+
+    pub(crate) fn create_prompt(&mut self, creator: Uuid, body: &str) -> ItemId {
+        self.doc.create_prompt(creator, body)
+    }
+    pub(crate) fn create_comment(
+        &mut self,
+        creator: Uuid,
+        target: CommentTarget,
+        body: &str,
+    ) -> ItemId {
+        self.doc.create_comment(creator, target, body)
+    }
+    pub(crate) fn edit_body(&mut self, id: ItemId, edit: &TextEdit) -> bool {
+        self.doc.edit_body(id, edit)
+    }
+    #[cfg(test)]
+    pub(crate) fn set_body(&mut self, id: ItemId, body: &str) -> Option<TextEdit> {
+        self.doc.set_body(id, body)
+    }
+    pub(crate) fn add_attachment(&mut self, block: ItemId, record: AttachmentRecord) -> bool {
+        self.doc.add_attachment(block, record)
+    }
+    pub(crate) fn remove_attachment(&mut self, id: AttachmentId) -> bool {
+        self.doc.remove_attachment(id)
+    }
+
+    pub(super) fn take_local_update(&mut self) -> Option<Vec<u8>> {
+        self.doc.take_local_update()
+    }
+
+    /// Maintains projection caches without granting mutable canonical access.
+    pub(crate) fn update_draft_editors<R>(
+        &mut self,
+        f: impl FnOnce(&[DraftItem], &mut DraftEditorState) -> R,
+    ) -> R {
+        let items = self.items();
+        f(&items, &mut self.editor_state)
+    }
+
+    /// Replaces, rather than merges, rejected optimistic edits. A fresh client
+    /// id ensures subsequent authorized edits cannot depend on rejected ones.
+    pub(super) fn reset(&mut self, bytes: &[u8]) -> anyhow::Result<()> {
+        let doc = Draft::new();
+        doc.apply_update(bytes)?;
+        doc.validate()?;
+        self.doc = doc;
+        // Entity handles may outlive the reset in queued input events. Removing
+        // their slots makes those old events inert, including draft-position
+        // events that would otherwise create a new block after Write returns.
+        self.editor_state.editors.clear();
+        self.editor_state.synced_text.clear();
+        self.editor_state.draft_position = None;
+        self.attachment_batches
+            .retain(|_, id| self.doc.contains(*id));
+        let records = self.attachment_records();
+        let removed = self
+            .uploads
+            .keys()
+            .copied()
+            .filter(|id| !records.iter().any(|record| record.id == *id))
+            .collect::<Vec<_>>();
+        for id in removed {
+            self.drop_file(id);
+        }
+        Ok(())
     }
 
     /// Records a participant's presence. The time it last changed only moves
@@ -205,7 +304,7 @@ impl ThreadDraft {
         if others.is_empty() {
             return Vec::new();
         }
-        let Some(body) = self.doc.body(id) else {
+        let Some(body) = self.body(id) else {
             return Vec::new();
         };
         others
@@ -214,8 +313,7 @@ impl ThreadDraft {
                 let (presence, changed) = self.presence.get(&participant)?;
                 let selection = presence.selection.as_ref()?;
                 let resolve = |anchor: &[u8]| {
-                    self.doc
-                        .resolve_anchor(id, anchor)
+                    self.resolve_anchor(id, anchor)
                         .map(|offset| body.floor_char_boundary(offset))
                 };
                 let head = resolve(&selection.head)?;
@@ -265,7 +363,9 @@ impl ThreadDraft {
             *participant != self.author && !presence.pending_reads.is_empty()
         })
     }
+}
 
+impl DraftEditorState {
     /// All local editors, including both comment views even when folded.
     /// This is lookup order, not the composer's navigation order.
     pub(crate) fn all_editors(&self) -> impl Iterator<Item = (EditorSlot, &Entity<TextareaState>)> {
@@ -304,7 +404,9 @@ impl ThreadDraft {
             _ => None,
         }
     }
+}
 
+impl ThreadDraft {
     /// The editors Up and Down move between, top to bottom: the composer's
     /// comment editors unless folded, the prompt blocks, and the draft
     /// position.
@@ -348,7 +450,7 @@ impl ThreadDraft {
         editor: EntityId,
         typed: &str,
     ) -> Option<String> {
-        let body = self.doc.body(id)?;
+        let body = self.body(id)?;
         let synced = self
             .synced_text
             .get(&editor)
@@ -358,10 +460,12 @@ impl ThreadDraft {
             if let Some(remote) = TextEdit::diff(&synced, &body) {
                 edit.range = remote.map_offset(edit.range.start)..remote.map_offset(edit.range.end);
             }
-            self.doc.edit_body(id, &edit);
+            self.edit_body(id, &edit);
         }
         // Everything the editor shows is in the document now.
-        self.synced_text.insert(editor, typed.to_owned());
+        self.editor_state
+            .synced_text
+            .insert(editor, typed.to_owned());
         self.doc.body(id)
     }
 
@@ -397,9 +501,9 @@ impl ThreadDraft {
     pub(crate) fn take_items(&mut self, ids: &[ItemId]) {
         self.doc.remove_items(ids);
         for id in ids {
-            if let Some(editors) = self.editors.remove(id) {
+            if let Some(editors) = self.editor_state.editors.remove(id) {
                 for editor in editors.all() {
-                    self.synced_text.remove(&editor.entity_id());
+                    self.editor_state.synced_text.remove(&editor.entity_id());
                 }
             }
         }
@@ -578,7 +682,7 @@ impl ThreadDraft {
             AttachmentTarget::NewBlock(batch) => Some(batch),
         };
         if let Some(id) = batch.and_then(|batch| self.attachment_batches.get(&batch).copied())
-            && self.doc.contains(id)
+            && self.contains(id)
         {
             return id;
         }

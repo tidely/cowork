@@ -10,6 +10,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
 
 use crate::models::{ModelCatalog, ModelRef};
+pub(crate) use crate::thread::{PeerMode, PeerPermissions, PermissionDenied};
 
 /// Bounds how much memory a single frame from a peer can make us buffer.
 ///
@@ -34,7 +35,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 17;
+pub(crate) const PROTOCOL_VERSION: u32 = 19;
 
 /// A request from a collaborator to the host.
 ///
@@ -57,8 +58,10 @@ pub(crate) enum CollaboratorMessage {
     /// Stops the agent run producing message `message_id`, if it is still
     /// running.
     Stop { message_id: uuid::Bytes },
-    /// A Yrs update of the collaborator's own changes to the draft.
-    DraftUpdate(Vec<u8>),
+    /// A Yrs update from this peer's current draft replica. Generation is
+    /// assigned by the host; queued bytes from a rejected replica stay fenced
+    /// out even if the peer regains Write before they reach the host.
+    DraftUpdate { generation: u64, update: Vec<u8> },
     /// Submits the draft. `sequence` is the number of user messages the
     /// collaborator has seen, so a submission that raced another one is
     /// ignored instead of submitting whatever was typed in between.
@@ -150,12 +153,12 @@ pub(crate) struct PendingRead {
 
 /// A change to a shared thread, authored by the host.
 ///
-/// Every variant except [`HostMessage::Welcome`] and [`HostMessage::Rejected`]
-/// is a thread wide event: the host applies it to its own thread and
-/// broadcasts the identical value to all connected collaborators, who replay
-/// it onto their mirror of the timeline. `Welcome` is peer specific and
-/// re-bases a single collaborator onto a full snapshot, which is how a peer
-/// both joins and recovers from falling behind.
+/// Most variants are thread-wide events: the host applies them locally and
+/// broadcasts the identical value for collaborators to replay. `Welcome`,
+/// `Rejected`, `PermissionDenied`, and `DraftReset` are peer-specific.
+/// `Welcome` joins or rebases a peer; both it and `DraftReset` preserve unsent
+/// draft edits only at a matching generation. A newer generation replaces the
+/// draft, discarding optimistic CRDT history the host rejected.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum HostMessage {
     /// Replaces the collaborator's entire view of the thread. Boxed, as it
@@ -236,6 +239,21 @@ pub(crate) enum HostMessage {
         participant: uuid::Bytes,
         name: String,
     },
+    /// A peer-specific rejection of a runtime command; the session stays open.
+    PermissionDenied(PermissionDenied),
+    /// Replaces a peer's draft with fresh authoritative state. A generation
+    /// change discards rejected optimistic history; a repeated reset for the
+    /// same generation is a normal merge, preserving fresh authorized edits.
+    DraftReset {
+        generation: u64,
+        state: Vec<u8>,
+    },
+    DefaultPeerModeChanged(PeerMode),
+    /// `None` resumes live inheritance from the default.
+    PeerModeOverrideChanged {
+        participant: uuid::Bytes,
+        mode: Option<PeerMode>,
+    },
 }
 
 /// A typed value encoded as a JSON string on the wire. This lets types that
@@ -299,6 +317,9 @@ pub(crate) struct Welcome {
     pub(crate) thread: ThreadSnapshot,
     /// The full state of the draft as a Yrs update.
     pub(crate) draft: Vec<u8>,
+    /// This receiving peer's draft epoch, not a thread-wide revision. A changed
+    /// epoch requires replacement, while matching epochs preserve unsent edits.
+    pub(crate) draft_generation: u64,
     /// Every connected participant's presence.
     pub(crate) presence: Vec<(uuid::Bytes, Presence)>,
     /// The attachments whose bytes the host holds. They follow the welcome
@@ -319,6 +340,9 @@ pub(crate) struct ThreadSnapshot {
     /// The selected model, if any. It may be missing from `models`; see
     /// [`HostMessage::ModelCatalogChanged`].
     pub(crate) model: Option<ModelRef>,
+    /// Host-owned default and sparse overrides. The host is always Admin and
+    /// alone manages policy; Admin peers cannot delegate access.
+    pub(crate) peer_permissions: PeerPermissions,
     /// The context window use the provider last measured, if any.
     pub(crate) context_tokens: Option<u64>,
     /// Bytes of agent output streamed since `context_tokens` was measured.
@@ -764,6 +788,7 @@ mod tests {
             profiles: vec![([11; 16], sample_profile()), ([13; 16], Profile::default())],
             models: sample_catalog(),
             model: Some(sample_model()),
+            peer_permissions: PeerPermissions::default(),
             context_tokens: Some(4_096),
             streamed_bytes: 120,
             messages: vec![
@@ -811,6 +836,7 @@ mod tests {
             participant_id: [12; 16],
             thread: snapshot,
             draft: vec![1, 2, 3],
+            draft_generation: 42,
             presence: vec![([12; 16], sample_presence())],
             stored_attachments: vec![[14; 16]],
         }));
@@ -851,6 +877,29 @@ mod tests {
             },
             HostMessage::ModelSelected(sample_model()),
             HostMessage::DraftUpdate(vec![4, 5, 6]),
+            HostMessage::DraftReset {
+                generation: 7,
+                state: vec![7, 8, 9],
+            },
+            HostMessage::PermissionDenied(PermissionDenied {
+                participant: [1; 16],
+                operation: crate::thread::PermissionOperation::EditDraft,
+                reason: crate::thread::DenialReason::InsufficientMode,
+            }),
+            HostMessage::PermissionDenied(PermissionDenied {
+                participant: [1; 16],
+                operation: crate::thread::PermissionOperation::EditDraft,
+                reason: crate::thread::DenialReason::StaleDraftGeneration,
+            }),
+            HostMessage::DefaultPeerModeChanged(PeerMode::ReadOnly),
+            HostMessage::PeerModeOverrideChanged {
+                participant: [1; 16],
+                mode: Some(PeerMode::Write),
+            },
+            HostMessage::PeerModeOverrideChanged {
+                participant: [1; 16],
+                mode: None,
+            },
             HostMessage::Presence {
                 participant: [1; 16],
                 presence: sample_presence(),
@@ -873,7 +922,10 @@ mod tests {
             CollaboratorMessage::Stop {
                 message_id: [2; 16],
             },
-            CollaboratorMessage::DraftUpdate(vec![7, 8]),
+            CollaboratorMessage::DraftUpdate {
+                generation: 7,
+                update: vec![7, 8],
+            },
             CollaboratorMessage::Submit { sequence: 3 },
             CollaboratorMessage::Presence(sample_presence()),
             CollaboratorMessage::AttachmentData(sample_chunk()),

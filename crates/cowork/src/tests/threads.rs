@@ -4,10 +4,10 @@
 use super::*;
 
 #[test]
-fn collaborator_threads_are_writable_and_removed_on_disconnect() {
-    assert!(ThreadOwnership::Remote.can_write());
+fn collaborator_threads_are_removed_on_disconnect_and_default_to_admin() {
+    assert_eq!(PeerPermissions::default().default_mode(), PeerMode::Admin);
+    assert!(PeerMode::Admin.can_edit_draft());
     assert!(ThreadOwnership::Remote.remove_on_disconnect());
-    assert!(ThreadOwnership::Local.can_write());
     assert!(!ThreadOwnership::Local.remove_on_disconnect());
 }
 
@@ -74,12 +74,12 @@ fn sharing_before_first_message_materializes_an_empty_owned_thread(cx: &mut gpui
     view.read_with(cx, |view, cx| {
         let thread = view.thread.read(cx);
         assert!(thread.timeline.is_empty());
-        assert_eq!(thread.draft.id, view.draft_id);
+        assert_eq!(thread.draft().id, view.draft_id);
         assert_eq!(thread.summary.title, "New thread");
-        assert_eq!(thread.ownership, ThreadOwnership::Local);
-        assert_eq!(thread.model, Some(ollama_qwen()));
-        assert_eq!(*thread.models, test_catalog());
-        assert!(thread.participants.is_empty());
+        assert_eq!(thread.ownership(), ThreadOwnership::Local);
+        assert_eq!(thread.model().cloned(), Some(ollama_qwen()));
+        assert_eq!(**thread.models(), test_catalog());
+        assert!(thread.participants().is_empty());
         assert!(matches!(thread.sharing, ThreadSharing::NotShared));
     });
 }
@@ -298,12 +298,12 @@ fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_a
     cx.update(|_, cx| {
         view.update(cx, |view, cx| {
             view.host.update(cx, |thread, cx| {
-                thread.participants = vec![thread.participant_id];
-                thread.apply(joined(collaborator_participant), cx);
+                thread.apply_for_test(joined(thread.participant_id()), cx);
+                thread.apply_for_test(joined(collaborator_participant), cx);
             });
             for event in events.iter().take(joined_after) {
                 view.host
-                    .update(cx, |thread, cx| thread.apply(event.clone(), cx));
+                    .update(cx, |thread, cx| thread.apply_for_test(event.clone(), cx));
             }
 
             if matches!(
@@ -319,9 +319,10 @@ fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_a
                 assert_eq!(calls[0].result.is_some(), !matches!(join_at, JoinAt::Call));
             }
             let welcome = protocol::Welcome {
+                draft_generation: 0,
                 participant_id: collaborator_participant.into_bytes(),
                 thread: view.host.read(cx).to_protocol(),
-                draft: view.host.read(cx).draft.doc.encode_state(),
+                draft: view.host.read(cx).draft().encode_state(),
                 presence: Vec::new(),
                 stored_attachments: Vec::new(),
             };
@@ -337,8 +338,8 @@ fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_a
 
             for event in events.iter().skip(joined_after) {
                 view.host
-                    .update(cx, |thread, cx| thread.apply(event.clone(), cx));
-                collaborator.update(cx, |thread, cx| thread.apply(event.clone(), cx));
+                    .update(cx, |thread, cx| thread.apply_for_test(event.clone(), cx));
+                collaborator.update(cx, |thread, cx| thread.apply_for_test(event.clone(), cx));
             }
             view.collaborator = Some(collaborator);
         });
@@ -355,15 +356,15 @@ fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_a
         assert_eq!(collaborator.conversation(), host.conversation());
         assert_eq!(collaborator.summary.id, host.summary.id);
         assert_ne!(collaborator.instance_id, host.instance_id);
-        assert_eq!(collaborator.participant_id, collaborator_participant);
-        assert_eq!(collaborator.draft.author, collaborator_participant);
-        assert_eq!(collaborator.participants, host.participants);
-        assert_eq!(collaborator.participants.len(), 3);
+        assert_eq!(collaborator.participant_id(), collaborator_participant);
+        assert_eq!(collaborator.draft().author, collaborator_participant);
+        assert_eq!(collaborator.participants(), host.participants());
+        assert_eq!(collaborator.participants().len(), 3);
         assert_eq!(
-            collaborator.participants[..2],
+            collaborator.participants()[..2],
             [host_participant, collaborator_participant]
         );
-        assert_eq!(collaborator.model, Some(ollama_qwen()));
+        assert_eq!(collaborator.model().cloned(), Some(ollama_qwen()));
         assert_eq!(collaborator.max_tokens(), 65_536);
         assert_eq!(collaborator.context_tokens, Some(2_048));
         assert!(!host.generating);
@@ -441,8 +442,8 @@ fn failed_run_without_rig_output_shows_its_failure(cx: &mut gpui::TestAppContext
     });
     view.update(cx, |view, cx| {
         view.host.update(cx, |thread, cx| {
-            thread.apply(agent_started(message_id, None, "Try this"), cx);
-            thread.apply(
+            thread.apply_for_test(agent_started(message_id, None, "Try this"), cx);
+            thread.apply_for_test(
                 protocol::HostMessage::AgentEnded {
                     id: message_id.into_bytes(),
                     outcome: crate::protocol::RunOutcome::Failed("Model unavailable".into()),
@@ -460,9 +461,10 @@ fn failed_run_without_rig_output_shows_its_failure(cx: &mut gpui::TestAppContext
         assert_eq!(message.run.failure(), Some("Model unavailable"));
         let restored = Thread::from_welcome(
             protocol::Welcome {
+                draft_generation: 0,
                 participant_id: ParticipantId::new().into_bytes(),
                 thread: snapshot,
-                draft: host.draft.doc.encode_state(),
+                draft: host.draft().encode_state(),
                 presence: Vec::new(),
                 stored_attachments: Vec::new(),
             },
@@ -498,9 +500,9 @@ fn separate_runs_reconstruct_only_their_own_tool_calls(cx: &mut gpui::TestAppCon
     view.update(cx, |view, cx| {
         view.host.update(cx, |thread, cx| {
             for event in agent_stream_events(first_id) {
-                thread.apply(event, cx);
+                thread.apply_for_test(event, cx);
             }
-            thread.apply(agent_started(second_id, None, "Calculate this"), cx);
+            thread.apply_for_test(agent_started(second_id, None, "Calculate this"), cx);
             let mut events = streamed_tool_call(
                 "call",
                 "calculate",
@@ -512,9 +514,9 @@ fn separate_runs_reconstruct_only_their_own_tool_calls(cx: &mut gpui::TestAppCon
             let events = agent::test_support::canonical(events);
             let results = tool_results(&events, "5");
             for event in events.into_iter().chain(results).chain([turn_ended(256)]) {
-                thread.apply(agent_event(second_id, event), cx);
+                thread.apply_for_test(agent_event(second_id, event), cx);
             }
-            thread.apply(
+            thread.apply_for_test(
                 protocol::HostMessage::AgentEnded {
                     id: second_id.into_bytes(),
                     outcome: crate::protocol::RunOutcome::Completed,
@@ -531,9 +533,10 @@ fn separate_runs_reconstruct_only_their_own_tool_calls(cx: &mut gpui::TestAppCon
             }
         }
         let welcome = protocol::Welcome {
+            draft_generation: 0,
             participant_id: ParticipantId::new().into_bytes(),
             thread: snapshot,
-            draft: host.draft.doc.encode_state(),
+            draft: host.draft().encode_state(),
             presence: Vec::new(),
             stored_attachments: Vec::new(),
         };
@@ -593,9 +596,9 @@ fn failed_run_keeps_output_the_transcript_never_got_for_joiners(cx: &mut gpui::T
     view.update(cx, |view, cx| {
         view.host.update(cx, |thread, cx| {
             for event in events.iter().take(through_call) {
-                thread.apply(event.clone(), cx);
+                thread.apply_for_test(event.clone(), cx);
             }
-            thread.apply(
+            thread.apply_for_test(
                 protocol::HostMessage::AgentEnded {
                     id: message_id.into_bytes(),
                     outcome: crate::protocol::RunOutcome::Failed("stream failed".into()),
@@ -618,9 +621,10 @@ fn failed_run_keeps_output_the_transcript_never_got_for_joiners(cx: &mut gpui::T
                 .count()
         );
         let welcome = protocol::Welcome {
+            draft_generation: 0,
             participant_id: ParticipantId::new().into_bytes(),
             thread: snapshot,
-            draft: host.draft.doc.encode_state(),
+            draft: host.draft().encode_state(),
             presence: Vec::new(),
             stored_attachments: Vec::new(),
         };
@@ -704,12 +708,14 @@ fn incremental_output_matches_a_fresh_derivation_after_every_event(cx: &mut gpui
     });
     view.update(cx, |view, cx| {
         for (index, event) in events.into_iter().enumerate() {
-            view.host.update(cx, |thread, cx| thread.apply(event, cx));
+            view.host
+                .update(cx, |thread, cx| thread.apply_for_test(event, cx));
             let host = view.host.read(cx);
             let welcome = protocol::Welcome {
+                draft_generation: 0,
                 participant_id: ParticipantId::new().into_bytes(),
                 thread: host.to_protocol(),
-                draft: host.draft.doc.encode_state(),
+                draft: host.draft().encode_state(),
                 presence: Vec::new(),
                 stored_attachments: Vec::new(),
             };
@@ -774,9 +780,9 @@ fn a_restated_block_shows_as_rig_accumulates_it(cx: &mut gpui::TestAppContext) {
     });
     view.update(cx, |view, cx| {
         view.host.update(cx, |thread, cx| {
-            thread.apply(agent_started(message_id, None, "Is it?"), cx);
+            thread.apply_for_test(agent_started(message_id, None, "Is it?"), cx);
             for event in turn {
-                thread.apply(agent_event(message_id, event), cx);
+                thread.apply_for_test(agent_event(message_id, event), cx);
             }
         });
         let host = view.host.read(cx);
@@ -789,9 +795,10 @@ fn a_restated_block_shows_as_rig_accumulates_it(cx: &mut gpui::TestAppContext) {
         );
         assert_eq!(message.output.text, "Yes.");
         let welcome = protocol::Welcome {
+            draft_generation: 0,
             participant_id: ParticipantId::new().into_bytes(),
             thread: host.to_protocol(),
-            draft: host.draft.doc.encode_state(),
+            draft: host.draft().encode_state(),
             presence: Vec::new(),
             stored_attachments: Vec::new(),
         };
@@ -804,7 +811,7 @@ fn a_restated_block_shows_as_rig_accumulates_it(cx: &mut gpui::TestAppContext) {
         assert_eq!(restored.conversation(), view.host.read(cx).conversation());
 
         view.host.update(cx, |thread, cx| {
-            thread.apply(agent_event(message_id, ended), cx);
+            thread.apply_for_test(agent_event(message_id, ended), cx);
         });
         let host = view.host.read(cx);
         let TimelineMessage::Agent(message) = &host.timeline[0] else {
@@ -846,14 +853,15 @@ fn snapshots_with_agent_runs_the_transcript_cannot_hold_are_rejected(
     view.update(cx, |view, cx| {
         view.host.update(cx, |thread, cx| {
             for event in agent_stream_events(message_id) {
-                thread.apply(event, cx);
+                thread.apply_for_test(event, cx);
             }
         });
         let host = view.host.read(cx);
         let welcome = protocol::Welcome {
+            draft_generation: 0,
             participant_id: ParticipantId::new().into_bytes(),
             thread: host.to_protocol(),
-            draft: host.draft.doc.encode_state(),
+            draft: host.draft().encode_state(),
             presence: Vec::new(),
             stored_attachments: Vec::new(),
         };
@@ -931,18 +939,22 @@ fn snapshots_with_agent_runs_the_transcript_cannot_hold_are_rejected(
         .expect("decode an untrusted transcript message");
         view.host.update(cx, |thread, cx| {
             let snapshot = postcard::to_stdvec(&thread.to_protocol()).unwrap();
-            let draft = thread.draft.doc.encode_state();
-            let participant = thread.participant_id;
-            let stored = thread.draft.stored.clone();
+            let draft = thread.draft().encode_state();
+            let participant = thread.participant_id();
+            let stored = thread.draft().stored.clone();
             for invalid in [two_generating, invalid_json] {
-                assert!(thread.try_rebase(invalid, cx).is_err());
+                assert!(
+                    thread
+                        .try_apply_for_test(protocol::HostMessage::Welcome(Box::new(invalid)), cx)
+                        .is_err()
+                );
                 assert_eq!(
                     postcard::to_stdvec(&thread.to_protocol()).unwrap(),
                     snapshot
                 );
-                assert_eq!(thread.draft.doc.encode_state(), draft);
-                assert_eq!(thread.participant_id, participant);
-                assert_eq!(thread.draft.stored, stored);
+                assert_eq!(thread.draft().encode_state(), draft);
+                assert_eq!(thread.participant_id(), participant);
+                assert_eq!(thread.draft().stored, stored);
             }
         });
     });
@@ -981,7 +993,7 @@ fn expanded_thinking_stays_open_as_the_run_continues(cx: &mut gpui::TestAppConte
     view.update(cx, |view, cx| {
         view.host.update(cx, |thread, cx| {
             for event in events.iter().take(thinking_done) {
-                thread.apply(event.clone(), cx);
+                thread.apply_for_test(event.clone(), cx);
             }
             let message = thread
                 .agent_message_mut(message_id.into_bytes())
@@ -991,7 +1003,7 @@ fn expanded_thinking_stays_open_as_the_run_continues(cx: &mut gpui::TestAppConte
             assert!(!message.step_views[0].expanded());
             message.step_views[0].set_expanded(true);
             for event in events.iter().skip(thinking_done) {
-                thread.apply(event.clone(), cx);
+                thread.apply_for_test(event.clone(), cx);
             }
             let message = thread
                 .agent_message_mut(message_id.into_bytes())
@@ -1037,9 +1049,9 @@ fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
     });
     view.update(cx, |view, cx| {
         view.host.update(cx, |thread, cx| {
-            thread.apply(agent_started(message_id, None, "Add 1 and 2"), cx);
+            thread.apply_for_test(agent_started(message_id, None, "Add 1 and 2"), cx);
             for event in turn.iter().take(second_thinking_started) {
-                thread.apply(agent_event(message_id, event.clone()), cx);
+                thread.apply_for_test(agent_event(message_id, event.clone()), cx);
             }
             let message = thread
                 .agent_message_mut(message_id.into_bytes())
@@ -1060,9 +1072,9 @@ fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
             assert!(message.work_expanded, "work shows while the run goes");
 
             for event in turn.iter().skip(second_thinking_started) {
-                thread.apply(agent_event(message_id, event.clone()), cx);
+                thread.apply_for_test(agent_event(message_id, event.clone()), cx);
             }
-            thread.apply(
+            thread.apply_for_test(
                 protocol::HostMessage::AgentEnded {
                     id: message_id.into_bytes(),
                     outcome: crate::protocol::RunOutcome::Completed,
@@ -1085,9 +1097,10 @@ fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
         assert!(!message.work_expanded, "work collapses when the run ends");
 
         let welcome = protocol::Welcome {
+            draft_generation: 0,
             participant_id: ParticipantId::new().into_bytes(),
             thread: host.to_protocol(),
-            draft: host.draft.doc.encode_state(),
+            draft: host.draft().encode_state(),
             presence: Vec::new(),
             stored_attachments: Vec::new(),
         };
@@ -1133,22 +1146,22 @@ fn membership_events_are_idempotent_and_uncatalogued_models_cannot_run(
                 // even when the catalog does not offer it.
                 protocol::HostMessage::ModelSelected(ollama_model("no-such-model")),
             ] {
-                thread.apply(event, cx);
+                thread.apply_for_test(event, cx);
             }
-            assert_eq!(thread.participants, [first, second]);
-            assert_eq!(thread.model, Some(ollama_model("no-such-model")));
+            assert_eq!(thread.participants(), [first, second]);
+            assert_eq!(thread.model().cloned(), Some(ollama_model("no-such-model")));
             assert!(thread.runnable_model().is_none());
             assert_eq!(thread.max_tokens(), 0);
 
-            thread.apply(
+            thread.apply_for_test(
                 protocol::HostMessage::ParticipantLeft(first.into_bytes()),
                 cx,
             );
-            thread.apply(
+            thread.apply_for_test(
                 protocol::HostMessage::ParticipantLeft(first.into_bytes()),
                 cx,
             );
-            assert_eq!(thread.participants, [second]);
+            assert_eq!(thread.participants(), [second]);
         });
     });
 }
@@ -1166,14 +1179,20 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
 
     cowork.update(cx, |cowork, cx| {
         let local = cowork.active_thread(cx).expect("active thread");
-        let joined = cx.new(|_| {
-            let mut thread = test_thread(
-                Uuid::new_v4(),
-                Vec::new(),
+        let joined = cx.new(|cx| {
+            Thread::from_welcome(
+                protocol::Welcome {
+                    participant_id: ParticipantId::new().into_bytes(),
+                    thread: local.read(cx).to_protocol(),
+                    draft_generation: 0,
+                    draft: local.read(cx).draft().encode_state(),
+                    presence: Vec::new(),
+                    stored_attachments: Vec::new(),
+                },
                 ThreadDraft::new(ParticipantId::new()),
-            );
-            thread.ownership = ThreadOwnership::Remote;
-            thread
+                ThreadSharing::NotShared,
+                cx,
+            )
         });
 
         let at = |seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
@@ -1212,8 +1231,8 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
         for (thread, seconds) in [(&local, 20), (&joined, 90)] {
             let id = Uuid::new_v4().into_bytes();
             thread.update(cx, |thread, cx| {
-                thread.apply(agent_started(Uuid::from_bytes(id), None, "prompt"), cx);
-                thread.apply(
+                thread.apply_for_test(agent_started(Uuid::from_bytes(id), None, "prompt"), cx);
+                thread.apply_for_test(
                     protocol::HostMessage::AgentEnded {
                         id,
                         outcome: crate::protocol::RunOutcome::Completed,
@@ -1250,24 +1269,25 @@ fn context_tokens_are_estimated_while_streaming(cx: &mut gpui::TestAppContext) {
         let thread = view.read(cx).thread.clone();
         thread.update(cx, |thread, cx| {
             assert_eq!(thread.live_context_tokens(), None);
-            thread.apply(agent_started(Uuid::from_bytes(id), None, "prompt"), cx);
+            thread.apply_for_test(agent_started(Uuid::from_bytes(id), None, "prompt"), cx);
 
             // Before any count, streamed output is all there is.
-            thread.apply(text("12345"), cx);
+            thread.apply_for_test(text("12345"), cx);
             assert_eq!(thread.live_context_tokens(), Some(2));
 
             // A measurement replaces the estimate, which then grows on.
-            thread.apply(agent_event(Uuid::from_bytes(id), turn_ended(100)), cx);
+            thread.apply_for_test(agent_event(Uuid::from_bytes(id), turn_ended(100)), cx);
             assert_eq!(thread.live_context_tokens(), Some(100));
-            thread.apply(text("12345678"), cx);
+            thread.apply_for_test(text("12345678"), cx);
             assert_eq!(thread.live_context_tokens(), Some(102));
         });
 
         // Someone joining mid-stream sees the same count.
         let welcome = protocol::Welcome {
+            draft_generation: 0,
             participant_id: ParticipantId::new().into_bytes(),
             thread: thread.read(cx).to_protocol(),
-            draft: thread.read(cx).draft.doc.encode_state(),
+            draft: thread.read(cx).draft().encode_state(),
             presence: Vec::new(),
             stored_attachments: Vec::new(),
         };
@@ -1278,7 +1298,7 @@ fn context_tokens_are_estimated_while_streaming(cx: &mut gpui::TestAppContext) {
 
         // Output of a stopped request never reaches the transcript.
         thread.update(cx, |thread, cx| {
-            thread.apply(
+            thread.apply_for_test(
                 protocol::HostMessage::AgentEnded {
                     id,
                     outcome: crate::protocol::RunOutcome::Completed,
@@ -1323,13 +1343,13 @@ fn running_agent_message_is_the_incomplete_one(cx: &mut gpui::TestAppContext) {
                 },
                 agent_started(running, None, "prompt"),
             ] {
-                thread.apply(event, cx);
+                thread.apply_for_test(event, cx);
             }
             assert_eq!(thread.running_agent_message_id(), Some(running));
             // A running message has no duration yet.
             assert_eq!(thread.generation_time(), Duration::from_secs(3));
 
-            thread.apply(
+            thread.apply_for_test(
                 protocol::HostMessage::AgentEnded {
                     id: running.into_bytes(),
                     outcome: crate::protocol::RunOutcome::Completed,
@@ -1359,13 +1379,13 @@ fn collaborator_requests_select_models_and_stop_only_the_running_generation(
     cowork.update(cx, |cowork, cx| {
         cowork.set_models(catalog_of(&[ollama_qwen()]), cx);
         let thread = cowork.active_thread(cx).expect("active thread");
+        let collaborator = ParticipantId::new();
+        thread.update(cx, |thread, cx| {
+            thread.apply_for_test(joined(collaborator), cx)
+        });
         cowork.active_generations.insert(
             thread_id,
-            ActiveGeneration {
-                message_id: running_message_id,
-                abort_handle: task.abort_handle(),
-                cancelled: cancelled.clone(),
-            },
+            ActiveGeneration::for_test(running_message_id, task.abort_handle(), cancelled.clone()),
         );
 
         for request in [
@@ -1376,10 +1396,10 @@ fn collaborator_requests_select_models_and_stop_only_the_running_generation(
             },
         ] {
             cowork
-                .collaborator_request(&thread, ParticipantId::new(), request, cx)
+                .collaborator_request(&thread, collaborator, request, cx)
                 .expect("valid request");
         }
-        assert_eq!(thread.read(cx).model, None);
+        assert_eq!(thread.read(cx).model().cloned(), None);
         assert!(!cancelled.load(Ordering::Acquire));
 
         for request in [
@@ -1389,10 +1409,10 @@ fn collaborator_requests_select_models_and_stop_only_the_running_generation(
             },
         ] {
             cowork
-                .collaborator_request(&thread, ParticipantId::new(), request, cx)
+                .collaborator_request(&thread, collaborator, request, cx)
                 .expect("valid request");
         }
-        assert_eq!(thread.read(cx).model, Some(ollama_qwen()));
+        assert_eq!(thread.read(cx).model().cloned(), Some(ollama_qwen()));
         assert!(cancelled.load(Ordering::Acquire));
         // Only the requesting peer picked it; new local threads keep the
         // local user's choice.
@@ -1456,10 +1476,12 @@ fn renaming_never_changes_what_the_agent_was_sent(cx: &mut gpui::TestAppContext)
     });
     thread.update(cx, |thread, _| {
         thread.generating = false;
+        let actor = thread.participant_id();
         thread
-            .draft
-            .doc
-            .create_prompt(thread.draft.author.as_uuid(), "second");
+            .with_authorized::<EditDraft, _>(actor, |auth| {
+                auth.edit(|draft| draft.create_prompt(draft.author.as_uuid(), "second"))
+            })
+            .expect("host edit");
     });
     cx.update(|window, cx| {
         cowork.update(cx, |cowork, cx| cowork.submit_composer(window, cx));
@@ -1509,8 +1531,8 @@ fn a_stopped_run_keeps_its_outcome_and_collapses_its_work(cx: &mut gpui::TestApp
     });
     view.update(cx, |view, cx| {
         view.host.update(cx, |thread, cx| {
-            thread.apply(agent_started(message_id, None, "Add 1 and 2"), cx);
-            thread.apply(
+            thread.apply_for_test(agent_started(message_id, None, "Add 1 and 2"), cx);
+            thread.apply_for_test(
                 agent_event(message_id, streamed_text("answer", "Let me check.", false)),
                 cx,
             );
@@ -1520,9 +1542,9 @@ fn a_stopped_run_keeps_its_outcome_and_collapses_its_work(cx: &mut gpui::TestApp
             // Until a tool call follows, the text may be the response.
             assert_eq!(message.output.text, "Let me check.");
             for event in turn.iter().skip(1) {
-                thread.apply(agent_event(message_id, event.clone()), cx);
+                thread.apply_for_test(agent_event(message_id, event.clone()), cx);
             }
-            thread.apply(
+            thread.apply_for_test(
                 protocol::HostMessage::AgentEnded {
                     id: message_id.into_bytes(),
                     outcome: protocol::RunOutcome::Stopped,
@@ -1542,9 +1564,10 @@ fn a_stopped_run_keeps_its_outcome_and_collapses_its_work(cx: &mut gpui::TestApp
         assert_eq!(message.output.work().collect::<Vec<_>>(), [0, 1]);
 
         let welcome = protocol::Welcome {
+            draft_generation: 0,
             participant_id: ParticipantId::new().into_bytes(),
             thread: host.to_protocol(),
-            draft: host.draft.doc.encode_state(),
+            draft: host.draft().encode_state(),
             presence: Vec::new(),
             stored_attachments: Vec::new(),
         };

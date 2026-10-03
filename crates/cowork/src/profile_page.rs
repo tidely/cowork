@@ -22,8 +22,7 @@ use itertools::Itertools;
 use crate::{
     Cowork, MainStage,
     profile::{Profile, display_name_error, load_profile_picture, participant_name},
-    protocol,
-    thread::{Thread, ThreadOwnership, ThreadSharing},
+    thread::{Thread, ThreadOwnership},
     usage::{
         ActivityBucket, ActivityRange, format_stat_count, format_stat_duration,
         token_activity_chart,
@@ -150,7 +149,7 @@ impl Cowork {
             .threads
             .iter()
             .map(|thread| thread.read(cx))
-            .filter(|thread| thread.ownership == ThreadOwnership::Local)
+            .filter(|thread| thread.ownership() == ThreadOwnership::Local)
     }
 
     pub(crate) fn total_chats(&self, cx: &App) -> usize {
@@ -545,24 +544,8 @@ impl Cowork {
         self.profile = profile;
         let threads = self.thread_store.read(cx).threads.clone();
         for thread in threads {
-            thread.update(cx, |thread, cx| match thread.sharing {
-                ThreadSharing::Shared { .. } => thread.emit(
-                    protocol::HostMessage::ProfileChanged {
-                        participant: thread.participant_id.into_bytes(),
-                        profile: self.profile.to_protocol(),
-                    },
-                    cx,
-                ),
-                ThreadSharing::Connected { .. } => {
-                    thread.request(protocol::CollaboratorMessage::Profile(
-                        self.profile.to_protocol(),
-                    ));
-                }
-                ThreadSharing::NotShared | ThreadSharing::Sharing | ThreadSharing::Failed => {
-                    thread
-                        .profiles
-                        .insert(thread.participant_id, self.profile.clone());
-                }
+            thread.update(cx, |thread, cx| {
+                thread.update_local_profile(&self.profile, cx);
             });
         }
         cx.notify();

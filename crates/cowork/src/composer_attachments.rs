@@ -19,7 +19,7 @@ use gpui_component::{
     progress::Progress,
 };
 use gpui_kit_assets::IconName as AssetIconName;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use uuid::Uuid;
 
 use crate::{
@@ -99,6 +99,7 @@ pub(crate) struct PendingAttachment {
 }
 
 enum AttachmentReadEvent {
+    Begin(Uuid, oneshot::Sender<()>),
     Progress(Uuid, f32),
     Finished(Uuid, anyhow::Result<FileAttachment>),
 }
@@ -109,6 +110,18 @@ pub(crate) struct AttachmentError {
 }
 
 impl Cowork {
+    /// Cancels unaccepted reads for this destination. In-flight disk reads may
+    /// finish, but their callbacks no longer have a pending entry to attach.
+    pub(crate) fn cancel_draft_attachment_reads(&mut self, draft_id: Uuid, cx: &mut Context<Self>) {
+        let before = self.pending_attachments.len();
+        self.pending_attachments
+            .retain(|pending| pending.draft_id != draft_id);
+        if self.pending_attachments.len() != before {
+            self.publish_presence(cx);
+            cx.notify();
+        }
+    }
+
     /// Whether files are still on their way: being read by anyone, or not
     /// yet with the host. Either holds submission back.
     pub(crate) fn draft_is_loading_attachments(&self, draft_id: Uuid, cx: &App) -> bool {
@@ -140,9 +153,12 @@ impl Cowork {
         window: Option<gpui::AnyWindowHandle>,
         cx: &mut Context<Self>,
     ) {
-        if sources.is_empty() {
+        if sources.is_empty() || !self.draft_can_edit(draft_id, cx) {
             return;
         }
+        let Some(generation) = self.attachment_draft_generation(draft_id, cx) else {
+            return;
+        };
         self.attachment_errors
             .retain(|error| error.draft_id != draft_id);
         let entries = sources
@@ -166,6 +182,18 @@ impl Cowork {
         cx.background_executor()
             .spawn(async move {
                 for (id, source) in entries {
+                    // Ask the UI before starting each file: a queued read may
+                    // have been canceled while an earlier file was loading.
+                    let (started, authorized) = oneshot::channel();
+                    if sender
+                        .send(AttachmentReadEvent::Begin(id, started))
+                        .is_err()
+                    {
+                        break;
+                    }
+                    if authorized.await.is_err() {
+                        continue;
+                    }
                     let result = load_attachment(source, |progress| {
                         _ = sender.send(AttachmentReadEvent::Progress(id, progress));
                     });
@@ -176,7 +204,7 @@ impl Cowork {
         cx.spawn(async move |this, cx| {
             while let Some(event) = receiver.recv().await {
                 let Ok(new_block) = this.update(cx, |this, cx| {
-                    this.attachment_read_event(draft_id, event, cx)
+                    this.attachment_read_event(draft_id, generation, event, cx)
                 }) else {
                     break;
                 };
@@ -207,18 +235,37 @@ impl Cowork {
     fn attachment_read_event(
         &mut self,
         draft_id: Uuid,
+        generation: u64,
         event: AttachmentReadEvent,
         cx: &mut Context<Self>,
     ) -> Option<ItemId> {
+        if !self.draft_can_edit(draft_id, cx) {
+            self.cancel_draft_attachment_reads(draft_id, cx);
+            return None;
+        }
         let id = match &event {
-            AttachmentReadEvent::Progress(id, _) | AttachmentReadEvent::Finished(id, _) => *id,
+            AttachmentReadEvent::Begin(id, _)
+            | AttachmentReadEvent::Progress(id, _)
+            | AttachmentReadEvent::Finished(id, _) => *id,
         };
         let index = self
             .pending_attachments
             .iter()
-            .position(|pending| pending.id == id)?;
+            .position(|pending| pending.id == id && pending.draft_id == draft_id)?;
+        if self.attachment_draft_generation(draft_id, cx) != Some(generation) {
+            // A reset installs a fresh destination even if its draft UUID is
+            // unchanged. Old callbacks must not attach to the fresh replica.
+            self.pending_attachments.remove(index);
+            self.publish_presence(cx);
+            cx.notify();
+            return None;
+        }
         let mut new_block = None;
         match event {
+            AttachmentReadEvent::Begin(_, started) => {
+                _ = started.send(());
+                return None;
+            }
             AttachmentReadEvent::Progress(_, progress) => {
                 self.pending_attachments[index].progress = Some(progress);
             }
@@ -248,7 +295,7 @@ impl Cowork {
                         };
                         let id = record.id;
                         draft.files.insert(id, attachment);
-                        draft.doc.add_attachment(block, record);
+                        draft.add_attachment(block, record);
                         Ok(Some((id, block)))
                     })
                     // The draft is gone (sent, or its thread was closed).
@@ -281,6 +328,9 @@ impl Cowork {
     /// announces it, as it already holds the bytes; a collaborator uploads
     /// it to the host, which announces it once it has every byte.
     fn attachment_added(&mut self, draft_id: Uuid, id: AttachmentId, cx: &mut Context<Self>) {
+        if !self.draft_can_edit(draft_id, cx) {
+            return;
+        }
         let thread = self.draft_thread(draft_id, cx);
         let joined = thread.as_ref().is_some_and(|thread| {
             matches!(thread.read(cx).sharing, ThreadSharing::Connected { .. })
@@ -288,14 +338,7 @@ impl Cowork {
         match thread {
             Some(thread) if joined => self.start_upload(thread, id, cx),
             Some(thread) => thread.update(cx, |thread, cx| {
-                let uploader = thread.participant_id.into_bytes();
-                thread.emit(
-                    protocol::HostMessage::AttachmentStored {
-                        id: id.as_uuid().into_bytes(),
-                        uploader,
-                    },
-                    cx,
-                );
+                thread.mark_local_attachment_stored(id, cx);
             }),
             None => {
                 self.update_draft(draft_id, cx, |draft| draft.stored.insert(id));
@@ -306,22 +349,32 @@ impl Cowork {
     /// Sends a file of a joined thread's draft to its host, one chunk at a
     /// time. Stops early once the file is removed.
     fn start_upload(&mut self, thread: Entity<Thread>, id: AttachmentId, cx: &mut Context<Self>) {
+        let draft_id = thread.read(cx).draft().id;
+        if !self.draft_can_edit(draft_id, cx) {
+            return;
+        }
         let ThreadSharing::Connected { uploads, .. } = &thread.read(cx).sharing else {
             return;
         };
         let uploads = uploads.clone();
+        if !thread.update(cx, |thread, _| thread.mark_upload_progress(id, 0)) {
+            return;
+        }
         let thread = thread.downgrade();
         cx.spawn(async move |this, cx| {
             let mut offset = 0;
             loop {
                 let Ok(chunk) = thread.update(cx, |thread, _| {
-                    thread.draft.chunk(id, offset).filter(|_| {
-                        thread
-                            .draft
-                            .attachment_records()
-                            .iter()
-                            .any(|record| record.id == id)
-                    })
+                    let draft = thread.draft();
+                    (draft.id == draft_id)
+                        .then(|| draft.chunk(id, offset))
+                        .flatten()
+                        .filter(|_| {
+                            draft
+                                .attachment_records()
+                                .iter()
+                                .any(|record| record.id == id)
+                        })
                 }) else {
                     return;
                 };
@@ -345,10 +398,8 @@ impl Cowork {
                     return;
                 }
                 let updated = thread.update(cx, |thread, _| {
-                    // Until the host confirms it has every byte.
-                    if !thread.draft.stored.contains(&id) {
-                        thread.draft.uploads.insert(id, next);
-                    }
+                    // Accepted uploads may finish after losing Write access.
+                    thread.mark_upload_progress(id, next);
                 });
                 if updated.is_err() || this.update(cx, |_, cx| cx.notify()).is_err() {
                     return;
@@ -362,13 +413,22 @@ impl Cowork {
         .detach();
     }
 
+    fn attachment_draft_generation(&self, draft_id: Uuid, cx: &App) -> Option<u64> {
+        if self.new_thread_draft.id == draft_id {
+            Some(0)
+        } else {
+            self.draft_thread(draft_id, cx)
+                .map(|thread| thread.read(cx).draft_generation())
+        }
+    }
+
     /// The thread whose draft is `draft_id`, if it has one yet.
     fn draft_thread(&self, draft_id: Uuid, cx: &App) -> Option<Entity<Thread>> {
         self.thread_store
             .read(cx)
             .threads
             .iter()
-            .find(|thread| thread.read(cx).draft.id == draft_id)
+            .find(|thread| thread.read(cx).draft().id == draft_id)
             .cloned()
     }
 
@@ -382,6 +442,9 @@ impl Cowork {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.draft_can_edit(draft_id, cx) {
+            return;
+        }
         let block_focused = self
             .read_draft(draft_id, cx, |draft| {
                 draft
@@ -390,7 +453,7 @@ impl Cowork {
             })
             .unwrap_or(false);
         self.update_draft(draft_id, cx, |draft| {
-            draft.doc.remove_attachment(attachment);
+            draft.remove_attachment(attachment);
             draft.drop_removed_file(attachment);
             if !block_focused {
                 draft.remove_if_unattended(block);
@@ -410,6 +473,7 @@ impl Cowork {
         let Some(draft_id) = self.writable_draft_id(cx) else {
             return;
         };
+        let generation = self.attachment_draft_generation(draft_id, cx);
         let selected = cx.prompt_for_paths(PathPromptOptions {
             files: true,
             directories: false,
@@ -420,6 +484,11 @@ impl Cowork {
         cx.spawn_in(window, async move |this, cx| {
             let result = selected.await;
             _ = this.update_in(cx, |this, window, cx| {
+                if !this.draft_can_edit(draft_id, cx)
+                    || this.attachment_draft_generation(draft_id, cx) != generation
+                {
+                    return;
+                }
                 match result {
                     Ok(Ok(Some(paths))) => this.add_attachments(
                         draft_id,
@@ -466,6 +535,9 @@ impl Cowork {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.draft_can_edit(draft_id, cx) {
+            return;
+        }
         self.add_attachments(
             draft_id,
             target,
@@ -503,6 +575,9 @@ impl Cowork {
         let Some((draft_id, slot, _)) = self.focused_draft_editor(window, cx) else {
             return;
         };
+        if !self.draft_can_edit(draft_id, cx) {
+            return;
+        }
         let target = match slot {
             EditorSlot::Prompt(id) => AttachmentTarget::Block(id),
             EditorSlot::DraftPosition => AttachmentTarget::NewBlock(Uuid::new_v4()),
@@ -608,7 +683,9 @@ impl Cowork {
             })
             .media(media)
             .content(content);
-        if let Some((draft_id, block, attachment_id)) = removal {
+        if let Some((draft_id, block, attachment_id)) =
+            removal.filter(|(draft_id, _, _)| self.draft_can_edit(*draft_id, cx))
+        {
             card = card.actions(
                 AttachmentActions::new().child(
                     Button::new(format!("remove-attachment-{attachment_id}"))
@@ -624,5 +701,142 @@ impl Cowork {
             );
         }
         card
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        draft_editing::tests::EditorTestApp, test_support::text_attachment, thread::PeerMode,
+    };
+
+    #[gpui::test]
+    fn completed_read_cannot_attach_after_destination_write_is_revoked(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let mut app = EditorTestApp::start(cx);
+        let thread = app.thread.clone();
+        let cowork = app.cowork.clone();
+        let pending_id = Uuid::new_v4();
+        let (draft_id, generation, canonical) = thread.read_with(app.cx, |thread, _| {
+            (
+                thread.draft().id,
+                thread.draft_generation(),
+                thread.draft().items(),
+            )
+        });
+        cowork.update(app.cx, |cowork, cx| {
+            cowork.pending_attachments.push(PendingAttachment {
+                id: pending_id,
+                draft_id,
+                target: AttachmentTarget::NewBlock(Uuid::new_v4()),
+                name: "late.txt".into(),
+                is_image: false,
+                progress: Some(90.),
+            });
+            // The active composer is still writable. Only the captured
+            // destination's policy may decide where this completion lands.
+            cowork.active_thread_id = None;
+            assert!(cowork.writable_draft_id(cx).is_some());
+        });
+        app.set_mode(PeerMode::ReadOnly);
+        cowork.update(app.cx, |cowork, cx| {
+            assert!(
+                cowork
+                    .attachment_read_event(
+                        draft_id,
+                        generation,
+                        AttachmentReadEvent::Finished(
+                            pending_id,
+                            Ok(text_attachment("late.txt", "late bytes"))
+                        ),
+                        cx
+                    )
+                    .is_none()
+            );
+            assert!(cowork.pending_attachments.is_empty());
+            assert!(cowork.attachment_errors.is_empty());
+        });
+        app.set_mode(PeerMode::Write);
+        cowork.update(app.cx, |cowork, cx| {
+            assert!(
+                cowork
+                    .attachment_read_event(
+                        draft_id,
+                        generation,
+                        AttachmentReadEvent::Finished(
+                            pending_id,
+                            Ok(text_attachment("late.txt", "late bytes"))
+                        ),
+                        cx
+                    )
+                    .is_none()
+            );
+        });
+        thread.read_with(app.cx, |thread, _| {
+            assert_eq!(thread.draft().items(), canonical);
+            assert!(thread.draft().attachment_records().is_empty());
+            assert!(thread.draft().files.is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn completed_read_from_rejected_generation_cannot_attach_after_reset(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        let app = EditorTestApp::start(cx);
+        let thread = app.thread.clone();
+        let cowork = app.cowork.clone();
+        let pending_id = Uuid::new_v4();
+        let (draft_id, generation, state, canonical) = thread.read_with(app.cx, |thread, _| {
+            (
+                thread.draft().id,
+                thread.draft_generation(),
+                thread.draft().encode_state(),
+                thread.draft().items(),
+            )
+        });
+        cowork.update(app.cx, |cowork, _| {
+            cowork.pending_attachments.push(PendingAttachment {
+                id: pending_id,
+                draft_id,
+                target: AttachmentTarget::NewBlock(Uuid::new_v4()),
+                name: "rejected.txt".into(),
+                is_image: false,
+                progress: None,
+            });
+        });
+        thread.update(app.cx, |thread, cx| {
+            thread.apply_for_test(
+                protocol::HostMessage::DraftReset {
+                    generation: generation + 1,
+                    state,
+                },
+                cx,
+            );
+        });
+        cowork.update(app.cx, |cowork, cx| {
+            assert!(cowork.draft_can_edit(draft_id, cx));
+            assert!(
+                cowork
+                    .attachment_read_event(
+                        draft_id,
+                        generation,
+                        AttachmentReadEvent::Finished(
+                            pending_id,
+                            Ok(text_attachment("rejected.txt", "old bytes"))
+                        ),
+                        cx
+                    )
+                    .is_none()
+            );
+            assert!(cowork.pending_attachments.is_empty());
+        });
+        thread.read_with(app.cx, |thread, _| {
+            assert_eq!(thread.draft().items(), canonical);
+            assert!(thread.draft().attachment_records().is_empty());
+            assert!(thread.draft().files.is_empty());
+        });
     }
 }

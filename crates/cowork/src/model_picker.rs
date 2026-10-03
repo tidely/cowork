@@ -20,7 +20,6 @@ use crate::{
     Cowork, MainStage, ProviderSetupStage,
     assets::OLLAMA_AVATAR_PATH,
     models::{ModelCatalog, ModelInfo, ModelProvider, ModelRef},
-    protocol,
     thread::{Thread, ThreadOwnership},
     usage::{ContextUsage, format_token_count},
 };
@@ -228,12 +227,7 @@ impl Cowork {
         self.models = Arc::new(catalog.clone());
         for thread in self.thread_store.read(cx).threads.clone() {
             thread.update(cx, |thread, cx| {
-                if thread.ownership == ThreadOwnership::Local && *thread.models != catalog {
-                    thread.emit(
-                        protocol::HostMessage::ModelCatalogChanged(catalog.clone()),
-                        cx,
-                    );
-                }
+                thread.set_model_catalog(catalog.clone(), cx);
             });
         }
     }
@@ -246,10 +240,16 @@ impl Cowork {
             return;
         }
         if let Some(thread) = self.active_thread(cx) {
-            if thread.read(cx).ownership == ThreadOwnership::Local {
-                self.new_thread_model = Some(model.clone());
+            let local = thread.read(cx).ownership() == ThreadOwnership::Local;
+            if thread
+                .update(cx, |thread, cx| thread.select_model(model.clone(), cx))
+                .is_err()
+            {
+                return;
             }
-            thread.update(cx, |thread, cx| thread.select_model(model, cx));
+            if local {
+                self.new_thread_model = Some(model);
+            }
         } else {
             self.new_thread_model = Some(model);
         }
@@ -259,7 +259,7 @@ impl Cowork {
     /// The model of the active thread, or of the thread about to be created.
     pub(crate) fn active_model(&self, cx: &App) -> Option<ModelRef> {
         self.active_thread(cx)
-            .map(|thread| thread.read(cx).model.clone())
+            .map(|thread| thread.read(cx).model().cloned())
             .unwrap_or_else(|| self.new_thread_model.clone())
     }
 
@@ -267,7 +267,7 @@ impl Cowork {
     pub(crate) fn active_catalog(&self, cx: &App) -> Arc<ModelCatalog> {
         self.active_thread(cx).map_or_else(
             || self.models.clone(),
-            |thread| thread.read(cx).models.clone(),
+            |thread| thread.read(cx).models().clone(),
         )
     }
 

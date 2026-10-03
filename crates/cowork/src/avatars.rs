@@ -23,7 +23,7 @@ impl Cowork {
             .unwrap_or_default();
         profiles.insert(self.local_participant_id, self.profile.clone());
         if let Some(thread) = thread {
-            profiles.insert(thread.participant_id, self.profile.clone());
+            profiles.insert(thread.participant_id(), self.profile.clone());
         }
         profiles
     }

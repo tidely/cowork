@@ -32,7 +32,8 @@ use crate::{
     profile::validate_profile,
     protocol,
     thread::{
-        HostPeer, PeerLink, SharingStatus, THREAD_EVENT_CAPACITY, Thread, ThreadHost, ThreadSharing,
+        ChangeModel, ControlGeneration, HostPeer, PeerLink, PermissionDenied, SharingStatus,
+        Thread, ThreadHost, ThreadSharing,
     },
     thread_draft::ThreadDraft,
 };
@@ -61,7 +62,7 @@ pub(crate) struct JoinDialog {
 }
 
 impl Cowork {
-    fn prepare_thread_for_sharing(&mut self, cx: &mut Context<Self>) -> Entity<Thread> {
+    pub(crate) fn prepare_thread_for_sharing(&mut self, cx: &mut Context<Self>) -> Entity<Thread> {
         if let Some(thread) = self
             .active_thread_id
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
@@ -112,13 +113,9 @@ impl Cowork {
                     return;
                 }
             };
-            thread.update(cx, |thread, _| {
-                thread.sharing = ThreadSharing::Shared {
-                    endpoint,
-                    events: broadcast::channel(THREAD_EVENT_CAPACITY).0,
-                };
-                thread.participants = vec![thread.participant_id];
-            });
+            if !thread.update(cx, |thread, _| thread.start_hosting(endpoint)) {
+                return;
+            }
             if this.update(cx, |_, cx| cx.notify()).is_err() {
                 return;
             }
@@ -276,7 +273,7 @@ impl Cowork {
         loop {
             let chunk = match sends.front() {
                 Some(&(id, offset)) => {
-                    thread.update(cx, |thread, _| thread.draft.chunk(id, offset))?
+                    thread.update(cx, |thread, _| thread.draft().chunk(id, offset))?
                 }
                 None => None,
             };
@@ -345,9 +342,30 @@ impl Cowork {
                     let Some(thread) = thread.upgrade() else {
                         return Ok(());
                     };
-                    cowork.update(cx, |cowork, cx| {
+                    let result = cowork.update(cx, |cowork, cx| {
                         cowork.collaborator_request(&thread, participant_id, request, cx)
-                    })??;
+                    })?;
+                    if let Err(error) = result {
+                        if let Some(denied) = error.downcast_ref::<PermissionDenied>() {
+                            // Do not disconnect a peer for an action that raced with
+                            // revocation. Rejected optimistic edits need replacement,
+                            // not a merge with their existing CRDT history.
+                            let reset = if denied.operation
+                                == crate::thread::PermissionOperation::EditDraft
+                            {
+                                Some(thread.update(cx, |thread, _| thread.draft_reset_for(participant_id)))
+                            } else {
+                                None
+                            };
+                            peer.send(protocol::HostMessage::PermissionDenied(denied.clone()))
+                                .await?;
+                            if let Some(reset) = reset {
+                                peer.send(reset).await?;
+                            }
+                        } else {
+                            return Err(error);
+                        }
+                    }
                 }
             }
         }
@@ -365,37 +383,40 @@ impl Cowork {
         broadcast::Receiver<protocol::HostMessage>,
         Vec<AttachmentId>,
     )> {
-        let (snapshot, draft, presence, stored_attachments, files, events) = thread
-            .update(cx, |thread, _| {
-                let presence = thread
-                    .draft
-                    .presence
-                    .iter()
-                    .map(|(participant, (presence, _))| {
-                        (participant.into_bytes(), presence.clone())
-                    })
-                    .collect();
-                let stored = thread
-                    .draft
-                    .stored
-                    .iter()
-                    .map(|id| id.as_uuid().into_bytes())
-                    .collect();
-                Some((
-                    thread.to_protocol(),
-                    thread.draft.doc.encode_state(),
-                    presence,
-                    stored,
-                    thread.files_for(participant_id),
-                    thread.subscribe()?,
-                ))
-            })?
-            .context("Thread is no longer shared.")?;
+        let (snapshot, draft, draft_generation, presence, stored_attachments, files, events) =
+            thread
+                .update(cx, |thread, _| {
+                    let presence = thread
+                        .draft()
+                        .presence
+                        .iter()
+                        .map(|(participant, (presence, _))| {
+                            (participant.into_bytes(), presence.clone())
+                        })
+                        .collect();
+                    let stored = thread
+                        .draft()
+                        .stored
+                        .iter()
+                        .map(|id| id.as_uuid().into_bytes())
+                        .collect();
+                    Some((
+                        thread.to_protocol(),
+                        thread.draft().encode_state(),
+                        thread.draft_generation_for(participant_id),
+                        presence,
+                        stored,
+                        thread.files_for(participant_id),
+                        thread.subscribe()?,
+                    ))
+                })?
+                .context("Thread is no longer shared.")?;
         peer.send(protocol::HostMessage::Welcome(Box::new(
             protocol::Welcome {
                 participant_id: participant_id.into_bytes(),
                 thread: snapshot,
                 draft,
+                draft_generation,
                 presence,
                 stored_attachments,
             },
@@ -433,19 +454,22 @@ impl Cowork {
                 });
                 cx.notify();
             }
-            protocol::CollaboratorMessage::DraftUpdate(update) => {
+            protocol::CollaboratorMessage::DraftUpdate { generation, update } => {
                 thread
                     .update(cx, |thread, _| {
-                        thread.apply_collaborator_update(participant, update)
+                        thread.apply_collaborator_update(participant, generation, update)
                     })
                     .with_context(|| format!("Invalid draft update from {participant:?}."))?;
                 cx.notify();
             }
             protocol::CollaboratorMessage::Submit { sequence } => {
+                thread.update(cx, |thread, _| {
+                    thread.with_authorized::<ControlGeneration, _>(participant, |_| ())
+                })?;
                 let (draft_id, stale) = {
                     let thread = thread.read(cx);
                     (
-                        thread.draft.id,
+                        thread.draft().id,
                         thread.runnable_model().is_none()
                             || thread.generating
                             || thread.submission_count() != sequence,
@@ -455,24 +479,14 @@ impl Cowork {
                 // everyone sees that one.
                 // TODO: tell the submitter why a submission was not accepted.
                 if !stale && !self.draft_is_loading_attachments(draft_id, cx) {
-                    self.accept_submission(draft_id, Some(thread.clone()), false, cx);
+                    self.accept_submission(draft_id, Some(thread.clone()), participant, false, cx);
                     let thread_id = thread.read(cx).instance_id;
                     self.thread_updated(thread_id, cx);
                 }
             }
             protocol::CollaboratorMessage::AttachmentCancelled(id) => {
                 let id = AttachmentId::from_uuid(Uuid::from_bytes(id));
-                thread.update(cx, |thread, _| {
-                    let draft = &mut thread.draft;
-                    let theirs = draft
-                        .incoming
-                        .get(&id)
-                        .is_some_and(|file| file.uploader == Some(participant));
-                    if theirs {
-                        draft.incoming.remove(&id);
-                        draft.discarded.insert(id);
-                    }
-                });
+                thread.update(cx, |thread, _| thread.cancel_upload(participant, id))?;
             }
             protocol::CollaboratorMessage::AttachmentData(chunk) => {
                 thread
@@ -487,12 +501,24 @@ impl Cowork {
                 cx.notify();
             }
             protocol::CollaboratorMessage::SelectModel(model) => {
-                thread.update(cx, |thread, cx| thread.host_select_model(model, cx));
+                thread.update(cx, |thread, cx| {
+                    thread.with_authorized::<ChangeModel, _>(participant, |auth| {
+                        auth.select_model(model, cx);
+                    })
+                })?;
                 cx.notify();
             }
             protocol::CollaboratorMessage::Stop { message_id } => {
+                thread.update(cx, |thread, _| {
+                    thread.with_authorized::<ControlGeneration, _>(participant, |_| ())
+                })?;
                 let thread_id = thread.read(cx).instance_id;
-                self.cancel_generation(thread_id, Some(Uuid::from_bytes(message_id)), cx);
+                self.cancel_generation(
+                    thread_id,
+                    participant,
+                    Some(Uuid::from_bytes(message_id)),
+                    cx,
+                );
             }
         }
         Ok(())
@@ -825,12 +851,20 @@ impl Cowork {
                     protocol::HostMessage::Presence { .. }
                         | protocol::HostMessage::AttachmentData(_)
                 );
+                let permission_denied = match &event {
+                    protocol::HostMessage::PermissionDenied(denied) => Some(denied.clone()),
+                    _ => None,
+                };
                 if let Err(error) = thread.update(cx, |thread, cx| thread.try_apply(event, cx)) {
                     eprintln!("closed shared thread after invalid event from host: {error:#}");
                     break;
                 }
                 if this
                     .update(cx, |this, cx| {
+                        this.reconcile_peer_access(thread_id, cx);
+                        if let Some(denied) = permission_denied {
+                            this.show_permission_denied(thread_id, &denied, cx);
+                        }
                         if presence_only {
                             cx.notify();
                         } else {
@@ -880,16 +914,7 @@ impl Cowork {
             SharingStatus::Shared => {
                 // Replacing the state drops the event channel, which ends every
                 // peer's subscription and unwinds the tasks serving them.
-                let endpoint = thread.update(cx, |thread, _| {
-                    let ThreadSharing::Shared { endpoint, .. } =
-                        std::mem::replace(&mut thread.sharing, ThreadSharing::NotShared)
-                    else {
-                        return None;
-                    };
-                    thread.participants.clear();
-                    thread.draft.presence.clear();
-                    Some(endpoint)
-                });
+                let endpoint = thread.update(cx, |thread, cx| thread.stop_hosting(cx));
                 if let Some(endpoint) = endpoint {
                     self.tokio_handle.spawn(async move {
                         endpoint.close().await;

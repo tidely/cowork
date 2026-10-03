@@ -135,7 +135,7 @@ impl Cowork {
         let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
             return;
         };
-        let can_write = thread.read(cx).ownership.can_write();
+        let can_write = thread.read(cx).can_edit_draft();
         self.active_thread_id = Some(thread_id);
         self.selection_message_id = None;
         self.main_stage = MainStage::Thread;

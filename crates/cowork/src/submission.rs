@@ -1,11 +1,16 @@
 //! Submitting a draft: which participant's submission wins, turning the
 //! draft into a user message, and the prompt sent for it.
 
+#[path = "generation.rs"]
+mod generation;
+pub(crate) use generation::ActiveGeneration;
+
 use std::{collections::HashMap, sync::Arc};
 
 use draft::{DraftItem, DraftItemKind};
 use gpui::{Context, Entity, SharedString, Window};
 use itertools::Itertools;
+use rig::completion::Message as RigMessage;
 use tools::TurnComments;
 use uuid::Uuid;
 
@@ -17,13 +22,23 @@ use crate::{
     profile::participant_name,
     prompt::{agent_message, prompt_name},
     protocol,
-    thread::{Thread, ThreadSharing},
+    thread::{ControlGeneration, Thread, ThreadSharing},
     thread_draft::{EditorSlot, ItemPresence, ThreadDraft},
     timeline::{
         CommentReference, PromptBlock, TimelineMessage, UserComment, UserCommentBody,
         UserMessageGroup,
     },
 };
+
+/// The owned run payload of an accepted submission, consumed synchronously
+/// before spawning any work. This is not a reusable authorization token.
+struct GenerationPlan {
+    thread_id: Uuid,
+    prompt: RigMessage,
+    history: Vec<RigMessage>,
+    comment_group_id: Option<Uuid>,
+    turn_comments: Arc<TurnComments>,
+}
 
 impl Cowork {
     pub(crate) fn composer_button_clicked(
@@ -54,6 +69,12 @@ impl Cowork {
 
     pub(crate) fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let active_thread = self.active_thread(cx);
+        if active_thread
+            .as_ref()
+            .is_some_and(|thread| !thread.read(cx).can_control_generation())
+        {
+            return;
+        }
         if !self.active_model_is_runnable(cx) {
             return;
         }
@@ -76,18 +97,29 @@ impl Cowork {
             .as_ref()
             .filter(|thread| matches!(thread.read(cx).sharing, ThreadSharing::Connected { .. }))
         {
-            let thread = thread.read(cx);
-            if !thread.draft.doc.items().iter().all(DraftItem::is_empty) {
-                thread.request(protocol::CollaboratorMessage::Submit {
-                    sequence: thread.submission_count(),
-                });
+            let requested = thread.update(cx, |thread, _| {
+                if thread.draft().items().iter().all(DraftItem::is_empty) {
+                    return false;
+                }
+                thread
+                    .with_authorized::<ControlGeneration, _>(thread.participant_id(), |auth| {
+                        auth.request_submit()
+                    })
+                    .unwrap_or(false)
+            });
+            if requested {
                 self.selection_message_id = None;
                 self.follow_generation = true;
             }
             return;
         }
 
-        if self.accept_submission(draft_id, active_thread, true, cx) {
+        let actor = active_thread
+            .as_ref()
+            .map_or(self.local_participant_id, |thread| {
+                thread.read(cx).participant_id()
+            });
+        if self.accept_submission(draft_id, active_thread, actor, true, cx) {
             self.selection_message_id = None;
             self.follow_generation = true;
             self.timeline_scroll_handle.scroll_to_bottom();
@@ -107,14 +139,24 @@ impl Cowork {
         &mut self,
         draft_id: Uuid,
         active_thread: Option<Entity<Thread>>,
+        actor: ParticipantId,
         submitted_locally: bool,
         cx: &mut Context<Self>,
     ) -> bool {
+        // An actor is the requester, not the host's local viewer. In particular,
+        // Write may edit the draft but cannot consume it on someone else's behalf.
+        if active_thread.as_ref().is_some_and(|thread| {
+            let thread = thread.read(cx);
+            !thread.is_host() || thread.draft().id != draft_id || thread.generating
+        }) || (active_thread.is_none()
+            && (actor != self.local_participant_id || draft_id != self.new_thread_draft.id))
+        {
+            return false;
+        }
         // Checked again here, as several participants' files add up.
         let attached = self
             .read_draft(draft_id, cx, |draft| {
                 draft
-                    .doc
                     .items()
                     .into_iter()
                     .filter(|item| !item.is_empty())
@@ -143,10 +185,20 @@ impl Cowork {
             cx.notify();
             return false;
         }
-        let Some((comments, blocks, comments_folded)) = self
-            .update_draft(draft_id, cx, Self::take_submission)
-            .flatten()
-        else {
+        let submission = if let Some(thread) = &active_thread {
+            thread.update(cx, |thread, _| {
+                thread
+                    .with_authorized::<ControlGeneration, _>(actor, |auth| {
+                        auth.take_submission(Self::take_submission)
+                    })
+                    .and_then(|result| result)
+                    .ok()
+                    .flatten()
+            })
+        } else {
+            Self::take_submission(&mut self.new_thread_draft)
+        };
+        let Some((comments, blocks, comments_folded)) = submission else {
             return false;
         };
         self.attachment_errors
@@ -157,7 +209,7 @@ impl Cowork {
                 let thread = thread.read(cx);
                 (
                     thread.timeline.clone(),
-                    thread.draft.files.clone(),
+                    thread.draft().files.clone(),
                     thread.transcript.clone(),
                     thread.prompt_names.clone(),
                 )
@@ -236,11 +288,13 @@ impl Cowork {
         };
 
         self.start_generation(
-            thread_id,
-            prompt,
-            history,
-            comment_group_id,
-            turn_comments,
+            GenerationPlan {
+                thread_id,
+                prompt,
+                history,
+                comment_group_id,
+                turn_comments,
+            },
             cx,
         );
         true
@@ -254,7 +308,6 @@ impl Cowork {
         draft: &mut ThreadDraft,
     ) -> Option<(Vec<UserComment>, Vec<PromptBlock>, bool)> {
         let items = draft
-            .doc
             .items()
             .into_iter()
             .filter(|item| !item.is_empty())

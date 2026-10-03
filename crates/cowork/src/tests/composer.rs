@@ -56,7 +56,6 @@ fn submission_waits_for_a_selected_model(cx: &mut gpui::TestAppContext) {
         assert!(
             cowork
                 .new_thread_draft
-                .doc
                 .items()
                 .iter()
                 .any(|item| !item.is_empty())
@@ -102,7 +101,7 @@ fn typing_at_the_draft_position_turns_it_into_a_block(cx: &mut gpui::TestAppCont
         let block_editor = draft.editor(EditorSlot::Prompt(id)).expect("block editor");
         assert_eq!(block_editor.entity_id(), draft_position.entity_id());
         assert_eq!(block_editor.read(cx).value(), "hi");
-        let item = draft.doc.item(id).expect("block");
+        let item = draft.item(id).expect("block");
         assert_eq!(item.creator, draft.author.as_uuid());
         assert_ne!(
             draft.draft_position.as_ref().map(Entity::entity_id),
@@ -224,8 +223,8 @@ fn emptied_blocks_are_removed_by_escape_backspace_and_leaving(cx: &mut gpui::Tes
 fn both_editors_of_a_comment_show_the_same_text(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     let comment = cowork.update(cx, |cowork, _| {
-        let draft = &cowork.new_thread_draft;
-        draft.doc.create_comment(
+        let draft = &mut cowork.new_thread_draft;
+        draft.create_comment(
             draft.author.as_uuid(),
             CommentTarget {
                 message_id: Uuid::new_v4(),
@@ -253,7 +252,7 @@ fn both_editors_of_a_comment_show_the_same_text(cx: &mut gpui::TestAppContext) {
 
     cowork.read_with(cx, |cowork, cx| {
         let draft = &cowork.new_thread_draft;
-        assert_eq!(draft.doc.body(comment).as_deref(), Some("xyz"));
+        assert_eq!(draft.body(comment).as_deref(), Some("xyz"));
         let inline = draft
             .editor(EditorSlot::CommentInline(comment))
             .expect("inline editor");
@@ -272,11 +271,11 @@ fn submissions_take_non_empty_items_and_leave_empty_ones(cx: &mut gpui::TestAppC
             range: 0..5,
             quote: "quote".into(),
         };
-        draft.doc.create_prompt(author, "first");
-        let empty_comment = draft.doc.create_comment(author, target.clone(), "  ");
-        draft.doc.create_comment(author, target, "why?");
-        draft.doc.create_prompt(author, "");
-        draft.doc.create_prompt(author, "second");
+        draft.create_prompt(author, "first");
+        let empty_comment = draft.create_comment(author, target.clone(), "  ");
+        draft.create_comment(author, target, "why?");
+        draft.create_prompt(author, "");
+        draft.create_prompt(author, "second");
         (empty_comment, Cowork::take_submission(draft))
     });
 
@@ -309,8 +308,8 @@ fn submission_keeps_attachment_only_blocks_and_their_files(cx: &mut gpui::TestAp
     cowork.update(cx, |cowork, _| {
         let draft = &mut cowork.new_thread_draft;
         let author = ParticipantId::new();
-        let empty = draft.doc.create_prompt(draft.author.as_uuid(), "  ");
-        let block = draft.doc.create_prompt(author.as_uuid(), "");
+        let empty = draft.create_prompt(draft.author.as_uuid(), "  ");
+        let block = draft.create_prompt(author.as_uuid(), "");
         let file = text_attachment("notes.txt", "file contents");
         let record = AttachmentRecord {
             id: AttachmentId::new(),
@@ -319,10 +318,10 @@ fn submission_keeps_attachment_only_blocks_and_their_files(cx: &mut gpui::TestAp
             size: file.len(),
             creator: author.as_uuid(),
         };
-        draft.doc.add_attachment(block, record.clone());
+        draft.add_attachment(block, record.clone());
         draft.files.insert(record.id, file);
         draft.stored.insert(record.id);
-        draft.comments_folded = true;
+        draft.update_draft_editors(|_, editors| editors.comments_folded = true);
 
         let (comments, blocks, folded) =
             Cowork::take_submission(draft).expect("attachment submission");
@@ -333,7 +332,7 @@ fn submission_keeps_attachment_only_blocks_and_their_files(cx: &mut gpui::TestAp
         assert_eq!(blocks[0].author, author);
         assert!(blocks[0].text.is_empty());
         assert_eq!(blocks[0].attachments, vec![record.clone()]);
-        let remaining = draft.doc.items();
+        let remaining = draft.items();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, empty);
         assert!(draft.attachment_records().is_empty());
@@ -349,8 +348,8 @@ fn editor_lookup_includes_both_comment_views_when_folded(cx: &mut gpui::TestAppC
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     cowork.update_in(cx, |cowork, window, cx| {
         let draft = &mut cowork.new_thread_draft;
-        let prompt = draft.doc.create_prompt(draft.author.as_uuid(), "prompt");
-        let comment = draft.doc.create_comment(
+        let prompt = draft.create_prompt(draft.author.as_uuid(), "prompt");
+        let comment = draft.create_comment(
             draft.author.as_uuid(),
             CommentTarget {
                 message_id: Uuid::new_v4(),
@@ -359,7 +358,7 @@ fn editor_lookup_includes_both_comment_views_when_folded(cx: &mut gpui::TestAppC
             },
             "comment",
         );
-        draft.comments_folded = true;
+        draft.update_draft_editors(|_, editors| editors.comments_folded = true);
         let draft_id = draft.id;
         cowork.prepare_draft(draft_id, window, cx);
 
@@ -430,8 +429,8 @@ fn submitting_keeps_focus_on_an_item_that_stays(cx: &mut gpui::TestAppContext) {
     cx.simulate_input("question");
     cx.run_until_parked();
     let comment = cowork.update(cx, |cowork, _| {
-        let draft = &cowork.new_thread_draft;
-        draft.doc.create_comment(
+        let draft = &mut cowork.new_thread_draft;
+        draft.create_comment(
             draft.author.as_uuid(),
             CommentTarget {
                 message_id: Uuid::new_v4(),
@@ -469,7 +468,7 @@ fn submitting_keeps_focus_on_an_item_that_stays(cx: &mut gpui::TestAppContext) {
             .active_thread(cx)
             .expect("the submission started a thread");
         let thread = thread.read(cx);
-        let remaining = thread.draft.doc.items();
+        let remaining = thread.draft().items();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, comment);
         let [TimelineMessage::User(message), ..] = thread.timeline.as_slice() else {

@@ -138,14 +138,14 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let timeline_scroll_handle = self.timeline_scroll_handle.clone();
-        let can_write = composer.is_some();
+        let can_write = self.writable_draft_id(cx).is_some();
         let active_thread = self.active_thread(cx);
-        // Picking the model and stopping the agent stay available to
-        // participants who cannot write to the draft.
-        let can_control = can_write
-            || active_thread
-                .as_ref()
-                .is_some_and(|thread| thread.read(cx).sharing.is_collaborating());
+        let can_control = active_thread
+            .as_ref()
+            .is_none_or(|thread| thread.read(cx).can_control_generation());
+        let can_change_model = active_thread
+            .as_ref()
+            .is_none_or(|thread| thread.read(cx).can_change_model());
 
         let loading_attachments = self
             .writable_draft_id(cx)
@@ -203,6 +203,7 @@ impl Cowork {
             }))
             .child(
                 Combobox::new(&self.model_picker)
+                    .disabled(!can_change_model)
                     .search_placeholder("Search models...")
                     .menu_width(px(360.))
                     .menu_max_h(rems(24.))
@@ -235,8 +236,8 @@ impl Cowork {
                                     .items_center()
                                     .gap_1()
                                     .rounded_md()
-                                    .cursor_pointer()
-                                    .when(model_picker_hovered, |this| {
+                                    .when(can_change_model, |this| this.cursor_pointer())
+                                    .when(model_picker_hovered && can_change_model, |this| {
                                         this.bg(cx.theme().secondary_hover)
                                     })
                                     .text_sm()
@@ -274,7 +275,7 @@ impl Cowork {
                             )
                     }),
             );
-        let button = if generating {
+        let button = if generating && can_control {
             Some(
                 Button::new("stop-generation")
                     .icon(Icon::new(AssetIconName::Square))
@@ -284,7 +285,7 @@ impl Cowork {
                     .tooltip("Stop generating")
                     .on_click(cx.listener(Self::composer_button_clicked)),
             )
-        } else if can_write {
+        } else if !generating && can_control {
             Some(
                 Button::new("send-message")
                     .icon(Icon::new(AssetIconName::SendHorizontal))
@@ -376,12 +377,10 @@ impl Cowork {
                         .on_click(cx.listener(Self::pick_attachments)),
                 )
             })
-            .when(can_control, |this| {
-                this.child(div().flex_1())
-                    .children(context_indicator)
-                    .child(model_picker)
-                    .children(button)
-            })
+            .child(div().flex_1())
+            .children(context_indicator)
+            .child(model_picker)
+            .children(button)
     }
 
     pub(crate) fn render_composer_input(
@@ -420,7 +419,7 @@ impl Cowork {
     /// when there are none, otherwise only while someone is there or files
     /// are being read for a new block.
     fn draft_row_visible(&self, draft: &ThreadDraft, window: &Window, cx: &App) -> bool {
-        !draft.doc.items().iter().any(|item| item.is_prompt())
+        !draft.items().iter().any(|item| item.is_prompt())
             || draft
                 .draft_position
                 .as_ref()
@@ -476,7 +475,7 @@ impl Cowork {
             .draft_position
             .as_ref()
             .is_some_and(|editor| editor.focus_handle(cx).is_focused(window));
-        let others = if draft.doc.items().iter().any(|item| item.is_prompt()) {
+        let others = if draft.items().iter().any(|item| item.is_prompt()) {
             draft.others_at_draft_position(participants)
         } else {
             participants
@@ -487,7 +486,7 @@ impl Cowork {
         };
         let local_included = local_there
             || participants.is_empty()
-            || !draft.doc.items().iter().any(|item| item.is_prompt());
+            || !draft.items().iter().any(|item| item.is_prompt());
         match (local_included, others.split_first()) {
             (false, Some((first, rest))) => (*first, rest.to_vec()),
             _ => (draft.author, others),
@@ -501,8 +500,8 @@ impl Cowork {
             .threads
             .iter()
             .map(|thread| thread.read(cx))
-            .find(|thread| thread.draft.id == draft_id)
-            .map(|thread| thread.participants.clone())
+            .find(|thread| thread.draft().id == draft_id)
+            .map(|thread| thread.participants().to_vec())
             .unwrap_or_default()
     }
 
@@ -512,16 +511,12 @@ impl Cowork {
         window: &Window,
         cx: &App,
     ) -> Option<Entity<TextareaState>> {
-        let draft_id = self.writable_draft_id(cx)?;
+        let draft_id = self.readable_draft_id(cx)?;
         self.read_draft(draft_id, cx, |draft| {
-            if self.draft_row_visible(draft, window, cx) {
+            if self.draft_can_edit(draft_id, cx) && self.draft_row_visible(draft, window, cx) {
                 return draft.draft_position.clone();
             }
-            let last_block = draft
-                .doc
-                .items()
-                .into_iter()
-                .rfind(|item| item.is_prompt())?;
+            let last_block = draft.items().into_iter().rfind(|item| item.is_prompt())?;
             draft.editor(EditorSlot::Prompt(last_block.id))
         })?
     }
@@ -535,7 +530,6 @@ impl Cowork {
         let participants = self.draft_participants(draft_id, cx);
         self.read_draft(draft_id, cx, |draft| {
             let blocks = draft
-                .doc
                 .items()
                 .into_iter()
                 .filter_map(|item| {
@@ -577,8 +571,17 @@ impl Cowork {
                 comments: draft.comment_views(&participants),
                 comments_folded: draft.comments_folded,
                 blocks,
-                draft_position: draft.draft_position.clone(),
-                draft_row_visible: self.draft_row_visible(draft, window, cx),
+                draft_position: self
+                    .draft_can_edit(draft_id, cx)
+                    .then(|| draft.draft_position.clone())
+                    .flatten(),
+                draft_row_visible: self.draft_row_visible(draft, window, cx)
+                    && (self.draft_can_edit(draft_id, cx)
+                        || !draft.others_at_draft_position(&participants).is_empty()
+                        || self
+                            .pending_reads(draft)
+                            .iter()
+                            .any(|pending| draft.pending_block(pending.target).is_none())),
                 draft_position_people: Self::draft_position_people(
                     draft,
                     &participants,
@@ -613,6 +616,7 @@ impl Cowork {
             draft_position_presence,
             mut pending,
         } = composer;
+        let can_edit = self.draft_can_edit(draft_id, cx);
         let mut rows = Vec::new();
         if !comments.is_empty() {
             let mut content = vec![
@@ -667,10 +671,11 @@ impl Cowork {
             let block_id = block.id;
             rows.push(
                 self.render_presence_row(block.creator, &block.presence.editors, content, cx)
-                    .can_drop(|value, _, _| {
-                        value
-                            .downcast_ref::<ExternalPaths>()
-                            .is_some_and(|paths| !paths.paths().is_empty())
+                    .can_drop(move |value, _, _| {
+                        can_edit
+                            && value
+                                .downcast_ref::<ExternalPaths>()
+                                .is_some_and(|paths| !paths.paths().is_empty())
                     })
                     .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
                         this.drop_attachments_on(
@@ -740,16 +745,21 @@ impl Cowork {
                     .w_full()
                     .flex_1()
                     .min_h(px(24.))
-                    .cursor_text()
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.focus_draft_editor(
-                            draft_id,
-                            EditorSlot::DraftPosition,
-                            None,
-                            window,
-                            cx,
-                        );
-                    })),
+                    .when(can_edit, |this| {
+                        this.cursor_text()
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                if !this.draft_can_edit(draft_id, cx) {
+                                    return;
+                                }
+                                this.focus_draft_editor(
+                                    draft_id,
+                                    EditorSlot::DraftPosition,
+                                    None,
+                                    window,
+                                    cx,
+                                );
+                            }))
+                    }),
             )
     }
 }

@@ -16,7 +16,7 @@ fn thread_draft_attachments(
             .thread(thread_id, cx)
             .expect("thread")
             .read(cx);
-        draft_attachments(&thread.draft)
+        draft_attachments(thread.draft())
     })
 }
 
@@ -96,8 +96,8 @@ fn the_attach_button_targets_the_focused_block_only(cx: &mut gpui::TestAppContex
     assert_eq!(target(cx), AttachmentTarget::Block(block));
 
     let comment = cowork.update(cx, |cowork, _| {
-        let draft = &cowork.new_thread_draft;
-        draft.doc.create_comment(
+        let draft = &mut cowork.new_thread_draft;
+        draft.create_comment(
             draft.author.as_uuid(),
             CommentTarget {
                 message_id: Uuid::new_v4(),

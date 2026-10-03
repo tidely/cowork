@@ -5,7 +5,20 @@ use std::collections::HashMap;
 use draft::{AttachmentId, AttachmentRecord};
 use uuid::Uuid;
 
-use crate::attachments::{FileAttachment, FileAttachmentContent};
+use crate::{
+    attachments::{FileAttachment, FileAttachmentContent},
+    protocol,
+    thread::{Thread, ThreadSharing},
+};
+
+/// Simulates a client that does not honor its local permission or epoch guards.
+/// The real host receiver still validates every request delivered this way.
+pub(crate) fn request_unchecked(thread: &Thread, request: protocol::CollaboratorMessage) -> bool {
+    let ThreadSharing::Connected { host, .. } = &thread.sharing else {
+        panic!("a connected test peer");
+    };
+    host.try_send(request).is_ok()
+}
 
 pub(crate) fn encoded_image(width: u32, format: image::ImageFormat) -> Vec<u8> {
     let mut bytes = Vec::new();

@@ -140,21 +140,21 @@ fn picked_models_apply_to_the_active_thread_and_new_threads(cx: &mut gpui::TestA
     cowork.update_in(cx, |cowork, window, cx| {
         cowork.set_models(test_catalog(), cx);
         let thread = cowork.active_thread(cx).expect("active thread");
-        assert_eq!(thread.read(cx).model, None);
-        assert_eq!(*thread.read(cx).models, test_catalog());
+        assert_eq!(thread.read(cx).model().cloned(), None);
+        assert_eq!(**thread.read(cx).models(), test_catalog());
 
         // Picking a model changes the active thread and later new threads.
         cowork.select_model(ollama_qwen(), cx);
-        assert_eq!(thread.read(cx).model, Some(ollama_qwen()));
+        assert_eq!(thread.read(cx).model().cloned(), Some(ollama_qwen()));
         assert_eq!(cowork.new_thread_model, Some(ollama_qwen()));
 
         // A model the catalog does not offer cannot be picked.
         cowork.select_model(ollama_model("no-such-model"), cx);
-        assert_eq!(thread.read(cx).model, Some(ollama_qwen()));
+        assert_eq!(thread.read(cx).model().cloned(), Some(ollama_qwen()));
 
         // A change made by someone else only moves the picker along.
         thread.update(cx, |thread, cx| {
-            thread.apply(protocol::HostMessage::ModelSelected(recommended_qwen()), cx);
+            thread.apply_for_test(protocol::HostMessage::ModelSelected(recommended_qwen()), cx);
         });
         cowork.sync_model_picker(window, cx);
         assert_eq!(
@@ -207,7 +207,7 @@ fn a_model_dropped_from_the_catalog_is_grayed_out_until_another_is_picked(
         cowork.set_models(catalog_of(&[recommended_qwen()]), cx);
         cowork.sync_model_picker(window, cx);
         let thread = cowork.active_thread(cx).expect("active thread");
-        assert_eq!(thread.read(cx).model, Some(ollama_qwen()));
+        assert_eq!(thread.read(cx).model().cloned(), Some(ollama_qwen()));
         assert_eq!(
             cowork.model_picker.read(cx).selected_value(),
             Some(ollama_qwen())
@@ -258,9 +258,10 @@ fn mirrored_picker_uses_host_catalog_and_restores_local_models(cx: &mut gpui::Te
         let mut snapshot = local.read(cx).to_protocol();
         snapshot.models = host_catalog.clone();
         let welcome = protocol::Welcome {
+            draft_generation: 0,
             participant_id: ParticipantId::new().into_bytes(),
             thread: snapshot,
-            draft: local.read(cx).draft.doc.encode_state(),
+            draft: local.read(cx).draft().encode_state(),
             presence: Vec::new(),
             stored_attachments: Vec::new(),
         };
@@ -281,13 +282,13 @@ fn mirrored_picker_uses_host_catalog_and_restores_local_models(cx: &mut gpui::Te
         assert_eq!(picker_catalog(cowork), host_catalog);
         // Local discovery must not replace the host's catalog while joined.
         cowork.set_models(ModelCatalog::default(), cx);
-        assert_eq!(*mirror.read(cx).models, host_catalog);
+        assert_eq!(**mirror.read(cx).models(), host_catalog);
         cowork.sync_model_picker(window, cx);
         assert_eq!(picker_catalog(cowork), host_catalog);
         cowork.set_models(local_catalog.clone(), cx);
 
         mirror.update(cx, |thread, cx| {
-            thread.apply(protocol::HostMessage::ModelSelected(host_model.clone()), cx);
+            thread.apply_for_test(protocol::HostMessage::ModelSelected(host_model.clone()), cx);
         });
         cowork.sync_model_picker(window, cx);
         assert_eq!(
@@ -300,7 +301,7 @@ fn mirrored_picker_uses_host_catalog_and_restores_local_models(cx: &mut gpui::Te
         // An empty catalog removes every choice, but not the selection,
         // which is grayed out instead.
         mirror.update(cx, |thread, cx| {
-            thread.apply(
+            thread.apply_for_test(
                 protocol::HostMessage::ModelCatalogChanged(ModelCatalog::default()),
                 cx,
             );
