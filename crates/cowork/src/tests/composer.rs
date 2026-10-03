@@ -304,6 +304,99 @@ fn submissions_take_non_empty_items_and_leave_empty_ones(cx: &mut gpui::TestAppC
 }
 
 #[gpui::test]
+fn submission_keeps_attachment_only_blocks_and_their_files(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    cowork.update(cx, |cowork, _| {
+        let draft = &mut cowork.new_thread_draft;
+        let author = ParticipantId::new();
+        let empty = draft.doc.create_prompt(draft.author.as_uuid(), "  ");
+        let block = draft.doc.create_prompt(author.as_uuid(), "");
+        let file = text_attachment("notes.txt", "file contents");
+        let record = AttachmentRecord {
+            id: AttachmentId::new(),
+            name: file.name.clone(),
+            kind: file.kind(),
+            size: file.len(),
+            creator: author.as_uuid(),
+        };
+        draft.doc.add_attachment(block, record.clone());
+        draft.files.insert(record.id, file);
+        draft.stored.insert(record.id);
+        draft.comments_folded = true;
+
+        let (comments, blocks, folded) =
+            Cowork::take_submission(draft).expect("attachment submission");
+        assert!(comments.is_empty());
+        assert!(folded);
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0].id, block.as_uuid());
+        assert_eq!(blocks[0].author, author);
+        assert!(blocks[0].text.is_empty());
+        assert_eq!(blocks[0].attachments, vec![record.clone()]);
+        let remaining = draft.doc.items();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].id, empty);
+        assert!(draft.attachment_records().is_empty());
+        assert_eq!(draft.files[&record.id].len(), record.size);
+        assert!(draft.stored.contains(&record.id));
+        assert!(!draft.discarded.contains(&record.id));
+        assert!(Cowork::take_submission(draft).is_none());
+    });
+}
+
+#[gpui::test]
+fn editor_lookup_includes_both_comment_views_when_folded(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    cowork.update_in(cx, |cowork, window, cx| {
+        let draft = &mut cowork.new_thread_draft;
+        let prompt = draft.doc.create_prompt(draft.author.as_uuid(), "prompt");
+        let comment = draft.doc.create_comment(
+            draft.author.as_uuid(),
+            CommentTarget {
+                message_id: Uuid::new_v4(),
+                range: 0..5,
+                quote: "quote".into(),
+            },
+            "comment",
+        );
+        draft.comments_folded = true;
+        let draft_id = draft.id;
+        cowork.prepare_draft(draft_id, window, cx);
+
+        let draft = &cowork.new_thread_draft;
+        assert_eq!(draft.all_editors().count(), 4);
+        assert_eq!(
+            draft
+                .navigation_chain()
+                .iter()
+                .map(|(slot, _)| *slot)
+                .collect::<Vec<_>>(),
+            [EditorSlot::Prompt(prompt), EditorSlot::DraftPosition]
+        );
+        for slot in [
+            EditorSlot::DraftPosition,
+            EditorSlot::Prompt(prompt),
+            EditorSlot::CommentInline(comment),
+            EditorSlot::CommentComposer(comment),
+        ] {
+            let editor = draft.editor(slot).expect("editor");
+            assert_eq!(draft.slot_of(editor.entity_id()), Some(slot));
+            editor.focus_handle(cx).focus(window, cx);
+            let (focused_draft, focused_slot, focused_editor) = cowork
+                .focused_draft_editor(window, cx)
+                .expect("focused editor");
+            assert_eq!(focused_draft, draft_id);
+            assert_eq!(focused_slot, slot);
+            assert_eq!(focused_editor.entity_id(), editor.entity_id());
+        }
+        let unrelated = cx.new(|cx| TextareaState::new(window, cx));
+        assert_eq!(draft.slot_of(unrelated.entity_id()), None);
+        unrelated.focus_handle(cx).focus(window, cx);
+        assert!(cowork.focused_draft_editor(window, cx).is_none());
+    });
+}
+
+#[gpui::test]
 fn syncing_editors_leaves_an_ime_composition_alone(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     cx.simulate_input("abc");

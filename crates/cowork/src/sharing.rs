@@ -779,7 +779,7 @@ impl Cowork {
         link: Option<PeerLink>,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<Uuid> {
-        Thread::validate_welcome(&welcome)?;
+        let welcome = Thread::prepare_welcome(welcome)?;
         let (host_requests, uploads, events) = host.split();
         let (requests, queued_requests) = async_channel::unbounded();
         cx.background_spawn(async move {
@@ -791,10 +791,10 @@ impl Cowork {
         })
         .detach();
 
-        // Re-authored with the id the host assigned by `from_welcome`.
+        // Re-authored with the id the host assigned by `from_prepared_welcome`.
         let draft = ThreadDraft::new(self.local_participant_id);
         let thread = cx.new(|cx| {
-            Thread::from_welcome(
+            Thread::from_prepared_welcome(
                 welcome,
                 draft,
                 ThreadSharing::Connected {

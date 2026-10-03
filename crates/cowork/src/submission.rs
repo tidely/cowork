@@ -264,29 +264,31 @@ impl Cowork {
         }
         let mut comments = Vec::new();
         let mut blocks = Vec::new();
-        for item in &items {
+        let mut ids = Vec::with_capacity(items.len());
+        for item in items {
+            ids.push(item.id);
             let author = ParticipantId::from_uuid(item.creator);
-            match &item.kind {
+            match item.kind {
                 DraftItemKind::Comment { target } => comments.push(UserComment {
                     id: item.id.as_uuid(),
                     author,
                     presence: ItemPresence::default(),
                     reference: CommentReference {
                         message_id: target.message_id,
-                        range: target.range.clone(),
-                        quote: target.quote.clone(),
+                        range: target.range,
+                        quote: target.quote,
                     },
-                    body: UserCommentBody::Submitted(item.body.clone().into()),
+                    body: UserCommentBody::Submitted(item.body.into()),
                 }),
                 DraftItemKind::Prompt { attachments } => blocks.push(PromptBlock {
                     id: item.id.as_uuid(),
                     author,
-                    text: item.body.clone(),
-                    attachments: attachments.clone(),
+                    text: item.body,
+                    attachments,
                 }),
             }
         }
-        let ids = items.iter().map(|item| item.id).collect::<Vec<_>>();
+
         // Their files stay: the submitted message shows and sends them.
         draft.take_items(&ids);
         Some((comments, blocks, draft.comments_folded))

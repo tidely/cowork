@@ -322,25 +322,9 @@ impl Cowork {
         let draft_id = self.writable_draft_id(cx)?;
         self.read_draft(draft_id, cx, |draft| {
             draft
-                .draft_position
-                .iter()
-                .map(|editor| (EditorSlot::DraftPosition, editor.clone()))
-                .chain(
-                    draft
-                        .editors
-                        .iter()
-                        .flat_map(|(&id, editors)| match editors {
-                            ItemEditors::Prompt(editor) => {
-                                vec![(EditorSlot::Prompt(id), editor.clone())]
-                            }
-                            ItemEditors::Comment { inline, composer } => vec![
-                                (EditorSlot::CommentInline(id), inline.clone()),
-                                (EditorSlot::CommentComposer(id), composer.clone()),
-                            ],
-                        }),
-                )
+                .all_editors()
                 .find(|(_, editor)| editor.focus_handle(cx).is_focused(window))
-                .map(|(slot, editor)| (draft_id, slot, editor))
+                .map(|(slot, editor)| (draft_id, slot, editor.clone()))
         })?
     }
 

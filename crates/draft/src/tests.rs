@@ -548,9 +548,11 @@ fn malformed_items_are_skipped() {
 
     // Malformed items can still be removed; the duplicate good entry goes with its item.
     assert_eq!(
-        draft.remove_items(&[dangling, unknown_kind, unordered, good]),
+        draft.remove_items(&[dangling, unknown_kind, unordered, good, dangling, good]),
         4
     );
+    assert_eq!(raw_counts(&draft), (6, 3));
+    assert_eq!(draft.remove_items(&[dangling, unordered, good]), 0);
     assert!(draft.items().is_empty());
 
     // The same data replicates and is skipped on the other side too.

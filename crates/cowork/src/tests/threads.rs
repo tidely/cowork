@@ -923,6 +923,28 @@ fn snapshots_with_agent_runs_the_transcript_cannot_hold_are_rejected(
             .messages
             .push(protocol::TimelineMessage::Agent(second));
         assert!(Thread::validate_welcome(&two_generating).is_err());
+
+        let mut invalid_json = welcome;
+        invalid_json.thread.transcript[0] = postcard::from_bytes(
+            &postcard::to_stdvec("not json").expect("encode invalid JSON string"),
+        )
+        .expect("decode an untrusted transcript message");
+        view.host.update(cx, |thread, cx| {
+            let snapshot = postcard::to_stdvec(&thread.to_protocol()).unwrap();
+            let draft = thread.draft.doc.encode_state();
+            let participant = thread.participant_id;
+            let stored = thread.draft.stored.clone();
+            for invalid in [two_generating, invalid_json] {
+                assert!(thread.try_rebase(invalid, cx).is_err());
+                assert_eq!(
+                    postcard::to_stdvec(&thread.to_protocol()).unwrap(),
+                    snapshot
+                );
+                assert_eq!(thread.draft.doc.encode_state(), draft);
+                assert_eq!(thread.participant_id, participant);
+                assert_eq!(thread.draft.stored, stored);
+            }
+        });
     });
 }
 

@@ -73,6 +73,31 @@ mod model_picker;
 mod search_palette;
 mod threads;
 
+impl Thread {
+    fn from_welcome(
+        welcome: protocol::Welcome,
+        draft: ThreadDraft,
+        sharing: ThreadSharing,
+        cx: &mut impl AppContext,
+    ) -> Self {
+        Self::from_prepared_welcome(
+            Self::prepare_welcome(welcome).expect("a valid thread snapshot"),
+            draft,
+            sharing,
+            cx,
+        )
+    }
+
+    fn validate_welcome(welcome: &protocol::Welcome) -> anyhow::Result<()> {
+        Self::prepare_welcome(welcome.clone()).map(|_| ())
+    }
+
+    fn rebase(&mut self, welcome: protocol::Welcome, cx: &mut impl AppContext) {
+        self.try_rebase(welcome, cx)
+            .expect("a valid thread snapshot");
+    }
+}
+
 fn ollama_model(id: &str) -> ModelRef {
     ModelRef {
         provider: ModelProvider::Ollama,

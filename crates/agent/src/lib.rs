@@ -211,7 +211,9 @@ impl TurnFold {
             | StreamEvent::BlockDelta {
                 id,
                 delta: Delta::TextMeta { .. },
-            } if !self.slots.contains_key(id) => self.reserve(id),
+            } if !self.slots.contains_key(id) => {
+                self.reserve(id);
+            }
             StreamEvent::BlockStart {
                 id,
                 kind: BlockKind::Reasoning { .. },
@@ -266,13 +268,8 @@ impl TurnFold {
                     }
                     BlockClose::ToolCall(_) | BlockClose::Image(_) => None,
                 };
-                match slot {
-                    Some(slot) => self.preview[slot] = Some(block.clone()),
-                    None => {
-                        self.slots.insert(id.clone(), self.preview.len());
-                        self.preview.push(Some(block.clone()));
-                    }
-                }
+                let slot = slot.unwrap_or_else(|| self.reserve(id));
+                self.preview[slot] = Some(block.clone());
                 return Some(block.clone());
             }
             _ => {}
@@ -281,9 +278,11 @@ impl TurnFold {
     }
 
     /// Holds the next place of the preview for block `id`.
-    fn reserve(&mut self, id: &BlockId) {
-        self.slots.insert(id.clone(), self.preview.len());
+    fn reserve(&mut self, id: &BlockId) -> usize {
+        let slot = self.preview.len();
+        self.slots.insert(id.clone(), slot);
         self.preview.push(None);
+        slot
     }
 }
 
@@ -610,6 +609,51 @@ mod tests {
         };
         assert_eq!(reasoning.display_text(), "Considered.");
         assert_eq!(reasoning.provider.as_deref(), Some("ollama"));
+    }
+
+    #[test]
+    fn block_ends_allocate_or_reuse_preview_slots() {
+        for event in turn() {
+            let AgentEvent::Model(StreamEvent::BlockEnd {
+                id,
+                end,
+                block: Some(block),
+            }) = &event
+            else {
+                continue;
+            };
+            for reserved in [false, true] {
+                let mut fold = TurnFold::default();
+                if reserved {
+                    assert_eq!(fold.reserve(id), 0);
+                    if matches!(end, BlockClose::Reasoning { .. }) {
+                        fold.open_reasoning.insert(id.clone());
+                    }
+                }
+                let slot = usize::from(reserved && matches!(end, BlockClose::ToolCall(_)));
+                assert_eq!(fold.apply(&event).block.as_ref(), Some(block));
+                assert_eq!(fold.slots[id], slot);
+                assert_eq!(fold.preview.len(), slot + 1);
+                assert_eq!(fold.preview[slot].as_ref(), Some(block));
+                assert!(!fold.open_reasoning.contains(id));
+                if slot == 1 {
+                    assert_eq!(fold.preview[0], None);
+                }
+
+                if matches!(end, BlockClose::Reasoning { .. }) {
+                    for event in canonical([model(StreamEvent::BlockStart {
+                        id: id.clone(),
+                        kind: BlockKind::Reasoning { provider_id: None },
+                    })]) {
+                        fold.apply(&event);
+                    }
+                    assert_eq!(fold.slots[id], 1);
+                    assert_eq!(fold.preview.len(), 2);
+                    assert_eq!(fold.preview[0].as_ref(), Some(block));
+                    assert_eq!(fold.preview[1], None);
+                }
+            }
+        }
     }
 
     /// A block's place in the preview is its place in the reply, so blocks

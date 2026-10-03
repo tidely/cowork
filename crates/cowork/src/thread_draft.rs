@@ -266,28 +266,28 @@ impl ThreadDraft {
         })
     }
 
-    pub(crate) fn slot_of(&self, editor: EntityId) -> Option<EditorSlot> {
-        if self
-            .draft_position
-            .as_ref()
-            .is_some_and(|draft_position| draft_position.entity_id() == editor)
-        {
-            return Some(EditorSlot::DraftPosition);
-        }
-        self.editors
+    /// All local editors, including both comment views even when folded.
+    /// This is lookup order, not the composer's navigation order.
+    pub(crate) fn all_editors(&self) -> impl Iterator<Item = (EditorSlot, &Entity<TextareaState>)> {
+        self.draft_position
             .iter()
-            .find_map(|(&id, editors)| match editors {
-                ItemEditors::Prompt(prompt) => {
-                    (prompt.entity_id() == editor).then_some(EditorSlot::Prompt(id))
+            .map(|editor| (EditorSlot::DraftPosition, editor))
+            .chain(self.editors.iter().flat_map(|(&id, editors)| {
+                match editors {
+                    ItemEditors::Prompt(editor) => [Some((EditorSlot::Prompt(id), editor)), None],
+                    ItemEditors::Comment { inline, composer } => [
+                        Some((EditorSlot::CommentInline(id), inline)),
+                        Some((EditorSlot::CommentComposer(id), composer)),
+                    ],
                 }
-                ItemEditors::Comment { inline, composer } => {
-                    if inline.entity_id() == editor {
-                        Some(EditorSlot::CommentInline(id))
-                    } else {
-                        (composer.entity_id() == editor).then_some(EditorSlot::CommentComposer(id))
-                    }
-                }
-            })
+                .into_iter()
+                .flatten()
+            }))
+    }
+
+    pub(crate) fn slot_of(&self, editor: EntityId) -> Option<EditorSlot> {
+        self.all_editors()
+            .find_map(|(slot, candidate)| (candidate.entity_id() == editor).then_some(slot))
     }
 
     pub(crate) fn editor(&self, slot: EditorSlot) -> Option<Entity<TextareaState>> {

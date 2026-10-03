@@ -196,19 +196,19 @@ impl Draft {
         let mut txn = self.doc.transact_mut();
         let mut removed = HashSet::new();
 
-        let entries: Vec<Option<ItemId>> = self
+        let entries: Vec<(usize, ItemId)> = self
             .order
             .iter(&txn)
-            .map(|entry| parse_order_entry(&entry))
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                let id = parse_order_entry(&entry)?;
+                targets.contains(&id).then_some((index, id))
+            })
             .collect();
         // Back to front so the remaining indices stay valid.
-        for (index, entry) in entries.into_iter().enumerate().rev() {
-            if let Some(id) = entry
-                && targets.contains(&id)
-            {
-                self.order.remove(&mut txn, index as u32);
-                removed.insert(id);
-            }
+        for (index, id) in entries.into_iter().rev() {
+            self.order.remove(&mut txn, index as u32);
+            removed.insert(id);
         }
 
         for id in targets {

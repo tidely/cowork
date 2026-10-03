@@ -177,14 +177,23 @@ pub(crate) struct Thread {
     pub(crate) ownership: ThreadOwnership,
 }
 
+/// A host snapshot whose transcript and agent runs have been checked before
+/// creating an entity or changing existing state. Keep the parsed transcript
+/// alongside it so installation does not decode the same messages again.
+pub(crate) struct PreparedWelcome {
+    welcome: protocol::Welcome,
+    transcript: Vec<RigMessage>,
+}
+
 impl Thread {
     /// Builds the local mirror of a thread hosted by someone else.
-    pub(crate) fn from_welcome(
-        welcome: protocol::Welcome,
+    pub(crate) fn from_prepared_welcome(
+        prepared: PreparedWelcome,
         draft: ThreadDraft,
         sharing: ThreadSharing,
         cx: &mut impl AppContext,
     ) -> Self {
+        let welcome = &prepared.welcome;
         let mut thread = Self {
             instance_id: Uuid::new_v4(),
             summary: ThreadSummary {
@@ -208,14 +217,14 @@ impl Thread {
             sharing,
             ownership: ThreadOwnership::Remote,
         };
-        thread.rebase(welcome, cx);
+        thread.apply_welcome(prepared, cx);
         thread
     }
 
     /// Validates the nested Rig JSON in an untrusted host snapshot, and that
     /// its agent messages fit its transcript, before an entity is created or
     /// existing thread state is changed.
-    pub(crate) fn validate_welcome(welcome: &protocol::Welcome) -> anyhow::Result<()> {
+    pub(crate) fn prepare_welcome(welcome: protocol::Welcome) -> anyhow::Result<PreparedWelcome> {
         let transcript = parse_transcript(&welcome.thread.transcript)?;
         let agent_messages = welcome
             .thread
@@ -226,25 +235,31 @@ impl Thread {
                 protocol::TimelineMessage::User(_) => None,
             })
             .collect::<Vec<_>>();
-        validate_agent_runs(&transcript, &agent_messages).context("invalid host snapshot")
+        validate_agent_runs(&transcript, &agent_messages).context("invalid host snapshot")?;
+        Ok(PreparedWelcome {
+            welcome,
+            transcript,
+        })
     }
 
-    /// Replaces everything the host is authoritative for with its snapshot.
-    ///
-    /// The draft is merged rather than replaced: local edits the host has
-    /// not received yet are still on their way to it and must survive.
-    pub(crate) fn rebase(&mut self, welcome: protocol::Welcome, cx: &mut impl AppContext) {
-        self.try_rebase(welcome, cx)
-            .expect("a valid thread snapshot");
-    }
-
-    /// Applies a snapshot received from the host.
+    /// Applies a snapshot received from the host, replacing authoritative
+    /// state but merging the draft so unsent local edits survive.
     pub(crate) fn try_rebase(
         &mut self,
         welcome: protocol::Welcome,
         cx: &mut impl AppContext,
     ) -> anyhow::Result<()> {
-        Self::validate_welcome(&welcome)?;
+        let prepared = Self::prepare_welcome(welcome)?;
+        self.apply_welcome(prepared, cx);
+        Ok(())
+    }
+
+    /// Installs a checked snapshot, merging the draft to retain unsent edits.
+    fn apply_welcome(&mut self, prepared: PreparedWelcome, cx: &mut impl AppContext) {
+        let PreparedWelcome {
+            welcome,
+            transcript,
+        } = prepared;
         let protocol::Welcome {
             participant_id,
             mut thread,
@@ -252,7 +267,6 @@ impl Thread {
             presence,
             stored_attachments,
         } = welcome;
-        let transcript = parse_transcript(&thread.transcript)?;
         self.draft.stored = stored_attachments
             .into_iter()
             .map(|id| AttachmentId::from_uuid(Uuid::from_bytes(id)))
@@ -299,7 +313,6 @@ impl Thread {
         self.summary = summary;
         self.set_timeline(timeline);
         self.restore_agent_output(cx);
-        Ok(())
     }
 
     pub(crate) fn to_protocol(&self) -> protocol::ThreadSnapshot {
@@ -467,23 +480,29 @@ impl Thread {
     /// The stored files `participant` needs the bytes of: all but the ones
     /// they attached themselves. Timeline files come first, in order.
     pub(crate) fn files_for(&self, participant: ParticipantId) -> Vec<AttachmentId> {
-        let timeline = self.timeline.iter().flat_map(|message| match message {
-            TimelineMessage::User(group) => group
-                .blocks
-                .iter()
-                .flat_map(|block| block.attachments.clone())
-                .collect(),
-            TimelineMessage::Agent(_) => Vec::new(),
-        });
-        timeline
-            .chain(self.draft.attachment_records())
-            .filter(|record| {
-                record.creator != participant.as_uuid()
-                    && self.draft.stored.contains(&record.id)
-                    && self.draft.files.contains_key(&record.id)
+        let eligible = |record: &draft::AttachmentRecord| {
+            record.creator != participant.as_uuid()
+                && self.draft.stored.contains(&record.id)
+                && self.draft.files.contains_key(&record.id)
+        };
+        let timeline = self
+            .timeline
+            .iter()
+            .filter_map(|message| match message {
+                TimelineMessage::User(group) => Some(group),
+                TimelineMessage::Agent(_) => None,
             })
-            .map(|record| record.id)
-            .collect()
+            .flat_map(|group| &group.blocks)
+            .flat_map(|block| &block.attachments)
+            .filter(|record| eligible(record))
+            .map(|record| record.id);
+        let draft = self
+            .draft
+            .attachment_records()
+            .into_iter()
+            .filter(eligible)
+            .map(|record| record.id);
+        timeline.chain(draft).collect()
     }
 
     /// Marks a file as held by the host and tells everyone.
