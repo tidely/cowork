@@ -155,11 +155,6 @@ pub(crate) fn validate_agent_runs(
 }
 
 impl Thread {
-    pub(crate) fn push_transcript(&mut self, message: &Json<RigMessage>) -> anyhow::Result<()> {
-        self.transcript.push(message.to_rig()?);
-        Ok(())
-    }
-
     /// Folds an event of the agent producing message `message_id` into the
     /// transcript, and shows the message's output as it now stands.
     pub(crate) fn apply_agent_event(

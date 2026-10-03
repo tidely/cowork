@@ -789,7 +789,7 @@ impl Thread {
                 started_at,
                 prompt,
             } => {
-                self.push_transcript(&prompt)?;
+                self.transcript.push(prompt.to_rig()?);
                 self.timeline.push(TimelineMessage::Agent(AgentMessage::new(
                     Uuid::from_bytes(id),
                     comment_group_id.map(Uuid::from_bytes),
@@ -872,8 +872,10 @@ impl Thread {
                     comment_responses: message
                         .comment_responses
                         .iter()
-                        .map(|response| {
-                            (response.id, response.comment_id, response.response.clone())
+                        .map(|response| CommentResponseShown {
+                            id: response.id,
+                            comment_id: response.comment_id,
+                            response: response.response.clone(),
                         })
                         .collect(),
                 }),
@@ -884,7 +886,11 @@ impl Thread {
             timeline: snapshot.messages,
             agent_output,
             transcript: self.transcript.clone(),
-            prompt_names: snapshot.prompt_names,
+            prompt_names: snapshot
+                .prompt_names
+                .into_iter()
+                .map(|(participant, name)| PromptName { participant, name })
+                .collect(),
             files,
         }
     }
@@ -914,17 +920,33 @@ pub(crate) struct Conversation {
     /// What each agent message shows, which is derived rather than sent.
     pub(crate) agent_output: Vec<AgentShown>,
     pub(crate) transcript: Vec<RigMessage>,
-    pub(crate) prompt_names: Vec<(uuid::Bytes, String)>,
+    pub(crate) prompt_names: Vec<PromptName>,
     /// The bytes of each file in the timeline, `None` while missing.
     pub(crate) files: Vec<(uuid::Bytes, Option<Vec<u8>>)>,
+}
+
+/// The name a participant is known by in the agent's prompts.
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(crate) struct PromptName {
+    pub(crate) participant: uuid::Bytes,
+    pub(crate) name: String,
 }
 
 #[cfg(test)]
 #[derive(Debug, PartialEq)]
 pub(crate) struct AgentShown {
     pub(crate) output: crate::timeline::AgentOutput,
-    /// Each reply's id, the comment it answers, and its text.
-    pub(crate) comment_responses: Vec<(Uuid, Uuid, String)>,
+    pub(crate) comment_responses: Vec<CommentResponseShown>,
+}
+
+/// A reply to a comment, without its participant-local view state.
+#[cfg(test)]
+#[derive(Debug, PartialEq)]
+pub(crate) struct CommentResponseShown {
+    pub(crate) id: Uuid,
+    pub(crate) comment_id: Uuid,
+    pub(crate) response: String,
 }
 
 fn parse_transcript(transcript: &[protocol::Json<RigMessage>]) -> anyhow::Result<Vec<RigMessage>> {
