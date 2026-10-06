@@ -4,9 +4,9 @@
 use super::*;
 
 #[test]
-fn collaborator_threads_are_removed_on_disconnect_and_default_to_admin() {
-    assert_eq!(PeerPermissions::default().default_mode(), PeerMode::Admin);
-    assert!(PeerMode::Admin.can_edit_draft());
+fn collaborator_threads_are_removed_on_disconnect_and_default_to_write() {
+    assert_eq!(PeerPermissions::default().default_mode(), PeerMode::Write);
+    assert!(PeerMode::Write.can_edit_draft());
     assert!(ThreadOwnership::Remote.remove_on_disconnect());
     assert!(!ThreadOwnership::Local.remove_on_disconnect());
 }
@@ -99,39 +99,26 @@ impl Render for ThreadMirrorTestView {
 /// thinks, answers, and replies to a comment with a tool call, then the
 /// tool's result and a second turn.
 fn agent_stream_events(message_id: Uuid) -> Vec<protocol::HostMessage> {
-    use rig::streaming::{BlockClose, BlockKind};
-
     let user_message_id = Uuid::new_v4().into_bytes();
     let comment_id = Uuid::new_v4().into_bytes();
-    let mut first_turn = vec![
-        streamed_text("thinking", "Weighing ", true),
-        streamed_text("thinking", "options.", true),
-        // No explicit thinking end, so the first answer token closes it.
-        streamed_text("answer", "Here is ", false),
-    ];
-    first_turn.extend(streamed_tool_call(
-        "call",
-        "respond_to_comment",
-        serde_json::json!({"comment_id": "comment_1", "response": "Because of this."}),
-    ));
-    first_turn.extend([
-        streamed_text("answer", "the answer.", false),
-        turn_ended(1_024),
-    ]);
-    let first_turn = agent::test_support::canonical(first_turn);
-    let results = tool_results(&first_turn, "Recorded");
-    let mut second_turn = streamed_block(
-        "second",
-        BlockKind::Text {
-            additional_params: None,
-        },
-        [rig::streaming::Delta::Text {
-            text: " Done.".into(),
-        }],
-        BlockClose::Text,
+    let first_turn = model_turn(
+        [
+            streamed_text("thinking", "Weighing ", true),
+            streamed_text("thinking", "options.", true),
+            // The thinking stays open until the turn ends, but the answer
+            // follows it from its first token.
+            streamed_text("answer", "Here is ", false),
+            streamed_text("answer", "the answer.", false),
+            streamed_tool_call(
+                "call",
+                "respond_to_comment",
+                serde_json::json!({"comment_id": "comment_1", "response": "Because of this."}),
+            ),
+        ],
+        1_024,
     );
-    second_turn.push(turn_ended(2_048));
-    let second_turn = agent::test_support::canonical(second_turn);
+    let results = tool_results(&first_turn, "Recorded");
+    let second_turn = model_turn([streamed_text("second", " Done.", false)], 2_048);
     let agent = first_turn
         .into_iter()
         .chain(results)
@@ -232,20 +219,31 @@ enum JoinAt {
 }
 
 fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_at: JoinAt) {
-    use rig::streaming::{BlockClose, StreamEvent};
+    use rig::{completion::AssistantContent, streaming::StreamEvent};
 
     cx.update(gpui_component::init);
     let message_id = Uuid::new_v4();
     let events = agent_stream_events(message_id);
     let joined_after = match join_at {
-        JoinAt::Reasoning => 4,
+        JoinAt::Reasoning => {
+            events
+                .iter()
+                .position(|event| {
+                    matches!(event, protocol::HostMessage::AgentEvent { event, .. }
+                    if matches!(event.to_agent(), Ok(agent::AgentEvent::Model(
+                        StreamEvent::Reasoning { .. }
+                    ))))
+                })
+                .expect("thinking")
+                + 1
+        }
         JoinAt::Call => {
             events
                 .iter()
                 .position(|event| {
                     matches!(event, protocol::HostMessage::AgentEvent { event, .. }
                     if matches!(event.to_agent(), Ok(agent::AgentEvent::Model(
-                        StreamEvent::BlockEnd { end: BlockClose::ToolCall(_), .. }
+                        StreamEvent::End { content: AssistantContent::ToolCall(_), .. }
                     ))))
                 })
                 .expect("completed tool call")
@@ -261,18 +259,20 @@ fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_a
                 .expect("tool result")
                 + 1
         }
-        JoinAt::SecondTurn => events
-            .iter()
-            .position(|event| {
-                matches!(event,
-                    protocol::HostMessage::AgentEvent { event, .. }
-                    if matches!(event.to_agent(), Ok(agent::AgentEvent::Model(
-                        StreamEvent::BlockDelta { delta: rig::streaming::Delta::Text { text }, .. }
-                    )) if text == " Done.")
-                )
-            })
-            .expect("later turn's text")
-            + 1,
+        JoinAt::SecondTurn => {
+            events
+                .iter()
+                .position(|event| {
+                    matches!(event,
+                        protocol::HostMessage::AgentEvent { event, .. }
+                        if matches!(event.to_agent(), Ok(agent::AgentEvent::Model(
+                            StreamEvent::Text { text, .. }
+                        )) if text == " Done.")
+                    )
+                })
+                .expect("later turn's text")
+                + 1
+        }
         JoinAt::Finished => {
             events
                 .iter()
@@ -408,15 +408,15 @@ fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_a
         assert_eq!(collaborator.transcript, host.transcript);
         let [
             RigMessage::User { .. },
-            RigMessage::Assistant { content, .. },
+            RigMessage::Assistant(reply),
             RigMessage::User { .. },
-            RigMessage::Assistant { .. },
+            RigMessage::Assistant(_),
         ] = collaborator.transcript.as_slice()
         else {
             panic!("expected prompt, reply, tool result, reply");
         };
         assert!(matches!(
-            content.as_slice(),
+            reply.content.as_slice(),
             [
                 rig::completion::AssistantContent::Reasoning(_),
                 rig::completion::AssistantContent::Text(_),
@@ -503,17 +503,19 @@ fn separate_runs_reconstruct_only_their_own_tool_calls(cx: &mut gpui::TestAppCon
                 thread.apply_for_test(event, cx);
             }
             thread.apply_for_test(agent_started(second_id, None, "Calculate this"), cx);
-            let mut events = streamed_tool_call(
-                "call",
-                "calculate",
-                serde_json::json!({
-                    "operation": "add", "a": 2, "b": 3
-                }),
+            let events = model_turn(
+                [streamed_tool_call(
+                    "call",
+                    "calculate",
+                    serde_json::json!({
+                        "operation": "add", "a": 2, "b": 3
+                    }),
+                )],
+                128,
             );
-            events.push(turn_ended(128));
-            let events = agent::test_support::canonical(events);
             let results = tool_results(&events, "5");
-            for event in events.into_iter().chain(results).chain([turn_ended(256)]) {
+            let answer = model_turn([streamed_text("answer", "It is 5.", false)], 256);
+            for event in events.into_iter().chain(results).chain(answer) {
                 thread.apply_for_test(agent_event(second_id, event), cx);
             }
             thread.apply_for_test(
@@ -568,7 +570,7 @@ fn separate_runs_reconstruct_only_their_own_tool_calls(cx: &mut gpui::TestAppCon
 
 #[gpui::test]
 fn failed_run_keeps_output_the_transcript_never_got_for_joiners(cx: &mut gpui::TestAppContext) {
-    use rig::streaming::{BlockClose, StreamEvent};
+    use rig::{completion::AssistantContent, streaming::StreamEvent};
 
     cx.update(gpui_component::init);
     let message_id = Uuid::new_v4();
@@ -578,7 +580,7 @@ fn failed_run_keeps_output_the_transcript_never_got_for_joiners(cx: &mut gpui::T
         .position(|event| {
             matches!(event, protocol::HostMessage::AgentEvent { event, .. }
             if matches!(event.to_agent(), Ok(agent::AgentEvent::Model(
-                StreamEvent::BlockEnd { end: BlockClose::ToolCall(_), .. }
+                StreamEvent::End { content: AssistantContent::ToolCall(_), .. }
             ))))
         })
         .unwrap()
@@ -649,7 +651,7 @@ fn failed_run_keeps_output_the_transcript_never_got_for_joiners(cx: &mut gpui::T
         assert_eq!(restored.output.text, "");
         assert!(matches!(
             &restored.output.steps[1],
-            AgentStep::Text(text) if text == "Here is "
+            AgentStep::Text(text) if text == "Here is the answer."
         ));
         assert_eq!(restored.comment_responses.len(), 1);
         assert_eq!(restored.comment_responses[0].response, "Because of this.");
@@ -668,27 +670,32 @@ fn incremental_output_matches_a_fresh_derivation_after_every_event(cx: &mut gpui
     // A second run whose turn calls two tools, answered one at a time, so
     // results arrive for committed calls before they join the transcript.
     events.push(agent_started(second_id, None, "Calculate both"));
-    let mut turn = vec![streamed_text("thinking", "Two sums.", true)];
-    turn.extend(streamed_tool_call(
-        "first",
-        "calculate",
-        serde_json::json!({"operation": "add", "a": 1, "b": 2}),
-    ));
-    turn.extend(streamed_tool_call(
-        "second",
-        "calculate",
-        serde_json::json!({"operation": "add", "a": 3, "b": 4}),
-    ));
-    turn.push(turn_ended(300));
-    let mut turn = agent::test_support::canonical(turn);
+    let mut turn = model_turn(
+        [
+            streamed_text("thinking", "Two sums.", true),
+            streamed_tool_call(
+                "first",
+                "calculate",
+                serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+            ),
+            streamed_tool_call(
+                "second",
+                "calculate",
+                serde_json::json!({"operation": "add", "a": 3, "b": 4}),
+            ),
+        ],
+        300,
+    );
     let results = tool_results(&turn, "sum");
     assert_eq!(results.len(), 2);
     turn.extend(results);
-    turn.extend(agent::test_support::canonical([
-        streamed_text("answer", "3 and ", false),
-        streamed_text("answer", "7.", false),
-        turn_ended(400),
-    ]));
+    turn.extend(model_turn(
+        [
+            streamed_text("answer", "3 and ", false),
+            streamed_text("answer", "7.", false),
+        ],
+        400,
+    ));
     events.extend(turn.into_iter().map(|event| agent_event(second_id, event)));
     events.push(protocol::HostMessage::AgentEnded {
         id: second_id.into_bytes(),
@@ -746,27 +753,35 @@ fn incremental_output_matches_a_fresh_derivation_after_every_event(cx: &mut gpui
     });
 }
 
-/// A block's end may restate the whole block, superseding what streamed.
-/// What the message shows follows Rig's accumulation, so it shows the
-/// restatement, as the transcript records it, and so does someone joining.
+/// A part's end may state other content than its fragments did, superseding
+/// what streamed. What the message shows follows Rig's accumulation, so it
+/// shows the content the end states, as the transcript records it, and so
+/// does someone joining.
 #[gpui::test]
-fn a_restated_block_shows_as_rig_accumulates_it(cx: &mut gpui::TestAppContext) {
-    use rig::streaming::{BlockClose, BlockKind, Delta};
-
+fn a_restated_part_shows_as_rig_accumulates_it(cx: &mut gpui::TestAppContext) {
     cx.update(gpui_component::init);
     let message_id = Uuid::new_v4();
-    let mut turn = streamed_block(
-        "thinking",
-        BlockKind::Reasoning { provider_id: None },
-        [Delta::Reasoning { text: "Hm".into() }],
-        BlockClose::Reasoning {
-            reasoning: Some(rig::message::Reasoning::new("Considered.")),
-            signature: None,
-            wire_sent: true,
+    let event = |value: serde_json::Value| {
+        agent::AgentEvent::Model(serde_json::from_value(value).expect("a stream event"))
+    };
+    let mut turn = vec![
+        event(serde_json::json!({"event": "start", "part": 0, "kind": "reasoning"})),
+        event(serde_json::json!({"event": "reasoning", "part": 0, "text": "Hm"})),
+        event(serde_json::json!({"event": "end", "part": 0,
+            "content": {"type": "reasoning", "text": "Considered."}})),
+        event(serde_json::json!({"event": "start", "part": 1, "kind": "text"})),
+        event(serde_json::json!({"event": "text", "part": 1, "text": "Yes."})),
+        event(serde_json::json!({"event": "end", "part": 1,
+            "content": {"type": "text", "text": "Yes."}})),
+    ];
+    turn.push(agent::AgentEvent::TurnEnded {
+        origin: None,
+        stop: Some(rig::message::StopReason::Stop),
+        usage: Usage {
+            total_tokens: Some(64),
+            ..Usage::default()
         },
-    );
-    turn.extend([streamed_text("answer", "Yes.", false), turn_ended(64)]);
-    let mut turn = agent::test_support::canonical(turn);
+    });
     let ended = turn.pop().expect("the turn's end");
     let (view, cx) = cx.add_window_view(|_, cx| ThreadMirrorTestView {
         host: Cowork::new_empty_local_thread(
@@ -821,13 +836,13 @@ fn a_restated_block_shows_as_rig_accumulates_it(cx: &mut gpui::TestAppContext) {
             message.output.thinking().collect::<Vec<_>>(),
             ["Considered."]
         );
-        let [_, RigMessage::Assistant { content, .. }] = host.transcript.as_slice() else {
+        let [_, RigMessage::Assistant(reply)] = host.transcript.as_slice() else {
             panic!("expected the prompt and the reply");
         };
         assert!(matches!(
-            content.first(),
+            reply.content.first(),
             Some(rig::completion::AssistantContent::Reasoning(reasoning))
-                if reasoning.display_text() == "Considered."
+                if reasoning.text == "Considered."
         ));
     });
 }
@@ -880,19 +895,16 @@ fn snapshots_with_agent_runs_the_transcript_cannot_hold_are_rejected(
         assert!(with_agent_message(&|message| message.prompt = 1).is_err());
         assert!(with_agent_message(&|message| message.prompt = 99).is_err());
         // Events completing a turn would have joined the transcript.
+        let more = model_turn([streamed_text("answer", "More", false)], 1)
+            .into_iter()
+            .map(protocol::Json::shared)
+            .collect::<Vec<_>>();
+        assert!(with_agent_message(&|message| message.pending_events = more.clone()).is_err());
+        assert!(with_agent_message(&|message| message.pending_events = more[..2].to_vec()).is_ok());
+        // Events Rig's stream could not have produced: text before its part
+        // started.
         assert!(
-            with_agent_message(&|message| {
-                message.pending_events =
-                    vec![protocol::Json::shared(turn_ended(1)).expect("a folded event")];
-            })
-            .is_err()
-        );
-        assert!(
-            with_agent_message(&|message| {
-                message.pending_events =
-                    vec![protocol::Json::shared(streamed_text("answer", "More", false)).unwrap()];
-            })
-            .is_ok()
+            with_agent_message(&|message| message.pending_events = more[1..2].to_vec()).is_err()
         );
 
         // Only the last run can still be generating.
@@ -973,9 +985,7 @@ fn expanded_thinking_stays_open_as_the_run_continues(cx: &mut gpui::TestAppConte
         .position(|event| {
             matches!(event, protocol::HostMessage::AgentEvent { event, .. }
             if matches!(event.to_agent(), Ok(agent::AgentEvent::Model(
-                rig::streaming::StreamEvent::BlockDelta {
-                    delta: rig::streaming::Delta::Text { .. }, ..
-                }
+                rig::streaming::StreamEvent::Text { .. }
             ))))
         })
         .expect("an answer token")
@@ -1020,23 +1030,29 @@ fn expanded_thinking_stays_open_as_the_run_continues(cx: &mut gpui::TestAppConte
 fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
     cx.update(gpui_component::init);
     let message_id = Uuid::new_v4();
-    let mut turn = vec![streamed_text("thinking", "Add first.", true)];
-    turn.extend(streamed_tool_call(
-        "sum",
-        "calculate",
-        serde_json::json!({"operation": "add", "a": 1, "b": 2}),
-    ));
-    turn.push(turn_ended(100));
-    let mut turn = agent::test_support::canonical(turn);
+    let mut turn = model_turn(
+        [
+            streamed_text("thinking", "Add first.", true),
+            streamed_tool_call(
+                "sum",
+                "calculate",
+                serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+            ),
+        ],
+        100,
+    );
     turn.extend(tool_results(&turn, "3"));
-    // Through the first fragment of the second thinking.
-    let second_thinking_started = turn.len() + 1;
-    turn.extend(agent::test_support::canonical([
-        streamed_text("second-thinking", "Now ", true),
-        streamed_text("second-thinking", "answer.", true),
-        streamed_text("answer", "It is 3.", false),
-        turn_ended(200),
-    ]));
+    // Through the first fragment of the second thinking: its part's start,
+    // then the fragment.
+    let second_thinking_started = turn.len() + 2;
+    turn.extend(model_turn(
+        [
+            streamed_text("second-thinking", "Now ", true),
+            streamed_text("second-thinking", "answer.", true),
+            streamed_text("answer", "It is 3.", false),
+        ],
+        200,
+    ));
     let (view, cx) = cx.add_window_view(|_, cx| ThreadMirrorTestView {
         host: Cowork::new_empty_local_thread(
             ThreadDraft::new(ParticipantId::new()),
@@ -1263,7 +1279,15 @@ fn context_tokens_are_estimated_while_streaming(cx: &mut gpui::TestAppContext) {
         }
     });
     let id = Uuid::new_v4().into_bytes();
-    let text = |text: &str| agent_event(Uuid::from_bytes(id), streamed_text("answer", text, false));
+    let apply = |thread: &mut Thread, events: &[agent::AgentEvent], cx: &mut Context<Thread>| {
+        for event in events {
+            thread.apply_for_test(agent_event(Uuid::from_bytes(id), event.clone()), cx);
+        }
+    };
+    // Each turn streams its text's start, then the text.
+    let first = model_turn([streamed_text("answer", "12345", false)], 100);
+    let (first_text, first_end) = first.split_at(2);
+    let second = model_turn([streamed_text("answer", "12345678", false)], 200);
 
     cx.update(|_, cx| {
         let thread = view.read(cx).thread.clone();
@@ -1272,13 +1296,13 @@ fn context_tokens_are_estimated_while_streaming(cx: &mut gpui::TestAppContext) {
             thread.apply_for_test(agent_started(Uuid::from_bytes(id), None, "prompt"), cx);
 
             // Before any count, streamed output is all there is.
-            thread.apply_for_test(text("12345"), cx);
+            apply(thread, first_text, cx);
             assert_eq!(thread.live_context_tokens(), Some(2));
 
             // A measurement replaces the estimate, which then grows on.
-            thread.apply_for_test(agent_event(Uuid::from_bytes(id), turn_ended(100)), cx);
+            apply(thread, first_end, cx);
             assert_eq!(thread.live_context_tokens(), Some(100));
-            thread.apply_for_test(text("12345678"), cx);
+            apply(thread, &second[..2], cx);
             assert_eq!(thread.live_context_tokens(), Some(102));
         });
 
@@ -1381,7 +1405,12 @@ fn collaborator_requests_select_models_and_stop_only_the_running_generation(
         let thread = cowork.active_thread(cx).expect("active thread");
         let collaborator = ParticipantId::new();
         thread.update(cx, |thread, cx| {
-            thread.apply_for_test(joined(collaborator), cx)
+            thread.apply_for_test(joined(collaborator), cx);
+            thread
+                .with_authorized::<ManageAccess, _>(thread.participant_id(), |mut auth| {
+                    auth.set_override(collaborator, Some(PeerMode::Admin), cx);
+                })
+                .expect("host manages access");
         });
         cowork.active_generations.insert(
             thread_id,
@@ -1512,13 +1541,19 @@ fn renaming_never_changes_what_the_agent_was_sent(cx: &mut gpui::TestAppContext)
 fn a_stopped_run_keeps_its_outcome_and_collapses_its_work(cx: &mut gpui::TestAppContext) {
     cx.update(gpui_component::init);
     let message_id = Uuid::new_v4();
-    let mut turn = vec![streamed_text("answer", "Let me check.", false)];
-    turn.extend(streamed_tool_call(
-        "sum",
-        "calculate",
-        serde_json::json!({"operation": "add", "a": 1, "b": 2}),
-    ));
-    let turn = agent::test_support::canonical(turn);
+    let mut turn = model_turn(
+        [
+            streamed_text("answer", "Let me check.", false),
+            streamed_tool_call(
+                "sum",
+                "calculate",
+                serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+            ),
+        ],
+        100,
+    );
+    // Stopped before the turn ended.
+    turn.pop();
     let (view, cx) = cx.add_window_view(|_, cx| ThreadMirrorTestView {
         host: Cowork::new_empty_local_thread(
             ThreadDraft::new(ParticipantId::new()),
@@ -1532,16 +1567,16 @@ fn a_stopped_run_keeps_its_outcome_and_collapses_its_work(cx: &mut gpui::TestApp
     view.update(cx, |view, cx| {
         view.host.update(cx, |thread, cx| {
             thread.apply_for_test(agent_started(message_id, None, "Add 1 and 2"), cx);
-            thread.apply_for_test(
-                agent_event(message_id, streamed_text("answer", "Let me check.", false)),
-                cx,
-            );
+            // The text's start, then the text.
+            for event in &turn[..2] {
+                thread.apply_for_test(agent_event(message_id, event.clone()), cx);
+            }
             let message = thread
                 .agent_message_mut(message_id.into_bytes())
                 .expect("the agent message");
             // Until a tool call follows, the text may be the response.
             assert_eq!(message.output.text, "Let me check.");
-            for event in turn.iter().skip(1) {
+            for event in turn.iter().skip(2) {
                 thread.apply_for_test(agent_event(message_id, event.clone()), cx);
             }
             thread.apply_for_test(

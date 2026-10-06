@@ -67,6 +67,7 @@ fn file_text(draft: &ThreadDraft, id: AttachmentId) -> Option<String> {
 #[gpui::test]
 fn a_collaborators_file_is_uploaded_and_stored(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
+    set_default(&mut session, PeerMode::Admin);
     let collaborator_thread = session.collaborator_thread().expect("joined");
     let host_thread = session.host_thread.clone();
     let block = session.items(&host_thread)[0].id;

@@ -144,12 +144,12 @@ pub(crate) struct AgentToolCall {
 
 impl AgentToolCall {
     pub(crate) fn arguments_text(&self) -> String {
-        pretty_json(&self.call.function.arguments)
+        pretty_json(&self.call.function.arguments_value())
     }
 
     /// The arguments on one line, for the call's collapsed row.
     pub(crate) fn arguments_summary(&self) -> String {
-        self.call.function.arguments.to_string()
+        self.call.function.arguments_value().to_string()
     }
 
     /// The result's content as text, one item per line.

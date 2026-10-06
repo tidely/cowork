@@ -8,13 +8,14 @@
 //! The host forwards what its agent loop reports ([`AgentEvent`]s) as it
 //! happens, and every participant, the host included, folds them with the
 //! agent crate's [`TurnFold`] into the transcript, which ends up exactly as
-//! the loop recorded it: each reply is the blocks Rig finalized, which the
-//! block ends carry.
+//! the loop recorded it: each reply is the content Rig finalized, which the
+//! part ends carry. The fold checks the events' order as Rig checks a relayed
+//! stream, so a host's events that Rig could not have produced are refused.
 //!
 //! What an agent message shows ([`AgentOutput`]) is never sent. It is a
 //! function of Rig messages alone: the ones its run added to the transcript,
 //! followed by the message it is folding, as far as it has come
-//! ([`TurnFold::partial`]: the blocks Rig has finalized, and a preview of
+//! ([`TurnFold::partial`]: the parts Rig has finalized, and a preview of
 //! the ones still streaming). That message is the fold of the run's pending
 //! events, the events since its output last joined the transcript, which a
 //! snapshot carries raw. So someone joining rebuilds it exactly, and every
@@ -36,8 +37,8 @@ use rig::{
         AssistantContent, Message as RigMessage,
         message::{ToolResultContent, UserContent},
     },
-    message::{ToolCall, ToolCallId},
-    streaming::{Delta, StreamEvent},
+    message::{CallId, ToolCall},
+    streaming::StreamEvent,
     tool::Tool as _,
 };
 use tools::{RespondToComment, RespondToCommentArgs, TurnComments};
@@ -66,21 +67,13 @@ impl Json<RigMessage> {
 }
 
 impl Json<AgentEvent> {
-    /// The event as it is folded, or `None` when folding ignores it: the
-    /// stream's terminal record, whose usage, message id and reasoning
-    /// issuer `TurnEnded` carries, and provider payloads Rig does not model.
-    /// A block's end keeps the block Rig finalized, which is what the reply
-    /// is made of, even though its deltas already streamed: rebuilding it
-    /// from them would be a second accumulation that could disagree.
-    pub(crate) fn shared(event: AgentEvent) -> Option<Self> {
-        if matches!(
-            event,
-            AgentEvent::Model(StreamEvent::Final(_) | StreamEvent::Unknown(_))
-        ) {
-            return None;
-        }
+    /// The event as it is sent. A part's end keeps the content Rig
+    /// finalized, which is what the reply is made of, even though its
+    /// fragments already streamed: rebuilding it from them would be a second
+    /// accumulation that could disagree.
+    pub(crate) fn shared(event: AgentEvent) -> Self {
         // Rig's events are plain data, which always encodes.
-        Some(Self::from_value(&event).expect("an agent event encodes as JSON"))
+        Self::from_value(&event).expect("an agent event encodes as JSON")
     }
 
     pub(crate) fn to_agent(&self) -> anyhow::Result<AgentEvent> {
@@ -142,11 +135,11 @@ pub(crate) fn validate_agent_runs(
         );
         let mut fold = fold_after(transcript, &output);
         for (event_index, event) in message.pending_events.iter().enumerate() {
-            let event = event.to_agent().with_context(|| {
-                format!("invalid pending event {event_index} of agent message {index}")
-            })?;
+            let invalid =
+                || format!("invalid pending event {event_index} of agent message {index}");
+            let event = event.to_agent().with_context(invalid)?;
             anyhow::ensure!(
-                fold.apply(&event).message.is_none(),
+                fold.apply(&event).with_context(invalid)?.message.is_none(),
                 "agent message {index}'s pending events complete a message the transcript lacks"
             );
         }
@@ -164,7 +157,10 @@ impl Thread {
         cx: &mut impl AppContext,
     ) -> anyhow::Result<()> {
         let decoded = event.to_agent()?;
-        let folded = self.agent_turn.apply(&decoded);
+        let folded = self
+            .agent_turn
+            .apply(&decoded)
+            .context("the host sent an agent event out of order")?;
         let completed = folded.message.is_some();
         self.transcript.extend(folded.message);
         self.measure_agent_event(&decoded);
@@ -232,7 +228,8 @@ impl Thread {
                 let event = event
                     .to_agent()
                     .expect("pending events validated with the snapshot");
-                fold.apply(&event);
+                fold.apply(&event)
+                    .expect("pending events validated with the snapshot");
             }
             message.restore(&self.transcript[output], fold.partial().as_ref(), cx);
             let message_id = message.id;
@@ -248,10 +245,9 @@ impl Thread {
     /// carries the counts.
     fn measure_agent_event(&mut self, event: &AgentEvent) {
         match event {
-            AgentEvent::Model(StreamEvent::BlockDelta {
-                delta: Delta::Text { text } | Delta::Reasoning { text },
-                ..
-            }) => self.streamed_bytes += text.len() as u64,
+            AgentEvent::Model(
+                StreamEvent::Text { text, .. } | StreamEvent::Reasoning { text, .. },
+            ) => self.streamed_bytes += text.len() as u64,
             // Each request sends the whole transcript, so its usage is how
             // full the context is.
             AgentEvent::TurnEnded { usage, .. } if usage.is_reported() => {
@@ -287,11 +283,14 @@ impl Thread {
         call: &ToolCall,
         cx: &mut impl AppContext,
     ) {
-        if call.function.name != RespondToComment::NAME {
+        // A call whose arguments are not a JSON object never ran.
+        if call.function.name.as_str() != RespondToComment::NAME
+            || call.function.invalid_arguments.is_some()
+        {
             return;
         }
         let Ok(args) =
-            serde_json::from_value::<RespondToCommentArgs>(call.function.arguments.clone())
+            serde_json::from_value::<RespondToCommentArgs>(call.function.arguments_value())
         else {
             return;
         };
@@ -346,11 +345,11 @@ impl AgentOutput {
     /// Adds what `message`, the next message of a run's output, shows.
     fn push(&mut self, message: &RigMessage) {
         match message {
-            RigMessage::Assistant { content, .. } => {
-                for part in content {
+            RigMessage::Assistant(reply) => {
+                for part in &reply.content {
                     match part {
                         AssistantContent::Reasoning(reasoning) => {
-                            self.push_thinking(reasoning.display_text());
+                            self.push_thinking(&reasoning.text);
                         }
                         AssistantContent::Text(text) => self.push_text(&text.text),
                         AssistantContent::ToolCall(call) => {
@@ -359,7 +358,7 @@ impl AgentOutput {
                                 result: None,
                             }));
                         }
-                        AssistantContent::Image(_) => {}
+                        AssistantContent::Image(_) | AssistantContent::Opaque(_) => {}
                     }
                 }
             }
@@ -376,11 +375,11 @@ impl AgentOutput {
 
     /// Continues the thinking the output ends with, or starts new thinking
     /// if it ends with something else.
-    fn push_thinking(&mut self, text: String) {
+    fn push_thinking(&mut self, text: &str) {
         match self.steps.last_mut() {
-            Some(AgentStep::Thinking(thinking)) => thinking.push_str(&text),
+            Some(AgentStep::Thinking(thinking)) => thinking.push_str(text),
             _ if text.is_empty() => {}
-            _ => self.steps.push(AgentStep::Thinking(text)),
+            _ => self.steps.push(AgentStep::Thinking(text.to_owned())),
         }
     }
 
@@ -409,7 +408,7 @@ impl AgentOutput {
     /// Records what the tool returned for `call`. Results answer the latest
     /// reply, and Rig may mint the same id for id-less calls of different
     /// replies, so the latest call with that id is the one answered.
-    fn record_tool_result(&mut self, call: &ToolCallId, content: &[ToolResultContent]) {
+    fn record_tool_result(&mut self, call: &CallId, content: &[ToolResultContent]) {
         if let Some(tool_call) = self
             .tool_calls_mut()
             .rfind(|tool_call| tool_call.call.id == *call)
@@ -458,11 +457,11 @@ impl AgentOutput {
     fn still_reasoning(partial: Option<&RigMessage>) -> bool {
         matches!(
             partial,
-            Some(RigMessage::Assistant { content, .. })
+            Some(RigMessage::Assistant(reply))
                 if matches!(
-                    content.last(),
+                    reply.content.last(),
                     Some(AssistantContent::Reasoning(reasoning))
-                        if !reasoning.display_text().is_empty()
+                        if !reasoning.text.is_empty()
                 )
         )
     }
@@ -586,7 +585,10 @@ fn agent_message(timeline: &mut [TimelineMessage], id: Uuid) -> Option<&mut Agen
 mod tests {
     use super::*;
 
-    use rig::message::{ImageMediaType, Reasoning, ToolCall, ToolFunction, UserContent};
+    use rig::message::{
+        AssistantMessage, ImageMediaType, Origin, Reasoning, StopReason, ToolCall, ToolFunction,
+        ToolName, UserContent,
+    };
     use serde_json::json;
 
     /// A prompt with an image, a reply with reasoning and a tool call, and
@@ -594,7 +596,8 @@ mod tests {
     /// recorded.
     #[test]
     fn messages_round_trip_exactly() {
-        let call_id = ToolCallId::new("call_1").expect("a valid id");
+        let call_id = CallId::from_wire("call_1");
+        let tool = ToolName::new("respond_to_comment").expect("a valid name");
         let messages = [
             RigMessage::User {
                 content: vec![
@@ -602,21 +605,22 @@ mod tests {
                     UserContent::image_base64("AQID", Some(ImageMediaType::PNG), None),
                 ],
             },
-            RigMessage::Assistant {
-                id: Some("reply-1".into()),
+            RigMessage::Assistant(AssistantMessage {
                 content: vec![
                     AssistantContent::Reasoning(Reasoning::new("Look it up first.")),
                     AssistantContent::text("Checking."),
                     AssistantContent::ToolCall(ToolCall::new(
-                        call_id,
+                        call_id.clone(),
                         ToolFunction::new(
-                            "respond_to_comment".into(),
+                            tool.clone(),
                             json!({"comment_id": "comment_1", "response": "Yes", "n": 1.5}),
                         ),
                     )),
                 ],
-            },
-            RigMessage::tool_result("call_1", "respond_to_comment", "Recorded"),
+                origin: Some(Origin::new("ollama.chat", "ollama", "qwen")),
+                stop: Some(StopReason::ToolUse),
+            }),
+            RigMessage::tool_result(call_id, tool, "Recorded"),
         ];
         for message in messages {
             let wire = postcard::to_stdvec(&Json::from_rig(&message)).expect("encode");

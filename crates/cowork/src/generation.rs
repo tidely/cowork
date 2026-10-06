@@ -94,7 +94,9 @@ impl Cowork {
             let (selected_model, max_tokens) =
                 selected_model.context("No available model selected")?;
             let model = match selected_model.provider {
-                ModelProvider::Ollama => Ollama::new().completion(selected_model.id),
+                // `num_ctx` is a model option only the native `/api/chat`
+                // accepts; the OpenAI-compatible route refuses the request.
+                ModelProvider::Ollama => Ollama::new().native_completion(selected_model.id),
             };
             // The same tools on every run, whether or not a turn has comments:
             // the definitions are part of the prompt prefix, so changing them
@@ -130,9 +132,7 @@ impl Cowork {
                 if let AgentEvent::TurnEnded { usage, .. } = &event {
                     turn_usage += *usage;
                 }
-                let Some(event) = protocol::Json::shared(event) else {
-                    continue;
-                };
+                let event = protocol::Json::shared(event);
                 thread.update(cx, |thread, cx| {
                     thread.emit(
                         protocol::HostMessage::AgentEvent {
@@ -154,7 +154,9 @@ impl Cowork {
 
             if stream_completed {
                 let failed = |error: anyhow::Error| {
-                    protocol::RunOutcome::Failed(format!("Unable to generate a response: {error}"))
+                    protocol::RunOutcome::Failed(format!(
+                        "Unable to generate a response: {error:#}"
+                    ))
                 };
                 let outcome = match generation_task.await {
                     Ok(Ok(())) => protocol::RunOutcome::Completed,

@@ -177,9 +177,12 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
             cx,
         );
         let call = |id: &str, arguments: serde_json::Value| {
-            rig::message::ToolCall::new(
-                rig::message::ToolCallId::new(id).expect("a valid id"),
-                rig::message::ToolFunction::new("calculate".into(), arguments),
+            rig::message::ToolCall::from_wire(
+                id,
+                rig::message::ToolFunction::new(
+                    rig::message::ToolName::new("calculate").expect("a valid name"),
+                    arguments,
+                ),
             )
         };
         let steps = vec![

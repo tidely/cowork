@@ -244,35 +244,21 @@ fn agent_started(
 fn agent_event(id: Uuid, event: agent::AgentEvent) -> protocol::HostMessage {
     protocol::HostMessage::AgentEvent {
         id: id.into_bytes(),
-        event: protocol::Json::shared(event).expect("an event that is folded"),
+        event: protocol::Json::shared(event),
     }
 }
 
-/// The stream events of one block: its start, its fragments, and its end.
-fn streamed_block(
-    id: &str,
-    kind: rig::streaming::BlockKind,
-    deltas: impl IntoIterator<Item = rig::streaming::Delta>,
-    end: rig::streaming::BlockClose,
+/// The events of a model turn whose provider streams `script`, then ends the
+/// reply having used `total` tokens. See [`agent::test_support::turn`].
+fn model_turn(
+    script: impl IntoIterator<Item = agent::test_support::MockStreamEvent>,
+    total: u64,
 ) -> Vec<agent::AgentEvent> {
-    use rig::streaming::{BlockId, StreamEvent};
+    use agent::test_support::{MockStreamEvent, mock_final_with_total_tokens};
 
-    let block = BlockId::from(id);
-    std::iter::once(StreamEvent::BlockStart {
-        id: block.clone(),
-        kind,
-    })
-    .chain(deltas.into_iter().map(|delta| StreamEvent::BlockDelta {
-        id: block.clone(),
-        delta,
-    }))
-    .chain([StreamEvent::BlockEnd {
-        id: block.clone(),
-        end,
-        block: None,
-    }])
-    .map(agent::AgentEvent::Model)
-    .collect()
+    agent::test_support::turn(script.into_iter().chain([MockStreamEvent::FinalResponse(
+        mock_final_with_total_tokens(total),
+    )]))
 }
 
 /// A streamed call of the `name` tool with `arguments`.
@@ -280,56 +266,31 @@ fn streamed_tool_call(
     id: &str,
     name: &str,
     arguments: serde_json::Value,
-) -> Vec<agent::AgentEvent> {
-    use rig::streaming::{BlockClose, BlockKind, Delta, ToolCallEnd, UnparseableToolInput};
-
-    streamed_block(
-        id,
-        BlockKind::ToolCall,
-        [
-            Delta::ToolName { name: name.into() },
-            Delta::ToolArguments {
-                arguments: arguments.to_string(),
-            },
-        ],
-        BlockClose::ToolCall(ToolCallEnd::new(UnparseableToolInput::Error)),
-    )
+) -> agent::test_support::MockStreamEvent {
+    agent::test_support::MockStreamEvent::tool_call(id, name, arguments)
 }
 
-/// A text fragment streamed into block `id`, thinking or answer.
-fn streamed_text(id: &str, text: &str, thinking: bool) -> agent::AgentEvent {
-    use rig::streaming::{BlockId, Delta, StreamEvent};
+/// A fragment of thinking, streamed as reasoning item `id`, or of the
+/// answer.
+fn streamed_text(id: &str, text: &str, thinking: bool) -> agent::test_support::MockStreamEvent {
+    use agent::test_support::MockStreamEvent;
 
-    let text = text.to_owned();
-    agent::AgentEvent::Model(StreamEvent::BlockDelta {
-        id: BlockId::from(id),
-        delta: if thinking {
-            Delta::Reasoning { text }
-        } else {
-            Delta::Text { text }
-        },
-    })
-}
-
-/// The end of a model turn that used `total` tokens.
-fn turn_ended(total: u64) -> agent::AgentEvent {
-    agent::AgentEvent::TurnEnded {
-        message_id: None,
-        usage: Usage {
-            total_tokens: Some(total),
-            ..Default::default()
-        },
-        reasoning_issuer: None,
+    if thinking {
+        MockStreamEvent::ReasoningDelta {
+            id: id.into(),
+            reasoning: text.into(),
+        }
+    } else {
+        MockStreamEvent::text(text)
     }
 }
 
 /// The results of every tool the turn in `events` called, as the agent
-/// loop would report them. `events` must be canonical: see
-/// [`agent::test_support::canonical`].
+/// loop would report them.
 fn tool_results(events: &[agent::AgentEvent], output: &str) -> Vec<agent::AgentEvent> {
     let mut fold = agent::TurnFold::default();
     for event in events {
-        fold.apply(event);
+        fold.apply(event).expect("a valid event");
     }
     fold.pending_calls()
         .iter()
@@ -736,4 +697,23 @@ impl<'a> Collaboration<'a> {
             cowork.update(cx, |cowork, cx| cowork.focus_composer(window, cx));
         });
     }
+}
+
+/// Sets the host's default peer mode and waits for the mirror to see it.
+/// Collaborators join as `Write`, so tests that submit or stop runs from
+/// the collaborator grant `Admin` first.
+fn set_default(session: &mut Collaboration<'_>, mode: PeerMode) {
+    session.host_thread.update(session.cx, |thread, cx| {
+        thread
+            .with_authorized::<ManageAccess, _>(thread.participant_id(), |mut auth| {
+                auth.set_default_mode(mode, cx);
+            })
+            .expect("host manages access");
+    });
+    session.wait_until("the mirror receives the default mode", |this| {
+        let mirror = this.collaborator_thread().expect("joined");
+        mirror.read_with(this.cx, |thread, _| {
+            thread.peer_permissions().default_mode() == mode
+        })
+    });
 }

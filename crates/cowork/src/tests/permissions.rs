@@ -535,22 +535,6 @@ fn denial_feedback_targets_its_origin_when_another_thread_is_active(cx: &mut gpu
     });
 }
 
-fn set_default(session: &mut Collaboration<'_>, mode: PeerMode) {
-    session.host_thread.update(session.cx, |thread, cx| {
-        thread
-            .with_authorized::<ManageAccess, _>(thread.participant_id(), |mut auth| {
-                auth.set_default_mode(mode, cx);
-            })
-            .expect("host manages access");
-    });
-    session.wait_until("the mirror receives the default mode", |this| {
-        let mirror = this.collaborator_thread().expect("joined");
-        mirror.read_with(this.cx, |thread, _| {
-            thread.peer_permissions().default_mode() == mode
-        })
-    });
-}
-
 fn set_override(session: &mut Collaboration<'_>, mode: Option<PeerMode>) {
     let mirror = session.collaborator_thread().expect("joined");
     let actor = mirror.read_with(session.cx, |thread, _| thread.participant_id());
@@ -632,7 +616,7 @@ fn overrides_inherit_the_live_default_and_explicit_equal_modes_survive_changes(
     let actor = mirror.read_with(session.cx, |thread, _| thread.participant_id());
     assert_eq!(
         mirror.read_with(session.cx, |thread, _| thread.local_mode()),
-        PeerMode::Admin
+        PeerMode::Write
     );
     set_override(&mut session, Some(PeerMode::Admin));
     set_default(&mut session, PeerMode::ReadOnly);
@@ -787,18 +771,7 @@ fn readonly_peers_keep_receiving_drafts_models_and_agent_output(cx: &mut gpui::T
             .select_model(recommended_qwen(), cx)
             .expect("host model selection");
         thread.emit_for_test(agent_started(message_id, None, "visible prompt"), cx);
-        let mut events = streamed_block(
-            "answer",
-            rig::streaming::BlockKind::Text {
-                additional_params: None,
-            },
-            [rig::streaming::Delta::Text {
-                text: "visible answer".into(),
-            }],
-            rig::streaming::BlockClose::Text,
-        );
-        events.push(turn_ended(42));
-        for event in agent::test_support::canonical(events) {
+        for event in model_turn([streamed_text("answer", "visible answer", false)], 42) {
             thread.emit_for_test(agent_event(message_id, event), cx);
         }
         thread.emit_for_test(
@@ -1121,6 +1094,11 @@ fn direct_cancel_rechecks_current_actor_permissions_before_aborting(cx: &mut gpu
         let thread = cowork.active_thread(cx).expect("thread");
         thread.update(cx, |thread, cx| {
             thread.apply_for_test(joined(actor), cx);
+            thread
+                .with_authorized::<ManageAccess, _>(thread.participant_id(), |mut auth| {
+                    auth.set_override(actor, Some(PeerMode::Admin), cx);
+                })
+                .expect("grant controls");
             thread
                 .with_authorized::<ControlGeneration, _>(actor, |_| ())
                 .expect("initial Admin");

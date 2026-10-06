@@ -831,7 +831,7 @@ impl Cowork {
                         .size_3()
                         .flex_none(),
                     )
-                    .child(div().flex_none().child(call.call.function.name.clone()))
+                    .child(div().flex_none().child(call.call.function.name.to_string()))
                     .child(
                         div()
                             .flex_1()

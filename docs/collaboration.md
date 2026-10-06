@@ -13,7 +13,7 @@ Yrs drafts with prompt blocks, comments as items, per-block attachments,
 navigation, and empty-item removal, the draft
 synced through the host with host-coordinated submission, presence, and
 attachment transfer. Peer permissions are also implemented: `ReadOnly`, `Write`,
-and `Admin`, initially defaulting to `Admin` to preserve the old behavior.
+and `Admin`, defaulting to `Write`.
 The right-aligned titlebar gateway opens a nonmodal sharing popover with sharing
 and link actions; the host also manages live defaults before sharing and per-connection
 overrides there. Snapshots and host events sync the unchanged policy.
@@ -22,7 +22,9 @@ including after regrant; snapshots and resets merge only at a matching epoch.
 The host sanitizes read-only presence and clears stale announcements on
 downgrade. Stopping sharing cleans peers and unfinished uploads before
 clearing membership. Denial feedback is routed to the originating thread.
-The protocol version is **19**.
+Agent events are checked on arrival in the order Rig's stream could produce
+them.
+The protocol version is **20**.
 
 Not yet implemented:
 
@@ -142,7 +144,7 @@ cannot delegate it.
 | Change the selected model                             | No         | No      | Yes     |
 | Manage default access or individual overrides         | No         | No      | No      |
 
-The default starts as `Admin`. Overrides are sparse and keyed by the
+The default starts as `Write`. Overrides are sparse and keyed by the
 host-assigned participant UUID for this connection. No override means
 inherit the **current** default, so changing it immediately affects existing
 inheriting peers as well as future joins. An explicit override remains
@@ -444,15 +446,20 @@ A single-block submission looks like the current user message.
   completed.
 - Every participant mirrors the transcript and the prompt names. The
   host forwards what its agent loop reports, as it happens, in
-  `AgentEvent`: Rig's stream events (deltas and block boundaries), the end
-  of each model turn with its usage and reasoning issuer, and each tool's
-  result. Everyone, the host included, folds them the same way (the agent
-  crate's `TurnFold`) into the transcript, which comes out exactly as the
-  agent loop recorded it. Each reply is the blocks Rig finalized, which
-  every block end carries, so no participant accumulates the stream itself;
-  deltas only feed a preview of the blocks still streaming. The stream's
-  terminal record and provider payloads Rig does not model are not
-  forwarded.
+  `AgentEvent`: Rig's stream events (each part of the reply starting,
+  growing by fragments, and ending with its content), the end of each model
+  turn with its usage and the origin and stop reason Rig gave it, and each
+  tool's result. Every event travels on its own as it happens. Everyone,
+  the host included, folds them the same way (the agent crate's
+  `TurnFold`) into the transcript, which comes out exactly as the agent
+  loop recorded it. Each reply is the content Rig finalized, which every
+  part's end carries, in the parts' positions, so no participant
+  accumulates the stream itself; fragments only feed a preview of the parts
+  still streaming. The fold checks each turn's events as Rig checks a
+  relayed stream (`Transcript::push`): an event Rig's stream could not have
+  produced after the turn's events so far, such as a fragment of a part
+  that never started, is invalid host data. Provider payloads Rig does not
+  model are not forwarded.
 - What an agent message shows (its thinking, text, tool calls with their
   results, and replies to comments, in the order the agent produced them)
   is never sent. It is a function of Rig

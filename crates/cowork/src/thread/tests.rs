@@ -33,7 +33,7 @@ fn add_peer(thread: &mut Thread) -> ParticipantId {
 
 #[test]
 fn modes_keep_editing_and_generation_distinct() {
-    assert_eq!(PeerMode::default(), PeerMode::Admin);
+    assert_eq!(PeerMode::default(), PeerMode::Write);
     assert!(!PeerMode::ReadOnly.can_edit_draft());
     assert!(PeerMode::Write.can_edit_draft());
     assert!(!PeerMode::Write.can_control_generation());

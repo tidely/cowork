@@ -7,8 +7,8 @@ The important distinction from Rig's standard multi-turn stream is that
 everything is observable as it streams, including a completed tool call:
 
 ```text
-provider ToolCall block ends
-  -> AgentEvent::Model(BlockEnd) completes the call, while the turn streams on
+provider closes a tool call
+  -> AgentEvent::Model(End) completes the call, while the turn streams on
   -> the rest of the model turn is consumed
   -> AgentEvent::TurnEnded: the reply joins the history
   -> tools execute, each reporting AgentEvent::ToolResult
@@ -21,20 +21,25 @@ the whole model turn commits.
 A run is fully described by its events. `TurnFold` folds them into the
 messages they add to the history, and the loop records its own history by
 folding them, so anyone folding the same events, in this process or after
-sending them elsewhere (they are serializable), ends up with exactly the same
-history.
+sending them elsewhere one at a time (each is serializable on its own), ends
+up with exactly the same history.
 
-That history is Rig's own. Rig's stream is canonical: each block end carries
-the block Rig finalized. A reply is exactly those blocks, collected by Rig's
-`CompletionFold` and stamped as Rig stamps its response, so it is the
-response Rig returns for the turn (the loop asserts this in debug builds).
-Nothing re-accumulates the stream. Deltas only feed `TurnFold::partial`, a
-preview of the message being folded: finished blocks as Rig finalized them,
-and open ones as their deltas so far, each where the reply will have it. The
-preview never joins the history.
+That history is Rig's own. Each part of Rig's stream ends with the content
+Rig finalized, at the part's position in the reply. A reply is exactly that
+content, with the origin and stop reason Rig gave the turn, so it is the
+message Rig's response appends (the loop asserts this in debug builds).
+Nothing re-accumulates the stream. Fragments only feed `TurnFold::partial`,
+a preview of the message being folded: finished parts as Rig finalized them,
+and open ones as their fragments so far, each where the reply will have it.
+The preview never joins the history.
 
-Events scripted by hand must be canonical too; with the `test-support`
-feature, `agent::test_support::canonical` makes them so.
+The fold checks each turn's events as Rig checks a relayed stream, with
+`Transcript::push`, and refuses one Rig's stream could not have produced,
+such as a fragment of a part that never started. Events from elsewhere are
+checked before they are folded.
+
+With the `test-support` feature, `agent::test_support::turn` scripts a turn
+through Rig's mock model, so its events are exactly what Rig emits.
 
 ## Sketch
 
@@ -60,10 +65,10 @@ Agent::new(model.erase(), tools)
         "think": "medium"
     }))
     .run(Message::user("Reply to comment_1 and comment_2."), &mut history, |event| {
-        let folded = fold.apply(&event);
+        let folded = fold.apply(&event).expect("Rig's events are in order");
         if let Some(rig::completion::AssistantContent::ToolCall(call)) = folded.block {
-            // This occurs as soon as the provider's record for this call arrives.
-            println!("{}: {}", call.function.name, call.function.arguments);
+            // This occurs as soon as the provider closes this call.
+            println!("{}: {}", call.function.name, call.function.arguments_value());
         }
         if let AgentEvent::TurnEnded { usage, .. } = event {
             println!("turn used {usage:?}");

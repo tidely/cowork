@@ -67,6 +67,7 @@ fn collaborators_receive_the_draft_and_edit_it_live(cx: &mut gpui::TestAppContex
 #[gpui::test]
 fn the_host_accepts_one_submission_per_sequence(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
+    set_default(&mut session, PeerMode::Admin);
     let collaborator_thread = session.collaborator_thread().expect("joined");
     let host_thread = session.host_thread.clone();
 
@@ -167,6 +168,7 @@ fn concurrent_blocks_converge_to_one_order(cx: &mut gpui::TestAppContext) {
 #[gpui::test]
 fn a_submitted_block_moves_its_typist_to_the_draft_position(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
+    set_default(&mut session, PeerMode::Admin);
     let collaborator_thread = session.collaborator_thread().expect("joined");
     let collaborator = session.collaborator.clone();
     session.focus(&collaborator);
@@ -374,6 +376,7 @@ fn keystrokes_merge_with_edits_the_editor_does_not_show_yet(cx: &mut gpui::TestA
 #[gpui::test]
 fn a_submission_includes_the_last_keystroke(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
+    set_default(&mut session, PeerMode::Admin);
     let host_thread = session.host_thread.clone();
     let collaborator = session.collaborator.clone();
     session.focus(&collaborator);

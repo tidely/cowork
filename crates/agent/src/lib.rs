@@ -2,31 +2,31 @@
 //!
 //! Unlike Rig's multi-turn agent stream, this crate surfaces everything as it
 //! streams, including a completed tool call as soon as the provider closes
-//! that call's block. Tool execution still waits for the complete model turn,
+//! that call's part. Tool execution still waits for the complete model turn,
 //! keeping the assistant message and its tool results in a valid history
 //! order.
 //!
 //! A run is fully described by the [`AgentEvent`]s it emits: folding them
 //! with a [`TurnFold`] rebuilds exactly the history the loop records, because
-//! the loop records it by folding them itself. Events are serializable, so
-//! they can be sent elsewhere and folded there with the same result.
+//! the loop records it by folding them itself. Events are serializable one at
+//! a time, so they can be sent elsewhere as they happen and folded there with
+//! the same result.
 //!
-//! The history is Rig's own: each reply is what Rig's [`CompletionFold`]
-//! collects from the canonical blocks the stream's block ends carry, which
-//! is the response Rig returns for the turn.
+//! The history is Rig's own: each reply is the content the stream's part ends
+//! carry, in the parts' positions, with the origin and stop Rig gave the
+//! turn, which is the turn Rig's response appends.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::BTreeMap;
 
 use anyhow::{Context as _, Result};
 use futures::StreamExt as _;
 use rig::{
     DynModel,
     completion::{AssistantContent, CompletionRequest, Message, Usage},
-    message::{Reasoning, ReasoningContent, Text, ToolCall, ToolCallId, UserContent},
-    operation::{Completion, CompletionFold},
-    streaming::{BlockClose, BlockId, BlockKind, Delta, StreamEvent, stamp_reasoning},
-    tool::{ToolContext, ToolResult, ToolSet},
-    wire::Fold as _,
+    message::{AssistantMessage, CallId, Origin, StopReason, ToolCall, UserContent},
+    operation::Completion,
+    streaming::{Item, SequenceError, StreamEvent, Transcript},
+    tool::{ToolContext, ToolExecutionError, ToolResult, ToolSet},
 };
 use serde::{Deserialize, Serialize};
 
@@ -39,27 +39,24 @@ pub mod test_support;
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum AgentEvent {
-    /// A canonical provider event, as Rig's stream yields it: text and
-    /// reasoning deltas, block ends carrying the block they finalized (the
-    /// end of a tool call's block completes the call), and the terminal
-    /// record.
+    /// An event of Rig's completion stream: a part starts, grows, or ends
+    /// with the content Rig finalized (the end of a tool call's part
+    /// completes the call). Payloads Rig passes along unmodeled are not
+    /// reported, as they are not part of the reply.
     Model(StreamEvent),
     /// A model turn ended cleanly, so its reply joins the history. Carries
-    /// what the stream reported besides its content: the reply's id, the
-    /// tokens the request used, which sum to the run's usage even when a
-    /// later request fails or is cancelled, and the issuer Rig records on
-    /// the reply's reasoning.
+    /// what the response reported besides its content: who produced the
+    /// turn and how it ended, which the reply keeps, and the tokens the
+    /// request used, which sum to the run's usage even when a later request
+    /// fails or is cancelled.
     TurnEnded {
-        message_id: Option<String>,
+        origin: Option<Origin>,
+        stop: Option<StopReason>,
         usage: Usage,
-        reasoning_issuer: Option<String>,
     },
     /// A tool the last reply called returned. The call itself is in the
     /// reply.
-    ToolResult {
-        call: ToolCallId,
-        result: ToolResult,
-    },
+    ToolResult { call: CallId, result: ToolResult },
 }
 
 /// Folds a run's events into the messages they add to the history.
@@ -68,24 +65,22 @@ pub enum AgentEvent {
 /// called has returned, their results add the prompt of the next request.
 /// The initial prompt is the caller's, and never comes out of a fold.
 ///
-/// A reply is exactly what Rig collects from its canonical block ends, and
-/// nothing else. Deltas only feed [`TurnFold::partial`], a preview of the
-/// reply while it streams, which never joins the history.
+/// A reply is exactly the content Rig's part ends carry, and nothing else.
+/// Fragments only feed [`TurnFold::partial`], a preview of the reply while it
+/// streams, which never joins the history.
+///
+/// Model events are checked as Rig checks a relayed stream (see
+/// [`Transcript::push`]), so events from elsewhere that Rig's stream could
+/// not have produced are refused rather than folded.
 #[derive(Default)]
 pub struct TurnFold {
-    /// Rig's fold of the reply being streamed: its finished blocks, in the
-    /// order they began.
-    reply: CompletionFold,
-    /// The reply as it shows while streaming, one entry per block Rig
-    /// places, in its order. A block that has ended shows as Rig finalized
-    /// it; one still open shows its deltas so far, and `None` until it has
-    /// any.
-    preview: Vec<Option<AssistantContent>>,
-    /// The latest preview entry each block key holds, placed as Rig's fold
-    /// places it so that nothing moves when a block ends.
-    slots: HashMap<BlockId, usize>,
-    /// Reasoning keys whose block began and has not ended.
-    open_reasoning: HashSet<BlockId>,
+    /// The reply's events so far, in the order Rig's stream yields them.
+    transcript: Transcript,
+    /// The parts of the reply that ended, by position: what the reply is.
+    ended: BTreeMap<usize, AssistantContent>,
+    /// The text and reasoning of parts still streaming, by position: shown
+    /// in the preview only.
+    streaming: BTreeMap<usize, AssistantContent>,
     /// The calls of the last reply that have not returned yet.
     calls: Vec<ToolCall>,
     /// The results of those that have.
@@ -97,7 +92,7 @@ pub struct TurnFold {
 pub struct Folded {
     /// A message it completed, for the history.
     pub message: Option<Message>,
-    /// A block of the reply it completed, such as a tool call.
+    /// A part of the reply it completed, such as a tool call.
     pub block: Option<AssistantContent>,
 }
 
@@ -106,7 +101,7 @@ impl TurnFold {
     /// waiting for the results of the tools it called.
     pub fn after(reply: &Message) -> Self {
         let calls = match reply {
-            Message::Assistant { content, .. } => tool_calls(content),
+            Message::Assistant(reply) => pending_calls(&reply.content, reply.stop.as_ref()),
             Message::User { .. } | Message::System { .. } => Vec::new(),
         };
         Self {
@@ -124,169 +119,115 @@ impl TurnFold {
     /// reply streaming, or once it has ended, the results of the tools that
     /// have returned. `None` while there is neither.
     ///
-    /// The preview shows each block where the reply will have it: as Rig
-    /// finalized it once it has ended, and as its deltas so far while it is
-    /// open. The reply that joins the history is Rig's alone, so it can
-    /// differ from the last preview where Rig's finalization does, as when
-    /// it records the reasoning's issuer.
+    /// The preview shows each part where the reply will have it: as Rig
+    /// finalized it once it has ended, and as its fragments so far while it
+    /// is open.
     pub fn partial(&self) -> Option<Message> {
         if !self.results.is_empty() {
             return Some(Message::User {
                 content: self.results.clone(),
             });
         }
-        let content = self.preview.iter().flatten().cloned().collect::<Vec<_>>();
-        (!content.is_empty()).then_some(Message::Assistant { id: None, content })
+        let mut parts = self.streaming.clone();
+        parts.extend(self.ended.clone());
+        let content = parts.into_values().collect::<Vec<_>>();
+        (!content.is_empty()).then(|| Message::Assistant(AssistantMessage::new(content)))
     }
 
-    pub fn apply(&mut self, event: &AgentEvent) -> Folded {
+    /// Folds `event`, refusing a model event Rig's stream could not have
+    /// produced after the turn's events so far.
+    pub fn apply(&mut self, event: &AgentEvent) -> Result<Folded, SequenceError> {
         match event {
             AgentEvent::Model(event) => {
-                // Collecting a canonical event never fails.
-                _ = self.reply.absorb(event);
-                Folded {
+                self.transcript.push(Item::Event(event.clone()))?;
+                Ok(Folded {
                     message: None,
                     block: self.show(event),
-                }
+                })
             }
-            AgentEvent::TurnEnded {
-                message_id,
-                reasoning_issuer,
-                ..
-            } => {
-                let mut content = std::mem::take(&mut self.reply).snapshot();
-                if let Some(issuer) = reasoning_issuer {
-                    content = stamp_reasoning(content, issuer);
-                }
-                self.preview.clear();
-                self.slots.clear();
-                self.open_reasoning.clear();
-                self.calls = tool_calls(&content);
+            AgentEvent::TurnEnded { origin, stop, .. } => {
+                let content = std::mem::take(&mut self.ended)
+                    .into_values()
+                    .collect::<Vec<_>>();
+                self.transcript = Transcript::default();
+                self.streaming.clear();
+                self.calls = pending_calls(&content, stop.as_ref());
                 self.results.clear();
-                Folded {
-                    message: Some(Message::Assistant {
-                        id: message_id.clone(),
+                // Rig appends no message for an empty reply.
+                let message = (!content.is_empty()).then(|| {
+                    Message::Assistant(AssistantMessage {
                         content,
-                    }),
+                        origin: origin.clone(),
+                        stop: stop.clone(),
+                    })
+                });
+                Ok(Folded {
+                    message,
                     block: None,
-                }
+                })
             }
             AgentEvent::ToolResult { call, result } => {
                 let Some(call) = self.calls.iter().find(|pending| pending.id == *call) else {
-                    return Folded::default();
+                    return Ok(Folded::default());
                 };
-                self.results.push(UserContent::tool_result_for(
+                self.results.push(rig::transcript::tool_result_output(
                     call.id.clone(),
-                    call.provider.clone(),
                     call.function.name.clone(),
-                    result.output().clone().into_content(),
+                    result,
                 ));
                 if self.results.len() < self.calls.len() {
-                    return Folded::default();
+                    return Ok(Folded::default());
                 }
                 self.calls.clear();
-                Folded {
+                Ok(Folded {
                     message: Some(Message::User {
                         content: std::mem::take(&mut self.results),
                     }),
                     block: None,
-                }
+                })
             }
         }
     }
 
-    /// Updates the preview with a model event, returning the block it
-    /// finalized, if any. Blocks are placed as [`CompletionFold`] places
-    /// them: text at its first content, reasoning when it begins, and tool
-    /// calls and images at their end.
+    /// Updates the preview with a model event, returning the part it
+    /// finalized, if any.
     fn show(&mut self, event: &StreamEvent) -> Option<AssistantContent> {
         match event {
-            StreamEvent::BlockStart {
-                id,
-                kind:
-                    BlockKind::Text {
-                        additional_params: Some(_),
-                    },
-            }
-            | StreamEvent::BlockDelta {
-                id,
-                delta: Delta::TextMeta { .. },
-            } if !self.slots.contains_key(id) => {
-                self.reserve(id);
-            }
-            StreamEvent::BlockStart {
-                id,
-                kind: BlockKind::Reasoning { .. },
-            } if !self.open_reasoning.contains(id) => {
-                self.open_reasoning.insert(id.clone());
-                self.reserve(id);
-            }
-            StreamEvent::BlockDelta {
-                id,
-                delta: Delta::Text { text },
-            } => {
-                if !self.slots.contains_key(id) {
-                    self.reserve(id);
-                }
-                let shown = &mut self.preview[self.slots[id]];
-                match shown {
-                    Some(AssistantContent::Text(part)) => part.text.push_str(text),
-                    None => *shown = Some(AssistantContent::Text(Text::new(text))),
-                    Some(_) => {}
+            StreamEvent::Text { part, text } => {
+                if let AssistantContent::Text(shown) = self
+                    .streaming
+                    .entry(part.index())
+                    .or_insert_with(|| AssistantContent::text(""))
+                {
+                    shown.text.push_str(text);
                 }
             }
-            StreamEvent::BlockDelta {
-                id,
-                delta: Delta::Reasoning { text },
-            } => {
-                if self.open_reasoning.insert(id.clone()) {
-                    self.reserve(id);
-                }
-                let shown = &mut self.preview[self.slots[id]];
-                match shown {
-                    Some(AssistantContent::Reasoning(part)) => {
-                        if let Some(ReasoningContent::Text { text: body, .. }) =
-                            part.content.last_mut()
-                        {
-                            body.push_str(text);
-                        }
-                    }
-                    None => *shown = Some(AssistantContent::Reasoning(Reasoning::new(text))),
-                    Some(_) => {}
+            StreamEvent::Reasoning { part, text } => {
+                if let AssistantContent::Reasoning(shown) = self
+                    .streaming
+                    .entry(part.index())
+                    .or_insert_with(|| AssistantContent::reasoning(""))
+                {
+                    shown.text.push_str(text);
                 }
             }
-            StreamEvent::BlockEnd {
-                id,
-                end,
-                block: Some(block),
-            } => {
-                let slot = match end {
-                    BlockClose::Text => self.slots.get(id).copied(),
-                    BlockClose::Reasoning { .. } => {
-                        self.open_reasoning.remove(id);
-                        self.slots.get(id).copied()
-                    }
-                    BlockClose::ToolCall(_) | BlockClose::Image(_) => None,
-                };
-                let slot = slot.unwrap_or_else(|| self.reserve(id));
-                self.preview[slot] = Some(block.clone());
-                return Some(block.clone());
+            StreamEvent::End { part, content } => {
+                self.streaming.remove(&part.index());
+                self.ended.insert(part.index(), content.clone());
+                return Some(content.clone());
             }
-            _ => {}
+            StreamEvent::Start { .. } | StreamEvent::Arguments { .. } => {}
         }
         None
     }
-
-    /// Holds the next place of the preview for block `id`.
-    fn reserve(&mut self, id: &BlockId) -> usize {
-        let slot = self.preview.len();
-        self.slots.insert(id.clone(), slot);
-        self.preview.push(None);
-        slot
-    }
 }
 
-fn tool_calls(content: &[AssistantContent]) -> Vec<ToolCall> {
+/// The calls of a reply that ended with `stop` that wait for results: none
+/// when the turn failed, as none of its calls run.
+fn pending_calls(content: &[AssistantContent], stop: Option<&StopReason>) -> Vec<ToolCall> {
+    if stop.is_some_and(StopReason::is_failure) {
+        return Vec::new();
+    }
     content
         .iter()
         .filter_map(|part| match part {
@@ -333,7 +274,8 @@ impl Agent {
     ///
     /// `history` gains `prompt` and then exactly the messages a [`TurnFold`]
     /// folds out of the emitted events. On failure, it ends with the prompt
-    /// of the request that failed.
+    /// of the request that failed, or with the reply of a turn the provider
+    /// failed, whose tool calls never run.
     pub async fn run(
         &self,
         mut prompt: Message,
@@ -358,45 +300,68 @@ impl Agent {
                 .model
                 .stream(request)
                 .context("failed to start model stream")?;
-            while let Some(event) = stream.next().await {
-                let event = AgentEvent::Model(event.context("model stream failed")?);
-                fold.apply(&event);
+            while let Some(item) = stream.next().await {
+                let Item::Event(event) = item.context("model stream failed")? else {
+                    continue;
+                };
+                let event = AgentEvent::Model(event);
+                fold.apply(&event)
+                    .context("model stream yielded an event out of order")?;
                 emit(event);
             }
-            let reasoning_issuer = stream.folded().reasoning_issuer().map(str::to_owned);
             let response = stream
                 .finish()
+                .await
                 .context("model stream ended without a complete reply")?;
+            let head = response.head();
             let ended = AgentEvent::TurnEnded {
-                message_id: response.message_id.clone(),
+                origin: head.origin,
+                stop: head.stop,
                 usage: response.usage,
-                reasoning_issuer,
             };
-            let reply = fold.apply(&ended).message;
+            let reply = fold.apply(&ended)?.message;
             debug_assert_eq!(
-                reply.as_ref(),
-                Some(&Message::from(response)),
+                reply,
+                response.message(),
                 "the folded reply is the one Rig returned"
             );
             emit(ended);
             history.extend(reply);
+            if let Some(failure) = rig::message::turn_failure(
+                &response.choice,
+                Some(&response.stop()),
+                response.finish_reason().as_ref(),
+            ) {
+                anyhow::bail!(failure);
+            }
 
             let calls = fold.pending_calls().to_vec();
             if calls.is_empty() {
                 return Ok(());
             }
             for call in calls {
-                let arguments = serde_json::to_string(&call.function.arguments)
-                    .context("failed to serialize tool arguments")?;
-                let result = self
-                    .tools
-                    .execute(&call.function.name, arguments, &mut ToolContext::new())
-                    .await;
+                let name = call.function.name.as_str();
+                let result = match &call.function.invalid_arguments {
+                    // The tool never sees arguments it cannot read; the
+                    // model is told why and can call again.
+                    Some(raw) => ToolResult::failed(ToolExecutionError::invalid_args(
+                        rig::transcript::invalid_arguments_feedback(name, raw),
+                    )),
+                    None => {
+                        self.tools
+                            .execute(
+                                name,
+                                call.function.arguments_value().to_string(),
+                                &mut ToolContext::new(),
+                            )
+                            .await
+                    }
+                };
                 let event = AgentEvent::ToolResult {
                     call: call.id,
                     result,
                 };
-                if let Some(results) = fold.apply(&event).message {
+                if let Some(results) = fold.apply(&event)?.message {
                     prompt = results;
                 }
                 emit(event);
@@ -410,101 +375,72 @@ mod tests {
     use super::*;
 
     use rig::{
-        streaming::{ToolCallEnd, UnparseableToolInput},
         test_utils::{MockCompletionModel, MockStreamEvent, mock_final_with_total_tokens},
         tool::ToolOutput,
     };
 
-    use crate::test_support::canonical;
+    use crate::test_support::turn;
 
-    fn model(event: StreamEvent) -> AgentEvent {
-        AgentEvent::Model(event)
+    /// A model event read from its JSON form, as one arrives from elsewhere.
+    fn event(value: serde_json::Value) -> AgentEvent {
+        AgentEvent::Model(serde_json::from_value(value).expect("a stream event"))
+    }
+
+    fn ended() -> AgentEvent {
+        AgentEvent::TurnEnded {
+            origin: None,
+            stop: Some(StopReason::Stop),
+            usage: Usage::default(),
+        }
     }
 
     /// A turn that thinks, answers and calls a tool, as Rig streams it.
-    fn turn() -> Vec<AgentEvent> {
-        let (thinking, text, tool) = (BlockId::from("r"), BlockId::from("t"), BlockId::from("c"));
-        canonical([
-            model(StreamEvent::BlockStart {
-                id: thinking.clone(),
-                kind: BlockKind::Reasoning { provider_id: None },
-            }),
-            model(StreamEvent::BlockDelta {
-                id: thinking.clone(),
-                delta: Delta::Reasoning {
-                    text: "Hmm.".into(),
-                },
-            }),
-            model(StreamEvent::BlockEnd {
-                id: thinking,
-                end: BlockClose::Reasoning {
-                    reasoning: None,
-                    signature: None,
-                    wire_sent: true,
-                },
-                block: None,
-            }),
-            model(StreamEvent::BlockDelta {
-                id: text.clone(),
-                delta: Delta::Text {
-                    text: "Checking.".into(),
-                },
-            }),
-            model(StreamEvent::BlockEnd {
-                id: text,
-                end: BlockClose::Text,
-                block: None,
-            }),
-            model(StreamEvent::BlockStart {
-                id: tool.clone(),
-                kind: BlockKind::ToolCall,
-            }),
-            model(StreamEvent::BlockDelta {
-                id: tool.clone(),
-                delta: Delta::ToolName {
-                    name: "lookup".into(),
-                },
-            }),
-            model(StreamEvent::BlockDelta {
-                id: tool.clone(),
-                delta: Delta::ToolArguments {
-                    arguments: r#"{"q":1}"#.into(),
-                },
-            }),
-            model(StreamEvent::BlockEnd {
-                id: tool,
-                end: BlockClose::ToolCall(ToolCallEnd::new(UnparseableToolInput::Error)),
-                block: None,
-            }),
-            AgentEvent::TurnEnded {
-                message_id: Some("m1".into()),
-                usage: Usage::default(),
-                reasoning_issuer: None,
+    fn thinking_turn() -> Vec<AgentEvent> {
+        turn([
+            MockStreamEvent::ReasoningDelta {
+                id: "r".into(),
+                reasoning: "Hmm.".into(),
             },
+            MockStreamEvent::text("Checking."),
+            MockStreamEvent::tool_call("c", "lookup", serde_json::json!({"q": 1})),
+            MockStreamEvent::FinalResponse(mock_final_with_total_tokens(10)),
         ])
+    }
+
+    fn fold_all(fold: &mut TurnFold, events: &[AgentEvent]) -> Vec<Folded> {
+        events
+            .iter()
+            .map(|event| fold.apply(event).expect("a valid event"))
+            .collect()
     }
 
     #[test]
     fn folding_rebuilds_replies_and_tool_results() {
         let mut fold = TurnFold::default();
-        let mut blocks = Vec::new();
-        let mut messages = Vec::new();
-        for event in turn() {
-            let folded = fold.apply(&event);
-            blocks.extend(folded.block);
-            messages.extend(folded.message);
-        }
-        // The tool call is complete as soon as its block ends.
-        let [.., AssistantContent::ToolCall(call)] = blocks.as_slice() else {
+        let folded = fold_all(&mut fold, &thinking_turn());
+        let blocks = folded
+            .iter()
+            .filter_map(|folded| folded.block.clone())
+            .collect::<Vec<_>>();
+        let messages = folded
+            .into_iter()
+            .filter_map(|folded| folded.message)
+            .collect::<Vec<_>>();
+        // The tool call is complete as soon as its part ends.
+        let Some(AssistantContent::ToolCall(call)) = blocks
+            .iter()
+            .find(|block| matches!(block, AssistantContent::ToolCall(_)))
+        else {
             panic!("expected the completed tool call, got {blocks:?}");
         };
-        assert_eq!(call.function.name, "lookup");
-        let [Message::Assistant { id, content }] = messages.as_slice() else {
+        assert_eq!(call.function.name.as_str(), "lookup");
+        let [Message::Assistant(reply)] = messages.as_slice() else {
             panic!("expected the reply");
         };
-        assert_eq!(id.as_deref(), Some("m1"));
+        assert!(reply.origin.is_some());
+        assert_eq!(reply.stop, Some(StopReason::ToolUse));
         assert!(matches!(
-            content.as_slice(),
+            reply.content.as_slice(),
             [
                 AssistantContent::Reasoning(_),
                 AssistantContent::Text(_),
@@ -519,8 +455,15 @@ mod tests {
             call: call.id.clone(),
             result: ToolResult::success(ToolOutput::text("found")),
         };
-        let expected = fold.apply(&result).message.expect("the results prompt");
-        assert_eq!(resumed.apply(&result).message, Some(expected.clone()));
+        let expected = fold
+            .apply(&result)
+            .expect("a result")
+            .message
+            .expect("the results prompt");
+        assert_eq!(
+            resumed.apply(&result).expect("a result").message,
+            Some(expected.clone())
+        );
         assert!(matches!(
             expected,
             Message::User { content } if matches!(content.as_slice(), [UserContent::ToolResult(_)])
@@ -531,193 +474,160 @@ mod tests {
     /// the turn ends it is the reply the turn adds.
     #[test]
     fn partial_messages_grow_into_the_messages_folded() {
-        let events = turn();
+        let events = thinking_turn();
         let (turn_ended, streamed) = events.split_last().expect("a turn");
         let mut fold = TurnFold::default();
         assert_eq!(fold.partial(), None);
-        fold.apply(&streamed[0]);
-        fold.apply(&streamed[1]);
-        let Some(Message::Assistant { content, .. }) = fold.partial() else {
+        fold_all(&mut fold, &streamed[..2]);
+        let Some(Message::Assistant(partial)) = fold.partial() else {
             panic!("expected the reply so far");
         };
         assert!(matches!(
-            content.as_slice(),
+            partial.content.as_slice(),
             [AssistantContent::Reasoning(_)]
         ));
 
-        for event in &streamed[2..] {
-            fold.apply(event);
-        }
-        let Some(Message::Assistant {
-            content: partial, ..
-        }) = fold.partial()
-        else {
+        fold_all(&mut fold, &streamed[2..]);
+        let Some(Message::Assistant(partial)) = fold.partial() else {
             panic!("expected the whole reply");
         };
-        let Some(Message::Assistant { content, .. }) = fold.apply(turn_ended).message else {
+        let Some(Message::Assistant(reply)) = fold.apply(turn_ended).expect("an end").message
+        else {
             panic!("expected the reply");
         };
-        assert_eq!(partial, content);
+        assert_eq!(partial.content, reply.content);
     }
 
-    /// The reply is the blocks Rig finalized, not what streamed before them:
-    /// an end that restates its block supersedes the deltas the preview
-    /// showed.
+    /// The reply is the content Rig finalized, not what streamed before it:
+    /// an end that states other content supersedes the fragments the
+    /// preview showed.
     #[test]
-    fn replies_hold_the_blocks_rig_finalized() {
-        let thinking = BlockId::from("r");
-        let events = canonical([
-            model(StreamEvent::BlockDelta {
-                id: thinking.clone(),
-                delta: Delta::Reasoning { text: "Hm".into() },
-            }),
-            model(StreamEvent::BlockEnd {
-                id: thinking.clone(),
-                end: BlockClose::Reasoning {
-                    reasoning: Some(Reasoning::new("Considered.")),
-                    signature: None,
-                    wire_sent: true,
-                },
-                block: None,
-            }),
-            AgentEvent::TurnEnded {
-                message_id: None,
-                usage: Usage::default(),
-                reasoning_issuer: Some("ollama".into()),
-            },
-        ]);
+    fn replies_hold_the_content_rig_finalized() {
+        let events = [
+            event(serde_json::json!({"event": "start", "part": 0, "kind": "reasoning"})),
+            event(serde_json::json!({"event": "reasoning", "part": 0, "text": "Hm"})),
+            event(serde_json::json!({"event": "end", "part": 0,
+                "content": {"type": "reasoning", "text": "Considered."}})),
+            ended(),
+        ];
         let mut fold = TurnFold::default();
-        fold.apply(&events[0]);
-        let Some(Message::Assistant { content, .. }) = fold.partial() else {
+        fold_all(&mut fold, &events[..2]);
+        let Some(Message::Assistant(partial)) = fold.partial() else {
             panic!("expected the preview");
         };
         assert!(matches!(
-            content.as_slice(),
-            [AssistantContent::Reasoning(reasoning)] if reasoning.display_text() == "Hm"
+            partial.content.as_slice(),
+            [AssistantContent::Reasoning(reasoning)] if reasoning.text == "Hm"
         ));
 
-        let Some(AssistantContent::Reasoning(finalized)) = fold.apply(&events[1]).block else {
+        let Some(AssistantContent::Reasoning(finalized)) =
+            fold.apply(&events[2]).expect("an end").block
+        else {
             panic!("expected the finalized reasoning");
         };
-        assert_eq!(finalized.display_text(), "Considered.");
-        let Some(Message::Assistant { content, .. }) = fold.apply(&events[2]).message else {
+        assert_eq!(finalized.text, "Considered.");
+        let Some(Message::Assistant(reply)) = fold.apply(&events[3]).expect("an end").message
+        else {
             panic!("expected the reply");
         };
-        // Stamped with the issuer, as Rig's response is.
-        let [AssistantContent::Reasoning(reasoning)] = content.as_slice() else {
-            panic!("expected the reasoning, got {content:?}");
+        let [AssistantContent::Reasoning(reasoning)] = reply.content.as_slice() else {
+            panic!("expected the reasoning, got {:?}", reply.content);
         };
-        assert_eq!(reasoning.display_text(), "Considered.");
-        assert_eq!(reasoning.provider.as_deref(), Some("ollama"));
+        assert_eq!(reasoning.text, "Considered.");
     }
 
-    #[test]
-    fn block_ends_allocate_or_reuse_preview_slots() {
-        for event in turn() {
-            let AgentEvent::Model(StreamEvent::BlockEnd {
-                id,
-                end,
-                block: Some(block),
-            }) = &event
-            else {
-                continue;
-            };
-            for reserved in [false, true] {
-                let mut fold = TurnFold::default();
-                if reserved {
-                    assert_eq!(fold.reserve(id), 0);
-                    if matches!(end, BlockClose::Reasoning { .. }) {
-                        fold.open_reasoning.insert(id.clone());
-                    }
-                }
-                let slot = usize::from(reserved && matches!(end, BlockClose::ToolCall(_)));
-                assert_eq!(fold.apply(&event).block.as_ref(), Some(block));
-                assert_eq!(fold.slots[id], slot);
-                assert_eq!(fold.preview.len(), slot + 1);
-                assert_eq!(fold.preview[slot].as_ref(), Some(block));
-                assert!(!fold.open_reasoning.contains(id));
-                if slot == 1 {
-                    assert_eq!(fold.preview[0], None);
-                }
-
-                if matches!(end, BlockClose::Reasoning { .. }) {
-                    for event in canonical([model(StreamEvent::BlockStart {
-                        id: id.clone(),
-                        kind: BlockKind::Reasoning { provider_id: None },
-                    })]) {
-                        fold.apply(&event);
-                    }
-                    assert_eq!(fold.slots[id], 1);
-                    assert_eq!(fold.preview.len(), 2);
-                    assert_eq!(fold.preview[0].as_ref(), Some(block));
-                    assert_eq!(fold.preview[1], None);
-                }
-            }
-        }
-    }
-
-    /// A block's place in the preview is its place in the reply, so blocks
+    /// A part's place in the preview is its place in the reply, so parts
     /// don't move when one ends: text that began before a tool call stays
     /// before it, even though the call ends first.
     #[test]
-    fn blocks_keep_their_place_when_they_end() {
-        let (text, tool) = (BlockId::from("t"), BlockId::from("c"));
-        let events = canonical([
-            model(StreamEvent::text(text.clone(), "Checking")),
-            model(StreamEvent::BlockStart {
-                id: tool.clone(),
-                kind: BlockKind::ToolCall,
-            }),
-            model(StreamEvent::BlockDelta {
-                id: tool.clone(),
-                delta: Delta::ToolName {
-                    name: "lookup".into(),
-                },
-            }),
-            model(StreamEvent::BlockDelta {
-                id: tool.clone(),
-                delta: Delta::ToolArguments {
-                    arguments: "{}".into(),
-                },
-            }),
-            model(StreamEvent::BlockEnd {
-                id: tool,
-                end: BlockClose::ToolCall(ToolCallEnd::new(UnparseableToolInput::Error)),
-                block: None,
-            }),
-            model(StreamEvent::text(text, " twice.")),
-            AgentEvent::TurnEnded {
-                message_id: None,
-                usage: Usage::default(),
-                reasoning_issuer: None,
-            },
-        ]);
+    fn parts_keep_their_place_when_they_end() {
+        let events = [
+            event(serde_json::json!({"event": "start", "part": 0, "kind": "text"})),
+            event(serde_json::json!({"event": "text", "part": 0, "text": "Checking"})),
+            event(
+                serde_json::json!({"event": "start", "part": 1, "kind": "tool_call",
+                "name": "lookup"}),
+            ),
+            event(serde_json::json!({"event": "arguments", "part": 1, "json": "{}"})),
+            event(serde_json::json!({"event": "end", "part": 1, "content": {
+                "type": "toolcall", "id": {"provider": "c"},
+                "function": {"name": "lookup", "arguments": {}}}})),
+            event(serde_json::json!({"event": "text", "part": 0, "text": " twice."})),
+            event(serde_json::json!({"event": "end", "part": 0,
+                "content": {"type": "text", "text": "Checking twice."}})),
+            ended(),
+        ];
         let (turn_ended, streamed) = events.split_last().expect("a turn");
         let mut fold = TurnFold::default();
         for event in streamed {
-            fold.apply(event);
-            if let Some(Message::Assistant { content, .. }) = fold.partial()
-                && content.len() == 2
+            fold.apply(event).expect("a valid event");
+            if let Some(Message::Assistant(partial)) = fold.partial()
+                && partial.content.len() == 2
             {
                 assert!(matches!(
-                    content.as_slice(),
+                    partial.content.as_slice(),
                     [AssistantContent::Text(_), AssistantContent::ToolCall(_)]
                 ));
             }
         }
-        let Some(Message::Assistant { content, .. }) = fold.apply(turn_ended).message else {
+        let Some(Message::Assistant(reply)) = fold.apply(turn_ended).expect("an end").message
+        else {
             panic!("expected the reply");
         };
-        let [AssistantContent::Text(text), AssistantContent::ToolCall(_)] = content.as_slice()
+        let [AssistantContent::Text(text), AssistantContent::ToolCall(_)] =
+            reply.content.as_slice()
         else {
-            panic!("expected the text, then the call, got {content:?}");
+            panic!("expected the text, then the call, got {:?}", reply.content);
         };
         assert_eq!(text.text, "Checking twice.");
     }
 
+    /// Events Rig's stream could not have produced are refused, as Rig
+    /// refuses them in a relayed stream: here, text for a part that never
+    /// started, and a part that ends twice.
+    #[test]
+    fn events_out_of_order_are_refused() {
+        let mut fold = TurnFold::default();
+        assert!(
+            fold.apply(&event(
+                serde_json::json!({"event": "text", "part": 0, "text": "Hi"})
+            ))
+            .is_err()
+        );
+
+        let start = event(serde_json::json!({"event": "start", "part": 0, "kind": "text"}));
+        let end = event(serde_json::json!({"event": "end", "part": 0,
+            "content": {"type": "text", "text": "Hi"}}));
+        let mut fold = TurnFold::default();
+        fold_all(&mut fold, &[start.clone(), end.clone()]);
+        assert!(fold.apply(&end).is_err());
+
+        // Positions are per turn: the next turn starts over.
+        fold.apply(&ended()).expect("an end");
+        fold_all(&mut fold, &[start, end]);
+    }
+
+    /// A failed turn's calls never run, so nothing waits for their results.
+    #[test]
+    fn a_failed_turns_calls_are_not_pending() {
+        let reply = Message::Assistant(AssistantMessage {
+            content: vec![AssistantContent::ToolCall(ToolCall::from_wire(
+                "c",
+                rig::message::ToolFunction::new(
+                    rig::message::ToolName::new("lookup").expect("a name"),
+                    serde_json::json!({}),
+                ),
+            ))],
+            origin: None,
+            stop: Some(StopReason::Error("refused".into())),
+        });
+        assert!(TurnFold::after(&reply).pending_calls().is_empty());
+    }
+
     /// A run records the replies Rig returns (`run` asserts each against
-    /// the response), and folding what it emitted, as someone it was sent
-    /// to does, rebuilds that history exactly.
+    /// the response), and folding what it emitted, one event at a time from
+    /// its JSON form as someone it was sent to does, rebuilds that history
+    /// exactly.
     #[tokio::test]
     async fn runs_record_the_replies_rig_returns() {
         let model = MockCompletionModel::from_stream_turns([
@@ -727,12 +637,11 @@ mod tests {
                     reasoning: "Add them.".into(),
                 },
                 MockStreamEvent::Text("Adding.".into()),
-                MockStreamEvent::ToolCall {
-                    id: "c".into(),
-                    name: "calculate".into(),
-                    arguments: serde_json::json!({"operation": "add", "a": 1, "b": 2}),
-                    call_id: None,
-                },
+                MockStreamEvent::tool_call(
+                    "c",
+                    "calculate",
+                    serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+                ),
                 MockStreamEvent::FinalResponse(mock_final_with_total_tokens(10)),
             ],
             vec![
@@ -753,22 +662,26 @@ mod tests {
 
         let [
             Message::User { .. },
-            Message::Assistant { content, .. },
-            Message::User { .. },
-            Message::Assistant { .. },
+            Message::Assistant(reply),
+            Message::User { content: results },
+            Message::Assistant(_),
         ] = history.as_slice()
         else {
             panic!("expected prompt, reply, tool result, reply, got {history:?}");
         };
-        let [
-            AssistantContent::Reasoning(reasoning),
-            AssistantContent::Text(_),
-            AssistantContent::ToolCall(_),
-        ] = content.as_slice()
-        else {
-            panic!("expected reasoning, text and a call, got {content:?}");
-        };
-        assert!(reasoning.provider.is_some());
+        assert!(matches!(
+            reply.content.as_slice(),
+            [
+                AssistantContent::Reasoning(_),
+                AssistantContent::Text(_),
+                AssistantContent::ToolCall(_),
+            ]
+        ));
+        assert!(reply.origin.is_some());
+        assert!(matches!(
+            results.as_slice(),
+            [UserContent::ToolResult(result)] if !result.is_error
+        ));
 
         let mut fold = TurnFold::default();
         let folded = events
@@ -777,7 +690,7 @@ mod tests {
                 serde_json::from_str::<AgentEvent>(&serde_json::to_string(event).expect("encode"))
                     .expect("decode")
             })
-            .filter_map(|event| fold.apply(&event).message);
+            .filter_map(|event| fold.apply(&event).expect("a valid event").message);
         let prompt = Message::user("1 + 2?");
         assert_eq!(
             std::iter::once(prompt).chain(folded).collect::<Vec<_>>(),
@@ -785,17 +698,62 @@ mod tests {
         );
     }
 
-    /// What a run emits folds the same after crossing a JSON boundary.
+    /// A call whose arguments are not a JSON object never reaches the tool:
+    /// it is answered with an error telling the model why.
+    #[tokio::test]
+    async fn malformed_arguments_are_answered_without_running_the_tool() {
+        let model = MockCompletionModel::from_stream_turns([
+            vec![
+                MockStreamEvent::ToolCallNameDelta {
+                    id: "c".into(),
+                    name: "calculate".into(),
+                },
+                MockStreamEvent::ToolCallArgumentsDelta {
+                    id: "c".into(),
+                    arguments: "{\"a\": ".into(),
+                },
+                MockStreamEvent::ToolCallEnd { id: "c".into() },
+                MockStreamEvent::FinalResponse(mock_final_with_total_tokens(10)),
+            ],
+            vec![
+                MockStreamEvent::Text("Sorry.".into()),
+                MockStreamEvent::FinalResponse(mock_final_with_total_tokens(20)),
+            ],
+        ]);
+        let mut tools = ToolSet::default();
+        tools.add_tool(tools::Calculate);
+        let mut history = Vec::new();
+        Agent::new(model.erase(), tools)
+            .run(Message::user("1 + ?"), &mut history, |_| {})
+            .await
+            .expect("the run");
+        let Some(Message::User { content }) = history.get(2) else {
+            panic!("expected the tool result, got {history:?}");
+        };
+        let [UserContent::ToolResult(result)] = content.as_slice() else {
+            panic!("expected one result, got {content:?}");
+        };
+        assert!(result.is_error);
+        assert!(
+            result.content[0]
+                .as_text()
+                .is_some_and(|text| text.contains("not a JSON object")),
+            "{result:?}"
+        );
+    }
+
+    /// What a run emits folds the same after each event crosses a JSON
+    /// boundary on its own.
     #[test]
     fn events_fold_the_same_after_serialization() {
         let fold = |events: &[AgentEvent]| {
             let mut fold = TurnFold::default();
             events
                 .iter()
-                .filter_map(|event| fold.apply(event).message)
+                .filter_map(|event| fold.apply(event).expect("a valid event").message)
                 .collect::<Vec<_>>()
         };
-        let events = turn();
+        let events = thinking_turn();
         let received = events
             .iter()
             .map(|event| {
