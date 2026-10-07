@@ -358,7 +358,7 @@ impl AgentOutput {
                                 result: None,
                             }));
                         }
-                        AssistantContent::Image(_) | AssistantContent::Opaque(_) => {}
+                        _ => {}
                     }
                 }
             }
@@ -605,8 +605,8 @@ mod tests {
                     UserContent::image_base64("AQID", Some(ImageMediaType::PNG), None),
                 ],
             },
-            RigMessage::Assistant(AssistantMessage {
-                content: vec![
+            RigMessage::Assistant(
+                AssistantMessage::new(vec![
                     AssistantContent::Reasoning(Reasoning::new("Look it up first.")),
                     AssistantContent::text("Checking."),
                     AssistantContent::ToolCall(ToolCall::new(
@@ -616,10 +616,10 @@ mod tests {
                             json!({"comment_id": "comment_1", "response": "Yes", "n": 1.5}),
                         ),
                     )),
-                ],
-                origin: Some(Origin::new("ollama.chat", "ollama", "qwen")),
-                stop: Some(StopReason::ToolUse),
-            }),
+                ])
+                .with_origin(Origin::new("ollama.chat", "ollama", "qwen"))
+                .with_stop(StopReason::ToolUse),
+            ),
             RigMessage::tool_result(call_id, tool, "Recorded"),
         ];
         for message in messages {

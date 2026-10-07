@@ -155,11 +155,11 @@ impl TurnFold {
                 self.results.clear();
                 // Rig appends no message for an empty reply.
                 let message = (!content.is_empty()).then(|| {
-                    Message::Assistant(AssistantMessage {
-                        content,
-                        origin: origin.clone(),
-                        stop: stop.clone(),
-                    })
+                    Message::Assistant(
+                        AssistantMessage::new(content)
+                            .with_origin(origin.clone())
+                            .with_stop(stop.clone()),
+                    )
                 });
                 Ok(Folded {
                     message,
@@ -610,17 +610,16 @@ mod tests {
     /// A failed turn's calls never run, so nothing waits for their results.
     #[test]
     fn a_failed_turns_calls_are_not_pending() {
-        let reply = Message::Assistant(AssistantMessage {
-            content: vec![AssistantContent::ToolCall(ToolCall::from_wire(
+        let reply = Message::Assistant(
+            AssistantMessage::new(vec![AssistantContent::ToolCall(ToolCall::from_wire(
                 "c",
                 rig::message::ToolFunction::new(
                     rig::message::ToolName::new("lookup").expect("a name"),
                     serde_json::json!({}),
                 ),
-            ))],
-            origin: None,
-            stop: Some(StopReason::Error("refused".into())),
-        });
+            ))])
+            .with_stop(StopReason::Error("refused".into())),
+        );
         assert!(TurnFold::after(&reply).pending_calls().is_empty());
     }
 

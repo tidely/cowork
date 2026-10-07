@@ -718,11 +718,11 @@ mod tests {
 
     #[test]
     fn usage_tokens_falls_back_to_input_and_output() {
-        let usage = |input, output, total| Usage {
-            input_tokens: input,
-            output_tokens: output,
-            total_tokens: total,
-            ..Default::default()
+        let usage = |input: Option<u64>, output: Option<u64>, total: Option<u64>| {
+            Usage::new()
+                .input_tokens(input)
+                .output_tokens(output)
+                .total_tokens(total)
         };
         assert_eq!(usage_tokens(usage(Some(10), Some(5), Some(20))), 20);
         assert_eq!(usage_tokens(usage(Some(10), Some(5), None)), 15);

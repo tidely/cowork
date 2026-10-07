@@ -777,10 +777,7 @@ fn a_restated_part_shows_as_rig_accumulates_it(cx: &mut gpui::TestAppContext) {
     turn.push(agent::AgentEvent::TurnEnded {
         origin: None,
         stop: Some(rig::message::StopReason::Stop),
-        usage: Usage {
-            total_tokens: Some(64),
-            ..Usage::default()
-        },
+        usage: Usage::new().total_tokens(64),
     });
     let ended = turn.pop().expect("the turn's end");
     let (view, cx) = cx.add_window_view(|_, cx| ThreadMirrorTestView {
@@ -1188,10 +1185,7 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
         .build()
         .expect("test runtime");
     let (cowork, _, cx) = attachment_test_cowork(cx, runtime.handle().clone());
-    let turn = |total| Usage {
-        total_tokens: Some(total),
-        ..Default::default()
-    };
+    let turn = |total: u64| Usage::new().total_tokens(total);
 
     cowork.update(cx, |cowork, cx| {
         let local = cowork.active_thread(cx).expect("active thread");
