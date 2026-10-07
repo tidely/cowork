@@ -72,6 +72,7 @@ mod model_picker;
 mod permissions;
 mod search_palette;
 mod threads;
+mod tool_approval;
 
 impl Thread {
     fn from_welcome(
@@ -545,6 +546,7 @@ impl<'a> Collaboration<'a> {
                     },
                     committed: Default::default(),
                     comment_calls_checked: 0,
+                    awaiting_approval: None,
                     step_views: Vec::new(),
                     work_expanded: false,
                     text_view: cx.new(|cx| TextViewState::markdown(&text, cx)),

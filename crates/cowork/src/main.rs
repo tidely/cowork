@@ -38,6 +38,7 @@ mod assets;
 mod attachments;
 mod avatars;
 mod caret;
+mod component_preview;
 mod composer;
 mod composer_attachments;
 mod draft_editing;
@@ -62,6 +63,8 @@ mod thread;
 use thread::{draft as thread_draft, sharing, submission};
 mod timeline;
 mod timeline_view;
+mod tool_approval;
+mod tool_call_card;
 mod top_bar;
 mod transcript;
 mod usage;
@@ -499,6 +502,16 @@ fn main() -> anyhow::Result<()> {
             {
                 cx.on_action(|_: &Quit, cx| cx.quit());
                 cx.bind_keys([KeyBinding::new("cmd-q", Quit, None)]);
+            }
+            if component_preview::requested() {
+                if let Err(error) = component_preview::open(cx) {
+                    eprintln!("failed to open the component preview: {error}");
+                    cx.quit();
+                    return;
+                }
+                cx.set_quit_mode(QuitMode::LastWindowClosed);
+                cx.activate(true);
+                return;
             }
             let window_options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(

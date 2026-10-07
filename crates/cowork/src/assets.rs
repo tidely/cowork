@@ -34,6 +34,8 @@ gpui_kit_assets::icon_assets!(
         Image,
         Pen,
         X,
+        Wrench,
+        Hourglass,
         WindowMinimize,
         WindowMaximize,
         WindowRestore,
@@ -85,6 +87,20 @@ mod tests {
             let path = icon.path();
             let bytes = Assets.load(&path).unwrap().expect("bundled sharing icon");
             assert!(!bytes.is_empty(), "empty sharing icon: {path}");
+        }
+    }
+
+    #[test]
+    fn tool_call_card_icons_are_bundled() {
+        for icon in [
+            IconName::Wrench,
+            IconName::Hourglass,
+            IconName::Check,
+            IconName::X,
+        ] {
+            let path = icon.path();
+            let bytes = Assets.load(&path).unwrap().expect("bundled tool call icon");
+            assert!(!bytes.is_empty(), "empty tool call icon: {path}");
         }
     }
 

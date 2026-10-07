@@ -81,6 +81,19 @@ impl Json<AgentEvent> {
     }
 }
 
+impl Json<CallId> {
+    /// A call id as it is sent. Through JSON rather than its text, since an
+    /// id rig minted cannot be rebuilt from its text.
+    pub(crate) fn call_id(call: &CallId) -> Self {
+        // A call id is plain data, which always encodes.
+        Self::from_value(call).expect("a call id encodes as JSON")
+    }
+
+    pub(crate) fn to_call_id(&self) -> anyhow::Result<CallId> {
+        self.parse().context("failed to decode a tool call id")
+    }
+}
+
 /// The transcript entries each run output, given where each run's prompt is,
 /// in timeline order: those after its prompt, up to the next run's. Prompts
 /// must be increasing and within the transcript; see [`validate_agent_runs`].
@@ -143,8 +156,22 @@ pub(crate) fn validate_agent_runs(
                 "agent message {index}'s pending events complete a message the transcript lacks"
             );
         }
+        if let Some(call) = &message.awaiting_approval {
+            let call = call.to_call_id()?;
+            anyhow::ensure!(
+                message.run.is_generating() && is_pending(&fold, &call),
+                "agent message {index} awaits approval of a call that is not waiting"
+            );
+        }
     }
     Ok(())
+}
+
+/// Whether `call` is one of the calls `fold` is waiting for the results of.
+fn is_pending(fold: &TurnFold, call: &CallId) -> bool {
+    fold.pending_calls()
+        .iter()
+        .any(|pending| pending.id == *call)
 }
 
 impl Thread {
@@ -173,10 +200,43 @@ impl Thread {
         } else {
             message.pending_events.push(event);
         }
+        // A call that returned no longer waits, however the host decided.
+        if let AgentEvent::ToolResult { call, .. } = &decoded
+            && message.awaiting_approval.as_ref() == Some(call)
+        {
+            message.awaiting_approval = None;
+        }
         let completed = completed.then(|| self.transcript.last()).flatten();
         message.advance(completed, partial.as_ref(), cx);
         self.show_comment_responses(message_id, cx);
         Ok(())
+    }
+
+    /// Marks `call` as waiting for approval in the run producing message
+    /// `message_id`, refusing a call the run is not waiting on.
+    pub(crate) fn await_tool_approval(
+        &mut self,
+        message_id: Uuid,
+        call: CallId,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            is_pending(&self.agent_turn, &call),
+            "the host asked to approve a call that is not waiting for its result"
+        );
+        let message = agent_message(&mut self.timeline, message_id)
+            .filter(|message| message.is_generating())
+            .context("the host asked to approve a call of a run that is not going")?;
+        message.awaiting_approval = Some(call);
+        Ok(())
+    }
+
+    /// Stops showing `call` as waiting for approval; its result follows.
+    pub(crate) fn resolve_tool_approval(&mut self, message_id: Uuid, call: &CallId) {
+        if let Some(message) = agent_message(&mut self.timeline, message_id)
+            && message.awaiting_approval.as_ref() == Some(call)
+        {
+            message.awaiting_approval = None;
+        }
     }
 
     /// Ends the run producing message `id`. What it streamed that never
@@ -198,6 +258,8 @@ impl Thread {
             return;
         };
         message.run = AgentRun::Ended { outcome, duration };
+        // A run that ends no longer waits for anything.
+        message.awaiting_approval = None;
         // The work collapses under its summary, leaving the response.
         message.work_expanded = false;
         message.advance(None, partial.as_ref(), cx);

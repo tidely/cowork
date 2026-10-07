@@ -35,7 +35,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 21;
+pub(crate) const PROTOCOL_VERSION: u32 = 22;
 
 /// A request from a collaborator to the host.
 ///
@@ -75,6 +75,14 @@ pub(crate) enum CollaboratorMessage {
     /// Part of a file the collaborator attached to the draft. Sent on the
     /// bulk queue; see [`Peer::bulk`].
     AttachmentData(AttachmentChunk),
+    /// Allows or denies the tool call `call` that the run producing message
+    /// `message_id` is waiting on. The host ignores a call no run is
+    /// waiting on, so a decision that raced another one changes nothing.
+    DecideToolCall {
+        message_id: uuid::Bytes,
+        call: Json<rig::message::CallId>,
+        allow: bool,
+    },
 }
 
 /// How a participant presents themselves. Chosen by the participant and
@@ -254,6 +262,19 @@ pub(crate) enum HostMessage {
         participant: uuid::Bytes,
         mode: Option<PeerMode>,
     },
+    /// The run producing message `id` is waiting for someone who may approve
+    /// tool calls to allow or deny `call`, one of the calls of its last
+    /// reply that has not returned.
+    ToolApprovalRequested {
+        id: uuid::Bytes,
+        call: Json<rig::message::CallId>,
+    },
+    /// `call` was allowed or denied, and its result follows as an
+    /// `AgentEvent`: a denied call's says so.
+    ToolApprovalResolved {
+        id: uuid::Bytes,
+        call: Json<rig::message::CallId>,
+    },
 }
 
 /// A typed value encoded as a JSON string on the wire. This lets types that
@@ -423,6 +444,9 @@ pub(crate) struct AgentMessage {
     /// these, never sent separately; see `transcript.rs`.
     pub(crate) pending_events: Vec<Json<agent::AgentEvent>>,
     pub(crate) run: AgentRun,
+    /// The tool call the run is waiting for approval of; see
+    /// [`HostMessage::ToolApprovalRequested`].
+    pub(crate) awaiting_approval: Option<Json<rig::message::CallId>>,
 }
 
 /// Whether an agent message's run is still going.
@@ -827,6 +851,9 @@ mod tests {
                         outcome: RunOutcome::Failed("Failed".into()),
                         duration: Duration::from_millis(12_345),
                     },
+                    awaiting_approval: Some(Json::call_id(&rig::message::CallId::from_wire(
+                        "call_1",
+                    ))),
                 }),
             ],
             transcript: vec![json(r#"{"role":"user"}"#), json(r#"{"role":"assistant"}"#)],
@@ -929,6 +956,17 @@ mod tests {
             CollaboratorMessage::Submit { sequence: 3 },
             CollaboratorMessage::Presence(sample_presence()),
             CollaboratorMessage::AttachmentData(sample_chunk()),
+            CollaboratorMessage::DecideToolCall {
+                message_id: [2; 16],
+                call: Json::call_id(&rig::message::CallId::from_wire("call_1")),
+                allow: true,
+            },
+            // A call id rig minted for a call the provider sent without one.
+            CollaboratorMessage::DecideToolCall {
+                message_id: [2; 16],
+                call: Json::call_id(&rig::message::CallId::from_wire("")),
+                allow: false,
+            },
         ] {
             let encoded = postcard::to_stdvec(&message).expect("encode protocol message");
             let decoded: CollaboratorMessage =
@@ -969,8 +1007,36 @@ mod tests {
                 participant: [11; 16],
                 name: "Ada".into(),
             },
+            HostMessage::ToolApprovalRequested {
+                id: [7; 16],
+                call: Json::call_id(&rig::message::CallId::from_wire("call_1")),
+            },
+            HostMessage::ToolApprovalResolved {
+                id: [7; 16],
+                call: Json::call_id(&rig::message::CallId::from_wire("")),
+            },
         ] {
             assert_eq!(round_trip(&message), message);
+        }
+    }
+
+    /// A call id comes back as the same id, including one rig minted, which
+    /// cannot be rebuilt from its text.
+    #[test]
+    fn call_ids_survive_the_wire() {
+        for call in [
+            rig::message::CallId::from_wire("call_1"),
+            rig::message::CallId::from_wire(""),
+        ] {
+            let message = HostMessage::ToolApprovalRequested {
+                id: [7; 16],
+                call: Json::call_id(&call),
+            };
+            let HostMessage::ToolApprovalRequested { call: decoded, .. } = round_trip(&message)
+            else {
+                unreachable!()
+            };
+            assert_eq!(decoded.to_call_id().expect("a call id"), call);
         }
     }
 }

@@ -258,6 +258,7 @@ impl Cowork {
             PermissionOperation::ChangeModel => "change the model",
             PermissionOperation::ManageAccess => "manage peer access",
             PermissionOperation::UploadAttachment => "upload this attachment",
+            PermissionOperation::ApproveTools => "allow or deny tool calls",
         };
         if let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) {
             let draft_id = thread.read(cx).draft().id;

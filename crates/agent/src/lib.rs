@@ -15,11 +15,16 @@
 //! The history is Rig's own: each reply is the content the stream's part ends
 //! carry, in the parts' positions, with the origin and stop Rig gave the
 //! turn, which is the turn Rig's response appends.
+//!
+//! A [`ToolHook`] decides whether each call may run before its tool sees it,
+//! so policy such as asking the user lives in one place rather than in every
+//! tool. A call it denies is answered like any other, so the history stays
+//! valid and the model learns why.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use anyhow::{Context as _, Result};
-use futures::StreamExt as _;
+use futures::{StreamExt as _, future::BoxFuture};
 use rig::{
     DynModel,
     completion::{AssistantContent, CompletionRequest, Message, Usage},
@@ -237,12 +242,35 @@ fn pending_calls(content: &[AssistantContent], stop: Option<&StopReason>) -> Vec
         .collect()
 }
 
+/// Whether a tool call may run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ToolDecision {
+    Allow,
+    /// The call is answered with `reason` instead of running, which the
+    /// model reads as the call's result.
+    Deny {
+        reason: String,
+    },
+}
+
+/// Decides whether each tool call may run, before its tool sees it.
+///
+/// Called once per call, in the order the reply made them, and awaited: a
+/// hook may take as long as it needs, such as while someone decides. Dropping
+/// the run drops the pending decision with it. Calls whose arguments could not
+/// be read never reach the hook, as they never run anyway.
+pub trait ToolHook: Send + Sync {
+    fn before_tool_call<'a>(&'a self, call: &'a ToolCall) -> BoxFuture<'a, ToolDecision>;
+}
+
 /// A provider-independent, streaming tool loop.
 pub struct Agent {
     model: DynModel<Completion>,
     tools: ToolSet,
     preamble: Option<String>,
     additional_params: Option<serde_json::Value>,
+    /// `None` lets every call run.
+    tool_hook: Option<Arc<dyn ToolHook>>,
 }
 
 impl Agent {
@@ -252,7 +280,13 @@ impl Agent {
             tools,
             preamble: None,
             additional_params: None,
+            tool_hook: None,
         }
+    }
+
+    pub fn tool_hook(mut self, hook: Arc<dyn ToolHook>) -> Self {
+        self.tool_hook = Some(hook);
+        self
     }
 
     pub fn preamble(mut self, preamble: impl Into<String>) -> Self {
@@ -267,6 +301,13 @@ impl Agent {
 }
 
 impl Agent {
+    async fn decide(&self, call: &ToolCall) -> ToolDecision {
+        match &self.tool_hook {
+            Some(hook) => hook.before_tool_call(call).await,
+            None => ToolDecision::Allow,
+        }
+    }
+
     /// Runs until the model produces a turn with no tool calls.
     ///
     /// `emit` is called synchronously as stream events arrive. It should do
@@ -347,15 +388,19 @@ impl Agent {
                     Some(raw) => ToolResult::failed(ToolExecutionError::invalid_args(
                         rig::transcript::invalid_arguments_feedback(name, raw),
                     )),
-                    None => {
-                        self.tools
-                            .execute(
-                                name,
-                                call.function.arguments_value().to_string(),
-                                &mut ToolContext::new(),
-                            )
-                            .await
-                    }
+                    None => match self.decide(&call).await {
+                        ToolDecision::Allow => {
+                            self.tools
+                                .execute(
+                                    name,
+                                    call.function.arguments_value().to_string(),
+                                    &mut ToolContext::new(),
+                                )
+                                .await
+                        }
+                        // Rig's result for a call runtime policy skipped.
+                        ToolDecision::Deny { reason } => ToolResult::skipped(reason),
+                    },
                 };
                 let event = AgentEvent::ToolResult {
                     call: call.id,
@@ -739,6 +784,78 @@ mod tests {
                 .is_some_and(|text| text.contains("not a JSON object")),
             "{result:?}"
         );
+    }
+
+    /// Denies every call, remembering which it was asked about.
+    #[derive(Default)]
+    struct DenyAll {
+        asked: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl ToolHook for DenyAll {
+        fn before_tool_call<'a>(&'a self, call: &'a ToolCall) -> BoxFuture<'a, ToolDecision> {
+            self.asked.lock().unwrap().push(call.id.to_string());
+            Box::pin(async {
+                ToolDecision::Deny {
+                    reason: "Not now.".into(),
+                }
+            })
+        }
+    }
+
+    fn calculation_turns() -> MockCompletionModel {
+        MockCompletionModel::from_stream_turns([
+            vec![
+                MockStreamEvent::tool_call(
+                    "c",
+                    "calculate",
+                    serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+                ),
+                MockStreamEvent::FinalResponse(mock_final_with_total_tokens(10)),
+            ],
+            vec![
+                MockStreamEvent::Text("I could not.".into()),
+                MockStreamEvent::FinalResponse(mock_final_with_total_tokens(20)),
+            ],
+        ])
+    }
+
+    /// A call the hook denies is answered with its reason without running,
+    /// and the run goes on to the model's next turn.
+    #[tokio::test]
+    async fn denied_calls_are_answered_without_running_the_tool() {
+        let mut tools = ToolSet::default();
+        tools.add_tool(tools::Calculate);
+        let hook = Arc::new(DenyAll::default());
+        let mut history = Vec::new();
+        let mut events = Vec::new();
+        Agent::new(calculation_turns().erase(), tools)
+            .tool_hook(hook.clone())
+            .run(Message::user("1 + 2?"), &mut history, |event| {
+                events.push(event)
+            })
+            .await
+            .expect("the run");
+
+        assert_eq!(*hook.asked.lock().unwrap(), ["c"]);
+        let results = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ToolResult { result, .. } => Some(result),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [result] = results.as_slice() else {
+            panic!("expected one result, got {events:?}");
+        };
+        assert!(result.is_skipped(), "{result:?}");
+        let [_, _, Message::User { content }, Message::Assistant(_)] = history.as_slice() else {
+            panic!("expected prompt, call, result, reply, got {history:?}");
+        };
+        let [UserContent::ToolResult(result)] = content.as_slice() else {
+            panic!("expected one result, got {content:?}");
+        };
+        assert_eq!(result.content[0].as_text(), Some("Not now."));
     }
 
     /// What a run emits folds the same after each event crosses a JSON

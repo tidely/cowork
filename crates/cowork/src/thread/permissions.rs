@@ -7,6 +7,7 @@
 use std::{collections::BTreeMap, fmt, marker::PhantomData};
 
 use gpui::AppContext;
+use rig::message::CallId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -31,6 +32,12 @@ impl PeerMode {
     }
 
     pub(crate) const fn can_change_model(self) -> bool {
+        matches!(self, Self::Admin)
+    }
+
+    /// Whether this peer may allow or deny the agent's tool calls that need
+    /// approval.
+    pub(crate) const fn can_approve_tools(self) -> bool {
         matches!(self, Self::Admin)
     }
 
@@ -84,6 +91,7 @@ pub(crate) enum PermissionOperation {
     ChangeModel,
     ManageAccess,
     UploadAttachment,
+    ApproveTools,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -127,6 +135,7 @@ pub(crate) struct EditDraft;
 pub(crate) struct ControlGeneration;
 pub(crate) struct ChangeModel;
 pub(crate) struct ManageAccess;
+pub(crate) struct ApproveTools;
 
 macro_rules! operation {
     ($type:ident) => {
@@ -140,6 +149,7 @@ operation!(EditDraft);
 operation!(ControlGeneration);
 operation!(ChangeModel);
 operation!(ManageAccess);
+operation!(ApproveTools);
 
 pub(crate) struct Authorized<'a, Op: Operation> {
     thread: &'a mut Thread,
@@ -183,6 +193,9 @@ impl Thread {
     pub(crate) fn can_change_model(&self) -> bool {
         self.local_mode().can_change_model()
     }
+    pub(crate) fn can_approve_tools(&self) -> bool {
+        self.local_mode().can_approve_tools()
+    }
 
     pub(super) fn check_permission(
         &self,
@@ -210,6 +223,7 @@ impl Thread {
                 }
                 PermissionOperation::ControlGeneration => mode.can_control_generation(),
                 PermissionOperation::ChangeModel => mode.can_change_model(),
+                PermissionOperation::ApproveTools => mode.can_approve_tools(),
                 PermissionOperation::ManageAccess => false,
             };
             (!allowed).then_some(DenialReason::InsufficientMode)
@@ -303,6 +317,32 @@ impl Authorized<'_, ControlGeneration> {
 impl Authorized<'_, ChangeModel> {
     pub(crate) fn select_model(self, model: ModelRef, cx: &mut impl AppContext) {
         self.thread.select_model_authorized(model, cx);
+    }
+}
+
+impl Authorized<'_, ApproveTools> {
+    /// Tells everyone that the call agent message `message_id` was waiting
+    /// on has been decided. Only the host decides; the run it belongs to
+    /// holds the decision itself.
+    pub(crate) fn resolved(self, message_id: Uuid, call: &CallId, cx: &mut impl AppContext) {
+        if self.thread.is_host() {
+            self.thread.emit(
+                protocol::HostMessage::ToolApprovalResolved {
+                    id: message_id.into_bytes(),
+                    call: protocol::Json::call_id(call),
+                },
+                cx,
+            );
+        }
+    }
+
+    pub(crate) fn request_decision(self, message_id: Uuid, call: &CallId, allow: bool) -> bool {
+        self.thread
+            .request(protocol::CollaboratorMessage::DecideToolCall {
+                message_id: message_id.into_bytes(),
+                call: protocol::Json::call_id(call),
+                allow,
+            })
     }
 }
 

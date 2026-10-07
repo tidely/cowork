@@ -7,7 +7,10 @@ use agent::AgentEvent;
 use draft::AttachmentRecord;
 use gpui::{AppContext, Entity, SharedString};
 use gpui_base::{TextViewState, input::TextareaState};
-use rig::{completion::message::ToolResultContent, message::ToolCall};
+use rig::{
+    completion::message::ToolResultContent,
+    message::{CallId, ToolCall},
+};
 use uuid::Uuid;
 
 use crate::{
@@ -61,6 +64,10 @@ pub(crate) struct AgentMessage {
     /// How many of `output`'s tool calls have been checked for replies to
     /// comments.
     pub(crate) comment_calls_checked: usize,
+    /// The tool call the run is waiting for someone to allow or deny. Kept
+    /// beside `output` rather than in it, since the output is refolded on
+    /// every event. One at most, as the agent runs calls one at a time.
+    pub(crate) awaiting_approval: Option<CallId>,
 
     // Local view state.
     /// Whether the agent's work (everything but its response) is shown. Open
@@ -444,6 +451,7 @@ impl AgentMessage {
             },
             committed: OutputMark::default(),
             comment_calls_checked: 0,
+            awaiting_approval: None,
             step_views: Vec::new(),
             text_view: cx.new(|cx| TextViewState::markdown("", cx)),
             comment_responses: Vec::new(),
@@ -467,6 +475,16 @@ impl AgentMessage {
         self.run.is_generating()
     }
 
+    /// Where the call awaiting approval is among `output`'s steps. Rig may
+    /// mint the same id for id-less calls of different replies, and only the
+    /// last reply's calls can be waiting, so it is the latest with that id.
+    pub(crate) fn awaiting_approval_step(&self) -> Option<usize> {
+        let awaiting = self.awaiting_approval.as_ref()?;
+        self.output.steps.iter().rposition(
+            |step| matches!(step, AgentStep::ToolCall(call) if call.call.id == *awaiting),
+        )
+    }
+
     pub(crate) fn to_protocol(&self) -> protocol::AgentMessage {
         protocol::AgentMessage {
             id: self.id.into_bytes(),
@@ -475,6 +493,7 @@ impl AgentMessage {
             prompt: self.prompt,
             pending_events: self.pending_events.clone(),
             run: self.run.clone(),
+            awaiting_approval: self.awaiting_approval.as_ref().map(protocol::Json::call_id),
         }
     }
 }
@@ -482,8 +501,9 @@ impl AgentMessage {
 impl protocol::AgentMessage {
     /// The message, showing nothing until `Thread::restore_agent_output`
     /// shows its output.
+    /// `awaiting_approval` must have passed `validate_agent_runs`.
     pub(crate) fn into_native(self, cx: &mut impl AppContext) -> AgentMessage {
-        AgentMessage::new(
+        let mut message = AgentMessage::new(
             Uuid::from_bytes(self.id),
             self.comment_group_id.map(Uuid::from_bytes),
             self.started_at,
@@ -491,7 +511,11 @@ impl protocol::AgentMessage {
             self.run,
             self.pending_events,
             cx,
-        )
+        );
+        message.awaiting_approval = self
+            .awaiting_approval
+            .map(|call| call.to_call_id().expect("validated with the snapshot"));
+        message
     }
 }
 

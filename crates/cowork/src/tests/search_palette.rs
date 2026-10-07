@@ -47,6 +47,7 @@ fn reply(text: &str, cx: &mut App) -> TimelineMessage {
         },
         committed: Default::default(),
         comment_calls_checked: 0,
+        awaiting_approval: None,
         step_views: Vec::new(),
         work_expanded: false,
         text_view: cx.new(|cx| TextViewState::markdown(text, cx)),

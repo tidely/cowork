@@ -32,8 +32,8 @@ use crate::{
     profile::validate_profile,
     protocol,
     thread::{
-        ChangeModel, ControlGeneration, HostPeer, PeerLink, PermissionDenied, SharingStatus,
-        Thread, ThreadHost, ThreadSharing,
+        ApproveTools, ChangeModel, ControlGeneration, HostPeer, PeerLink, PermissionDenied,
+        SharingStatus, Thread, ThreadHost, ThreadSharing,
     },
     thread_draft::ThreadDraft,
 };
@@ -517,6 +517,27 @@ impl Cowork {
                     thread_id,
                     participant,
                     Some(Uuid::from_bytes(message_id)),
+                    cx,
+                );
+            }
+            protocol::CollaboratorMessage::DecideToolCall {
+                message_id,
+                call,
+                allow,
+            } => {
+                let call = call
+                    .to_call_id()
+                    .with_context(|| format!("Invalid tool call id from {participant:?}."))?;
+                thread.update(cx, |thread, _| {
+                    thread.with_authorized::<ApproveTools, _>(participant, |_| ())
+                })?;
+                let thread_id = thread.read(cx).instance_id;
+                self.resolve_tool_call(
+                    thread_id,
+                    participant,
+                    Uuid::from_bytes(message_id),
+                    &call,
+                    allow,
                     cx,
                 );
             }

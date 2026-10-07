@@ -19,7 +19,7 @@ pub(crate) mod sharing;
 #[path = "submission.rs"]
 pub(crate) mod submission;
 pub(crate) use permissions::{
-    ChangeModel, ControlGeneration, DenialReason, EditDraft, ManageAccess, PeerMode,
+    ApproveTools, ChangeModel, ControlGeneration, DenialReason, EditDraft, ManageAccess, PeerMode,
     PeerPermissions, PermissionDenied, PermissionOperation,
 };
 
@@ -1071,6 +1071,9 @@ impl Thread {
                 Some(PermissionOperation::ControlGeneration)
             }
             protocol::CollaboratorMessage::SelectModel(_) => Some(PermissionOperation::ChangeModel),
+            protocol::CollaboratorMessage::DecideToolCall { .. } => {
+                Some(PermissionOperation::ApproveTools)
+            }
             protocol::CollaboratorMessage::AttachmentData(_) => {
                 Some(PermissionOperation::UploadAttachment)
             }
@@ -1375,6 +1378,12 @@ impl Thread {
                 outcome,
                 duration,
             } => self.end_agent_run(id, outcome, duration, cx),
+            protocol::HostMessage::ToolApprovalRequested { id, call } => {
+                self.await_tool_approval(Uuid::from_bytes(id), call.to_call_id()?)?;
+            }
+            protocol::HostMessage::ToolApprovalResolved { id, call } => {
+                self.resolve_tool_approval(Uuid::from_bytes(id), &call.to_call_id()?);
+            }
         }
         Ok(())
     }

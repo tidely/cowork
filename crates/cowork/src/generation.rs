@@ -2,7 +2,7 @@
 //! in it; see `transcript.rs` for how that is folded.
 
 use std::{
-    collections::hash_map::Entry,
+    collections::{HashMap, hash_map::Entry},
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -10,12 +10,12 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use agent::{Agent as StreamingAgent, AgentEvent};
+use agent::{Agent as StreamingAgent, AgentEvent, ToolDecision};
 use anyhow::Context as _;
 use gpui::{App, Context, Entity};
-use rig::{completion::Usage, providers::ollama::Ollama, tool::ToolSet};
+use rig::{completion::Usage, message::CallId, providers::ollama::Ollama, tool::ToolSet};
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tools::{Calculate, RespondToComment};
 
 use super::GenerationPlan;
@@ -27,6 +27,7 @@ use crate::{
     participant::ParticipantId,
     protocol,
     thread::{ControlGeneration, Thread, ThreadOwnership, ThreadSharing},
+    tool_approval::{ApprovalGate, RunUpdate},
     usage::{TokenActivity, usage_tokens},
 };
 
@@ -38,6 +39,20 @@ pub(crate) struct ActiveGeneration {
     message_id: Uuid,
     abort_handle: tokio::task::AbortHandle,
     cancelled: Arc<AtomicBool>,
+    /// How to answer each call the run is waiting on a decision for.
+    /// Dropping one, as when the run ends, denies its call.
+    approvals: HashMap<CallId, oneshot::Sender<ToolDecision>>,
+}
+
+impl ActiveGeneration {
+    pub(crate) fn message_id(&self) -> Uuid {
+        self.message_id
+    }
+
+    /// Takes how to answer `call`, if the run is still waiting on it.
+    pub(crate) fn take_approval(&mut self, call: &CallId) -> Option<oneshot::Sender<ToolDecision>> {
+        self.approvals.remove(call)
+    }
 }
 
 #[cfg(test)]
@@ -51,6 +66,7 @@ impl ActiveGeneration {
             message_id,
             abort_handle,
             cancelled,
+            approvals: HashMap::new(),
         }
     }
 }
@@ -89,6 +105,7 @@ impl Cowork {
             );
         });
         let (sender, mut receiver) = mpsc::unbounded_channel();
+        let gate = ApprovalGate::new(sender.clone());
         let cancelled = Arc::new(AtomicBool::new(false));
         let generation_task = self.tokio_handle.spawn(async move {
             let (selected_model, max_tokens) =
@@ -105,13 +122,14 @@ impl Cowork {
             tools.add_tool(RespondToComment::new(turn_comments));
             tools.add_tool(Calculate);
             StreamingAgent::new(model.erase(), tools)
+                .tool_hook(gate)
                 .preamble(SYSTEM_PROMPT)
                 .additional_params(json!({
                     "num_ctx": max_tokens,
                     "think": "medium"
                 }))
                 .run(prompt, &mut history, move |event| {
-                    _ = sender.send(event);
+                    _ = sender.send(RunUpdate::Event(event));
                 })
                 .await?;
             Ok::<_, anyhow::Error>(())
@@ -122,13 +140,29 @@ impl Cowork {
                 message_id,
                 abort_handle: generation_task.abort_handle(),
                 cancelled: cancelled.clone(),
+                approvals: HashMap::new(),
             },
         );
 
         cx.spawn(async move |this, cx| {
             let mut stream_completed = true;
             let mut turn_usage = Usage::default();
-            while let Some(event) = receiver.recv().await {
+            while let Some(update) = receiver.recv().await {
+                let event = match update {
+                    RunUpdate::Event(event) => event,
+                    RunUpdate::Approval { call, decide } => {
+                        if this
+                            .update(cx, |this, cx| {
+                                this.await_tool_approval(thread_id, message_id, call, decide, cx)
+                            })
+                            .is_err()
+                        {
+                            stream_completed = false;
+                            break;
+                        }
+                        continue;
+                    }
+                };
                 if let AgentEvent::TurnEnded { usage, .. } = &event {
                     turn_usage += *usage;
                 }
@@ -191,6 +225,40 @@ impl Cowork {
             }
         })
         .detach();
+    }
+
+    /// Remembers how to answer `call`, which the run producing message
+    /// `message_id` waits on, and tells everyone it is waiting. A run that is
+    /// no longer the thread's drops `decide`, which denies the call.
+    pub(crate) fn await_tool_approval(
+        &mut self,
+        thread_id: Uuid,
+        message_id: Uuid,
+        call: CallId,
+        decide: oneshot::Sender<ToolDecision>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+            return;
+        };
+        let Some(generation) = self
+            .active_generations
+            .get_mut(&thread_id)
+            .filter(|generation| generation.message_id == message_id)
+        else {
+            return;
+        };
+        generation.approvals.insert(call.clone(), decide);
+        thread.update(cx, |thread, cx| {
+            thread.emit(
+                protocol::HostMessage::ToolApprovalRequested {
+                    id: message_id.into_bytes(),
+                    call: protocol::Json::call_id(&call),
+                },
+                cx,
+            );
+        });
+        self.thread_updated(thread_id, cx);
     }
 
     /// Adds a finished turn's usage to its thread and, unless the thread was

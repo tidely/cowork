@@ -24,7 +24,9 @@ downgrade. Stopping sharing cleans peers and unfinished uploads before
 clearing membership. Denial feedback is routed to the originating thread.
 Agent events are checked on arrival in the order Rig's stream could produce
 them.
-The protocol version is **20**.
+Tool calls outside a short always-allowed list wait for the host or an
+`Admin` peer to allow or deny them; see [Tool approval](#tool-approval).
+The protocol version is **22**.
 
 Not yet implemented:
 
@@ -141,6 +143,7 @@ cannot delegate it.
 | Receive live draft, attachments, models, agent output | Yes        | Yes     | Yes     |
 | Create, edit, remove any draft item or attachment     | No         | Yes     | Yes     |
 | Submit the whole draft or stop generation             | No         | No      | Yes     |
+| Allow or deny the agent's tool calls                  | No         | No      | Yes     |
 | Change the selected model                             | No         | No      | Yes     |
 | Manage default access or individual overrides         | No         | No      | No      |
 
@@ -529,6 +532,43 @@ checks current permission, cancels that run if it is still active, and
 ignores an authorized request otherwise. The run then ends with `AgentEnded`
 marked as stopped, so everyone can tell it apart from one that completed.
 
+### Tool approval
+
+The agent's calls to most tools wait for someone to allow them before they
+run. `tool_approval.rs` lists the tools whose calls always run
+(`ALWAYS_ALLOWED`, currently `respond_to_comment`, which only acts within the
+thread); every other tool's calls wait, so a newly added tool is asked about
+rather than trusted. `calculate` waits.
+
+The agent loop asks a hook about each call before its tool runs (calls whose
+arguments could not be read never run, so are never asked about). The host's
+hook lets listed tools through and otherwise asks the thread, on the same
+channel as the run's events, so the request always follows the reply that
+made the call. The host then emits `ToolApprovalRequested`, naming the agent
+message and the call, and the run waits.
+
+Everyone shows the waiting call as a card in the agent's work, which shows
+even if the work is collapsed. The host and `Admin` peers get Allow and Deny;
+everyone else sees that the call waits for the host or an admin. Deciding
+requires the `ApproveTools` permission, which only `Admin` has; the host is
+always `Admin`. A collaborator sends `DecideToolCall`; the host's own clicks
+go through the same checked path. The first decision wins: the host hands it
+to the run and emits `ToolApprovalResolved`, and a later or stale decision,
+or one for a run that has ended, changes nothing. An allowed call runs; a
+denied one is answered with Rig's skipped result, telling the model the user
+denied it, and the run continues. Either way its result follows as an
+`AgentEvent`, which also clears the waiting state.
+
+A run that ends while a call waits, as when someone stops it, drops the
+request and no longer shows the call waiting. Snapshots carry the waiting
+call (`awaiting_approval` on the agent message), so someone joining sees the
+card. Participants refuse a `ToolApprovalRequested`, live or in a snapshot,
+for a call the running reply did not make or that already returned.
+
+Not yet: remembering a decision for later calls ("always allow this tool
+here"), keyboard shortcuts for Allow and Deny, and showing a denied call
+differently from one that returned.
+
 ### Model selection
 
 - Model selection is per thread. New local threads start with the last model
@@ -682,7 +722,7 @@ Design decisions:
 ## Protocol
 
 All traffic goes through the host. Collaborators never talk to each other.
-`protocol.rs` defines the wire messages; the current version is **19** and
+`protocol.rs` defines the wire messages; the current version is **22** and
 versions must match exactly. `Join` keeps its variant index and version as
 its only field; `Rejected` keeps its variant index and string payload so a
 version mismatch can still be reported. Runtime permission denials use the
@@ -701,6 +741,7 @@ separate `PermissionDenied`, never this stable handshake rejection.
 | `Submit`              | Requests a submission at the given sequence; requires `Admin`                                          |
 | `Stop`                | Stops the named agent run; same permission as `Submit`                                                 |
 | `SelectModel`         | Selects a model by provider and model ID; requires `Admin`                                             |
+| `DecideToolCall`      | Allows or denies the named run's waiting tool call; requires `Admin`; ignored once decided             |
 
 **Host to collaborators**
 
@@ -724,6 +765,8 @@ separate `PermissionDenied`, never this stable handshake rejection.
 | `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and whether it completed, was stopped, or failed (with a message)                                                                                                                                 |
 | `AgentEvent`                                 | What the host's agent loop reported during a run, which everyone folds into the agent message and transcript                                                                                                                                                                |
 | `PromptNamed`                                | A participant's prompt name, fixed on their first submitted item                                                                                                                                                                                                            |
+| `ToolApprovalRequested`                      | A run waits for the named call of its last reply to be allowed or denied                                                                                                                                                                                                    |
+| `ToolApprovalResolved`                       | The waiting call was decided; its result follows as an `AgentEvent`                                                                                                                                                                                                         |
 
 The host is itself a participant. Its local edits, submissions, stops, and
 model changes go through the same authorization paths as a collaborator's,

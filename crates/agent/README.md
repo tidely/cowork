@@ -38,6 +38,13 @@ The fold checks each turn's events as Rig checks a relayed stream, with
 such as a fragment of a part that never started. Events from elsewhere are
 checked before they are folded.
 
+A `ToolHook` set with `Agent::tool_hook` decides whether each call may run
+before its tool sees it, and may take as long as it needs, such as while a
+user decides. A denied call is answered with Rig's skipped result carrying
+the hook's reason, so the history stays valid and the model learns why. The
+hook plays the part of Rig's own agent's `on_dispatch`, which this loop does
+not run.
+
 With the `test-support` feature, `agent::test_support::turn` scripts a turn
 through Rig's mock model, so its events are exactly what Rig emits.
 

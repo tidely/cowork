@@ -32,6 +32,7 @@ use crate::{
         AgentMessage, AgentStep, AgentToolCall, MessageAuthor, StepView, ThreadMessageId,
         TimelineMessage, UserComment, UserCommentBody, UserMessageGroup,
     },
+    tool_call_card::ToolCallCard,
 };
 
 /// The text view of a segment, identified by where the segment starts in its
@@ -877,14 +878,47 @@ impl Cowork {
             .into_any_element()
     }
 
+    /// A tool call the run is waiting on someone to allow or deny: Allow and
+    /// Deny for those who may decide, and a note that it waits for everyone
+    /// else.
+    fn render_tool_approval(
+        message_id: Uuid,
+        step_index: usize,
+        call: &AgentToolCall,
+        can_approve: bool,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        let card = ToolCallCard::new(
+            format!("tool-approval-{message_id}-{step_index}"),
+            call.call.clone(),
+        );
+        let card = if can_approve {
+            let allowed = call.call.id.clone();
+            let denied = call.call.id.clone();
+            card.decide(
+                cx.listener(move |this, _, _, cx| {
+                    this.decide_tool_call(message_id, allowed.clone(), true, cx);
+                }),
+                cx.listener(move |this, _, _, cx| {
+                    this.decide_tool_call(message_id, denied.clone(), false, cx);
+                }),
+            )
+        } else {
+            card
+        };
+        div().w_full().my_1().child(card).into_any_element()
+    }
+
     /// An agent message's work in order: its steps except the response.
     /// Consecutive tool calls sit back to back; everything else gets the
     /// timeline's usual spacing.
     fn render_work(
         thread_id: Uuid,
         message: &AgentMessage,
+        can_approve: bool,
         cx: &Context<Self>,
     ) -> Vec<gpui::AnyElement> {
+        let awaiting_step = message.awaiting_approval_step();
         let mut rendered = Vec::new();
         let mut calls = Vec::new();
         let flush = |calls: &mut Vec<gpui::AnyElement>, rendered: &mut Vec<gpui::AnyElement>| {
@@ -907,6 +941,15 @@ impl Cowork {
                 continue;
             };
             match (step, view) {
+                (AgentStep::ToolCall(call), _) if awaiting_step == Some(step_index) => {
+                    calls.push(Self::render_tool_approval(
+                        message.id,
+                        step_index,
+                        call,
+                        can_approve,
+                        cx,
+                    ));
+                }
                 (AgentStep::ToolCall(call), view) => calls.push(Self::render_tool_call(
                     thread_id,
                     message,
@@ -1278,8 +1321,15 @@ impl Cowork {
             || message.output.work().next().is_some()
             || !matches!(message.run.outcome(), Some(RunOutcome::Completed));
         let summary = summarized.then(|| Self::render_work_summary(thread_id, message, cx));
-        let work = if message.work_expanded {
-            Self::render_work(thread_id, message, cx)
+        // A call waiting for approval shows even in collapsed work, as the
+        // run cannot go on until someone sees it.
+        let work = if message.work_expanded || message.awaiting_approval.is_some() {
+            let can_approve = self
+                .thread_store
+                .read(cx)
+                .thread(thread_id, cx)
+                .is_some_and(|thread| thread.read(cx).can_approve_tools());
+            Self::render_work(thread_id, message, can_approve, cx)
         } else {
             Vec::new()
         };
