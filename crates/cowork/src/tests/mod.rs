@@ -176,6 +176,7 @@ fn test_cowork(
     window: &mut Window,
     cx: &mut Context<Cowork>,
 ) -> Cowork {
+    bind_app_keys(cx);
     let (model_picker, model_picker_subscription) = Cowork::new_model_picker(window, cx);
     let local_participant_id = active_thread_id
         .and_then(|id| thread_store.read(cx).thread(id, cx))

@@ -458,6 +458,21 @@ impl Render for Cowork {
     }
 }
 
+fn bind_app_keys(cx: &mut App) {
+    cx.bind_keys([
+        KeyBinding::new("ctrl-enter", SubmitComposer, None),
+        KeyBinding::new("cmd-enter", SubmitComposer, None),
+        KeyBinding::new(
+            cfg_select! {
+                target_os = "macos" => "cmd-k",
+                _ => "ctrl-k",
+            },
+            OpenSearchPalette,
+            None,
+        ),
+    ]);
+}
+
 fn main() -> anyhow::Result<()> {
     let worker_threads = std::thread::available_parallelism()
         .map(usize::from)
@@ -479,18 +494,7 @@ fn main() -> anyhow::Result<()> {
         .run(move |cx: &mut App| {
             gpui_component::init(cx);
             theme::init(cx);
-            cx.bind_keys([
-                KeyBinding::new("ctrl-enter", SubmitComposer, None),
-                KeyBinding::new("cmd-enter", SubmitComposer, None),
-                KeyBinding::new(
-                    cfg_select! {
-                        target_os = "macos" => "cmd-k",
-                        _ => "ctrl-k",
-                    },
-                    OpenSearchPalette,
-                    None,
-                ),
-            ]);
+            bind_app_keys(cx);
             #[cfg(target_os = "macos")]
             {
                 cx.on_action(|_: &Quit, cx| cx.quit());

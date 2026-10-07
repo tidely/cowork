@@ -20,12 +20,12 @@ base64 = "0.22"
 async-channel = "2"
 chrono = "0.4"
 # Must match the GPUI snapshot gpui-kit pins.
-gpui = { package = "gpui-pre", version = "=0.3.7" }
-gpui-base = { git = "https://github.com/longbridge/gpui-kit", rev = "3a142844d3661159964dce9e5512ca9a40286160" }
-gpui-component = { git = "https://github.com/longbridge/gpui-kit", rev = "3a142844d3661159964dce9e5512ca9a40286160" }
-gpui-kit-assets = { git = "https://github.com/longbridge/gpui-kit", rev = "3a142844d3661159964dce9e5512ca9a40286160" }
+gpui = { package = "gpui-pre", version = "=0.3.8" }
+gpui-base = "0.7.1"
+gpui-component = "0.7.1"
+gpui-kit-assets = "0.7.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.7", features = ["font-kit", "wayland", "x11", "runtime_shaders"] }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.8", features = ["font-kit", "wayland", "x11", "runtime_shaders"] }
 futures = "0.3"
 iroh = "1.2.0"
 itertools = "0.14"

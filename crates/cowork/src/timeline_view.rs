@@ -454,7 +454,7 @@ impl Cowork {
             .line_wrapper(window.text_style().font(), font_size);
         let fragments = [LineFragment::text(hard_line)];
         let end = wrapper
-            .wrap_line(&fragments, wrap_width)
+            .wrap_line(&fragments, wrap_width, gpui::IndentAdjustment::SameIndent)
             .map(|boundary| boundary.ix)
             .find(|boundary| *boundary >= selected_end_in_line)
             .unwrap_or(hard_line.len());

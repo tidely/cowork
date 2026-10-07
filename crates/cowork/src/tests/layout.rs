@@ -385,7 +385,10 @@ fn selected_user_message_text_copies(cx: &mut gpui::TestAppContext) {
     );
     cx.run_until_parked();
 
-    cx.simulate_keystrokes("cmd-c");
+    cx.simulate_keystrokes(cfg_select! {
+        target_os = "macos" => "cmd-c",
+        _ => "ctrl-c",
+    });
     cx.run_until_parked();
 
     assert_eq!(
