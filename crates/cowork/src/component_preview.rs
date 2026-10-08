@@ -122,6 +122,23 @@ impl Render for ComponentPreview {
                         cx,
                     ))
                     .child(Self::section(
+                        "A sandbox command, which only the host may allow",
+                        self.deciding("preview-command", run_command(), cx)
+                            .host_only(),
+                        cx,
+                    ))
+                    .child(Self::section(
+                        "A sandbox command waiting for the host",
+                        ToolCallCard::new("preview-command-waiting", run_command()).host_only(),
+                        cx,
+                    ))
+                    .child(Self::section(
+                        "A long command with a visible scrolling hint",
+                        self.deciding("preview-long-command", long_command(), cx)
+                            .host_only(),
+                        cx,
+                    ))
+                    .child(Self::section(
                         "Long and nested arguments",
                         self.deciding("preview-long", long_arguments(), cx),
                         cx,
@@ -153,6 +170,21 @@ fn calculate() -> ToolCall {
         "calculate",
         json!({"a": 12, "b": 30, "operation": "multiply"}),
     )
+}
+
+fn run_command() -> ToolCall {
+    tool_call(
+        "run_command",
+        json!({"command": "# Inspect Rust sources\nfor file in src/*.rs; do\n    printf '%s\\n' \"$file\"\n    grep -n 'TODO' \"$file\" | sort -n\ndone"}),
+    )
+}
+
+fn long_command() -> ToolCall {
+    let command = (1..=30)
+        .map(|line| format!("printf '%s\\n' 'Step {line}'"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    tool_call("run_command", json!({"command": command}))
 }
 
 fn respond_to_comment() -> ToolCall {

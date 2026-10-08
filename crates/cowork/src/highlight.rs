@@ -1,4 +1,4 @@
-//! Syntax highlighting for fenced code blocks in agent messages.
+//! Syntax highlighting for fenced code blocks and tool-call commands.
 
 use std::{ops::Range, sync::OnceLock};
 
@@ -112,6 +112,27 @@ mod tests {
                 highlights
                     .iter()
                     .all(|(range, _)| range.start < range.end && range.end <= code.len())
+            );
+        }
+    }
+
+    #[test]
+    fn highlights_multiline_shell_commands() {
+        let code = "# café\nfor file in *.rs; do\n    printf '%s\\n' \"$file\"\ndone";
+        let block = CodeBlock::from_code(code, Some("sh"));
+        for is_dark in [false, true] {
+            let highlights = highlight_code_block_in_mode(&block, is_dark);
+            assert!(!highlights.is_empty());
+            assert_eq!(highlights.first().unwrap().0.start, 0);
+            assert_eq!(highlights.last().unwrap().0.end, code.len());
+            assert!(highlights.iter().all(|(range, _)| {
+                range.start < range.end
+                    && code.is_char_boundary(range.start)
+                    && code.is_char_boundary(range.end)
+            }));
+            assert!(
+                highlights.windows(2).any(|pair| pair[0].1 != pair[1].1),
+                "shell tokens get different styles, not plain-text highlighting"
             );
         }
     }

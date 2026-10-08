@@ -10,8 +10,9 @@ use std::rc::Rc;
 
 use gpui::{
     AnyElement, App, ClickEvent, FontWeight, IntoElement, Pixels, RenderOnce, SharedString,
-    StyleRefinement, Window, div, prelude::*, px, relative,
+    StyleRefinement, StyledText, Window, div, prelude::*, px, relative,
 };
+use gpui_base::text::CodeBlock;
 use gpui_component::{
     ActiveTheme as _, Icon, Sizable as _,
     button::Button,
@@ -20,7 +21,10 @@ use gpui_component::{
     shimmer::ShimmerText,
 };
 use gpui_kit_assets::IconName;
-use rig::message::ToolCall;
+use rig::{message::ToolCall, tool::Tool as _};
+use sandbox::RunCommand;
+
+use crate::highlight::highlight_code_block_in_mode;
 
 type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
@@ -156,9 +160,15 @@ impl RenderOnce for ToolCallCard {
                     .into_any_element()
             }
         };
-        let body = self
-            .body
-            .unwrap_or_else(|| arguments_view(&id, &self.call, cx));
+        let body = self.body.unwrap_or_else(|| {
+            if self.call.function.name.as_str() == RunCommand::NAME
+                && let Some(command) = self.call.function.arguments_value()["command"].as_str()
+            {
+                command_view(&id, command, cx)
+            } else {
+                arguments_view(&id, &self.call, cx)
+            }
+        });
         div().debug_selector(move || id.to_string()).child(
             GroupBox::new()
                 .outline()
@@ -187,9 +197,40 @@ fn arguments_view(id: &SharedString, call: &ToolCall, cx: &App) -> AnyElement {
     code_block(format!("{id}-arguments"), json, cx)
 }
 
-/// `text` in a monospace block that scrolls past a few lines, for a card's
-/// body.
-pub(crate) fn code_block(id: impl Into<SharedString>, text: String, cx: &App) -> AnyElement {
+/// Highlights the exact command, without adding a prompt that could change
+/// how the shell syntax is parsed or what someone copies from the card.
+fn command_view(id: &SharedString, command: &str, cx: &App) -> AnyElement {
+    let block = CodeBlock::from_code(command, Some("sh"));
+    let highlights = highlight_code_block_in_mode(&block, cx.theme().is_dark());
+    let line_count = command.lines().count();
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_color(cx.theme().muted_foreground)
+                .child("/bin/sh · sandbox"),
+        )
+        .child(code_block(
+            format!("{id}-command"),
+            StyledText::new(command.to_owned()).with_highlights(highlights),
+            cx,
+        ))
+        .when(line_count > 6, |view| {
+            let selector = format!("{id}-command-continuation");
+            view.child(
+                div()
+                    .debug_selector(move || selector.clone())
+                    .text_color(cx.theme().muted_foreground)
+                    .child(format!("↓ {line_count} lines · Scroll to see more")),
+            )
+        })
+        .into_any_element()
+}
+
+/// Monospace content that scrolls past a few lines, for a card's body.
+fn code_block(id: impl Into<SharedString>, text: impl IntoElement, cx: &App) -> AnyElement {
     let id = id.into();
     div()
         .debug_selector({
@@ -201,7 +242,7 @@ pub(crate) fn code_block(id: impl Into<SharedString>, text: String, cx: &App) ->
         .overflow_y_scroll()
         .px_2()
         .py_1()
-        .rounded_sm()
+        .rounded_md()
         .bg(cx.theme().secondary)
         .font_family(cx.theme().mono_font_family.clone())
         .text_xs()
@@ -232,6 +273,7 @@ mod tests {
     }
 
     struct CardView {
+        call: ToolCall,
         offer: bool,
         allowed: Rc<Cell<u32>>,
         denied: Rc<Cell<u32>>,
@@ -239,7 +281,7 @@ mod tests {
 
     impl Render for CardView {
         fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
-            let card = ToolCallCard::new("card", call());
+            let card = ToolCallCard::new("card", self.call.clone());
             let card = if self.offer {
                 let allowed = self.allowed.clone();
                 let denied = self.denied.clone();
@@ -258,6 +300,14 @@ mod tests {
         offer: bool,
         cx: &mut gpui::TestAppContext,
     ) -> (Rc<Cell<u32>>, Rc<Cell<u32>>, &mut gpui::VisualTestContext) {
+        render_call_card(offer, call(), cx)
+    }
+
+    fn render_call_card(
+        offer: bool,
+        call: ToolCall,
+        cx: &mut gpui::TestAppContext,
+    ) -> (Rc<Cell<u32>>, Rc<Cell<u32>>, &mut gpui::VisualTestContext) {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::theme::init(cx);
@@ -265,6 +315,7 @@ mod tests {
         let allowed = Rc::new(Cell::new(0));
         let denied = Rc::new(Cell::new(0));
         let (_, cx) = cx.add_window_view(|_, _| CardView {
+            call,
             offer,
             allowed: allowed.clone(),
             denied: denied.clone(),
@@ -286,6 +337,53 @@ mod tests {
         assert!(deny.right() <= allow.left(), "Allow comes last");
         cx.simulate_click(allow.center(), Modifiers::default());
         assert_eq!((allowed.get(), denied.get()), (1, 1));
+    }
+
+    fn command_call(arguments: serde_json::Value) -> ToolCall {
+        ToolCall::new(
+            CallId::from_wire("command_1"),
+            ToolFunction::new(ToolName::new(RunCommand::NAME).unwrap(), arguments),
+        )
+    }
+
+    #[gpui::test]
+    fn terminal_calls_show_commands_instead_of_json(cx: &mut gpui::TestAppContext) {
+        let (_, _, cx) = render_call_card(
+            true,
+            command_call(json!({"command": "printf '%s\\n' \"hello\"\npwd"})),
+            cx,
+        );
+        assert!(cx.debug_bounds("card-command").is_some());
+        assert!(cx.debug_bounds("card-arguments").is_none());
+        assert!(cx.debug_bounds("card-command-continuation").is_none());
+        assert!(cx.debug_bounds("card-allow").is_some());
+        assert!(cx.debug_bounds("card-deny").is_some());
+    }
+
+    #[gpui::test]
+    fn long_commands_show_a_hint_outside_the_scroll_area(cx: &mut gpui::TestAppContext) {
+        let command = (0..30)
+            .map(|line| format!("echo {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let (_, _, cx) = render_call_card(true, command_call(json!({"command": command})), cx);
+        let command = cx.debug_bounds("card-command").expect("command is visible");
+        let hint = cx
+            .debug_bounds("card-command-continuation")
+            .expect("long commands show a continuation hint");
+        assert!(
+            hint.top() >= command.bottom(),
+            "hint is outside the clipped command"
+        );
+        let allow = cx.debug_bounds("card-allow").expect("Allow stays visible");
+        assert!(allow.top() >= hint.bottom());
+    }
+
+    #[gpui::test]
+    fn malformed_terminal_arguments_remain_visible(cx: &mut gpui::TestAppContext) {
+        let (_, _, cx) = render_call_card(false, command_call(json!({"command": 42})), cx);
+        assert!(cx.debug_bounds("card-command").is_none());
+        assert!(cx.debug_bounds("card-arguments").is_some());
     }
 
     #[test]

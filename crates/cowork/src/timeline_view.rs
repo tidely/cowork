@@ -19,8 +19,7 @@ use gpui_base::{
 };
 use gpui_component::{ActiveTheme, Icon, shimmer::ShimmerText};
 use gpui_kit_assets::IconName as AssetIconName;
-use rig::tool::Tool as _;
-use sandbox::RunCommand;
+
 use uuid::Uuid;
 
 use crate::{
@@ -35,7 +34,7 @@ use crate::{
         TimelineMessage, UserComment, UserCommentBody, UserMessageGroup,
     },
     tool_approval::{self, ApprovalRights},
-    tool_call_card::{ToolCallCard, code_block},
+    tool_call_card::ToolCallCard,
 };
 
 /// The text view of a segment, identified by where the segment starts in its
@@ -314,6 +313,7 @@ impl Cowork {
             .with_paragraph_gap(rems(0.75))
             .with_code_block(
                 gpui::StyleRefinement::default()
+                    .rounded_md()
                     .bg(code_background)
                     .text_color(cx.theme().foreground),
             )
@@ -893,16 +893,7 @@ impl Cowork {
     ) -> gpui::AnyElement {
         let id = format!("tool-approval-{message_id}-{step_index}");
         let tool = call.call.function.name.to_string();
-        let mut card = ToolCallCard::new(id.clone(), call.call.clone());
-        if tool == RunCommand::NAME
-            && let Some(command) = call.call.function.arguments_value()["command"].as_str()
-        {
-            card = card.body(code_block(
-                format!("{id}-command"),
-                format!("$ {command}"),
-                cx,
-            ));
-        }
+        let mut card = ToolCallCard::new(id, call.call.clone());
         if tool_approval::host_only(&tool) {
             card = card.host_only();
         }
