@@ -6,7 +6,6 @@ use std::{
 
 use rig::tool::{Tool, ToolContext, ToolExecutionError};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 /// A stable, model-facing identifier for a comment in one agent turn.
 ///
@@ -162,9 +161,12 @@ impl fmt::Display for CommentToolError {
 
 impl std::error::Error for CommentToolError {}
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct RespondToCommentArgs {
+    /// One of the comment_ids listed with the inline comments, for example comment_1. Never invent one.
     pub comment_id: String,
+    /// Your reply to that comment, shown beside it
     pub response: String,
 }
 
@@ -204,21 +206,7 @@ impl Tool for RespondToComment {
     }
 
     fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "comment_id": {
-                    "type": "string",
-                    "description": "One of the comment_ids listed with the inline comments, for example comment_1. Never invent one."
-                },
-                "response": {
-                    "type": "string",
-                    "description": "Your reply to that comment, shown beside it"
-                }
-            },
-            "required": ["comment_id", "response"],
-            "additionalProperties": false
-        })
+        schemars::schema_for!(RespondToCommentArgs).into()
     }
 
     fn map_error(&self, error: Self::Error) -> ToolExecutionError {
@@ -255,7 +243,41 @@ impl Tool for RespondToComment {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
+
+    #[test]
+    fn schema_and_argument_names_match() {
+        let tool = RespondToComment::new(Arc::new(TurnComments::new(1)));
+        let args: RespondToCommentArgs = serde_json::from_value(json!({
+            "comment_id": "comment_1", "response": "Reply"
+        }))
+        .unwrap();
+        assert_eq!(args.comment_id, "comment_1");
+        assert_eq!(args.response, "Reply");
+        assert!(
+            serde_json::from_value::<RespondToCommentArgs>(json!({
+                "comment_id": "comment_1"
+            }))
+            .is_err()
+        );
+        let parameters = tool.parameters();
+        assert_eq!(parameters["type"], "object");
+        assert_eq!(parameters["required"], json!(["comment_id", "response"]));
+        assert_eq!(parameters["additionalProperties"], false);
+        let properties = &parameters["properties"];
+        assert_eq!(properties["comment_id"]["type"], "string");
+        assert_eq!(
+            properties["comment_id"]["description"],
+            "One of the comment_ids listed with the inline comments, for example comment_1. Never invent one."
+        );
+        assert_eq!(properties["response"]["type"], "string");
+        assert_eq!(
+            properties["response"]["description"],
+            "Your reply to that comment, shown beside it"
+        );
+    }
 
     #[test]
     fn stale_calls_are_ignored_when_the_turn_has_no_comments() {

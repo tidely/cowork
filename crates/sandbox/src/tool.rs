@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 use rig::tool::{Tool, ToolContext, ToolExecutionError};
 use serde::Deserialize;
-use serde_json::json;
 
 use crate::{CommandOutput, SandboxError, Sandboxes, settings};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct RunCommandArgs {
+    /// A POSIX sh command (not Bash), for example `ls -la` or `printf '%s\n' hello`.
     pub command: String,
 }
 
@@ -56,17 +57,7 @@ impl Tool for RunCommand {
     }
 
     fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "command": {
-                    "type": "string",
-                    "description": "A POSIX sh command (not Bash), for example `ls -la` or `printf '%s\\n' hello`."
-                }
-            },
-            "required": ["command"],
-            "additionalProperties": false
-        })
+        schemars::schema_for!(RunCommandArgs).into()
     }
 
     fn map_error(&self, error: Self::Error) -> ToolExecutionError {
@@ -91,6 +82,8 @@ impl Tool for RunCommand {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+
+    use serde_json::json;
 
     use super::*;
 
@@ -128,7 +121,11 @@ mod tests {
         );
         let args: RunCommandArgs = serde_json::from_value(json!({"command": "ls"})).unwrap();
         assert_eq!(args.command, "ls");
-        assert_eq!(tool.parameters()["required"], json!(["command"]));
+        let parameters = tool.parameters();
+        assert_eq!(parameters["type"], "object");
+        assert_eq!(parameters["properties"]["command"]["type"], "string");
+        assert_eq!(parameters["required"], json!(["command"]));
+        assert_eq!(parameters["additionalProperties"], false);
         assert!(
             serde_json::from_value::<RunCommandArgs>(json!({"cmd": "ls"})).is_err(),
             "a misnamed argument is refused"

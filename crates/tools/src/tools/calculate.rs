@@ -2,10 +2,9 @@ use std::fmt;
 
 use rig::tool::{Tool, ToolContext, ToolExecutionError};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 
 /// Basic arithmetic operations available to the agent.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
     Add,
@@ -14,10 +13,14 @@ pub enum Operation {
     Divide,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[schemars(deny_unknown_fields)]
 pub struct CalculateArgs {
+    /// The arithmetic operation to perform
     pub operation: Operation,
+    /// The first operand
     pub a: f64,
+    /// The second operand
     pub b: f64,
 }
 
@@ -59,20 +62,7 @@ impl Tool for Calculate {
     }
 
     fn parameters(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "operation": {
-                    "type": "string",
-                    "enum": ["add", "subtract", "multiply", "divide"],
-                    "description": "The arithmetic operation to perform"
-                },
-                "a": { "type": "number", "description": "The first operand" },
-                "b": { "type": "number", "description": "The second operand" }
-            },
-            "required": ["operation", "a", "b"],
-            "additionalProperties": false
-        })
+        schemars::schema_for!(CalculateArgs).into()
     }
 
     fn map_error(&self, error: Self::Error) -> ToolExecutionError {
@@ -106,6 +96,8 @@ impl Tool for Calculate {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     fn calculate(operation: Operation, a: f64, b: f64) -> Result<f64, CalculateError> {
@@ -152,9 +144,27 @@ mod tests {
             }))
             .is_err()
         );
+        let parameters = Calculate.parameters();
+        assert_eq!(parameters["type"], "object");
+        assert_eq!(parameters["required"], json!(["operation", "a", "b"]));
+        assert_eq!(parameters["additionalProperties"], false);
+        let properties = &parameters["properties"];
+        assert_eq!(properties["a"]["type"], "number");
+        assert_eq!(properties["a"]["description"], "The first operand");
+        assert_eq!(properties["b"]["type"], "number");
+        assert_eq!(properties["b"]["description"], "The second operand");
         assert_eq!(
-            Calculate.parameters()["required"],
-            json!(["operation", "a", "b"])
+            properties["operation"]["description"],
+            "The arithmetic operation to perform"
+        );
+        let operation_ref = properties["operation"]["$ref"].as_str().unwrap();
+        let operation = parameters
+            .pointer(operation_ref.strip_prefix('#').unwrap())
+            .unwrap();
+        assert_eq!(operation["type"], "string");
+        assert_eq!(
+            operation["enum"],
+            json!(["add", "subtract", "multiply", "divide"])
         );
     }
 }
