@@ -14,6 +14,7 @@ use agent::{Agent as StreamingAgent, AgentEvent, ToolDecision};
 use anyhow::Context as _;
 use gpui::{App, Context, Entity};
 use rig::{completion::Usage, message::CallId, providers::ollama::Ollama, tool::ToolSet};
+use sandbox::RunCommand;
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tools::{Calculate, RespondToComment};
@@ -27,7 +28,7 @@ use crate::{
     participant::ParticipantId,
     protocol,
     thread::{ControlGeneration, Thread, ThreadOwnership, ThreadSharing},
-    tool_approval::{ApprovalGate, RunUpdate},
+    tool_approval::{self, ApprovalGate, RunUpdate},
     usage::{TokenActivity, usage_tokens},
 };
 
@@ -41,7 +42,14 @@ pub(crate) struct ActiveGeneration {
     cancelled: Arc<AtomicBool>,
     /// How to answer each call the run is waiting on a decision for.
     /// Dropping one, as when the run ends, denies its call.
-    approvals: HashMap<CallId, oneshot::Sender<ToolDecision>>,
+    approvals: HashMap<CallId, PendingApproval>,
+}
+
+struct PendingApproval {
+    /// Whether only the host may decide the call; see
+    /// [`tool_approval::HOST_ONLY`].
+    host_only: bool,
+    decide: oneshot::Sender<ToolDecision>,
 }
 
 impl ActiveGeneration {
@@ -51,7 +59,14 @@ impl ActiveGeneration {
 
     /// Takes how to answer `call`, if the run is still waiting on it.
     pub(crate) fn take_approval(&mut self, call: &CallId) -> Option<oneshot::Sender<ToolDecision>> {
-        self.approvals.remove(call)
+        self.approvals.remove(call).map(|pending| pending.decide)
+    }
+
+    /// Whether `call`, if the run waits on it, is one only the host decides.
+    pub(crate) fn approval_is_host_only(&self, call: &CallId) -> bool {
+        self.approvals
+            .get(call)
+            .is_some_and(|pending| pending.host_only)
     }
 }
 
@@ -106,6 +121,9 @@ impl Cowork {
         });
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let gate = ApprovalGate::new(sender.clone());
+        // Only the host runs agents, so commands run in the host's sandbox
+        // for this thread, whoever asked for the run.
+        let run_command = RunCommand::new(self.sandboxes.clone(), thread_id.to_string());
         let cancelled = Arc::new(AtomicBool::new(false));
         let generation_task = self.tokio_handle.spawn(async move {
             let (selected_model, max_tokens) =
@@ -121,6 +139,7 @@ impl Cowork {
             let mut tools = ToolSet::default();
             tools.add_tool(RespondToComment::new(turn_comments));
             tools.add_tool(Calculate);
+            tools.add_tool(run_command);
             StreamingAgent::new(model.erase(), tools)
                 .tool_hook(gate)
                 .preamble(SYSTEM_PROMPT)
@@ -150,10 +169,12 @@ impl Cowork {
             while let Some(update) = receiver.recv().await {
                 let event = match update {
                     RunUpdate::Event(event) => event,
-                    RunUpdate::Approval { call, decide } => {
+                    RunUpdate::Approval { call, tool, decide } => {
                         if this
                             .update(cx, |this, cx| {
-                                this.await_tool_approval(thread_id, message_id, call, decide, cx)
+                                this.await_tool_approval(
+                                    thread_id, message_id, call, &tool, decide, cx,
+                                )
                             })
                             .is_err()
                         {
@@ -235,6 +256,7 @@ impl Cowork {
         thread_id: Uuid,
         message_id: Uuid,
         call: CallId,
+        tool: &str,
         decide: oneshot::Sender<ToolDecision>,
         cx: &mut Context<Self>,
     ) {
@@ -248,7 +270,13 @@ impl Cowork {
         else {
             return;
         };
-        generation.approvals.insert(call.clone(), decide);
+        generation.approvals.insert(
+            call.clone(),
+            PendingApproval {
+                host_only: tool_approval::host_only(tool),
+                decide,
+            },
+        );
         thread.update(cx, |thread, cx| {
             thread.emit(
                 protocol::HostMessage::ToolApprovalRequested {

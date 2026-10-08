@@ -209,6 +209,7 @@ fn test_cowork(
         profile_error: None,
         profile_name_subscription: None,
         tokio_handle,
+        sandboxes: crate::test_support::unused_sandboxes(),
         active_generations: HashMap::new(),
         tokens_used: 0,
         token_activity: Vec::new(),

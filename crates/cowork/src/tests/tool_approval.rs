@@ -15,6 +15,19 @@ struct WaitingCall {
 /// Starts a run on the host whose reply calls `calculate`, and has it wait
 /// for approval as the agent's hook would, until everyone sees it waiting.
 fn wait_for_approval(session: &mut Collaboration<'_>) -> WaitingCall {
+    wait_for_approval_of(
+        session,
+        "calculate",
+        serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+    )
+}
+
+/// Like [`wait_for_approval`], for a call of `tool` with `arguments`.
+fn wait_for_approval_of(
+    session: &mut Collaboration<'_>,
+    tool: &str,
+    arguments: serde_json::Value,
+) -> WaitingCall {
     let host_thread = session.host_thread.clone();
     let thread_id = host_thread.read_with(session.cx, |thread, _| thread.instance_id);
     let message_id = Uuid::new_v4();
@@ -28,19 +41,12 @@ fn wait_for_approval(session: &mut Collaboration<'_>) -> WaitingCall {
         );
         host_thread.update(cx, |thread, cx| {
             thread.emit_for_test(agent_started(message_id, None, "1 + 2?"), cx);
-            let turn = model_turn(
-                [streamed_tool_call(
-                    "c",
-                    "calculate",
-                    serde_json::json!({"operation": "add", "a": 1, "b": 2}),
-                )],
-                10,
-            );
+            let turn = model_turn([streamed_tool_call("c", tool, arguments)], 10);
             for event in turn {
                 thread.emit_for_test(agent_event(message_id, event), cx);
             }
         });
-        cowork.await_tool_approval(thread_id, message_id, call.clone(), decide, cx);
+        cowork.await_tool_approval(thread_id, message_id, call.clone(), tool, decide, cx);
     });
     let mirror = session.collaborator_thread().expect("joined");
     session.wait_until("the mirror sees the call waiting", |this| {
@@ -119,6 +125,58 @@ fn only_admins_decide_a_waiting_call(cx: &mut gpui::TestAppContext) {
     session.host.update(session.cx, |cowork, cx| {
         cowork.decide_tool_call(message_id, call, true, cx);
     });
+    waiting.task.abort();
+}
+
+/// A command runs on the host's computer, so not even an admin may allow it.
+#[gpui::test]
+fn only_the_host_decides_a_command(cx: &mut gpui::TestAppContext) {
+    let mut session = Collaboration::start(cx);
+    set_default(&mut session, PeerMode::Admin);
+    let mut waiting = wait_for_approval_of(
+        &mut session,
+        "run_command",
+        serde_json::json!({"command": "ls"}),
+    );
+    let message_id = waiting.message_id;
+    let selector = move |part: &str| -> &'static str {
+        Box::leak(format!("tool-approval-{message_id}-0-{part}").into_boxed_str())
+    };
+
+    // The host is offered Allow; the admin waits. Both see the command.
+    assert!(session.cx.debug_bounds(selector("allow")).is_some());
+    assert!(session.cx.debug_bounds(selector("waiting")).is_some());
+    assert!(session.cx.debug_bounds(selector("command")).is_some());
+
+    // An admin who asks anyway is ignored by the host.
+    let mirror = session.collaborator_thread().expect("joined");
+    mirror.read_with(session.cx, |thread, _| {
+        assert!(thread.can_approve_tools(), "an admin approves other tools");
+        assert!(request_unchecked(
+            thread,
+            protocol::CollaboratorMessage::DecideToolCall {
+                message_id: message_id.into_bytes(),
+                call: protocol::Json::call_id(&waiting.call),
+                allow: true,
+            },
+        ));
+    });
+    session.settle();
+    assert!(waiting.decision.try_recv().is_err(), "the run still waits");
+    let host_thread = session.host_thread.clone();
+    assert_eq!(
+        awaiting(&host_thread, session.cx),
+        Some(waiting.call.clone())
+    );
+
+    let call = waiting.call.clone();
+    session.host.update(session.cx, |cowork, cx| {
+        cowork.decide_tool_call(message_id, call, true, cx);
+    });
+    session.wait_until("everyone sees the call decided", |this| {
+        awaiting(&host_thread, this.cx).is_none() && awaiting(&mirror, this.cx).is_none()
+    });
+    assert_eq!(waiting.decision.try_recv(), Ok(ToolDecision::Allow));
     waiting.task.abort();
 }
 

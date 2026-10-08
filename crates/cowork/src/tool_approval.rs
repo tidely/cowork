@@ -6,6 +6,8 @@
 //! call, and the host tells everyone the call is waiting. Anyone who may
 //! approve tool calls (the host, and `Admin` peers) then allows or denies it
 //! through the same checked path; the first decision wins and the run goes on.
+//! Calls of [`HOST_ONLY`] tools, which run something on the host's computer,
+//! only the host may decide.
 
 use std::sync::Arc;
 
@@ -16,11 +18,16 @@ use rig::{
     message::{CallId, ToolCall},
     tool::Tool as _,
 };
+use sandbox::RunCommand;
 use tokio::sync::{mpsc, oneshot};
 use tools::RespondToComment;
 use uuid::Uuid;
 
-use crate::{Cowork, participant::ParticipantId, thread::ApproveTools, thread::ThreadSharing};
+use crate::{
+    Cowork,
+    participant::ParticipantId,
+    thread::{ApproveTools, Thread, ThreadSharing},
+};
 
 /// Tools whose calls always run, as they only act within the thread.
 /// Every other tool's calls wait for approval, so a tool added without a
@@ -34,8 +41,39 @@ const DENIED: &str = "The user denied this tool call.";
 /// thread is gone.
 const UNDECIDED: &str = "The tool call was not approved.";
 
+/// Tools whose calls only the host may allow: they act on the host's computer
+/// (a sandbox there, for `run_command`), so an `Admin` peer may not decide
+/// for it.
+pub(crate) const HOST_ONLY: &[&str] = &[RunCommand::NAME];
+
 pub(crate) fn needs_approval(tool: &str) -> bool {
     !ALWAYS_ALLOWED.contains(&tool)
+}
+
+pub(crate) fn host_only(tool: &str) -> bool {
+    HOST_ONLY.contains(&tool)
+}
+
+/// Which waiting calls the local user may decide in a thread.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct ApprovalRights {
+    /// May approve tool calls at all: the host, or an `Admin` peer.
+    approves_tools: bool,
+    /// Is the host, who alone decides [`HOST_ONLY`] tools.
+    is_host: bool,
+}
+
+impl ApprovalRights {
+    pub(crate) fn of(thread: &Thread) -> Self {
+        Self {
+            approves_tools: thread.can_approve_tools(),
+            is_host: thread.is_host(),
+        }
+    }
+
+    pub(crate) fn may_decide(self, tool: &str) -> bool {
+        self.approves_tools && (self.is_host || !host_only(tool))
+    }
 }
 
 /// What a run reports to its thread, in the order it happened.
@@ -47,6 +85,8 @@ pub(crate) enum RunUpdate {
     /// A call of the last reply waits for a decision, given through `decide`.
     Approval {
         call: CallId,
+        /// The tool called, which decides who may answer.
+        tool: String,
         decide: oneshot::Sender<ToolDecision>,
     },
 }
@@ -78,6 +118,7 @@ impl ToolHook for ApprovalGate {
                 .updates
                 .send(RunUpdate::Approval {
                     call: call.id.clone(),
+                    tool: call.function.name.to_string(),
                     decide,
                 })
                 .is_err()
@@ -136,6 +177,7 @@ impl Cowork {
         if !thread.read(cx).is_host() {
             return;
         }
+        let host = thread.read(cx).participant_id();
         let Some(generation) = self
             .active_generations
             .get_mut(&thread_id)
@@ -147,6 +189,9 @@ impl Cowork {
         // decision never reaches the run.
         let decided = thread.update(cx, |thread, cx| {
             thread.with_authorized::<ApproveTools, _>(actor, |auth| {
+                if actor != host && generation.approval_is_host_only(call) {
+                    return false;
+                }
                 let Some(decide) = generation.take_approval(call) else {
                     return false;
                 };
@@ -175,7 +220,26 @@ mod tests {
     fn only_listed_tools_run_without_approval() {
         assert!(!needs_approval(RespondToComment::NAME));
         assert!(needs_approval(tools::Calculate::NAME));
+        assert!(needs_approval(RunCommand::NAME));
         assert!(needs_approval("a_tool_nobody_listed"));
+    }
+
+    #[test]
+    fn admins_decide_everything_but_host_only_tools() {
+        let host = ApprovalRights {
+            approves_tools: true,
+            is_host: true,
+        };
+        let admin = ApprovalRights {
+            approves_tools: true,
+            is_host: false,
+        };
+        let writer = ApprovalRights::default();
+        assert!(host.may_decide(RunCommand::NAME));
+        assert!(host.may_decide(tools::Calculate::NAME));
+        assert!(!admin.may_decide(RunCommand::NAME));
+        assert!(admin.may_decide(tools::Calculate::NAME));
+        assert!(!writer.may_decide(tools::Calculate::NAME));
     }
 
     fn call(name: &str) -> ToolCall {
@@ -200,10 +264,11 @@ mod tests {
         let calculation = call(tools::Calculate::NAME);
         let decision = gate.before_tool_call(&calculation);
         let answer = async {
-            let Some(RunUpdate::Approval { call, decide }) = asked.recv().await else {
+            let Some(RunUpdate::Approval { call, tool, decide }) = asked.recv().await else {
                 panic!("expected an approval request");
             };
             assert_eq!(call, CallId::from_wire("call_1"));
+            assert_eq!(tool, tools::Calculate::NAME);
             decide.send(ToolDecision::Allow).expect("the gate waits");
         };
         let (decision, ()) = tokio::join!(decision, answer);

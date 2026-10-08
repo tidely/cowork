@@ -1,0 +1,16 @@
+[package]
+name = "sandbox"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+dashmap.workspace = true
+futures.workspace = true
+microsandbox.workspace = true
+rig.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio = { workspace = true, features = ["time"] }

@@ -19,6 +19,8 @@ use gpui_base::{
 };
 use gpui_component::{ActiveTheme, Icon, shimmer::ShimmerText};
 use gpui_kit_assets::IconName as AssetIconName;
+use rig::tool::Tool as _;
+use sandbox::RunCommand;
 use uuid::Uuid;
 
 use crate::{
@@ -32,7 +34,8 @@ use crate::{
         AgentMessage, AgentStep, AgentToolCall, MessageAuthor, StepView, ThreadMessageId,
         TimelineMessage, UserComment, UserCommentBody, UserMessageGroup,
     },
-    tool_call_card::ToolCallCard,
+    tool_approval::{self, ApprovalRights},
+    tool_call_card::{ToolCallCard, code_block},
 };
 
 /// The text view of a segment, identified by where the segment starts in its
@@ -885,14 +888,25 @@ impl Cowork {
         message_id: Uuid,
         step_index: usize,
         call: &AgentToolCall,
-        can_approve: bool,
+        rights: ApprovalRights,
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
-        let card = ToolCallCard::new(
-            format!("tool-approval-{message_id}-{step_index}"),
-            call.call.clone(),
-        );
-        let card = if can_approve {
+        let id = format!("tool-approval-{message_id}-{step_index}");
+        let tool = call.call.function.name.to_string();
+        let mut card = ToolCallCard::new(id.clone(), call.call.clone());
+        if tool == RunCommand::NAME
+            && let Some(command) = call.call.function.arguments_value()["command"].as_str()
+        {
+            card = card.body(code_block(
+                format!("{id}-command"),
+                format!("$ {command}"),
+                cx,
+            ));
+        }
+        if tool_approval::host_only(&tool) {
+            card = card.host_only();
+        }
+        let card = if rights.may_decide(&tool) {
             let allowed = call.call.id.clone();
             let denied = call.call.id.clone();
             card.decide(
@@ -915,7 +929,7 @@ impl Cowork {
     fn render_work(
         thread_id: Uuid,
         message: &AgentMessage,
-        can_approve: bool,
+        rights: ApprovalRights,
         cx: &Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         let awaiting_step = message.awaiting_approval_step();
@@ -943,11 +957,7 @@ impl Cowork {
             match (step, view) {
                 (AgentStep::ToolCall(call), _) if awaiting_step == Some(step_index) => {
                     calls.push(Self::render_tool_approval(
-                        message.id,
-                        step_index,
-                        call,
-                        can_approve,
-                        cx,
+                        message.id, step_index, call, rights, cx,
                     ));
                 }
                 (AgentStep::ToolCall(call), view) => calls.push(Self::render_tool_call(
@@ -1324,12 +1334,13 @@ impl Cowork {
         // A call waiting for approval shows even in collapsed work, as the
         // run cannot go on until someone sees it.
         let work = if message.work_expanded || message.awaiting_approval.is_some() {
-            let can_approve = self
+            let rights = self
                 .thread_store
                 .read(cx)
                 .thread(thread_id, cx)
-                .is_some_and(|thread| thread.read(cx).can_approve_tools());
-            Self::render_work(thread_id, message, can_approve, cx)
+                .map(|thread| ApprovalRights::of(thread.read(cx)))
+                .unwrap_or_default();
+            Self::render_work(thread_id, message, rights, cx)
         } else {
             Vec::new()
         };

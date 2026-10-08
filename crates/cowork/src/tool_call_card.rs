@@ -35,6 +35,10 @@ enum Decision {
     Waiting,
 }
 
+/// Who a call that waits is waiting for, as its note names them.
+const DECIDERS: &str = "the host or an admin";
+const HOST: &str = "the host";
+
 #[derive(IntoElement)]
 pub(crate) struct ToolCallCard {
     /// Prefixes the ids and debug selectors of the card's parts, so it must
@@ -43,6 +47,7 @@ pub(crate) struct ToolCallCard {
     call: ToolCall,
     body: Option<AnyElement>,
     decision: Decision,
+    waiting_for: &'static str,
 }
 
 impl ToolCallCard {
@@ -54,7 +59,15 @@ impl ToolCallCard {
             call,
             body: None,
             decision: Decision::Waiting,
+            waiting_for: DECIDERS,
         }
+    }
+
+    /// Names only the host in the waiting note, for a tool only the host may
+    /// allow.
+    pub(crate) fn host_only(mut self) -> Self {
+        self.waiting_for = HOST;
+        self
     }
 
     /// Shows `body` instead of the arguments: a tool's own presentation of
@@ -134,8 +147,11 @@ impl RenderOnce for ToolCallCard {
                     // Shimmering like the "Working for" line, as both are
                     // something still under way.
                     .child(
-                        ShimmerText::new("Waiting for the host or an admin to allow this call…")
-                            .id(SharedString::from(waiting)),
+                        ShimmerText::new(format!(
+                            "Waiting for {} to allow this call…",
+                            self.waiting_for
+                        ))
+                        .id(SharedString::from(waiting)),
                     )
                     .into_any_element()
             }
@@ -168,8 +184,19 @@ const MAX_ARGUMENTS_HEIGHT: Pixels = px(112.);
 fn arguments_view(id: &SharedString, call: &ToolCall, cx: &App) -> AnyElement {
     // A `Value` always encodes.
     let json = serde_json::to_string_pretty(&call.function.arguments_value()).unwrap_or_default();
+    code_block(format!("{id}-arguments"), json, cx)
+}
+
+/// `text` in a monospace block that scrolls past a few lines, for a card's
+/// body.
+pub(crate) fn code_block(id: impl Into<SharedString>, text: String, cx: &App) -> AnyElement {
+    let id = id.into();
     div()
-        .id(SharedString::from(format!("{id}-arguments")))
+        .debug_selector({
+            let id = id.clone();
+            move || id.to_string()
+        })
+        .id(id)
         .max_h(MAX_ARGUMENTS_HEIGHT)
         .overflow_y_scroll()
         .px_2()
@@ -180,7 +207,7 @@ fn arguments_view(id: &SharedString, call: &ToolCall, cx: &App) -> AnyElement {
         .text_xs()
         .line_height(relative(1.35))
         .text_color(cx.theme().muted_foreground)
-        .child(json)
+        .child(text)
         .into_any_element()
 }
 
@@ -259,6 +286,13 @@ mod tests {
         assert!(deny.right() <= allow.left(), "Allow comes last");
         cx.simulate_click(allow.center(), Modifiers::default());
         assert_eq!((allowed.get(), denied.get()), (1, 1));
+    }
+
+    #[test]
+    fn host_only_cards_name_only_the_host() {
+        let card = ToolCallCard::new("card", call());
+        assert_eq!(card.waiting_for, DECIDERS);
+        assert_eq!(card.host_only().waiting_for, HOST);
     }
 
     #[gpui::test]

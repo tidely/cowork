@@ -25,6 +25,7 @@ itertools.workspace = true
 nucleo-matcher.workspace = true
 postcard.workspace = true
 rig.workspace = true
+sandbox.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 syntect.workspace = true

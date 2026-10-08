@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
+use anyhow::Context as _;
 use gpui::{
     App, AppContext, Bounds, Context, Entity, EntityId, ExternalPaths, IntoElement, KeyBinding,
     MouseButton, MouseUpEvent, PlatformInput, QuitMode, Render, ScrollHandle, SharedString,
@@ -119,6 +120,8 @@ struct Cowork {
     /// Watches the open profile name dialog's input.
     profile_name_subscription: Option<Subscription>,
     tokio_handle: tokio::runtime::Handle,
+    /// Where the agent's shell commands run, one microVM per hosted thread.
+    sandboxes: Arc<sandbox::Sandboxes>,
     active_generations: HashMap<Uuid, ActiveGeneration>,
     /// Tokens used across local threads, excluding ones joined from someone
     /// else; see [`Cowork::record_turn_usage`].
@@ -491,6 +494,10 @@ fn main() -> anyhow::Result<()> {
         TOKIO_RUNTIME.set(runtime).is_ok(),
         "the agent runtime was already initialized",
     );
+    let sandboxes = Arc::new(sandbox::Sandboxes::new(
+        sandbox_home()?,
+        Uuid::new_v4().simple().to_string(),
+    ));
 
     gpui_platform::application()
         .with_assets(Assets)
@@ -528,8 +535,24 @@ fn main() -> anyhow::Result<()> {
                 ..TitleBar::window_options()
             };
 
+            // microsandbox also stops the VMs once Cowork has exited; this
+            // stops them sooner where quitting leaves time for it.
+            cx.on_app_quit({
+                let sandboxes = sandboxes.clone();
+                let tokio_handle = tokio_handle.clone();
+                move |_| {
+                    let sandboxes = sandboxes.clone();
+                    let stopped = tokio_handle.spawn(async move { sandboxes.shutdown().await });
+                    async move {
+                        _ = stopped.await;
+                    }
+                }
+            })
+            .detach();
+
             if let Err(error) = cx.open_window(window_options, move |window, cx| {
                 let tokio_handle = tokio_handle.clone();
+                let sandboxes = sandboxes.clone();
                 let thread_store = cx.new(|_| ThreadStore::default());
                 let local_participant_id = ParticipantId::new();
                 let new_thread_draft = ThreadDraft::new(local_participant_id);
@@ -566,6 +589,7 @@ fn main() -> anyhow::Result<()> {
                         profile_error: None,
                         profile_name_subscription: None,
                         tokio_handle,
+                        sandboxes,
                         active_generations: HashMap::new(),
                         tokens_used: 0,
                         token_activity: Vec::new(),
@@ -596,6 +620,13 @@ fn main() -> anyhow::Result<()> {
         });
 
     Ok(())
+}
+
+/// Cowork's own microsandbox home, apart from any of the user's. Short, as
+/// microsandbox puts Unix sockets beneath it.
+fn sandbox_home() -> anyhow::Result<std::path::PathBuf> {
+    let home = std::env::home_dir().context("the home directory is unknown")?;
+    Ok(home.join(".cowork").join("microsandbox"))
 }
 
 #[cfg(test)]

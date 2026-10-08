@@ -1,6 +1,6 @@
 //! Helpers shared by the tests of several modules.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 
 use draft::{AttachmentId, AttachmentRecord};
 use uuid::Uuid;
@@ -18,6 +18,15 @@ pub(crate) fn request_unchecked(thread: &Thread, request: protocol::Collaborator
         panic!("a connected test peer");
     };
     host.try_send(request).is_ok()
+}
+
+/// Sandboxes for a test `Cowork`. Nothing is set up until a command runs, and
+/// tests run none, so the home is never created.
+pub(crate) fn unused_sandboxes() -> Arc<sandbox::Sandboxes> {
+    Arc::new(sandbox::Sandboxes::new(
+        std::env::temp_dir().join("cowork-test-sandboxes-unused"),
+        "test",
+    ))
 }
 
 pub(crate) fn encoded_image(width: u32, format: image::ImageFormat) -> Vec<u8> {
