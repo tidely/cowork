@@ -35,6 +35,11 @@ use std::time::Duration;
 /// The guest image: Alpine, pinned to the digest of its multi-arch index so
 /// the registry cannot substitute different contents for the tag. It is
 /// pulled once from Docker Hub by the host, then served from the local cache.
+/// All supported hosts use this Linux image, not their native shell or tools.
+/// Its x86-64 and ARM64 variants have the same executable paths: `/bin/sh`
+/// is BusyBox ash, and Bash and development toolchains are not installed.
+/// Keep the model-facing tool inventory in `RunCommand::description` aligned
+/// with this image when changing it.
 pub const IMAGE: &str = "docker.io/library/alpine:3.24.2@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6";
 
 /// Virtual CPUs, with no hotplug headroom (`max_cpus` is the same). Shared by

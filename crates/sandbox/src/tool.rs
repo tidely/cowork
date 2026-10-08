@@ -38,6 +38,10 @@ impl Tool for RunCommand {
         format!(
             "Run a shell command with /bin/sh -c in an isolated Alpine Linux virtual machine, \
              and get its exit code, stdout, and stderr. Every call waits for a person to allow it. \
+             Use POSIX sh (BusyBox ash), not Bash. Basic BusyBox utilities are available, \
+             including ls, cat, printf, grep, sed, awk, find, sort, and tar. Bash, git, Python, \
+             Node.js, and Rust toolchains are not installed. Check other commands with \
+             `command -v NAME` or list utilities with `busybox --list`. \
              The machine has no network access and none of the user's files; it runs as an \
              unprivileged user starting in {workdir}, and only {workdir} and similar scratch \
              locations are writable. Files persist between calls in this conversation until the \
@@ -57,7 +61,7 @@ impl Tool for RunCommand {
             "properties": {
                 "command": {
                     "type": "string",
-                    "description": "The shell command, for example `ls -la` or `echo $((6 * 7))`"
+                    "description": "A POSIX sh command (not Bash), for example `ls -la` or `printf '%s\\n' hello`."
                 }
             },
             "required": ["command"],
@@ -89,6 +93,32 @@ mod tests {
     use std::path::PathBuf;
 
     use super::*;
+
+    #[test]
+    fn description_names_the_guest_shell_and_tools() {
+        let tool = RunCommand::new(
+            Arc::new(Sandboxes::new(PathBuf::from("/nonexistent"), "test")),
+            "thread",
+        );
+        let description = tool.description();
+        for guidance in [
+            "Use POSIX sh (BusyBox ash), not Bash",
+            "Basic BusyBox utilities are available",
+            "Rust toolchains are not installed",
+            "busybox --list",
+            "command -v NAME",
+        ] {
+            assert!(
+                description.contains(guidance),
+                "missing guidance: {guidance}"
+            );
+        }
+        let parameter = tool.parameters()["properties"]["command"]["description"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(parameter.contains("not Bash"));
+    }
 
     #[test]
     fn schema_and_argument_names_match() {
