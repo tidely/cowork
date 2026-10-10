@@ -11,7 +11,7 @@ Cowork doesn't have releases yet, so you need to build it yourself. Install [Rus
 ```sh
 git clone https://github.com/tidely/cowork
 cd cowork
-cargo run --release -p cowork
+cargo run --release
 ```
 
 ## How does Cowork work?
