@@ -9,8 +9,10 @@
 //!
 //! Nothing here runs until the first command: no runtime download, no image
 //! pull, no files. The runtime (`msb` and `libkrunfw`) is then installed into
-//! Cowork's own microsandbox home, checked against [`RUNTIME_ARCHIVES`], so a
-//! user's own microsandbox installation and configuration are never used.
+//! Cowork's own microsandbox home, downloaded from the microsandbox GitHub
+//! release matching the crate's version, so a user's own microsandbox
+//! installation and configuration are never used. A runtime of another
+//! version there is replaced.
 //!
 //! Each VM runs in a child `msb` process. microsandbox stops it if Cowork
 //! exits, and as the sandboxes are ephemeral the runtime then discards them.
@@ -44,43 +46,21 @@ use microsandbox::{
         DeploymentProfile, PullPolicy, RlimitResource, SandboxStatus, SecurityProfile,
         StatVirtualization,
     },
-    setup::{InstallOptions, ensure_runtime},
+    setup::{InstallOptions, Version, install_runtime, resolve_runtime, resolve_runtime_version},
 };
 use output::CappedStream;
 pub use output::{CommandOutput, Killed};
 pub use project::{Project, ProjectFolder, folder_name};
 pub use tool::{ReadOnlyPass, RunCommand, RunCommandArgs};
 
-/// The SHA-256 of the runtime archive microsandbox 0.7.7 installs, for each
-/// platform it publishes one for. Taken from the v0.7.7 GitHub release, whose
-/// recorded asset digests match. Update these with the `microsandbox`
-/// version.
-pub const RUNTIME_ARCHIVES: &[(&str, &str, &str)] = &[
-    (
-        "macos",
-        "aarch64",
-        "eed5faa16217ad375ad9a4eb5e819656baeab8ccde0d3ab7e79c4af49319d403",
-    ),
-    (
-        "linux",
-        "x86_64",
-        "b3cc4a5e3f52dfdd938a6f67ac4a9a959ddfe304bab56de4964044b8613f01bb",
-    ),
-    (
-        "linux",
-        "aarch64",
-        "8997b1ea76de58689fb6d0fa7b32af6fbe8cbc24612da40b168a5b433c7d8318",
-    ),
-    (
-        "windows",
-        "x86_64",
-        "641375e70d65ce2ac167040f8eb238c878db92202edf4f1aa91d3ddcb7fdb8d1",
-    ),
-    (
-        "windows",
-        "aarch64",
-        "b89f02b2c5792c67bea46f1b1d8498bf1437e8e85302fa7e75584b36015f83d3",
-    ),
+/// The platforms, as `std::env::consts` `(OS, ARCH)`, microsandbox publishes
+/// a runtime for.
+const RUNTIME_PLATFORMS: &[(&str, &str)] = &[
+    ("macos", "aarch64"),
+    ("linux", "x86_64"),
+    ("linux", "aarch64"),
+    ("windows", "x86_64"),
+    ("windows", "aarch64"),
 ];
 
 /// The label every Cowork sandbox carries, so leftovers can be found.
@@ -420,7 +400,9 @@ impl Sandboxes {
     async fn ready(&self) -> Result<(), SandboxError> {
         self.ready
             .get_or_try_init(|| async {
-                let digest = runtime_archive_sha256().ok_or(SandboxError::Unsupported)?;
+                if !runtime_published() {
+                    return Err(SandboxError::Unsupported);
+                }
                 // Reading `config.json` from Cowork's home, which Cowork never
                 // writes, keeps the defaults of a user's own microsandbox
                 // configuration from loosening these sandboxes.
@@ -430,15 +412,25 @@ impl Sandboxes {
                     .build()
                     .await
                     .map_err(setup)?;
-                ensure_runtime(
-                    backend.config(),
-                    InstallOptions {
-                        expected_archive_sha256: Some(digest.to_owned()),
-                        ..InstallOptions::default()
-                    },
-                )
-                .await
-                .map_err(setup)?;
+                let options = InstallOptions::default();
+                // microsandbox launches only a runtime of its own version and
+                // never replaces a complete installation by itself, so one
+                // left by an earlier Cowork is replaced here.
+                let wanted = Version::parse(&options.version).ok();
+                let installed = resolve_runtime(backend.config())
+                    .ok()
+                    .and_then(|runtime| resolve_runtime_version(runtime.msb_path).ok().flatten());
+                if installed.is_none() || installed != wanted {
+                    install_runtime(
+                        backend.config(),
+                        InstallOptions {
+                            force: true,
+                            ..options
+                        },
+                    )
+                    .await
+                    .map_err(setup)?;
+                }
                 // Process-wide, as parts of microsandbox look the backend up
                 // rather than being handed it. Cowork has no other use for it.
                 microsandbox::set_default_backend(backend);
@@ -517,13 +509,9 @@ impl Drop for Sandboxes {
     }
 }
 
-/// The pinned runtime archive digest for this platform, if microsandbox
-/// publishes a runtime for it.
-fn runtime_archive_sha256() -> Option<&'static str> {
-    RUNTIME_ARCHIVES
-        .iter()
-        .find(|(os, arch, _)| *os == std::env::consts::OS && *arch == std::env::consts::ARCH)
-        .map(|(_, _, digest)| *digest)
+/// Whether microsandbox publishes a runtime for this platform.
+fn runtime_published() -> bool {
+    RUNTIME_PLATFORMS.contains(&(std::env::consts::OS, std::env::consts::ARCH))
 }
 
 fn setup(error: microsandbox::MicrosandboxError) -> SandboxError {
@@ -655,25 +643,6 @@ impl Drop for KillOnDrop {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn this_platform_has_a_pinned_runtime_or_is_unsupported() {
-        let supported = matches!(
-            (std::env::consts::OS, std::env::consts::ARCH),
-            ("macos", "aarch64")
-                | ("linux", "x86_64" | "aarch64")
-                | ("windows", "x86_64" | "aarch64")
-        );
-        assert_eq!(runtime_archive_sha256().is_some(), supported);
-    }
-
-    #[test]
-    fn pinned_digests_are_sha256() {
-        for (_, _, digest) in RUNTIME_ARCHIVES {
-            assert_eq!(digest.len(), 64);
-            assert!(digest.bytes().all(|byte| byte.is_ascii_hexdigit()));
-        }
-    }
 
     #[tokio::test]
     async fn bad_commands_are_rejected_before_anything_starts() {
