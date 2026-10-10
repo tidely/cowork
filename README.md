@@ -16,8 +16,6 @@ That's it!
 
 ## How does Cowork work?
 
-Cowork establishes peer-to-peer connections over the [iroh](https://www.iroh.computer) network. Collaborators connect using a public key that identifies the endpoint and helps secure the connection. This means your chats are end-to-end encrypted.
+The agent has access to provided projects and shell commands inside of a sandbox powered by [microsandbox](https://github.com/superradcompany/microsandbox). Each thread gets its own microVM: a lightweight virtual machine with its own Linux kernel, kept apart from your computer by hardware virtualization.
 
-Each thread is backed by a conflict-free replicated data type (CRDT), which allows multiple users to edit any part of the thread at the same time.
-
-The agent's shell commands run in a sandbox powered by [microsandbox](https://github.com/superradcompany/microsandbox). Each thread gets its own microVM: a lightweight virtual machine with its own Linux kernel, kept apart from your computer by hardware virtualization.
+Cowork establishes peer-to-peer connections over the [iroh](https://www.iroh.computer) network. Collaborators connect using a public key that identifies the endpoint and helps secure the connection. This means your chats are end-to-end encrypted. Each thread is backed by a conflict-free replicated data type (CRDT), which allows multiple users to edit any part of the thread at the same time.
