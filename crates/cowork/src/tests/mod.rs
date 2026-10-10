@@ -73,6 +73,7 @@ mod permissions;
 mod project_folders;
 mod project_mode;
 mod search_palette;
+mod sidebar;
 mod threads;
 mod tool_approval;
 
@@ -215,6 +216,8 @@ fn test_cowork(
         active_generations: HashMap::new(),
         tokens_used: 0,
         token_activity: Vec::new(),
+        deleted_chats: 0,
+        longest_deleted_chat: Duration::ZERO,
         activity_range: ActivityRange::default(),
         local_participant_id,
         typing_in: None,
@@ -336,6 +339,7 @@ fn attachment_test_cowork(
         let thread = cx.new(|_| test_thread(thread_id, Vec::new(), draft));
         let thread_store = cx.new(|_| ThreadStore {
             threads: VecDeque::from([thread]),
+            ..Default::default()
         });
         let cowork =
             cx.new(|cx| test_cowork(thread_store, Some(thread_id), tokio_handle, window, cx));
@@ -578,6 +582,7 @@ impl<'a> Collaboration<'a> {
             let thread = cx.new(|_| thread);
             let host_store = cx.new(|_| ThreadStore {
                 threads: VecDeque::from([thread]),
+                ..Default::default()
             });
             let host = cx.new(|cx| {
                 test_cowork(

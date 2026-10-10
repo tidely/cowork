@@ -394,6 +394,7 @@ fn assert_backslash_selection_creates_comment(
         let thread = cx.new(|_| test_thread(thread_id, timeline, draft));
         let thread_store = cx.new(|_| ThreadStore {
             threads: VecDeque::from([thread]),
+            ..Default::default()
         });
         let cowork =
             cx.new(|cx| test_cowork(thread_store, Some(thread_id), tokio_handle, window, cx));
@@ -708,6 +709,7 @@ fn commenting_on_a_long_response_keeps_the_timeline_scroll_position(cx: &mut gpu
         let thread = cx.new(|_| test_thread(thread_id, timeline, draft));
         let thread_store = cx.new(|_| ThreadStore {
             threads: VecDeque::from([thread]),
+            ..Default::default()
         });
         let cowork =
             cx.new(|cx| test_cowork(thread_store, Some(thread_id), tokio_handle, window, cx));

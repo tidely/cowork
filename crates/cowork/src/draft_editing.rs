@@ -938,6 +938,8 @@ pub(crate) mod tests {
                         active_generations: HashMap::new(),
                         tokens_used: 0,
                         token_activity: Vec::new(),
+                        deleted_chats: 0,
+                        longest_deleted_chat: Default::default(),
                         activity_range: ActivityRange::default(),
                         local_participant_id: actor,
                         typing_in: None,

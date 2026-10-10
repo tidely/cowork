@@ -33,6 +33,8 @@ gpui_kit_assets::icon_assets!(
         FolderOpen,
         FolderPlus,
         Trash,
+        Archive,
+        ArchiveRestore,
         TriangleAlert,
         FileText,
         Image,
@@ -120,6 +122,15 @@ mod tests {
             let path = icon.path();
             let bytes = Assets.load(&path).unwrap().expect("bundled project icon");
             assert!(!bytes.is_empty(), "empty project icon: {path}");
+        }
+    }
+
+    #[test]
+    fn archive_icons_are_bundled() {
+        for icon in [IconName::Archive, IconName::ArchiveRestore, IconName::Trash] {
+            let path = icon.path();
+            let bytes = Assets.load(&path).unwrap().expect("bundled archive icon");
+            assert!(!bytes.is_empty(), "empty archive icon: {path}");
         }
     }
 

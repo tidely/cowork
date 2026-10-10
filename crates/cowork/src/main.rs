@@ -37,6 +37,7 @@ use crate::{
     usage::{ActivityRange, TokenActivity},
 };
 
+mod archive;
 mod assets;
 mod attachments;
 mod avatars;
@@ -85,6 +86,8 @@ enum MainStage {
     ProviderSetup(ProviderSetupStage),
     Thread,
     Profile,
+    /// The archived threads, to restore or delete for good.
+    Archive,
 }
 
 /// The provider whose setup page occupies the main stage.
@@ -132,6 +135,11 @@ struct Cowork {
     tokens_used: u64,
     /// When those tokens were used, turn by turn, in the order turns ended.
     token_activity: Vec<TokenActivity>,
+    /// How many chats were deleted from the archive, and the longest the
+    /// agent generated in one of them, which the profile's statistics still
+    /// count; see [`Cowork::delete_archived_thread`].
+    deleted_chats: usize,
+    longest_deleted_chat: std::time::Duration,
     /// The period the profile page's token activity chart shows.
     activity_range: ActivityRange,
     /// Who the local user is in the threads this app creates and hosts.
@@ -452,6 +460,7 @@ impl Render for Cowork {
                             })
                             .map(|this| match self.main_stage {
                                 MainStage::Profile => this.child(self.render_profile_page(cx)),
+                                MainStage::Archive => this.child(self.render_archive_page(cx)),
                                 MainStage::Welcome => this.child(self.render_welcome(cx)),
                                 MainStage::ProviderSetup(provider) => {
                                     this.child(self.render_provider_setup(provider, cx))
@@ -603,6 +612,8 @@ fn main() -> anyhow::Result<()> {
                         active_generations: HashMap::new(),
                         tokens_used: 0,
                         token_activity: Vec::new(),
+                        deleted_chats: 0,
+                        longest_deleted_chat: Default::default(),
                         activity_range: ActivityRange::default(),
                         local_participant_id,
                         typing_in: None,

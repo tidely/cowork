@@ -220,6 +220,7 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
         });
         let thread_store = cx.new(|_| ThreadStore {
             threads: VecDeque::from([thread]),
+            ..Default::default()
         });
         Root::new(
             cx.new(|cx| {
@@ -342,6 +343,7 @@ fn selected_user_message_text_copies(cx: &mut gpui::TestAppContext) {
             cx.new(|_| test_thread(thread_id, timeline, ThreadDraft::new(ParticipantId::new())));
         let thread_store = cx.new(|_| ThreadStore {
             threads: VecDeque::from([thread]),
+            ..Default::default()
         });
         Root::new(
             cx.new(|cx| {
@@ -507,6 +509,7 @@ fn participants_sit_beside_the_right_aligned_thread_menu_without_an_extra_access
         let thread = cx.new(|_| thread);
         let thread_store = cx.new(|_| ThreadStore {
             threads: VecDeque::from([thread]),
+            ..Default::default()
         });
         let cowork =
             cx.new(|cx| test_cowork(thread_store, Some(thread_id), tokio_handle, window, cx));

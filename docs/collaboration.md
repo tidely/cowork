@@ -675,6 +675,12 @@ This is independent of the draft document and is the first feature to build.
   upload records and buffers, presence, overrides, and unattended empty items.
   It then clears membership and draft generations and ends hosting. Repeated
   serving-task departure cleanup is harmless; accepted content remains local.
+- **Host archives the thread**: the host stops its agent run and stops
+  sharing as above, so collaborators' copies are removed as when the host
+  disconnects. A thread archived while its sharing is still starting closes
+  the endpoint once it is bound instead of hosting. A restored thread is no
+  longer shared. Collaborators can't archive their copies; they disconnect
+  instead.
 - **Host disconnects**: the session ends and collaborators' copies of the
   thread are removed, as today. Host migration is out of scope.
 - **Invalid host data**: invalid draft snapshots, inconsistent transcript/run

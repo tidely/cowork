@@ -142,27 +142,29 @@ impl Cowork {
             )
     }
 
-    /// The chats the user started here, excluding joined ones.
+    /// The chats the user started here, archived ones included, excluding
+    /// joined ones.
     fn own_threads<'a>(&self, cx: &'a App) -> impl Iterator<Item = &'a Thread> {
-        self.thread_store
-            .read(cx)
+        let store = self.thread_store.read(cx);
+        store
             .threads
             .iter()
+            .chain(&store.archived)
             .map(|thread| thread.read(cx))
             .filter(|thread| thread.ownership() == ThreadOwnership::Local)
     }
 
+    /// How many chats the user has started, including deleted ones.
     pub(crate) fn total_chats(&self, cx: &App) -> usize {
-        self.own_threads(cx).count()
+        self.own_threads(cx).count() + self.deleted_chats
     }
 
     /// The most time the agent has spent generating in one of the user's
-    /// own chats.
+    /// own chats, including archived and deleted ones.
     pub(crate) fn longest_chat(&self, cx: &App) -> Duration {
         self.own_threads(cx)
             .map(Thread::generation_time)
-            .max()
-            .unwrap_or_default()
+            .fold(self.longest_deleted_chat, Duration::max)
     }
 
     /// A row of the user's usage statistics, each a value over its label.

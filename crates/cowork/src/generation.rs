@@ -243,6 +243,9 @@ impl Cowork {
                     {
                         entry.remove();
                     }
+                    if this.thread_store.read(cx).thread(thread_id, cx).is_none() {
+                        this.settle_retired_thread(&thread, cx);
+                    }
                     this.thread_updated(thread_id, cx);
                 });
             }

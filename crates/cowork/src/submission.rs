@@ -348,18 +348,18 @@ impl Cowork {
         Some((comments, blocks, draft.comments_folded))
     }
 
+    /// A thread's title: the start of its first prompt on one line. Longer
+    /// than the sidebar shows, which fades it out rather than marking the
+    /// cut, but capped, as it is sent to every collaborator.
     pub(crate) fn thread_title(prompt: &str) -> String {
-        const MAX_CHARACTERS: usize = 32;
+        const MAX_CHARACTERS: usize = 100;
 
-        let mut title = Itertools::intersperse(prompt.split_whitespace(), " ")
+        Itertools::intersperse(prompt.split_whitespace(), " ")
             .flat_map(str::chars)
-            .take(MAX_CHARACTERS + 1)
-            .collect::<String>();
-        if title.chars().count() > MAX_CHARACTERS {
-            title.pop();
-            title.push('…');
-        }
-        title
+            .take(MAX_CHARACTERS)
+            .collect::<String>()
+            .trim_end()
+            .to_owned()
     }
 
     pub(crate) fn title_for_first_message(

@@ -17,17 +17,19 @@ fn thread_titles_normalize_whitespace_and_truncate_by_character() {
         Cowork::thread_title("  Collaborate\non\tthis prompt  "),
         "Collaborate on this prompt"
     );
+    let hundred = "1234567890".repeat(10);
+    assert_eq!(Cowork::thread_title(&hundred), hundred);
+    // Cut without an ellipsis: the sidebar fades the title out instead.
+    assert_eq!(Cowork::thread_title(&format!("{hundred} more")), hundred);
     assert_eq!(
-        Cowork::thread_title("12345678901234567890123456789012"),
-        "12345678901234567890123456789012"
+        Cowork::thread_title("🦀".repeat(101).as_str()),
+        "🦀".repeat(100)
     );
+    // A cut right after a word doesn't leave a trailing space.
+    let ninety_nine = "x".repeat(99);
     assert_eq!(
-        Cowork::thread_title("12345678901234567890123456789012 more"),
-        "12345678901234567890123456789012…"
-    );
-    assert_eq!(
-        Cowork::thread_title("🦀".repeat(33).as_str()),
-        format!("{}…", "🦀".repeat(32))
+        Cowork::thread_title(&format!("{ninety_nine} more")),
+        ninety_nine
     );
 }
 

@@ -1684,6 +1684,10 @@ impl protocol::ThreadSnapshot {
 #[derive(Default)]
 pub(crate) struct ThreadStore {
     pub(crate) threads: VecDeque<Entity<Thread>>,
+    /// The user's own threads put away in the archive, most recently
+    /// archived first. They do nothing there: no run, no sharing, no
+    /// sandbox. Lookups by id don't find them until they are restored.
+    pub(crate) archived: VecDeque<Entity<Thread>>,
 }
 
 #[cfg(test)]
@@ -1694,6 +1698,13 @@ mod tests;
 impl ThreadStore {
     pub(crate) fn thread(&self, thread_id: Uuid, cx: &App) -> Option<Entity<Thread>> {
         self.threads
+            .iter()
+            .find(|thread| thread.read(cx).instance_id == thread_id)
+            .cloned()
+    }
+
+    pub(crate) fn archived_thread(&self, thread_id: Uuid, cx: &App) -> Option<Entity<Thread>> {
+        self.archived
             .iter()
             .find(|thread| thread.read(cx).instance_id == thread_id)
             .cloned()

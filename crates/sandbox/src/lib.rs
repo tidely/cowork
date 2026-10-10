@@ -259,6 +259,16 @@ impl Sandboxes {
         result
     }
 
+    /// Stops `thread`'s sandbox and forgets its project, as when the thread
+    /// is deleted. A boot in progress loses its slot, so it stops its sandbox
+    /// once started, like on [`Sandboxes::shutdown`].
+    pub async fn remove(&self, thread: &str) {
+        self.projects.remove(thread);
+        if let Some((_, Slot::Running { sandbox, .. })) = self.slots.remove(thread) {
+            _ = sandbox.kill().await;
+        }
+    }
+
     /// Stops every sandbox of this instance, as when Cowork quits. Boots in
     /// progress lose their slots, so they stop their sandboxes once started,
     /// without being waited for: an image pull can take minutes.
@@ -657,5 +667,22 @@ mod tests {
             Err(SandboxError::InvalidCommand(_))
         ));
         assert!(sandboxes.ready.get().is_none(), "nothing was set up");
+    }
+
+    #[tokio::test]
+    async fn removing_a_thread_forgets_its_project() {
+        let sandboxes = Sandboxes::new(PathBuf::from("/nonexistent"), "test");
+        let writable = Project {
+            folders: Vec::new(),
+            writable: true,
+        };
+        sandboxes.set_project("thread", writable.clone());
+        sandboxes.set_project("other", writable.clone());
+
+        sandboxes.remove("thread").await;
+
+        assert_eq!(sandboxes.project("thread"), Project::default());
+        assert_eq!(sandboxes.project("other"), writable);
+        assert!(!sandboxes.has_sandbox("thread"));
     }
 }

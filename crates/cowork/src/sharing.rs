@@ -99,6 +99,8 @@ impl Cowork {
 
         let (peers, accepted_peers) = async_channel::bounded(protocol::PEER_CHANNEL_CAPACITY);
         let endpoint_task = Self::bind_shared_endpoint(&self.tokio_handle, peers);
+        let thread_id = thread.read(cx).instance_id;
+        let tokio_handle = self.tokio_handle.clone();
 
         cx.spawn(async move |this, cx| {
             let endpoint = endpoint_task
@@ -114,6 +116,17 @@ impl Cowork {
                     return;
                 }
             };
+            let deleted = this
+                .read_with(cx, |this, cx| {
+                    this.thread_store.read(cx).thread(thread_id, cx).is_none()
+                })
+                .unwrap_or(true);
+            if deleted {
+                tokio_handle.spawn(async move {
+                    endpoint.close().await;
+                });
+                return;
+            }
             if !thread.update(cx, |thread, _| thread.start_hosting(endpoint)) {
                 return;
             }

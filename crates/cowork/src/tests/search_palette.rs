@@ -91,6 +91,7 @@ fn search_palette_finds_chats_by_title_prompt_and_reply(cx: &mut gpui::TestAppCo
         ids = Some((bread_id, review_id));
         let thread_store = cx.new(|cx| ThreadStore {
             threads: VecDeque::from([cx.new(|_| bread), cx.new(|_| review)]),
+            ..Default::default()
         });
         Root::new(
             cx.new(|cx| test_cowork(thread_store, None, tokio_handle, window, cx)),
