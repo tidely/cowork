@@ -25,10 +25,11 @@ clearing membership. Denial feedback is routed to the originating thread.
 Agent events are checked on arrival in the order Rig's stream could produce
 them.
 Tool calls outside a short always-allowed list wait for the host or an
-`Admin` peer to allow or deny them; see [Tool approval](#tool-approval).
-The host's project folders are shown to collaborators by name, along with
-whether the project is open for writing or reading; see
-[Project folders](#project-folders).
+`Admin` peer to allow or deny them, except `run_command` in a read-only
+project; see [Tool approval](#tool-approval).
+The host's project folders are mounted in its sandbox for the thread, read-only
+unless the project is in `Write` mode, and shown to collaborators by name with
+that mode; see [Project folders](#project-folders).
 The protocol version is **24**.
 
 Not yet implemented:
@@ -41,8 +42,7 @@ Not yet implemented:
 - fully validating writable peers' presence at the host (e.g. focus,
   selections, and announced file reads); read-only presence is sanitized;
 - showing others' selections in agent messages, which needs a gpui-kit
-  addition; see [gpui-kit-text-view-highlights.md](gpui-kit-text-view-highlights.md);
-- giving the project folders and mode to the agent's sandbox.
+  addition; see [gpui-kit-text-view-highlights.md](gpui-kit-text-view-highlights.md).
 
 Implementation notes on presence:
 
@@ -544,6 +544,13 @@ run. `tool_approval.rs` lists the tools whose calls always run
 thread); every other tool's calls wait, so a newly added tool is asked about
 rather than trusted. `calculate` waits.
 
+`run_command` calls run without asking while the thread's project is in
+`Read` mode, since their commands cannot change anything outside the
+sandbox then, and wait like any other in `Write` mode. The mode is checked
+when the hook is asked, and again as the command starts: a call let through
+as read-only is refused unrun, and the model told to call again, if the host
+switched to `Write` in between.
+
 The agent loop asks a hook about each call before its tool runs (calls whose
 arguments could not be read never run, so are never asked about). The host's
 hook lets listed tools through and otherwise asks the thread, on the same
@@ -609,19 +616,37 @@ differently from one that returned.
   order they were added. Only the host adds or removes them, from the
   bottom bar; a folder added twice is kept once. Folders added before the
   thread exists move into it with the draft.
-- Collaborators only learn each folder's name, its last path component.
-  Paths stay on the host, since they reveal how its machine is laid out.
-  The names arrive in the `Welcome` snapshot and are replaced as a whole by
-  `ProjectFoldersChanged` after every change, so a removal needs no
-  message of its own. Names can repeat.
+- Each folder is named by its last path component, with characters a mount
+  path cannot hold (`/ \ : ; ,` and control characters) replaced by `_`,
+  and `root` for a filesystem root. A name already in the project gets a
+  `-2`, `-3`, ... suffix (`src`, `src-2`), and names never change once
+  given, so removing a folder leaves the others where they are.
+- Collaborators only learn each folder's name. Paths stay on the host,
+  since they reveal how its machine is laid out. The names arrive in the
+  `Welcome` snapshot and are replaced as a whole by `ProjectFoldersChanged`
+  after every change, so a removal needs no message of its own.
 - Collaborators see the names but cannot change them; there is no
   collaborator message for it.
 - The project has a mode, `Write` or `Read`, picked from a menu in the
   bottom bar between the context indicator and the model picker. Every
   thread starts in `Read`. Only the host can change it; collaborators see
   it in the `Welcome` snapshot and follow `ProjectModeChanged`. A mode
-  picked before the thread exists moves into it with the folders.
-- Neither the folders nor the mode are given to the agent's sandbox yet.
+  picked before the thread exists moves into it with the folders. Hovering
+  `Write` in the menu warns that a malicious agent may be able to run
+  commands outside the sandbox.
+- The host's sandbox for the thread mounts each folder at
+  `/projects/<name>`, the host's real files shared live: read-only in
+  `Read` (refused by both the host's file server and the guest kernel),
+  and in `Write` the agent's changes apply to the host at once. Without
+  folders, `/projects` is empty. The mount settings are in the sandbox
+  crate's `settings.rs`.
+- A running sandbox cannot change its mounts. After a change to the
+  folders or mode, the agent's next command runs in a fresh sandbox with
+  the new project, losing the files commands made outside `/projects`;
+  its output says `sandbox_restarted`. When the thread already has a
+  sandbox, adding or removing a folder or switching the mode first asks
+  the host to confirm the restart. A change that would leave the project
+  as it is asks nothing.
 
 This is independent of the draft document and is the first feature to build.
 

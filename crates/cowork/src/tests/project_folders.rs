@@ -4,7 +4,7 @@
 
 use std::path::Path;
 
-use crate::project_folders::ProjectFolder;
+use crate::{project_folders::ProjectFolder, project_mode::ProjectMode};
 
 use super::*;
 
@@ -79,6 +79,53 @@ fn project_folders_move_into_the_new_thread(cx: &mut gpui::TestAppContext) {
     assert!(first.right() <= between.left() && between.right() <= second.left());
     assert!(second.right() <= before_add.left() && before_add.right() <= add.left());
     assert!(cx.debug_bounds("project-folders-separator-2").is_none());
+}
+
+#[gpui::test]
+fn the_sandbox_mounts_what_the_host_chose(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    cowork.update(cx, |cowork, cx| {
+        cowork.add_project_folders(None, vec![PathBuf::from("/a/src")], cx);
+        cowork.set_project_mode(None, ProjectMode::Write, cx);
+    });
+    cx.simulate_input("question");
+    cx.run_until_parked();
+    cx.update(|window, cx| cowork.update(cx, |cowork, cx| cowork.submit_composer(window, cx)));
+    let (thread, key) = cowork.read_with(cx, |cowork, cx| {
+        let thread = cowork.active_thread(cx).expect("a new thread");
+        let key = thread.read(cx).instance_id.to_string();
+        (thread, key)
+    });
+    let mounted = |cowork: &Cowork| cowork.sandboxes.project(&key);
+    cowork.read_with(cx, |cowork, _| {
+        assert_eq!(
+            mounted(cowork),
+            sandbox::Project {
+                folders: vec![sandbox::ProjectFolder {
+                    name: "src".into(),
+                    path: "/a/src".into(),
+                }],
+                writable: true,
+            }
+        );
+    });
+
+    // A second `src` is mounted beside the first, and changes follow.
+    cowork.update(cx, |cowork, cx| {
+        let target = Some(thread.downgrade());
+        cowork.add_project_folders(target.clone(), vec![PathBuf::from("/b/src")], cx);
+        cowork.remove_project_folder(target.clone(), Path::new("/a/src"), cx);
+        cowork.set_project_mode(target, ProjectMode::Read, cx);
+        let project = mounted(cowork);
+        assert!(!project.writable);
+        assert_eq!(
+            project.folders,
+            [sandbox::ProjectFolder {
+                name: "src-2".into(),
+                path: "/b/src".into(),
+            }]
+        );
+    });
 }
 
 #[gpui::test]

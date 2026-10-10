@@ -33,6 +33,7 @@ gpui_kit_assets::icon_assets!(
         FolderOpen,
         FolderPlus,
         Trash,
+        TriangleAlert,
         FileText,
         Image,
         Pen,
@@ -114,6 +115,7 @@ mod tests {
             IconName::FolderOpen,
             IconName::FolderPlus,
             IconName::Trash,
+            IconName::TriangleAlert,
         ] {
             let path = icon.path();
             let bytes = Assets.load(&path).unwrap().expect("bundled project icon");

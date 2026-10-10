@@ -21,10 +21,30 @@
 //! - Pull policy: if missing, so the registry is contacted only while the
 //!   image is not cached.
 //!
+//! Host folders: only the thread's project folders, each at
+//! `/projects/<name>` ([`PROJECTS_DIR`]), read-only unless the project is
+//! writable. They are the host's real files, so writes apply to the host at
+//! once. Each is a virtiofs bind mount with:
+//!
+//! - Its files shown as owned by [`PROJECT_OWNER`], so commands can write
+//!   them when allowed to. On the host they keep their owner, and files
+//!   commands create belong to the user running Cowork.
+//! - Guest `chmod` and `chown` kept in microsandbox's metadata overlay
+//!   (`HostPermissions::Private`, the default), in a `user.msb.override_stat`
+//!   extended attribute, never in the host's mode bits, so a command cannot
+//!   make a host file executable or setuid.
+//! - Relaxed stat virtualization instead of the default strict, so folders
+//!   on filesystems without extended attributes still mount; ownership is
+//!   then shown as [`PROJECT_OWNER`] and guest metadata changes fail.
+//! - `nosuid` and `nodev`, and symlinks in the host path not followed.
+//! - microsandbox's default cap on what commands may add, 4 GiB per folder.
+//!
+//! With no folders, `/projects` is an empty, read-only tmpfs.
+//!
 //! Left at microsandbox defaults that are already as restrictive as they go:
-//! no host folders shared, no published ports, no vsock routes, no secrets,
-//! nothing added to the image's environment, stdin from `/dev/null`, no
-//! terminal, and an anonymous HTTPS registry checked against system roots.
+//! no other host folders shared, no published ports, no vsock routes, no
+//! secrets, nothing added to the image's environment, stdin from `/dev/null`,
+//! no terminal, and an anonymous HTTPS registry checked against system roots.
 //!
 //! One thing cannot be turned off: the runtime copies the output of a
 //! sandbox's first command into an `exec.log` in its directory under
@@ -58,8 +78,22 @@ pub const ROOT_DISK_MIB: u32 = 256;
 /// default is root inside the guest.
 pub const USER: &str = "65534:65534";
 
-/// Where commands start. `nobody`'s home, `/`, is not writable; `/tmp` is.
-pub const WORKDIR: &str = "/tmp";
+/// Where commands start: the project, so they can name its folders
+/// directly. Read-only unless the project is writable, and with no folders
+/// an empty read-only tmpfs, so files that are not the project's go in
+/// [`SCRATCH_DIR`].
+pub const WORKDIR: &str = PROJECTS_DIR;
+
+/// Where the project's folders are, one directory each.
+pub const PROJECTS_DIR: &str = "/projects";
+
+/// Where commands can always write. It is in guest memory, and lost when
+/// the sandbox is replaced. `nobody`'s home, `/`, is not writable.
+pub const SCRATCH_DIR: &str = "/tmp";
+
+/// Who the project's files appear to belong to in the guest: [`USER`], so
+/// that commands can write them when the project is writable.
+pub const PROJECT_OWNER: (u32, u32) = (65534, 65534);
 
 /// The guest's hostname, instead of one derived from the sandbox's name,
 /// which would tell commands which thread they run for.

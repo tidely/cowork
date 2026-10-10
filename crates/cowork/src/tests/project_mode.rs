@@ -1,6 +1,8 @@
 //! The project mode: its default, where it sits, how collaborators learn of
 //! it, and that only the host can change it.
 
+use gpui_component::WindowExt as _;
+
 use crate::project_mode::ProjectMode;
 
 use super::*;
@@ -28,6 +30,49 @@ fn the_mode_starts_as_read_and_moves_into_the_new_thread(cx: &mut gpui::TestAppC
         assert_eq!(thread.read(cx).project_mode(), ProjectMode::Write);
         // The next new thread starts over at Read.
         assert_eq!(cowork.new_thread_project_mode, ProjectMode::Read);
+    });
+}
+
+#[gpui::test]
+fn the_write_option_warns_while_hovered(cx: &mut gpui::TestAppContext) {
+    let (_cowork, _runtime, cx) = composer_test_cowork(cx);
+    let trigger = cx.debug_bounds("project-mode").expect("mode toggle");
+    cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let write = cx
+        .debug_bounds("project-mode-write")
+        .expect("the menu lists Write");
+    assert!(write.bottom() <= trigger.top(), "the menu opens above");
+    assert!(cx.debug_bounds("project-mode-write-warning").is_none());
+
+    cx.simulate_mouse_move(write.center(), None, gpui::Modifiers::none());
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    let warning = cx
+        .debug_bounds("project-mode-write-warning")
+        .expect("hovering Write shows the warning");
+    // The text wraps within the tooltip instead of running past it.
+    let text = cx
+        .debug_bounds("project-mode-write-warning-text")
+        .expect("the warning's text");
+    assert!(warning.size.width <= px(280.), "{warning:?}");
+    assert!(text.right() <= warning.right(), "{text:?} in {warning:?}");
+    assert!(text.size.height > px(30.), "more than one line: {text:?}");
+}
+
+#[gpui::test]
+fn picking_write_from_the_menu_applies_it_without_a_sandbox(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let trigger = cx.debug_bounds("project-mode").expect("mode toggle");
+    cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let write = cx.debug_bounds("project-mode-write").expect("Write");
+    cx.simulate_click(write.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    // Nothing runs yet, so there is nothing to restart and no question.
+    cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
+    cowork.read_with(cx, |cowork, cx| {
+        assert_eq!(cowork.active_project_mode(cx).0, ProjectMode::Write);
     });
 }
 

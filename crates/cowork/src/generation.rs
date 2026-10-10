@@ -120,10 +120,12 @@ impl Cowork {
             );
         });
         let (sender, mut receiver) = mpsc::unbounded_channel();
-        let gate = ApprovalGate::new(sender.clone());
         // Only the host runs agents, so commands run in the host's sandbox
-        // for this thread, whoever asked for the run.
+        // for this thread, whoever asked for the run. Later project changes
+        // reach it through `Cowork::sync_sandbox_project`.
+        self.sync_sandbox_project(&thread, cx);
         let run_command = RunCommand::new(self.sandboxes.clone(), thread_id.to_string());
+        let gate = ApprovalGate::new(sender.clone(), run_command.read_only_pass());
         let cancelled = Arc::new(AtomicBool::new(false));
         let generation_task = self.tokio_handle.spawn(async move {
             let (selected_model, max_tokens) =

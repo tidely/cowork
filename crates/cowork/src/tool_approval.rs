@@ -8,6 +8,12 @@
 //! through the same checked path; the first decision wins and the run goes on.
 //! Calls of [`HOST_ONLY`] tools, which run something on the host's computer,
 //! only the host may decide.
+//!
+//! `run_command` calls run without asking while the thread's project is
+//! read-only, as they cannot change anything outside the sandbox then; in a
+//! writable project they are asked about like any other.
+//! [`sandbox::ReadOnlyPass`] makes sure such a call never runs in a project
+//! made writable after it was let through.
 
 use std::sync::Arc;
 
@@ -18,7 +24,7 @@ use rig::{
     message::{CallId, ToolCall},
     tool::Tool as _,
 };
-use sandbox::RunCommand;
+use sandbox::{ReadOnlyPass, RunCommand};
 use tokio::sync::{mpsc, oneshot};
 use tools::RespondToComment;
 use uuid::Uuid;
@@ -96,18 +102,27 @@ pub(crate) enum RunUpdate {
 /// request always arrives after the reply whose call it is.
 pub(crate) struct ApprovalGate {
     updates: mpsc::UnboundedSender<RunUpdate>,
+    /// Lets the run's `run_command` calls through while the project is
+    /// read-only.
+    read_only: ReadOnlyPass,
 }
 
 impl ApprovalGate {
-    pub(crate) fn new(updates: mpsc::UnboundedSender<RunUpdate>) -> Arc<Self> {
-        Arc::new(Self { updates })
+    pub(crate) fn new(
+        updates: mpsc::UnboundedSender<RunUpdate>,
+        read_only: ReadOnlyPass,
+    ) -> Arc<Self> {
+        Arc::new(Self { updates, read_only })
     }
 }
 
 impl ToolHook for ApprovalGate {
     fn before_tool_call<'a>(&'a self, call: &'a ToolCall) -> BoxFuture<'a, ToolDecision> {
         Box::pin(async move {
-            if !needs_approval(call.function.name.as_str()) {
+            let tool = call.function.name.as_str();
+            if !needs_approval(tool)
+                || (tool == RunCommand::NAME && self.read_only.grant_if_read_only())
+            {
                 return ToolDecision::Allow;
             }
             let (decide, decision) = oneshot::channel();
@@ -252,10 +267,63 @@ mod tests {
         )
     }
 
+    /// A gate for a run whose project is writable or read-only, and the
+    /// sandboxes holding that project.
+    fn gate(
+        writable: bool,
+    ) -> (
+        Arc<ApprovalGate>,
+        mpsc::UnboundedReceiver<RunUpdate>,
+        Arc<sandbox::Sandboxes>,
+    ) {
+        let sandboxes = crate::test_support::unused_sandboxes();
+        let thread = Uuid::new_v4().to_string();
+        sandboxes.set_project(
+            &thread,
+            sandbox::Project {
+                folders: Vec::new(),
+                writable,
+            },
+        );
+        let tool = RunCommand::new(sandboxes.clone(), thread);
+        let (updates, asked) = mpsc::unbounded_channel();
+        (
+            ApprovalGate::new(updates, tool.read_only_pass()),
+            asked,
+            sandboxes,
+        )
+    }
+
+    #[tokio::test]
+    async fn commands_run_unasked_only_in_a_read_only_project() {
+        let command = call(RunCommand::NAME);
+        let (read_only, mut asked, _sandboxes) = gate(false);
+        assert_eq!(
+            read_only.before_tool_call(&command).await,
+            ToolDecision::Allow
+        );
+        assert!(asked.try_recv().is_err(), "nobody was asked");
+
+        let (writable, mut asked, _sandboxes) = gate(true);
+        let decision = writable.before_tool_call(&command);
+        let answer = async {
+            let Some(RunUpdate::Approval { tool, decide, .. }) = asked.recv().await else {
+                panic!("a writable project asks");
+            };
+            assert_eq!(tool, RunCommand::NAME);
+            decide
+                .send(ToolDecision::Deny {
+                    reason: DENIED.into(),
+                })
+                .expect("the gate waits");
+        };
+        let (decision, ()) = tokio::join!(decision, answer);
+        assert!(matches!(decision, ToolDecision::Deny { .. }));
+    }
+
     #[tokio::test]
     async fn the_gate_asks_only_about_calls_that_need_approval() {
-        let (updates, mut asked) = mpsc::unbounded_channel();
-        let gate = ApprovalGate::new(updates);
+        let (gate, mut asked, _sandboxes) = gate(true);
 
         let comment = call(RespondToComment::NAME);
         assert_eq!(gate.before_tool_call(&comment).await, ToolDecision::Allow);
@@ -279,8 +347,7 @@ mod tests {
     /// rather than leaving the run waiting.
     #[tokio::test]
     async fn an_abandoned_request_denies_the_call() {
-        let (updates, mut asked) = mpsc::unbounded_channel();
-        let gate = ApprovalGate::new(updates);
+        let (gate, mut asked, _sandboxes) = gate(true);
         let calculation = call(tools::Calculate::NAME);
         let decision = gate.before_tool_call(&calculation);
         let abandon = async {

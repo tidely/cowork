@@ -65,6 +65,11 @@ pub struct CommandOutput {
     pub truncated: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub killed: Option<Killed>,
+    /// Whether the command ran in a new sandbox because the project's
+    /// folders or mode changed, losing the files earlier commands made
+    /// outside the project.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub sandbox_restarted: bool,
 }
 
 impl CommandOutput {
@@ -80,6 +85,7 @@ impl CommandOutput {
             stdout: stdout.into_text(),
             stderr: stderr.into_text(),
             killed,
+            sandbox_restarted: false,
         }
     }
 }
@@ -116,12 +122,13 @@ mod tests {
 
         let mut flood = CappedStream::new(1);
         flood.push(b"yy");
-        let killed = CommandOutput::new(
+        let mut killed = CommandOutput::new(
             Some(137),
             flood,
             CappedStream::new(4),
             Some(Killed::OutputLimit),
         );
+        killed.sandbox_restarted = true;
         assert_eq!(
             serde_json::to_value(&killed).unwrap(),
             serde_json::json!({
@@ -129,7 +136,8 @@ mod tests {
                 "stdout": "y",
                 "stderr": "",
                 "truncated": true,
-                "killed": "output_limit"
+                "killed": "output_limit",
+                "sandbox_restarted": true
             })
         );
     }

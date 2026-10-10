@@ -2,8 +2,10 @@
 //! microsandbox.
 //!
 //! Every setting is in [`settings`]. In short: no network, nothing from the
-//! host shared, an unprivileged user, a pinned image, memory-only writes, and
-//! limits on each command's time, output, and resources.
+//! host shared but the thread's project folders (read-only unless the project
+//! is writable; see [`Project`]), an unprivileged user, a pinned image,
+//! memory-only writes elsewhere, and limits on each command's time, output,
+//! and resources.
 //!
 //! Nothing here runs until the first command: no runtime download, no image
 //! pull, no files. The runtime (`msb` and `libkrunfw`) is then installed into
@@ -19,6 +21,7 @@
 //! runs.
 
 mod output;
+mod project;
 pub mod settings;
 mod tool;
 
@@ -37,12 +40,16 @@ use futures::{
 };
 use microsandbox::{
     ExecControl, ExecEvent, LocalBackend, Sandbox,
-    sandbox::{DeploymentProfile, PullPolicy, RlimitResource, SandboxStatus, SecurityProfile},
+    sandbox::{
+        DeploymentProfile, PullPolicy, RlimitResource, SandboxStatus, SecurityProfile,
+        StatVirtualization,
+    },
     setup::{InstallOptions, ensure_runtime},
 };
 use output::CappedStream;
 pub use output::{CommandOutput, Killed};
-pub use tool::{RunCommand, RunCommandArgs};
+pub use project::{Project, ProjectFolder, folder_name};
+pub use tool::{ReadOnlyPass, RunCommand, RunCommandArgs};
 
 /// The SHA-256 of the runtime archive microsandbox 0.7.7 installs, for each
 /// platform it publishes one for. Taken from the v0.7.7 GitHub release, whose
@@ -94,6 +101,10 @@ pub enum SandboxError {
     NotStarted(String),
     /// The model's command was rejected before reaching the sandbox.
     InvalidCommand(&'static str),
+    /// The command was let through without asking because the project was
+    /// read-only, but it became writable before the command started, so it
+    /// was not run.
+    NeedsApproval,
 }
 
 impl std::fmt::Display for SandboxError {
@@ -110,6 +121,10 @@ impl std::fmt::Display for SandboxError {
             ),
             Self::NotStarted(error) => write!(formatter, "the command did not start: {error}"),
             Self::InvalidCommand(reason) => formatter.write_str(reason),
+            Self::NeedsApproval => formatter.write_str(
+                "the project became writable before the command started, so it was not run; \
+                 call the tool again to ask the user to allow it",
+            ),
         }
     }
 }
@@ -119,16 +134,26 @@ impl std::error::Error for SandboxError {}
 /// A boot's outcome, which every command waiting on it gets a copy of.
 type Boot = Shared<BoxFuture<'static, Result<Arc<Sandbox>, SandboxError>>>;
 
-/// One thread's sandbox, from the moment its first command reserves it.
+/// One thread's sandbox, from the moment its first command reserves it,
+/// with the project it mounts.
 enum Slot {
     /// Its first command started a boot; commands arriving meanwhile wait
     /// for the same one. The boot runs in its own task, so it finishes even if
     /// every command waiting for it is stopped, and then replaces this slot
     /// with [`Slot::Running`], or removes it if the boot failed. `id` tells
-    /// this reservation from a later one for the same thread.
-    Booting { id: u64, ready: Boot },
+    /// this reservation from a later one for the same thread. `restart` is
+    /// whether it replaces a sandbox whose project changed.
+    Booting {
+        id: u64,
+        ready: Boot,
+        project: Project,
+        restart: bool,
+    },
     /// Commands run in it at the same time, each with its own clone.
-    Running(Arc<Sandbox>),
+    Running {
+        sandbox: Arc<Sandbox>,
+        project: Project,
+    },
 }
 
 impl Slot {
@@ -136,8 +161,8 @@ impl Slot {
         matches!(self, Self::Booting { id, .. } if *id == boot)
     }
 
-    fn holds(&self, sandbox: &Arc<Sandbox>) -> bool {
-        matches!(self, Self::Running(running) if Arc::ptr_eq(running, sandbox))
+    fn holds(&self, held: &Arc<Sandbox>) -> bool {
+        matches!(self, Self::Running { sandbox, .. } if Arc::ptr_eq(sandbox, held))
     }
 }
 
@@ -153,6 +178,9 @@ pub struct Sandboxes {
     /// on each other. Shared with boot tasks, which settle their own slot.
     /// A shard is never locked across an `await`.
     slots: Arc<DashMap<String, Slot>>,
+    /// The project each thread's next command should see. A sandbox that
+    /// mounts another one is replaced before that command runs.
+    projects: DashMap<String, Project>,
     next_boot: AtomicU64,
 }
 
@@ -166,14 +194,62 @@ impl Sandboxes {
             instance: instance.into(),
             ready: tokio::sync::OnceCell::new(),
             slots: Arc::new(DashMap::new()),
+            projects: DashMap::new(),
             next_boot: AtomicU64::new(0),
         }
+    }
+
+    /// Sets the project `thread`'s commands see from its next command on.
+    /// A sandbox already running with another project keeps running until
+    /// then, and is replaced by a fresh one, losing the files commands made
+    /// outside the project, when that command starts.
+    pub fn set_project(&self, thread: &str, project: Project) {
+        if project == Project::default() {
+            self.projects.remove(thread);
+        } else {
+            self.projects.insert(thread.to_owned(), project);
+        }
+    }
+
+    /// The project `thread`'s next command will see.
+    pub fn project(&self, thread: &str) -> Project {
+        self.projects
+            .get(thread)
+            .map(|project| project.clone())
+            .unwrap_or_default()
+    }
+
+    /// Whether `thread` has a sandbox, running or starting, that a change
+    /// to its project would replace.
+    pub fn has_sandbox(&self, thread: &str) -> bool {
+        self.slots.contains_key(thread)
     }
 
     /// Runs `command` with `/bin/sh -c` in `thread`'s sandbox, starting one
     /// if it has none. Commands of the same thread may run at the same time,
     /// sharing the sandbox's files and limits.
     pub async fn run(&self, thread: &str, command: &str) -> Result<CommandOutput, SandboxError> {
+        self.run_with(thread, command, false).await
+    }
+
+    /// Like [`Sandboxes::run`], but only in a read-only project: refuses the
+    /// command, without running it, when `thread`'s project is writable by
+    /// the time it would start. For commands let through without asking
+    /// because the project was read-only; see [`ReadOnlyPass`].
+    pub async fn run_read_only(
+        &self,
+        thread: &str,
+        command: &str,
+    ) -> Result<CommandOutput, SandboxError> {
+        self.run_with(thread, command, true).await
+    }
+
+    async fn run_with(
+        &self,
+        thread: &str,
+        command: &str,
+        read_only: bool,
+    ) -> Result<CommandOutput, SandboxError> {
         if command.trim().is_empty() {
             return Err(SandboxError::InvalidCommand("the command is empty"));
         }
@@ -183,8 +259,11 @@ impl Sandboxes {
             ));
         }
         self.ready().await?;
-        let sandbox = self.sandbox(thread).await?;
-        let result = run_command(&sandbox, command).await;
+        let (sandbox, restarted) = self.sandbox(thread, read_only).await?;
+        let result = run_command(&sandbox, command).await.map(|mut output| {
+            output.sandbox_restarted = restarted;
+            output
+        });
         if let Err(SandboxError::Failed(error)) = &result {
             if matches!(sandbox.status().await, Ok(SandboxStatus::Running)) {
                 // Only this command failed, so the sandbox and the commands
@@ -213,7 +292,7 @@ impl Sandboxes {
     fn take_running(&self) -> Vec<Arc<Sandbox>> {
         let mut running = Vec::new();
         self.slots.retain(|_, slot| {
-            if let Slot::Running(sandbox) = slot {
+            if let Slot::Running { sandbox, .. } = slot {
                 running.push(sandbox.clone());
             }
             false
@@ -222,40 +301,85 @@ impl Sandboxes {
     }
 
     /// `thread`'s sandbox, once it has started, starting it if no command
-    /// has yet.
-    async fn sandbox(&self, thread: &str) -> Result<Arc<Sandbox>, SandboxError> {
-        let (id, ready) = match self.slots.entry(thread.to_owned()) {
-            Entry::Occupied(slot) => match slot.get() {
-                Slot::Running(sandbox) => return Ok(sandbox.clone()),
-                Slot::Booting { id, ready } => (*id, ready.clone()),
+    /// has yet or its project changed. Also returns whether it replaces one
+    /// whose project changed.
+    /// With `read_only`, fails instead when the project is writable: the
+    /// project checked is the one the command runs with.
+    async fn sandbox(
+        &self,
+        thread: &str,
+        read_only: bool,
+    ) -> Result<(Arc<Sandbox>, bool), SandboxError> {
+        let project = self.project(thread);
+        if read_only && project.writable {
+            return Err(SandboxError::NeedsApproval);
+        }
+        let mut replaced = None;
+        let (id, ready, restart) = match self.slots.entry(thread.to_owned()) {
+            Entry::Occupied(mut slot) => match slot.get() {
+                Slot::Running {
+                    sandbox,
+                    project: mounted,
+                } if *mounted == project => return Ok((sandbox.clone(), false)),
+                Slot::Booting {
+                    id,
+                    ready,
+                    project: mounting,
+                    restart,
+                } if *mounting == project => (*id, ready.clone(), *restart),
+                // The project changed since this sandbox started. A boot it
+                // replaces stops its sandbox itself, once it finds its
+                // reservation gone.
+                _ => {
+                    let id = self.next_boot.fetch_add(1, Ordering::Relaxed);
+                    let ready = self.boot(thread, id, project.clone());
+                    let old = slot.insert(Slot::Booting {
+                        id,
+                        ready: ready.clone(),
+                        project,
+                        restart: true,
+                    });
+                    if let Slot::Running { sandbox, .. } = old {
+                        replaced = Some(sandbox);
+                    }
+                    (id, ready, true)
+                }
             },
             Entry::Vacant(slot) => {
                 let id = self.next_boot.fetch_add(1, Ordering::Relaxed);
-                let ready = self.boot(thread, id);
+                let ready = self.boot(thread, id, project.clone());
                 slot.insert(Slot::Booting {
                     id,
                     ready: ready.clone(),
+                    project,
+                    restart: false,
                 });
-                (id, ready)
+                (id, ready, false)
             }
         };
+        if let Some(replaced) = replaced {
+            // Commands still running in it fail.
+            _ = replaced.kill().await;
+        }
         let booted = ready.await;
         if booted.is_err() {
             // The boot task normally removes its failed reservation itself;
             // this covers it having panicked before it could.
             self.slots.remove_if(thread, |_, slot| slot.is_boot(id));
         }
-        booted
+        booted.map(|sandbox| (sandbox, restart))
     }
 
-    /// Starts a task booting `thread`'s sandbox for its reservation `id`.
-    fn boot(&self, thread: &str, id: u64) -> Boot {
+    /// Starts a task booting `thread`'s sandbox with `project` for its
+    /// reservation `id`.
+    fn boot(&self, thread: &str, id: u64, project: Project) -> Boot {
         let slots = self.slots.clone();
         let thread = thread.to_owned();
-        let name = format!("cowork-{}-{thread}", self.instance);
+        // Unique per boot, as a replaced sandbox may not be gone yet.
+        let name = format!("cowork-{}-{thread}-{id}", self.instance);
         let instance = self.instance.clone();
         let task = tokio::spawn(async move {
-            let created = create(name, &instance).await;
+            let created = create(name, &instance, &project).await;
             let sandbox = match created {
                 Ok(sandbox) => Arc::new(sandbox),
                 Err(error) => {
@@ -265,16 +389,20 @@ impl Sandboxes {
             };
             let kept = match slots.get_mut(&thread) {
                 Some(mut slot) if slot.is_boot(id) => {
-                    *slot = Slot::Running(sandbox.clone());
+                    *slot = Slot::Running {
+                        sandbox: sandbox.clone(),
+                        project,
+                    };
                     true
                 }
                 _ => false,
             };
             if !kept {
-                // Its reservation is gone: Cowork is shutting down.
+                // Its reservation is gone: Cowork is shutting down, or the
+                // project changed while it started.
                 _ = sandbox.kill().await;
                 return Err(SandboxError::Setup(
-                    "the sandboxes were stopped while this one started".into(),
+                    "the sandbox was stopped while it started".into(),
                 ));
             }
             Ok(sandbox)
@@ -322,9 +450,29 @@ impl Sandboxes {
     }
 }
 
-async fn create(name: String, instance: &str) -> Result<Sandbox, SandboxError> {
+async fn create(name: String, instance: &str, project: &Project) -> Result<Sandbox, SandboxError> {
     use settings::*;
-    Sandbox::builder(name)
+    project.validate()?;
+    let mut builder = Sandbox::builder(name);
+    for folder in &project.folders {
+        builder = builder.volume(Project::guest_path(folder), |mount| {
+            let mount = mount
+                .bind(&folder.path)
+                .owner(PROJECT_OWNER.0, PROJECT_OWNER.1)
+                .stat_virtualization(StatVirtualization::Relaxed)
+                .nosuid()
+                .nodev();
+            if project.writable {
+                mount
+            } else {
+                mount.readonly()
+            }
+        });
+    }
+    if project.folders.is_empty() {
+        builder = builder.volume(PROJECTS_DIR, |mount| mount.tmpfs().size(1).readonly());
+    }
+    builder
         .label(APP_LABEL.0, APP_LABEL.1)
         .label("instance", instance)
         .image(IMAGE)
