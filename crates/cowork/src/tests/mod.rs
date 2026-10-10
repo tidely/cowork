@@ -67,6 +67,7 @@ mod collaboration;
 mod comments;
 mod composer;
 mod file_transfer;
+mod generation_profile;
 mod layout;
 mod model_picker;
 mod permissions;
@@ -76,6 +77,8 @@ mod schedules;
 mod search_palette;
 mod sidebar;
 mod threads;
+mod timeline_bench;
+mod timeline_virtualization;
 mod tool_approval;
 
 impl Thread {
@@ -196,6 +199,7 @@ fn test_cowork(
         attachment_errors: Vec::new(),
         pending_attachments: Vec::new(),
         timeline_scroll_handle: ScrollHandle::new(),
+        timeline_pointer_down: false,
         timeline_focus_handle: cx.focus_handle(),
         follow_generation: true,
         thread_store,

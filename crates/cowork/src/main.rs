@@ -8,9 +8,9 @@ use std::{
 use anyhow::Context as _;
 use gpui::{
     App, AppContext, Bounds, Context, Entity, EntityId, ExternalPaths, IntoElement, KeyBinding,
-    MouseButton, MouseUpEvent, PlatformInput, QuitMode, Render, ScrollHandle, SharedString,
-    Subscription, TextRun, TitlebarOptions, Window, WindowBounds, WindowDecorations, WindowOptions,
-    actions, canvas, div, prelude::*, px, size,
+    MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput, QuitMode, Render, ScrollHandle,
+    SharedString, Subscription, TextRun, TitlebarOptions, Window, WindowBounds, WindowDecorations,
+    WindowOptions, actions, canvas, div, prelude::*, px, size,
 };
 use gpui_base::input::{Backspace, Escape, MoveDown, MoveUp};
 use gpui_component::{ActiveTheme as _, Root, TitleBar};
@@ -33,6 +33,7 @@ use crate::{
     thread_draft::ThreadDraft,
     timeline::{PromptBlock, ThreadMessageId, TimelineMessage},
     timeline_view::{SegmentTextView, ShownSegments},
+    timeline_virtualization::DeferredTimelineRow,
     top_bar::macos_traffic_light_position,
     usage::{ActivityRange, TokenActivity},
 };
@@ -73,6 +74,7 @@ mod thread;
 use thread::{draft as thread_draft, sharing, submission};
 mod timeline;
 mod timeline_view;
+mod timeline_virtualization;
 mod tool_approval;
 mod tool_call_card;
 mod top_bar;
@@ -109,6 +111,9 @@ struct Cowork {
     attachment_errors: Vec<AttachmentError>,
     pending_attachments: Vec<PendingAttachment>,
     timeline_scroll_handle: ScrollHandle,
+    /// A pressed pointer can anchor a drag before GPUI reports a nonempty
+    /// selection. Keep its offscreen participant alive until release.
+    timeline_pointer_down: bool,
     /// Taken when someone presses on a user message, as agent text takes
     /// focus itself, so that Copy reaches the window's text selection
     /// instead of an editor with nothing selected.
@@ -238,6 +243,7 @@ impl Cowork {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
+        let pointer_owner = cx.entity().downgrade();
         self.render_generation = self.render_generation.wrapping_add(1);
         let active_thread_id = self.active_thread_id;
         let (messages, draft_comments) = active_thread_id
@@ -288,6 +294,16 @@ impl Cowork {
         let row_width = text_width + px(80.);
         let available_width = window.viewport_size().width - sidebar_width - px(82.);
         let wrap_width = available_width.max(px(120.)).min(text_width);
+        // Keep native selection geometry for every row while a drag or selection
+        // is active. Otherwise stable history only needs its measured height and
+        // the rows near the viewport; the composer and live/interactive rows stay
+        // on the original layout path.
+        let defer_history = messages.len() >= 64;
+        let culling = defer_history
+            && !self.timeline_pointer_down
+            && !gpui_base::TextSelection::has_selection(window, cx);
+        let messages = Rc::new(messages);
+        let comments = Rc::new(comments);
         let mut timeline_messages = Vec::new();
         if let Some(thread_id) = active_thread_id {
             for (index, message) in messages.iter().enumerate() {
@@ -305,16 +321,93 @@ impl Cowork {
                         .unwrap_or_default(),
                     TimelineMessage::User(_) => &[],
                 };
-                timeline_messages.push(self.render_timeline_message(
-                    thread_id,
-                    index,
-                    message,
-                    &comments,
-                    submitted_comments,
-                    wrap_width,
-                    window,
-                    cx,
-                ));
+                let stable = match message {
+                    TimelineMessage::User(group) => {
+                        group.comments.is_empty()
+                            && group
+                                .blocks
+                                .iter()
+                                .all(|block| block.attachments.is_empty())
+                    }
+                    TimelineMessage::Agent(message) => {
+                        !message.is_generating()
+                            && !message.work_expanded
+                            && message.awaiting_approval.is_none()
+                            && message.comment_group_id.is_none()
+                            && message.comment_responses.is_empty()
+                            && !message.output.text.contains("![")
+                            && !message.output.text.to_ascii_lowercase().contains("<img")
+                            && !comments
+                                .iter()
+                                .any(|comment| comment.reference.message_id == message.id)
+                    }
+                };
+                let (message_id, source) = match message {
+                    TimelineMessage::User(group) => (group.id, None),
+                    TimelineMessage::Agent(message) => {
+                        (message.id, Some(message.text_view.clone()))
+                    }
+                };
+                let owner = cx.entity().downgrade();
+                let row_id: SharedString =
+                    format!("deferred-timeline-{thread_id}-{message_id}").into();
+                if stable && culling {
+                    let render_owner = owner.clone();
+                    let messages = messages.clone();
+                    let comments = comments.clone();
+                    timeline_messages.push(
+                        DeferredTimelineRow::new(
+                            row_id,
+                            wrap_width,
+                            owner,
+                            source,
+                            culling,
+                            move |window, cx| {
+                                render_owner
+                                    .update(cx, |this, cx| {
+                                        this.render_timeline_message(
+                                            thread_id,
+                                            index,
+                                            &messages[index],
+                                            &comments,
+                                            &[],
+                                            wrap_width,
+                                            window,
+                                            cx,
+                                        )
+                                    })
+                                    .expect("the timeline owner is mounted")
+                            },
+                        )
+                        .into_any_element(),
+                    );
+                } else {
+                    // Build interactive rows now, before the segment-cache sweep.
+                    // Keep the wrapper's ID even on this path so starting a
+                    // selection or crossing the history threshold never remounts
+                    // a participant under a different element ID.
+                    let row = self.render_timeline_message(
+                        thread_id,
+                        index,
+                        message,
+                        &comments,
+                        submitted_comments,
+                        wrap_width,
+                        window,
+                        cx,
+                    );
+                    timeline_messages.push(
+                        DeferredTimelineRow::new(
+                            row_id,
+                            wrap_width,
+                            owner,
+                            source,
+                            false,
+                            move |_, _| row,
+                        )
+                        .into_any_element(),
+                    );
+                }
             }
         }
 
@@ -337,6 +430,34 @@ impl Cowork {
             .border_l_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().background)
+            .child(
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _cx| {
+                        // Window-level capture includes release outside the timeline
+                        // and runs before a child can consume the pointer event.
+                        let owner = pointer_owner.clone();
+                        window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
+                            if phase.capture() && event.button == MouseButton::Left {
+                                _ = owner.update(cx, |this, cx| {
+                                    this.timeline_pointer_down = true;
+                                    cx.notify();
+                                });
+                            }
+                        });
+                        window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
+                            if phase.capture() && event.button == MouseButton::Left {
+                                _ = pointer_owner.update(cx, |this, cx| {
+                                    if std::mem::take(&mut this.timeline_pointer_down) {
+                                        cx.notify();
+                                    }
+                                });
+                            }
+                        });
+                    },
+                )
+                .absolute(),
+            )
             .child(
                 div()
                     .id("timeline-scroll")
@@ -395,6 +516,9 @@ impl Cowork {
 
 impl Render for Cowork {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        if self.main_stage != MainStage::Thread {
+            self.timeline_pointer_down = false;
+        }
         self.sync_model_picker(window, cx);
         let active_thread = self.active_thread(cx);
         self.shown_profiles =
@@ -604,6 +728,7 @@ fn main() -> anyhow::Result<()> {
                         attachment_errors: Vec::new(),
                         pending_attachments: Vec::new(),
                         timeline_scroll_handle: ScrollHandle::new(),
+                        timeline_pointer_down: false,
                         timeline_focus_handle: cx.focus_handle(),
                         follow_generation: true,
                         thread_store,
