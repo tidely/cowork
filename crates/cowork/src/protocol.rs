@@ -35,7 +35,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 22;
+pub(crate) const PROTOCOL_VERSION: u32 = 23;
 
 /// A request from a collaborator to the host.
 ///
@@ -195,6 +195,10 @@ pub(crate) enum HostMessage {
     /// Replaces the thread's catalog. A selected model the new catalog no
     /// longer offers stays selected, but cannot run until another is picked.
     ModelCatalogChanged(ModelCatalog),
+    /// Replaces the names of the folders in the thread's project, in the
+    /// order the host added them. Only names travel: the folders are on the
+    /// host's machine, and their paths would reveal how it is laid out.
+    ProjectFoldersChanged(Vec<String>),
     /// A Yrs update to the draft, made by the host or a collaborator.
     DraftUpdate(Vec<u8>),
     /// A participant's presence changed.
@@ -373,6 +377,9 @@ pub(crate) struct ThreadSnapshot {
     pub(crate) transcript: Vec<Json<rig::completion::Message>>,
     /// Everyone's name in prompts, sorted by participant.
     pub(crate) prompt_names: Vec<(uuid::Bytes, String)>,
+    /// The names of the project's folders; see
+    /// [`HostMessage::ProjectFoldersChanged`].
+    pub(crate) project_folders: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -858,6 +865,7 @@ mod tests {
             ],
             transcript: vec![json(r#"{"role":"user"}"#), json(r#"{"role":"assistant"}"#)],
             prompt_names: vec![([11; 16], "Ada".into())],
+            project_folders: vec!["zed".into(), "cowork".into()],
         };
         let message = HostMessage::Welcome(Box::new(Welcome {
             participant_id: [12; 16],
@@ -893,6 +901,8 @@ mod tests {
             HostMessage::Rejected("Version mismatch".into()),
             HostMessage::ModelCatalogChanged(ModelCatalog::default()),
             HostMessage::ModelCatalogChanged(sample_catalog()),
+            HostMessage::ProjectFoldersChanged(Vec::new()),
+            HostMessage::ProjectFoldersChanged(vec!["zed".into(), "cowork".into()]),
             HostMessage::ParticipantJoined {
                 participant: [1; 16],
                 profile: sample_profile(),

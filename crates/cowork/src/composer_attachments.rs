@@ -4,10 +4,7 @@
 use std::sync::Arc;
 
 use draft::{AttachmentId, AttachmentKind, AttachmentRecord, ItemId};
-use gpui::{
-    App, AppContext, Context, Entity, ExternalPaths, Focusable, PathPromptOptions, Window,
-    prelude::*, px,
-};
+use gpui::{App, AppContext, Context, Entity, ExternalPaths, Focusable, Window, prelude::*, px};
 use gpui_base::input::Paste;
 use gpui_component::{
     Icon, Sizable as _,
@@ -135,9 +132,8 @@ impl Cowork {
                 .unwrap_or(false)
     }
 
-    /// Where the attach button attaches to: the focused prompt block, or
-    /// otherwise a new block. Buttons do not take focus, so the editor the
-    /// user was typing in is still focused when one is clicked.
+    /// Where dropped files attach to when not dropped onto a block: the
+    /// focused prompt block, or otherwise a new block.
     pub(crate) fn attachment_target_at_focus(&self, window: &Window, cx: &App) -> AttachmentTarget {
         match self.focused_draft_editor(window, cx) {
             Some((_, EditorSlot::Prompt(id), _)) => AttachmentTarget::Block(id),
@@ -462,54 +458,6 @@ impl Cowork {
         self.attachment_errors
             .retain(|error| error.draft_id != draft_id);
         cx.notify();
-    }
-
-    pub(crate) fn pick_attachments(
-        &mut self,
-        _: &gpui::ClickEvent,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(draft_id) = self.writable_draft_id(cx) else {
-            return;
-        };
-        let generation = self.attachment_draft_generation(draft_id, cx);
-        let selected = cx.prompt_for_paths(PathPromptOptions {
-            files: true,
-            directories: false,
-            multiple: true,
-            prompt: Some("Attach text or images".into()),
-        });
-        let target = self.attachment_target_at_focus(window, cx);
-        cx.spawn_in(window, async move |this, cx| {
-            let result = selected.await;
-            _ = this.update_in(cx, |this, window, cx| {
-                if !this.draft_can_edit(draft_id, cx)
-                    || this.attachment_draft_generation(draft_id, cx) != generation
-                {
-                    return;
-                }
-                match result {
-                    Ok(Ok(Some(paths))) => this.add_attachments(
-                        draft_id,
-                        target,
-                        paths.into_iter().map(AttachmentSource::Path).collect(),
-                        Some(window.window_handle()),
-                        cx,
-                    ),
-                    Ok(Ok(None)) | Err(_) => {}
-                    Ok(Err(error)) => {
-                        this.attachment_errors.push(AttachmentError {
-                            draft_id,
-                            message: format!("Could not choose files: {error}"),
-                        });
-                        cx.notify();
-                    }
-                }
-                this.ensure_composer_focus(window, cx);
-            });
-        })
-        .detach();
     }
 
     pub(crate) fn drop_attachments(

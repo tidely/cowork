@@ -81,6 +81,7 @@ impl Cowork {
             self.new_thread_model.clone(),
             cx,
         );
+        self.move_project_folders_into(&thread, cx);
         self.active_thread_id = Some(thread.read(cx).instance_id);
         self.thread_store.update(cx, |store, _| {
             store.threads.push_front(thread.clone());

@@ -945,6 +945,7 @@ pub(crate) mod tests {
                         caret_label_refresh: None,
                         working_refresh: None,
                         new_thread_model: None,
+                        new_thread_project_folders: Vec::new(),
                         model_picker,
                         model_picker_hovered: false,
                         models: Arc::default(),

@@ -29,7 +29,10 @@ gpui_kit_assets::icon_assets!(
         Pencil,
         Shield,
         RotateCcw,
-        Paperclip,
+        Folder,
+        FolderOpen,
+        FolderPlus,
+        Trash,
         FileText,
         Image,
         Pen,
@@ -101,6 +104,20 @@ mod tests {
             let path = icon.path();
             let bytes = Assets.load(&path).unwrap().expect("bundled tool call icon");
             assert!(!bytes.is_empty(), "empty tool call icon: {path}");
+        }
+    }
+
+    #[test]
+    fn project_folder_icons_are_bundled() {
+        for icon in [
+            IconName::Folder,
+            IconName::FolderOpen,
+            IconName::FolderPlus,
+            IconName::Trash,
+        ] {
+            let path = icon.path();
+            let bytes = Assets.load(&path).unwrap().expect("bundled project icon");
+            assert!(!bytes.is_empty(), "empty project icon: {path}");
         }
     }
 

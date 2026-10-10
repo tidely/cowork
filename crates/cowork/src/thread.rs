@@ -3,6 +3,7 @@
 
 use std::{
     collections::{HashMap, VecDeque},
+    path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
 };
@@ -35,6 +36,7 @@ use crate::{
     models::{ModelCatalog, ModelInfo, ModelRef},
     participant::ParticipantId,
     profile::Profile,
+    project_folders::{self, ProjectFolder},
     protocol,
     timeline::{AgentMessage, TimelineMessage},
     transcript::validate_agent_runs,
@@ -182,6 +184,10 @@ pub(crate) struct Thread {
     pub(crate) generating: bool,
     pub(crate) sharing: ThreadSharing,
     ownership: ThreadOwnership,
+    /// The folders the thread works in, in the order the host added them.
+    /// The host knows their paths; a mirror only their names, since they
+    /// are on the host's machine. Not yet given to the agent.
+    project_folders: Vec<ProjectFolder>,
 }
 
 /// A host snapshot whose transcript and agent runs have been checked before
@@ -227,6 +233,7 @@ impl Thread {
             generating: false,
             sharing: ThreadSharing::NotShared,
             ownership: ThreadOwnership::Local,
+            project_folders: Vec::new(),
         }
     }
 
@@ -326,6 +333,47 @@ impl Thread {
         self.participants.clear();
         self.peer_draft_generations.clear();
         self.draft.presence.clear();
+    }
+
+    pub(crate) fn project_folders(&self) -> &[ProjectFolder] {
+        &self.project_folders
+    }
+
+    /// Adds folders on this machine to the project, skipping ones already
+    /// in it. Only the host can, as the folders are on its machine.
+    pub(crate) fn add_project_folders(&mut self, paths: Vec<PathBuf>) -> bool {
+        if !self.is_host() {
+            return false;
+        }
+        if project_folders::add_folders(&mut self.project_folders, paths) {
+            self.publish_project_folders();
+        }
+        true
+    }
+
+    pub(crate) fn remove_project_folder(&mut self, path: &Path) -> bool {
+        if !self.is_host() {
+            return false;
+        }
+        if project_folders::remove_folder(&mut self.project_folders, path) {
+            self.publish_project_folders();
+        }
+        true
+    }
+
+    fn project_folder_names(&self) -> Vec<String> {
+        self.project_folders
+            .iter()
+            .map(|folder| folder.name.to_string())
+            .collect()
+    }
+
+    /// Published rather than emitted: the host keeps paths the event leaves
+    /// out.
+    fn publish_project_folders(&self) {
+        self.publish(protocol::HostMessage::ProjectFoldersChanged(
+            self.project_folder_names(),
+        ));
     }
 
     /// Source catalogs are host maintenance, not an Admin peer model command.
@@ -446,6 +494,7 @@ impl Thread {
             generating: false,
             sharing,
             ownership: ThreadOwnership::Remote,
+            project_folders: Vec::new(),
         };
         thread
             .apply_welcome(prepared, cx)
@@ -553,6 +602,7 @@ impl Thread {
             .into_iter()
             .map(|(participant, name)| (ParticipantId::from_bytes(participant), name.into()))
             .collect();
+        self.project_folders = ProjectFolder::mirrored(std::mem::take(&mut thread.project_folders));
         let (summary, timeline) = thread.into_native(cx);
         self.summary = summary;
         self.set_timeline(timeline);
@@ -613,6 +663,7 @@ impl Thread {
                 .map(|(participant, name)| (participant.into_bytes(), name.to_string()))
                 .sorted()
                 .collect(),
+            project_folders: self.project_folder_names(),
         }
     }
 
@@ -1334,6 +1385,9 @@ impl Thread {
             }
             protocol::HostMessage::ModelCatalogChanged(models) => {
                 self.models = Arc::new(models);
+            }
+            protocol::HostMessage::ProjectFoldersChanged(names) => {
+                self.project_folders = ProjectFolder::mirrored(names);
             }
             protocol::HostMessage::ModelSelected(model) => {
                 self.model = Some(model);

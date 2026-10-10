@@ -264,6 +264,7 @@ fn rebasing_keeps_local_edits_the_host_has_not_seen(cx: &mut gpui::TestAppContex
             streamed_bytes: 0,
             transcript: Vec::new(),
             prompt_names: Vec::new(),
+            project_folders: Vec::new(),
             messages: Vec::new(),
         },
         draft: host_draft.encode_state(),

@@ -70,6 +70,7 @@ mod file_transfer;
 mod layout;
 mod model_picker;
 mod permissions;
+mod project_folders;
 mod search_palette;
 mod threads;
 mod tool_approval;
@@ -220,6 +221,7 @@ fn test_cowork(
         caret_label_refresh: None,
         working_refresh: None,
         new_thread_model: None,
+        new_thread_project_folders: Vec::new(),
         model_picker,
         model_picker_hovered: false,
         models: Arc::default(),

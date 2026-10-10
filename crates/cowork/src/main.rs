@@ -24,6 +24,7 @@ use crate::{
     models::{ModelCatalog, ModelRef},
     participant::ParticipantId,
     profile::Profile,
+    project_folders::ProjectFolder,
     sharing::JoinDialog,
     sidebar::SIDEBAR_WIDTH,
     submission::ActiveGeneration,
@@ -51,6 +52,7 @@ mod participant;
 mod peer_access;
 mod profile;
 mod profile_page;
+mod project_folders;
 mod prompt;
 mod protocol;
 mod search_palette;
@@ -143,6 +145,9 @@ struct Cowork {
     working_refresh: Option<gpui::Task<()>>,
     /// The model new threads start with: the last one selected locally.
     new_thread_model: Option<ModelRef>,
+    /// The folders added before the thread exists, which move into it with
+    /// the draft; see [`Thread::project_folders`].
+    new_thread_project_folders: Vec<ProjectFolder>,
     /// Always shows the active thread's model; see [`Cowork::sync_model_picker`].
     model_picker: Entity<ModelPickerState>,
     model_picker_hovered: bool,
@@ -600,6 +605,7 @@ fn main() -> anyhow::Result<()> {
                         caret_label_refresh: None,
                         working_refresh: None,
                         new_thread_model: None,
+                        new_thread_project_folders: Vec::new(),
                         model_picker,
                         model_picker_hovered: false,
                         models: Arc::default(),

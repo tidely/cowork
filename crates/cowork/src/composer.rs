@@ -138,7 +138,6 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let timeline_scroll_handle = self.timeline_scroll_handle.clone();
-        let can_write = self.writable_draft_id(cx).is_some();
         let active_thread = self.active_thread(cx);
         let can_control = active_thread
             .as_ref()
@@ -366,17 +365,7 @@ impl Cowork {
                 .right_0()
                 .h(px(1.)),
             )
-            .when(can_write, |this| {
-                this.child(
-                    Button::new("add-attachment")
-                        .icon(Icon::new(AssetIconName::Paperclip))
-                        .ghost()
-                        .small()
-                        .accessibility_label("Attach files")
-                        .tooltip("Attach files")
-                        .on_click(cx.listener(Self::pick_attachments)),
-                )
-            })
+            .child(self.render_project_folders(cx))
             .child(div().flex_1())
             .children(context_indicator)
             .child(model_picker)

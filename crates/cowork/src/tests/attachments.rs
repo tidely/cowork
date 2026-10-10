@@ -83,7 +83,7 @@ fn pasting_an_image_attaches_it_to_the_draft(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
-fn the_attach_button_targets_the_focused_block_only(cx: &mut gpui::TestAppContext) {
+fn unplaced_attachments_target_the_focused_block_only(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     let target = |cx: &mut gpui::VisualTestContext| {
         cx.update(|window, cx| cowork.read(cx).attachment_target_at_focus(window, cx))

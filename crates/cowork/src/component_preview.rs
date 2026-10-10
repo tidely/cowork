@@ -10,7 +10,12 @@ use gpui_component::{ActiveTheme as _, Root};
 use rig::message::{CallId, ToolCall, ToolFunction, ToolName};
 use serde_json::json;
 
-use crate::tool_call_card::ToolCallCard;
+use std::path::PathBuf;
+
+use crate::{
+    project_folders::{ProjectFolder, ProjectFolders},
+    tool_call_card::ToolCallCard,
+};
 
 /// Whether to open the preview instead of the app.
 pub(crate) fn requested() -> bool {
@@ -59,6 +64,29 @@ impl ComponentPreview {
                     .child(title),
             )
             .child(card)
+    }
+
+    /// The host's project, whose button and menus report clicks in the
+    /// header.
+    fn project(&self, id: &'static str, folders: &[&str], cx: &Context<Self>) -> ProjectFolders {
+        let folders = folders
+            .iter()
+            .map(|path| ProjectFolder::local(PathBuf::from(path)))
+            .collect();
+        ProjectFolders::new(id, folders).editable(
+            cx.listener(|this, _, _, cx| {
+                this.last_click = Some("Add a folder".into());
+                cx.notify();
+            }),
+            cx.listener(|this, path: &std::path::Path, _, cx| {
+                this.last_click = Some(format!("Open {}", path.display()).into());
+                cx.notify();
+            }),
+            cx.listener(|this, path: &std::path::Path, _, cx| {
+                this.last_click = Some(format!("Remove {}", path.display()).into());
+                cx.notify();
+            }),
+        )
     }
 
     /// A card offering a decision that reports clicks in the header.
@@ -152,6 +180,47 @@ impl Render for ComponentPreview {
                         "A custom body, as a tool's own card would pass",
                         self.deciding("preview-custom", respond_to_comment(), cx)
                             .body(custom_body(cx)),
+                        cx,
+                    ))
+                    .child(div().text_lg().child("Project folders"))
+                    .child(Self::section(
+                        "No folders yet",
+                        self.project("preview-project-empty", &[], cx),
+                        cx,
+                    ))
+                    .child(Self::section(
+                        "One folder",
+                        self.project("preview-project-one", &["/home/me/src/zed"], cx),
+                        cx,
+                    ))
+                    .child(Self::section(
+                        "Several folders, named by the first",
+                        self.project(
+                            "preview-project-several",
+                            &[
+                                "/home/me/src/zed",
+                                "/home/me/src/cowork",
+                                "/home/me/src/rig",
+                            ],
+                            cx,
+                        ),
+                        cx,
+                    ))
+                    .child(Self::section(
+                        "A long folder name",
+                        self.project(
+                            "preview-project-long",
+                            &["/home/me/src/a-folder-whose-name-is-far-too-long-to-show-in-full"],
+                            cx,
+                        ),
+                        cx,
+                    ))
+                    .child(Self::section(
+                        "A collaborator's view, with names only",
+                        ProjectFolders::new(
+                            "preview-project-mirrored",
+                            ProjectFolder::mirrored(vec!["zed".into(), "cowork".into()]),
+                        ),
                         cx,
                     )),
             )

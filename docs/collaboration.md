@@ -26,7 +26,9 @@ Agent events are checked on arrival in the order Rig's stream could produce
 them.
 Tool calls outside a short always-allowed list wait for the host or an
 `Admin` peer to allow or deny them; see [Tool approval](#tool-approval).
-The protocol version is **22**.
+The host's project folders are shown to collaborators by name; see
+[Project folders](#project-folders).
+The protocol version is **23**.
 
 Not yet implemented:
 
@@ -38,7 +40,8 @@ Not yet implemented:
 - fully validating writable peers' presence at the host (e.g. focus,
   selections, and announced file reads); read-only presence is sanitized;
 - showing others' selections in agent messages, which needs a gpui-kit
-  addition; see [gpui-kit-text-view-highlights.md](gpui-kit-text-view-highlights.md).
+  addition; see [gpui-kit-text-view-highlights.md](gpui-kit-text-view-highlights.md);
+- giving the project folders to the agent's sandbox.
 
 Implementation notes on presence:
 
@@ -310,7 +313,7 @@ over the protocol, never stored in the document.
 **Choosing the target block**:
 
 - Pasting or dropping onto a block attaches to that block.
-- The paperclip button attaches to the focused prompt block.
+- Pasting or dropping elsewhere attaches to the focused prompt block.
 - Otherwise (draft position, a comment, or no focus), a new block is created.
 
 **Lifecycle**:
@@ -599,6 +602,21 @@ differently from one that returned.
 - A run uses the model selected when its submission is accepted. Changing
   the model during a run affects the next run.
 
+### Project folders
+
+- A thread's project is a list of folders on the host's machine, in the
+  order they were added. Only the host adds or removes them, from the
+  bottom bar; a folder added twice is kept once. Folders added before the
+  thread exists move into it with the draft.
+- Collaborators only learn each folder's name, its last path component.
+  Paths stay on the host, since they reveal how its machine is laid out.
+  The names arrive in the `Welcome` snapshot and are replaced as a whole by
+  `ProjectFoldersChanged` after every change, so a removal needs no
+  message of its own. Names can repeat.
+- Collaborators see the names but cannot change them; there is no
+  collaborator message for it.
+- The folders are not yet given to the agent's sandbox.
+
 This is independent of the draft document and is the first feature to build.
 
 ## Sharing lifecycle
@@ -712,6 +730,7 @@ Design decisions:
 | Prompt names and agent transcript   | Thread state at the host, mirrored by protocol                           |
 | Presence                            | Host-relayed protocol messages                                           |
 | Selected model                      | Thread state at the host, synced by protocol                             |
+| Project folders                     | Paths at the host; names only mirrored by snapshots and events           |
 | Peer default and sparse overrides   | Host-owned thread state, mirrored by snapshots and events                |
 | Per-peer draft generation           | Host session per connection; receiving peer's `Welcome` and `DraftReset` |
 | Submission sequence                 | Thread state at the host                                                 |
@@ -722,7 +741,7 @@ Design decisions:
 ## Protocol
 
 All traffic goes through the host. Collaborators never talk to each other.
-`protocol.rs` defines the wire messages; the current version is **22** and
+`protocol.rs` defines the wire messages; the current version is **23** and
 versions must match exactly. `Join` keeps its variant index and version as
 its only field; `Rejected` keeps its variant index and string payload so a
 version mismatch can still be reported. Runtime permission denials use the
@@ -747,7 +766,7 @@ separate `PermissionDenied`, never this stable handshake rejection.
 
 | Message                                      | Purpose                                                                                                                                                                                                                                                                     |
 | -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Welcome`                                    | Participant UUID, timeline and transcript snapshot (models, run state, prompt names), draft and receiving peer's `draft_generation`, participants, profiles, presence, stored attachment IDs, and peer permissions; submission count comes from the timeline; peer-specific |
+| `Welcome`                                    | Participant UUID, timeline and transcript snapshot (models, run state, prompt names, project folder names), draft and receiving peer's `draft_generation`, participants, profiles, presence, stored attachment IDs, and peer permissions; submission count comes from the timeline; peer-specific |
 | `Rejected`                                   | Join refused (e.g. protocol version); stable handshake encoding, then disconnect; peer-specific                                                                                                                                                                             |
 | `PermissionDenied`                           | Runtime denial with participant UUID, operation, and reason (`NotParticipant`, `InsufficientMode`, `HostOnly`, or `StaleDraftGeneration`); peer-specific, connection stays open                                                                                             |
 | `DraftReset`                                 | `{ generation, state }`: peer-specific authoritative draft; matching epoch merges, newer epoch replaces, older epoch is ignored                                                                                                                                             |
@@ -761,6 +780,7 @@ separate `PermissionDenied`, never this stable handshake rejection.
 | `AttachmentStored`                           | The host holds every byte of an attachment                                                                                                                                                                                                                                  |
 | `ModelSelected`                              | The thread's model changed                                                                                                                                                                                                                                                  |
 | `ModelCatalogChanged`                        | Replaces the thread's model catalog (including with an empty one)                                                                                                                                                                                                           |
+| `ProjectFoldersChanged`                      | Replaces the names of the project's folders, in order; paths are never sent                                                                                                                                                                                                 |
 | `UserMessage`                                | An accepted submission with creators and attachment references instead of bytes; advances the submission count                                                                                                                                                              |
 | `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and whether it completed, was stopped, or failed (with a message)                                                                                                                                 |
 | `AgentEvent`                                 | What the host's agent loop reported during a run, which everyone folds into the agent message and transcript                                                                                                                                                                |
