@@ -72,6 +72,7 @@ mod model_picker;
 mod permissions;
 mod project_folders;
 mod project_mode;
+mod schedules;
 mod search_palette;
 mod sidebar;
 mod threads;
@@ -218,6 +219,7 @@ fn test_cowork(
         token_activity: Vec::new(),
         deleted_chats: 0,
         longest_deleted_chat: Duration::ZERO,
+        scheduler: Default::default(),
         activity_range: ActivityRange::default(),
         local_participant_id,
         typing_in: None,

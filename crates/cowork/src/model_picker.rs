@@ -167,19 +167,25 @@ impl Cowork {
         (picker, subscription)
     }
 
-    pub(crate) fn discover_models(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn discover_models(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
         if self.main_stage != MainStage::ProviderSetup(ProviderSetupStage::Ollama) {
             return;
         }
+        self.refresh_models(cx);
+    }
+
+    /// Asks Ollama which models it offers, and makes them the catalog. The
+    /// picker follows on the next frame; see [`Cowork::sync_model_picker`].
+    pub(crate) fn refresh_models(&mut self, cx: &mut Context<Self>) {
         let task = self.tokio_handle.spawn(async {
             Ollama::new()
                 .list_models()
                 .await
                 .map_err(anyhow::Error::from)
         });
-        cx.spawn_in(window, async move |this, cx| match task.await {
+        cx.spawn(async move |this, cx| match task.await {
             Ok(Ok(models)) => {
-                _ = this.update_in(cx, |this, window, cx| {
+                _ = this.update(cx, |this, cx| {
                     let mut catalog = ModelCatalog::default();
                     catalog.set_provider(
                         ModelProvider::Ollama,
@@ -198,7 +204,6 @@ impl Cowork {
                             }),
                     );
                     this.set_models(catalog, cx);
-                    this.sync_model_picker(window, cx);
                     cx.notify();
                 });
             }
@@ -225,11 +230,21 @@ impl Cowork {
     /// agent it runs. Mirrored threads keep their host's catalog.
     pub(crate) fn set_models(&mut self, catalog: ModelCatalog, cx: &mut Context<Self>) {
         self.models = Arc::new(catalog.clone());
-        for thread in self.thread_store.read(cx).threads.clone() {
+        let store = self.thread_store.read(cx);
+        // Archived threads too, as a scheduled run may bring one back.
+        let threads = store
+            .threads
+            .iter()
+            .chain(&store.archived)
+            .cloned()
+            .collect::<Vec<_>>();
+        for thread in threads {
             thread.update(cx, |thread, cx| {
                 thread.set_model_catalog(catalog.clone(), cx);
             });
         }
+        // Scheduled runs may have been waiting for models.
+        self.run_next_scheduled(chrono::Local::now().naive_local(), cx);
     }
 
     /// Applies a model picked by the local user to the active thread. Choices

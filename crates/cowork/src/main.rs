@@ -58,6 +58,9 @@ mod project_folders;
 mod project_mode;
 mod prompt;
 mod protocol;
+mod scheduled_task;
+mod scheduler;
+mod schedules;
 mod search_palette;
 
 mod sidebar;
@@ -88,6 +91,8 @@ enum MainStage {
     Profile,
     /// The archived threads, to restore or delete for good.
     Archive,
+    /// The scheduled prompts.
+    Schedules,
 }
 
 /// The provider whose setup page occupies the main stage.
@@ -140,6 +145,8 @@ struct Cowork {
     /// count; see [`Cowork::delete_archived_thread`].
     deleted_chats: usize,
     longest_deleted_chat: std::time::Duration,
+    /// The scheduled tasks, and the queue running them; see `scheduler.rs`.
+    scheduler: scheduler::Scheduler,
     /// The period the profile page's token activity chart shows.
     activity_range: ActivityRange,
     /// Who the local user is in the threads this app creates and hosts.
@@ -461,6 +468,7 @@ impl Render for Cowork {
                             .map(|this| match self.main_stage {
                                 MainStage::Profile => this.child(self.render_profile_page(cx)),
                                 MainStage::Archive => this.child(self.render_archive_page(cx)),
+                                MainStage::Schedules => this.child(self.render_schedules_page(cx)),
                                 MainStage::Welcome => this.child(self.render_welcome(cx)),
                                 MainStage::ProviderSetup(provider) => {
                                     this.child(self.render_provider_setup(provider, cx))
@@ -614,6 +622,7 @@ fn main() -> anyhow::Result<()> {
                         token_activity: Vec::new(),
                         deleted_chats: 0,
                         longest_deleted_chat: Default::default(),
+                        scheduler: Default::default(),
                         activity_range: ActivityRange::default(),
                         local_participant_id,
                         typing_in: None,
@@ -630,6 +639,10 @@ fn main() -> anyhow::Result<()> {
                         _model_picker_subscription: model_picker_subscription,
                         _window_activation_subscription: window_activation_subscription,
                     }
+                });
+                let window_handle = window.window_handle();
+                cowork.update(cx, |cowork, cx| {
+                    cowork.start_scheduler(scheduler::schedule_file(), Some(window_handle), cx);
                 });
                 cx.new(|cx| Root::new(cowork, window, cx))
             }) {

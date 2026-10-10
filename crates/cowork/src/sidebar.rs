@@ -375,6 +375,19 @@ impl Cowork {
                         .on_click(cx.listener(|this, _, window, cx| {
                             this.open_join_dialog(window, cx);
                         })),
+                )
+                .child(
+                    SidebarMenuItem::new("Scheduled")
+                        .min_h(px(34.))
+                        .icon(
+                            Icon::new(AssetIconName::CalendarClock)
+                                .size_4()
+                                .text_color(cx.theme().secondary_foreground),
+                        )
+                        .active(self.main_stage == MainStage::Schedules)
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            this.open_schedules(window, cx);
+                        })),
                 ),
         );
 

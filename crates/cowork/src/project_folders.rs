@@ -474,6 +474,33 @@ impl Cowork {
         cx.notify();
     }
 
+    /// Gives a thread exactly `paths` as its project, in that order where
+    /// they are new, with `mode`, as a scheduled run does before it starts.
+    /// Without asking first: nothing runs in the thread then, and its
+    /// sandbox only restarts if the project changed.
+    pub(crate) fn set_thread_project(
+        &mut self,
+        thread: &gpui::Entity<Thread>,
+        paths: &[PathBuf],
+        mode: ProjectMode,
+        cx: &mut App,
+    ) {
+        thread.update(cx, |thread, cx| {
+            let stale: Vec<PathBuf> = thread
+                .project_folders()
+                .iter()
+                .filter_map(|folder| folder.path.clone())
+                .filter(|path| !paths.contains(path))
+                .collect();
+            for path in stale {
+                thread.remove_project_folder(&path);
+            }
+            thread.add_project_folders(paths.to_vec());
+            thread.set_project_mode(mode, cx);
+        });
+        self.sync_sandbox_project(thread, cx);
+    }
+
     /// Moves the folders and mode chosen before the thread existed into it.
     /// The mode starts over for the next new thread.
     pub(crate) fn move_project_into(&mut self, thread: &gpui::Entity<Thread>, cx: &mut App) {

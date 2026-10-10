@@ -940,6 +940,7 @@ pub(crate) mod tests {
                         token_activity: Vec::new(),
                         deleted_chats: 0,
                         longest_deleted_chat: Default::default(),
+                        scheduler: Default::default(),
                         activity_range: ActivityRange::default(),
                         local_participant_id: actor,
                         typing_in: None,

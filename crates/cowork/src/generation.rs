@@ -36,6 +36,13 @@ use crate::{
 /// and diffs as prose; it is static, so it needs no templating.
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 
+/// What a finished run took, for the usage statistics.
+pub(crate) struct RunTotals {
+    pub(crate) started_at: SystemTime,
+    pub(crate) duration: Duration,
+    pub(crate) usage: Usage,
+}
+
 pub(crate) struct ActiveGeneration {
     message_id: Uuid,
     abort_handle: tokio::task::AbortHandle,
@@ -60,6 +67,11 @@ impl ActiveGeneration {
     /// Takes how to answer `call`, if the run is still waiting on it.
     pub(crate) fn take_approval(&mut self, call: &CallId) -> Option<oneshot::Sender<ToolDecision>> {
         self.approvals.remove(call).map(|pending| pending.decide)
+    }
+
+    /// Whether the run waits for someone to decide one of its calls.
+    pub(crate) fn is_waiting_for_approval(&self) -> bool {
+        !self.approvals.is_empty()
     }
 
     /// Whether `call`, if the run waits on it, is one only the host decides.
@@ -87,17 +99,22 @@ impl ActiveGeneration {
 }
 
 impl Cowork {
-    pub(super) fn start_generation(&mut self, plan: GenerationPlan, cx: &mut Context<Self>) {
+    /// Starts the agent on a submission, returning the agent message it
+    /// produces.
+    pub(super) fn start_generation(
+        &mut self,
+        plan: GenerationPlan,
+        cx: &mut Context<Self>,
+    ) -> Option<Uuid> {
         let GenerationPlan {
             thread_id,
             prompt,
             mut history,
             comment_group_id,
             turn_comments,
+            scheduled,
         } = plan;
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
-            return;
-        };
+        let thread = self.thread_store.read(cx).thread(thread_id, cx)?;
         let message_id = Uuid::new_v4();
         let started_at = SystemTime::now();
         // Monotonic, so the duration survives clock changes.
@@ -125,7 +142,7 @@ impl Cowork {
         // reach it through `Cowork::sync_sandbox_project`.
         self.sync_sandbox_project(&thread, cx);
         let run_command = RunCommand::new(self.sandboxes.clone(), thread_id.to_string());
-        let gate = ApprovalGate::new(sender.clone(), run_command.read_only_pass());
+        let gate = ApprovalGate::new(sender.clone(), run_command.read_only_pass(), scheduled);
         let cancelled = Arc::new(AtomicBool::new(false));
         let generation_task = self.tokio_handle.spawn(async move {
             let (selected_model, max_tokens) =
@@ -224,33 +241,77 @@ impl Cowork {
                     Err(error) => failed(error.into()),
                 };
                 let duration = started.elapsed();
-                thread.update(cx, |thread, cx| {
-                    thread.emit(
-                        protocol::HostMessage::AgentEnded {
-                            id: message_id.into_bytes(),
-                            outcome,
+                let ended = this.update(cx, |this, cx| {
+                    this.finish_generation(
+                        &thread,
+                        message_id,
+                        outcome.clone(),
+                        RunTotals {
+                            started_at,
                             duration,
+                            usage: turn_usage,
                         },
                         cx,
-                    );
+                    )
                 });
-                _ = this.update(cx, |this, cx| {
-                    this.record_turn_usage(&thread, turn_usage, started_at, duration, cx);
-                    // The profile page's statistics may be showing.
-                    cx.notify();
-                    if let Entry::Occupied(entry) = this.active_generations.entry(thread_id)
-                        && entry.get().message_id == message_id
-                    {
-                        entry.remove();
-                    }
-                    if this.thread_store.read(cx).thread(thread_id, cx).is_none() {
-                        this.settle_retired_thread(&thread, cx);
-                    }
-                    this.thread_updated(thread_id, cx);
-                });
+                if ended.is_err() {
+                    // Recorded anyway, so the transcript stays complete.
+                    thread.update(cx, |thread, cx| {
+                        thread.emit(
+                            protocol::HostMessage::AgentEnded {
+                                id: message_id.into_bytes(),
+                                outcome,
+                                duration,
+                            },
+                            cx,
+                        );
+                    });
+                }
             }
         })
         .detach();
+        Some(message_id)
+    }
+
+    /// Ends the run producing `message_id` with `outcome`, telling everyone,
+    /// counting its usage, and letting the scheduled run queue go on.
+    pub(crate) fn finish_generation(
+        &mut self,
+        thread: &Entity<Thread>,
+        message_id: Uuid,
+        outcome: protocol::RunOutcome,
+        totals: RunTotals,
+        cx: &mut Context<Self>,
+    ) {
+        let RunTotals {
+            started_at,
+            duration,
+            usage,
+        } = totals;
+        let thread_id = thread.read(cx).instance_id;
+        thread.update(cx, |thread, cx| {
+            thread.emit(
+                protocol::HostMessage::AgentEnded {
+                    id: message_id.into_bytes(),
+                    outcome: outcome.clone(),
+                    duration,
+                },
+                cx,
+            );
+        });
+        self.record_turn_usage(thread, usage, started_at, duration, cx);
+        // The profile page's statistics may be showing.
+        cx.notify();
+        if let Entry::Occupied(entry) = self.active_generations.entry(thread_id)
+            && entry.get().message_id == message_id
+        {
+            entry.remove();
+        }
+        if self.thread_store.read(cx).thread(thread_id, cx).is_none() {
+            self.settle_retired_thread(thread, cx);
+        }
+        self.thread_updated(thread_id, cx);
+        self.scheduled_generation_ended(thread_id, message_id, &outcome, cx);
     }
 
     /// Remembers how to answer `call`, which the run producing message
@@ -292,6 +353,7 @@ impl Cowork {
             );
         });
         self.thread_updated(thread_id, cx);
+        self.scheduled_run_waits(thread_id, message_id, tool, cx);
     }
 
     /// Adds a finished turn's usage to its thread and, unless the thread was

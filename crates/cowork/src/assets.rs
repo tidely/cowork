@@ -35,6 +35,12 @@ gpui_kit_assets::icon_assets!(
         Trash,
         Archive,
         ArchiveRestore,
+        CalendarClock,
+        Clock,
+        Repeat,
+        Plus,
+        Play,
+        MessageSquare,
         TriangleAlert,
         FileText,
         Image,
@@ -131,6 +137,22 @@ mod tests {
             let path = icon.path();
             let bytes = Assets.load(&path).unwrap().expect("bundled archive icon");
             assert!(!bytes.is_empty(), "empty archive icon: {path}");
+        }
+    }
+
+    #[test]
+    fn schedule_icons_are_bundled() {
+        for icon in [
+            IconName::CalendarClock,
+            IconName::Clock,
+            IconName::Repeat,
+            IconName::Plus,
+            IconName::Play,
+            IconName::MessageSquare,
+        ] {
+            let path = icon.path();
+            let bytes = Assets.load(&path).unwrap().expect("bundled schedule icon");
+            assert!(!bytes.is_empty(), "empty schedule icon: {path}");
         }
     }
 

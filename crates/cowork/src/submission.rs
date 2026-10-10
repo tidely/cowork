@@ -4,6 +4,8 @@
 #[path = "generation.rs"]
 mod generation;
 pub(crate) use generation::ActiveGeneration;
+#[cfg(test)]
+pub(crate) use generation::RunTotals;
 
 use std::{collections::HashMap, sync::Arc};
 
@@ -18,6 +20,7 @@ use crate::{
     Cowork, SubmitComposer,
     attachments::{MAX_MESSAGE_ATTACHMENT_BYTES, format_bytes},
     composer_attachments::AttachmentError,
+    models::ModelRef,
     participant::ParticipantId,
     profile::participant_name,
     prompt::{agent_message, prompt_name},
@@ -38,6 +41,9 @@ struct GenerationPlan {
     history: Vec<RigMessage>,
     comment_group_id: Option<Uuid>,
     turn_comments: Arc<TurnComments>,
+    /// Whether a scheduled task started the run, which nobody may be
+    /// watching; see `tool_approval.rs`.
+    scheduled: bool,
 }
 
 impl Cowork {
@@ -295,10 +301,88 @@ impl Cowork {
                 history,
                 comment_group_id,
                 turn_comments,
+                scheduled: false,
             },
             cx,
         );
         true
+    }
+
+    /// Submits a scheduled task's prompt to one of the user's own threads as
+    /// the host, leaving its draft alone, and starts the agent on it with
+    /// `model`. Names a thread that has no messages yet `title`. Returns the
+    /// agent message the run produces, or why it couldn't start.
+    pub(crate) fn submit_scheduled_prompt(
+        &mut self,
+        thread: &Entity<Thread>,
+        text: &str,
+        title: &str,
+        model: &ModelRef,
+        cx: &mut Context<Self>,
+    ) -> Result<Uuid, String> {
+        let state = thread.read(cx);
+        if !state.is_host() {
+            return Err("Only your own threads can be continued.".into());
+        }
+        if state.generating {
+            return Err("The thread was already running.".into());
+        }
+        if state.model() != Some(model) {
+            // Ignored when the catalog lacks the model, which is caught below.
+            _ = thread.update(cx, |thread, cx| thread.select_model(model.clone(), cx));
+        }
+        if thread.read(cx).runnable_model().is_none() {
+            return Err(format!("The model {} isn't available.", model.id));
+        }
+
+        let state = thread.read(cx);
+        let author = state.participant_id();
+        let blocks = vec![PromptBlock {
+            id: Uuid::new_v4(),
+            author,
+            text: text.to_owned(),
+            attachments: Vec::new(),
+        }];
+        let mut prompt_names = state.prompt_names.clone();
+        let profiles = self.profiles_for(Some(state));
+        prompt_names
+            .entry(author)
+            .or_insert_with(|| participant_name(author, profiles.get(&author)));
+        let prompt = agent_message(None, &blocks, &HashMap::new(), &prompt_names);
+        let history = state.transcript.clone();
+        let thread_id = state.instance_id;
+        let group = UserMessageGroup {
+            id: Uuid::new_v4(),
+            comments: Vec::new(),
+            blocks,
+            comments_folded: false,
+        };
+        thread.update(cx, |thread, cx| {
+            if thread.timeline.is_empty() {
+                thread.emit(
+                    protocol::HostMessage::ThreadTitled(Self::thread_title(title)),
+                    cx,
+                );
+            }
+            thread.publish(protocol::HostMessage::UserMessage(group.to_protocol()));
+            thread.timeline.push(TimelineMessage::User(group));
+            thread.name_in_prompts(prompt_names, cx);
+        });
+        let message_id = self
+            .start_generation(
+                GenerationPlan {
+                    thread_id,
+                    prompt,
+                    history,
+                    comment_group_id: None,
+                    turn_comments: Arc::new(TurnComments::new(0)),
+                    scheduled: true,
+                },
+                cx,
+            )
+            .ok_or("The thread is gone.")?;
+        self.thread_updated(thread_id, cx);
+        Ok(message_id)
     }
 
     /// Takes every non-empty item out of the draft, in draft order, as the

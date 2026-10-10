@@ -7,6 +7,7 @@ use gpui::{
 use gpui_component::{
     ActiveTheme as _, Disableable as _, Icon, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariant, ButtonVariants as _},
+    dialog::{DialogDescription, DialogFooter, DialogHeader, DialogTitle},
     h_flex, v_flex,
 };
 use gpui_kit_assets::IconName as AssetIconName;
@@ -121,8 +122,110 @@ impl Cowork {
                 .retain(|thread| thread.read(cx).instance_id != thread_id);
         });
         self.deleted_chats += 1;
+        self.forget_scheduled_thread(thread_id);
         self.settle_retired_thread(&thread, cx);
         cx.notify();
+    }
+
+    /// Deletes an archived thread, first warning when scheduled tasks
+    /// continue it: their next runs start a new thread instead, unless the
+    /// tasks are deleted too.
+    pub(crate) fn request_delete_archived_thread(
+        &mut self,
+        thread_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let continuing: Vec<(Uuid, String)> = self
+            .scheduler
+            .tasks_continuing(thread_id)
+            .into_iter()
+            .map(|task| (task.id, task.settings().title.clone()))
+            .collect();
+        if continuing.is_empty() {
+            self.delete_archived_thread(thread_id, cx);
+            return;
+        }
+        let names = continuing
+            .iter()
+            .map(|(_, title)| format!("“{title}”"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let (description, delete_tasks) = if continuing.len() == 1 {
+            (
+                format!(
+                    "The scheduled task {names} continues this thread. Its next run will start a new thread."
+                ),
+                "Delete Thread and Schedule",
+            )
+        } else {
+            (
+                format!(
+                    "The scheduled tasks {names} continue this thread. Their next runs will start a new thread."
+                ),
+                "Delete Thread and Schedules",
+            )
+        };
+        let task_ids: Vec<Uuid> = continuing.into_iter().map(|(task_id, _)| task_id).collect();
+        let cowork = cx.entity().downgrade();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let description = description.clone();
+            let delete_thread = cowork.clone();
+            let delete_both = cowork.clone();
+            let task_ids = task_ids.clone();
+            dialog
+                .w(px(460.))
+                .bg(cx.theme().popover)
+                .content(move |content, _, _| {
+                    let delete_thread = delete_thread.clone();
+                    let delete_both = delete_both.clone();
+                    let task_ids = task_ids.clone();
+                    content
+                        .child(
+                            DialogHeader::new()
+                                .child(
+                                    DialogTitle::new().child("Delete a thread used by a schedule?"),
+                                )
+                                .child(DialogDescription::new().child(description.clone())),
+                        )
+                        .child(
+                            DialogFooter::new()
+                                .child(
+                                    Button::new("cancel-delete-thread")
+                                        .outline()
+                                        .label("Cancel")
+                                        .on_click(|_, window, cx| window.close_dialog(cx)),
+                                )
+                                .child(
+                                    Button::new("delete-thread-and-schedule")
+                                        .outline()
+                                        .label(delete_tasks)
+                                        .debug_selector(|| "delete-thread-and-schedule".to_owned())
+                                        .on_click(move |_, window, cx| {
+                                            _ = delete_both.update(cx, |cowork, cx| {
+                                                for &task_id in &task_ids {
+                                                    cowork.delete_scheduled_task(task_id, cx);
+                                                }
+                                                cowork.delete_archived_thread(thread_id, cx);
+                                            });
+                                            window.close_dialog(cx);
+                                        }),
+                                )
+                                .child(
+                                    Button::new("delete-thread-only")
+                                        .danger()
+                                        .label("Delete Thread")
+                                        .debug_selector(|| "delete-thread-only".to_owned())
+                                        .on_click(move |_, window, cx| {
+                                            _ = delete_thread.update(cx, |cowork, cx| {
+                                                cowork.delete_archived_thread(thread_id, cx);
+                                            });
+                                            window.close_dialog(cx);
+                                        }),
+                                ),
+                        )
+                })
+        });
     }
 
     /// Asks before deleting every thread the archive shows now.
@@ -137,10 +240,23 @@ impl Cowork {
         if thread_ids.is_empty() {
             return;
         }
-        let description = match thread_ids.len() {
+        let mut description = match thread_ids.len() {
             1 => "The archived thread will be deleted. This can't be undone.".to_owned(),
             count => format!("All {count} archived threads will be deleted. This can't be undone."),
         };
+        let continued = thread_ids
+            .iter()
+            .map(|thread_id| self.scheduler.tasks_continuing(*thread_id).len())
+            .sum::<usize>();
+        match continued {
+            0 => {}
+            1 => description.push_str(
+                " A scheduled task continues one of them; its next run will start a new thread.",
+            ),
+            count => description.push_str(&format!(
+                " {count} scheduled tasks continue them; their next runs will start new threads."
+            )),
+        }
         let cowork = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let cowork = cowork.clone();
@@ -369,8 +485,8 @@ impl Cowork {
                     .debug_selector(move || format!("delete-thread-{thread_id}"))
                     .accessibility_label(format!("Delete {title} permanently"))
                     .tooltip("Delete permanently")
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.delete_archived_thread(thread_id, cx);
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.request_delete_archived_thread(thread_id, window, cx);
                     })),
             )
     }

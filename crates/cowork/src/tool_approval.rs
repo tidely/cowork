@@ -14,8 +14,13 @@
 //! writable project they are asked about like any other.
 //! [`sandbox::ReadOnlyPass`] makes sure such a call never runs in a project
 //! made writable after it was let through.
+//!
+//! A scheduled run may have nobody around to answer, so it doesn't wait the
+//! first time: a call that needs approval fails at once, telling the model
+//! that making it again with the same arguments asks the user. The repeat
+//! waits as usual, and the user is notified; see `docs/schedule.md`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use agent::{AgentEvent, ToolDecision, ToolHook};
 use futures::future::BoxFuture;
@@ -46,6 +51,10 @@ const DENIED: &str = "The user denied this tool call.";
 /// What the model is told about a call nobody could decide, as when the
 /// thread is gone.
 const UNDECIDED: &str = "The tool call was not approved.";
+
+/// What a scheduled run's model is told about a call it makes the first
+/// time, rather than waiting for someone who may not be there.
+pub(crate) const UNATTENDED: &str = "This tool call was not run: it needs the user's permission, and this is a scheduled run that nobody may be watching. Carry on without it if you can. If the call is necessary, make it again with exactly the same arguments: the user will then be notified and asked, and the run waits for their answer.";
 
 /// Tools whose calls only the host may allow: they act on the host's computer
 /// (a sandbox there, for `run_command`), so an `Admin` peer may not decide
@@ -105,14 +114,51 @@ pub(crate) struct ApprovalGate {
     /// Lets the run's `run_command` calls through while the project is
     /// read-only.
     read_only: ReadOnlyPass,
+    /// For a scheduled run, the calls already refused once, by tool and
+    /// arguments; `None` for a run someone started.
+    unattended: Option<Mutex<Vec<CallKey>>>,
 }
+
+/// What makes two calls the same: the tool, and its arguments however their
+/// keys are ordered.
+type CallKey = (
+    String,
+    serde_json::Map<String, serde_json::Value>,
+    Option<String>,
+);
 
 impl ApprovalGate {
     pub(crate) fn new(
         updates: mpsc::UnboundedSender<RunUpdate>,
         read_only: ReadOnlyPass,
+        scheduled: bool,
     ) -> Arc<Self> {
-        Arc::new(Self { updates, read_only })
+        Arc::new(Self {
+            updates,
+            read_only,
+            unattended: scheduled.then(Mutex::default),
+        })
+    }
+
+    /// Whether a scheduled run makes `call` for the first time, which is then
+    /// remembered so that the same call again is asked about.
+    fn refuses_unattended(&self, call: &ToolCall) -> bool {
+        let Some(refused) = &self.unattended else {
+            return false;
+        };
+        let key = (
+            call.function.name.to_string(),
+            call.function.arguments.clone(),
+            call.function.invalid_arguments.clone(),
+        );
+        let mut refused = refused
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if refused.contains(&key) {
+            return false;
+        }
+        refused.push(key);
+        true
     }
 }
 
@@ -124,6 +170,11 @@ impl ToolHook for ApprovalGate {
                 || (tool == RunCommand::NAME && self.read_only.grant_if_read_only())
             {
                 return ToolDecision::Allow;
+            }
+            if self.refuses_unattended(call) {
+                return ToolDecision::Deny {
+                    reason: UNATTENDED.into(),
+                };
             }
             let (decide, decision) = oneshot::channel();
             let undecided = || ToolDecision::Deny {
@@ -258,11 +309,15 @@ mod tests {
     }
 
     fn call(name: &str) -> ToolCall {
+        call_with(name, serde_json::json!({}))
+    }
+
+    fn call_with(name: &str, arguments: serde_json::Value) -> ToolCall {
         ToolCall::new(
             CallId::from_wire("call_1"),
             rig::message::ToolFunction::new(
                 rig::message::ToolName::new(name).expect("a valid name"),
-                serde_json::json!({}),
+                arguments,
             ),
         )
     }
@@ -271,6 +326,17 @@ mod tests {
     /// sandboxes holding that project.
     fn gate(
         writable: bool,
+    ) -> (
+        Arc<ApprovalGate>,
+        mpsc::UnboundedReceiver<RunUpdate>,
+        Arc<sandbox::Sandboxes>,
+    ) {
+        gate_for(writable, false)
+    }
+
+    fn gate_for(
+        writable: bool,
+        scheduled: bool,
     ) -> (
         Arc<ApprovalGate>,
         mpsc::UnboundedReceiver<RunUpdate>,
@@ -288,10 +354,58 @@ mod tests {
         let tool = RunCommand::new(sandboxes.clone(), thread);
         let (updates, asked) = mpsc::unbounded_channel();
         (
-            ApprovalGate::new(updates, tool.read_only_pass()),
+            ApprovalGate::new(updates, tool.read_only_pass(), scheduled),
             asked,
             sandboxes,
         )
+    }
+
+    #[tokio::test]
+    async fn a_scheduled_run_asks_only_when_a_call_is_repeated() {
+        let (gate, mut asked, _sandboxes) = gate_for(true, true);
+        let first = call_with(
+            tools::Calculate::NAME,
+            serde_json::json!({ "a": 1, "b": 2 }),
+        );
+        assert_eq!(
+            gate.before_tool_call(&first).await,
+            ToolDecision::Deny {
+                reason: UNATTENDED.into()
+            }
+        );
+        assert!(asked.try_recv().is_err(), "nobody was asked");
+
+        // Other arguments are another call, refused once too.
+        let other = call_with(tools::Calculate::NAME, serde_json::json!({ "a": 3 }));
+        assert!(matches!(
+            gate.before_tool_call(&other).await,
+            ToolDecision::Deny { .. }
+        ));
+        assert!(asked.try_recv().is_err());
+
+        // The same arguments, in any order, ask the user and wait.
+        let repeat = call_with(
+            tools::Calculate::NAME,
+            serde_json::json!({ "b": 2, "a": 1 }),
+        );
+        let decision = gate.before_tool_call(&repeat);
+        let answer = async {
+            let Some(RunUpdate::Approval { decide, .. }) = asked.recv().await else {
+                panic!("a repeated call asks");
+            };
+            decide.send(ToolDecision::Allow).expect("the gate waits");
+        };
+        let (decision, ()) = tokio::join!(decision, answer);
+        assert_eq!(decision, ToolDecision::Allow);
+
+        // Calls that need no approval still run at once.
+        let comment = call(RespondToComment::NAME);
+        assert_eq!(gate.before_tool_call(&comment).await, ToolDecision::Allow);
+        let (read_only, _asked, _sandboxes) = gate_for(false, true);
+        assert_eq!(
+            read_only.before_tool_call(&call(RunCommand::NAME)).await,
+            ToolDecision::Allow
+        );
     }
 
     #[tokio::test]
