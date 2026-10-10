@@ -75,7 +75,7 @@ pub(crate) fn format_stat_duration(duration: Duration) -> String {
 }
 
 /// A turn's tokens, dated when its response started generating.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TokenActivity {
     pub(crate) at: SystemTime,
     /// How long the response took, across which its tokens are spread.

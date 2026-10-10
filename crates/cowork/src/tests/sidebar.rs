@@ -82,6 +82,47 @@ fn archive_from_sidebar(thread_id: Uuid, cx: &mut gpui::VisualTestContext) {
 }
 
 #[gpui::test]
+fn usage_statistics_outlast_the_threads_of_an_earlier_session(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let dir = std::env::temp_dir().join(format!("cowork-statistics-{}", Uuid::new_v4()));
+    let path = dir.join("statistics.json");
+    cowork.update(cx, |cowork, _| cowork.start_statistics(Some(path.clone())));
+    add_thread(&cowork, 20, cx);
+    let used = add_thread(&cowork, 90, cx);
+    cowork.update(cx, |cowork, cx| {
+        let thread = cowork.thread_store.read(cx).thread(used, cx).unwrap();
+        let usage = Usage::new().total_tokens(100);
+        cowork.record_turn_usage(&thread, usage, SystemTime::now(), Duration::ZERO, cx);
+        cowork.save_statistics(cx);
+    });
+    let before = cowork.read_with(cx, |cowork, cx| cowork.statistics(cx));
+
+    // Threads aren't saved, so a restart starts with none of them.
+    cowork.update(cx, |cowork, cx| {
+        cowork
+            .thread_store
+            .update(cx, |store, _| store.threads.clear());
+        cowork.tokens_used = 0;
+        cowork.token_activity.clear();
+        cowork.deleted_chats = 0;
+        cowork.longest_deleted_chat = Duration::ZERO;
+        cowork.start_statistics(Some(path.clone()));
+    });
+
+    cowork.read_with(cx, |cowork, cx| {
+        assert_eq!(cowork.statistics(cx), before);
+        assert_eq!(cowork.tokens_used, 100);
+        assert_eq!(cowork.token_activity.len(), 1);
+        assert_eq!(cowork.total_chats(cx), 2);
+        assert_eq!(cowork.longest_chat(cx), Duration::from_secs(90));
+    });
+    add_thread(&cowork, 5, cx);
+    cowork.read_with(cx, |cowork, cx| assert_eq!(cowork.total_chats(cx), 3));
+
+    _ = std::fs::remove_dir_all(dir);
+}
+
+#[gpui::test]
 fn archiving_a_thread_from_the_sidebar_keeps_the_usage_statistics(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     let kept = add_thread(&cowork, 20, cx);

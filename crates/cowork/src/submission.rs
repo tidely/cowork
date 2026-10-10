@@ -290,6 +290,7 @@ impl Cowork {
             self.thread_store.update(cx, |store, _| {
                 store.threads.push_front(thread.clone());
             });
+            self.save_statistics(cx);
             self.active_thread_id = Some(thread_id);
             thread_id
         };

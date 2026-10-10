@@ -64,6 +64,7 @@ mod schedules;
 mod search_palette;
 
 mod sidebar;
+mod statistics;
 
 #[cfg(test)]
 mod test_support;
@@ -140,11 +141,15 @@ struct Cowork {
     tokens_used: u64,
     /// When those tokens were used, turn by turn, in the order turns ended.
     token_activity: Vec<TokenActivity>,
-    /// How many chats were deleted from the archive, and the longest the
-    /// agent generated in one of them, which the profile's statistics still
-    /// count; see [`Cowork::delete_archived_thread`].
+    /// How many chats were deleted from the archive or are gone since an
+    /// earlier session, and the longest the agent generated in one of them,
+    /// which the profile's statistics still count; see
+    /// [`Cowork::delete_archived_thread`] and `statistics.rs`.
     deleted_chats: usize,
     longest_deleted_chat: std::time::Duration,
+    /// Where the profile's statistics are saved; `None` keeps them in
+    /// memory, as in tests.
+    statistics_file: Option<std::path::PathBuf>,
     /// The scheduled tasks, and the queue running them; see `scheduler.rs`.
     scheduler: scheduler::Scheduler,
     /// The period the profile page's token activity chart shows.
@@ -622,6 +627,7 @@ fn main() -> anyhow::Result<()> {
                         token_activity: Vec::new(),
                         deleted_chats: 0,
                         longest_deleted_chat: Default::default(),
+                        statistics_file: None,
                         scheduler: Default::default(),
                         activity_range: ActivityRange::default(),
                         local_participant_id,
@@ -642,6 +648,7 @@ fn main() -> anyhow::Result<()> {
                 });
                 let window_handle = window.window_handle();
                 cowork.update(cx, |cowork, cx| {
+                    cowork.start_statistics(statistics::statistics_file());
                     cowork.start_scheduler(scheduler::schedule_file(), Some(window_handle), cx);
                 });
                 cx.new(|cx| Root::new(cowork, window, cx))

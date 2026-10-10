@@ -219,6 +219,7 @@ fn test_cowork(
         token_activity: Vec::new(),
         deleted_chats: 0,
         longest_deleted_chat: Duration::ZERO,
+        statistics_file: None,
         scheduler: Default::default(),
         activity_range: ActivityRange::default(),
         local_participant_id,

@@ -186,7 +186,8 @@ approval, for its thread, or for models.
   goes through the same code path as anyone else's (see
   [collaboration.md](collaboration.md)) and doesn't touch the shared draft. A
   shared thread's collaborators see the run like any other.
-- Tasks and their run history are the first state Cowork saves. The file is
+- Tasks and their run history are the first state Cowork saves (the
+  profile's statistics, in `statistics.rs`, are the only other). The file is
   written whole, replacing the old one only once written. One that can't be
   read, or has another format version, is moved aside rather than
   overwritten.

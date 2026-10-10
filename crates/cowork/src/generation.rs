@@ -310,6 +310,7 @@ impl Cowork {
         if self.thread_store.read(cx).thread(thread_id, cx).is_none() {
             self.settle_retired_thread(thread, cx);
         }
+        self.save_statistics(cx);
         self.thread_updated(thread_id, cx);
         self.scheduled_generation_ended(thread_id, message_id, &outcome, cx);
     }
