@@ -278,7 +278,7 @@ impl Cowork {
                 self.new_thread_model.clone(),
                 cx,
             );
-            self.move_project_folders_into(&thread, cx);
+            self.move_project_into(&thread, cx);
             thread.update(cx, |thread, cx| thread.name_in_prompts(prompt_names, cx));
             let thread_id = thread.read(cx).instance_id;
             self.thread_store.update(cx, |store, _| {

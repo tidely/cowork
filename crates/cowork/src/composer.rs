@@ -368,6 +368,7 @@ impl Cowork {
             .child(self.render_project_folders(cx))
             .child(div().flex_1())
             .children(context_indicator)
+            .child(self.render_project_mode(cx))
             .child(model_picker)
             .children(button)
     }

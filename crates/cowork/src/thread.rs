@@ -37,6 +37,7 @@ use crate::{
     participant::ParticipantId,
     profile::Profile,
     project_folders::{self, ProjectFolder},
+    project_mode::ProjectMode,
     protocol,
     timeline::{AgentMessage, TimelineMessage},
     transcript::validate_agent_runs,
@@ -188,6 +189,9 @@ pub(crate) struct Thread {
     /// The host knows their paths; a mirror only their names, since they
     /// are on the host's machine. Not yet given to the agent.
     project_folders: Vec<ProjectFolder>,
+    /// Whether the project is open for writing or only reading. Chosen by
+    /// the host and mirrored. Not yet given to the agent.
+    project_mode: ProjectMode,
 }
 
 /// A host snapshot whose transcript and agent runs have been checked before
@@ -234,6 +238,7 @@ impl Thread {
             sharing: ThreadSharing::NotShared,
             ownership: ThreadOwnership::Local,
             project_folders: Vec::new(),
+            project_mode: ProjectMode::default(),
         }
     }
 
@@ -357,6 +362,21 @@ impl Thread {
         }
         if project_folders::remove_folder(&mut self.project_folders, path) {
             self.publish_project_folders();
+        }
+        true
+    }
+
+    pub(crate) fn project_mode(&self) -> ProjectMode {
+        self.project_mode
+    }
+
+    /// Only the host can, as for the folders.
+    pub(crate) fn set_project_mode(&mut self, mode: ProjectMode, cx: &mut impl AppContext) -> bool {
+        if !self.is_host() {
+            return false;
+        }
+        if self.project_mode != mode {
+            self.emit(protocol::HostMessage::ProjectModeChanged(mode), cx);
         }
         true
     }
@@ -495,6 +515,7 @@ impl Thread {
             sharing,
             ownership: ThreadOwnership::Remote,
             project_folders: Vec::new(),
+            project_mode: ProjectMode::default(),
         };
         thread
             .apply_welcome(prepared, cx)
@@ -603,6 +624,7 @@ impl Thread {
             .map(|(participant, name)| (ParticipantId::from_bytes(participant), name.into()))
             .collect();
         self.project_folders = ProjectFolder::mirrored(std::mem::take(&mut thread.project_folders));
+        self.project_mode = thread.project_mode;
         let (summary, timeline) = thread.into_native(cx);
         self.summary = summary;
         self.set_timeline(timeline);
@@ -664,6 +686,7 @@ impl Thread {
                 .sorted()
                 .collect(),
             project_folders: self.project_folder_names(),
+            project_mode: self.project_mode,
         }
     }
 
@@ -1389,6 +1412,7 @@ impl Thread {
             protocol::HostMessage::ProjectFoldersChanged(names) => {
                 self.project_folders = ProjectFolder::mirrored(names);
             }
+            protocol::HostMessage::ProjectModeChanged(mode) => self.project_mode = mode,
             protocol::HostMessage::ModelSelected(model) => {
                 self.model = Some(model);
             }

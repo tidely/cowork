@@ -349,17 +349,18 @@ impl Cowork {
         cx.notify();
     }
 
-    /// Moves the folders added before the thread existed into it.
-    pub(crate) fn move_project_folders_into(
-        &mut self,
-        thread: &gpui::Entity<Thread>,
-        cx: &mut App,
-    ) {
+    /// Moves the folders and mode chosen before the thread existed into it.
+    /// The mode starts over for the next new thread.
+    pub(crate) fn move_project_into(&mut self, thread: &gpui::Entity<Thread>, cx: &mut App) {
         let paths = std::mem::take(&mut self.new_thread_project_folders)
             .into_iter()
             .filter_map(|folder| folder.path)
             .collect();
-        thread.update(cx, |thread, _| thread.add_project_folders(paths));
+        let mode = std::mem::take(&mut self.new_thread_project_mode);
+        thread.update(cx, |thread, cx| {
+            thread.add_project_folders(paths);
+            thread.set_project_mode(mode, cx);
+        });
     }
 }
 

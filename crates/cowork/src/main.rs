@@ -25,6 +25,7 @@ use crate::{
     participant::ParticipantId,
     profile::Profile,
     project_folders::ProjectFolder,
+    project_mode::ProjectMode,
     sharing::JoinDialog,
     sidebar::SIDEBAR_WIDTH,
     submission::ActiveGeneration,
@@ -53,6 +54,7 @@ mod peer_access;
 mod profile;
 mod profile_page;
 mod project_folders;
+mod project_mode;
 mod prompt;
 mod protocol;
 mod search_palette;
@@ -148,6 +150,9 @@ struct Cowork {
     /// The folders added before the thread exists, which move into it with
     /// the draft; see [`Thread::project_folders`].
     new_thread_project_folders: Vec<ProjectFolder>,
+    /// The mode chosen before the thread exists, which moves into it with
+    /// the folders; see [`Thread::project_mode`].
+    new_thread_project_mode: ProjectMode,
     /// Always shows the active thread's model; see [`Cowork::sync_model_picker`].
     model_picker: Entity<ModelPickerState>,
     model_picker_hovered: bool,
@@ -606,6 +611,7 @@ fn main() -> anyhow::Result<()> {
                         working_refresh: None,
                         new_thread_model: None,
                         new_thread_project_folders: Vec::new(),
+                        new_thread_project_mode: ProjectMode::default(),
                         model_picker,
                         model_picker_hovered: false,
                         models: Arc::default(),

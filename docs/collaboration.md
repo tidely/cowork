@@ -26,9 +26,10 @@ Agent events are checked on arrival in the order Rig's stream could produce
 them.
 Tool calls outside a short always-allowed list wait for the host or an
 `Admin` peer to allow or deny them; see [Tool approval](#tool-approval).
-The host's project folders are shown to collaborators by name; see
+The host's project folders are shown to collaborators by name, along with
+whether the project is open for writing or reading; see
 [Project folders](#project-folders).
-The protocol version is **23**.
+The protocol version is **24**.
 
 Not yet implemented:
 
@@ -41,7 +42,7 @@ Not yet implemented:
   selections, and announced file reads); read-only presence is sanitized;
 - showing others' selections in agent messages, which needs a gpui-kit
   addition; see [gpui-kit-text-view-highlights.md](gpui-kit-text-view-highlights.md);
-- giving the project folders to the agent's sandbox.
+- giving the project folders and mode to the agent's sandbox.
 
 Implementation notes on presence:
 
@@ -615,7 +616,12 @@ differently from one that returned.
   message of its own. Names can repeat.
 - Collaborators see the names but cannot change them; there is no
   collaborator message for it.
-- The folders are not yet given to the agent's sandbox.
+- The project has a mode, `Write` or `Read`, picked from a menu in the
+  bottom bar between the context indicator and the model picker. Every
+  thread starts in `Read`. Only the host can change it; collaborators see
+  it in the `Welcome` snapshot and follow `ProjectModeChanged`. A mode
+  picked before the thread exists moves into it with the folders.
+- Neither the folders nor the mode are given to the agent's sandbox yet.
 
 This is independent of the draft document and is the first feature to build.
 
@@ -731,6 +737,7 @@ Design decisions:
 | Presence                            | Host-relayed protocol messages                                           |
 | Selected model                      | Thread state at the host, synced by protocol                             |
 | Project folders                     | Paths at the host; names only mirrored by snapshots and events           |
+| Project mode                        | Thread state at the host, mirrored by snapshots and events               |
 | Peer default and sparse overrides   | Host-owned thread state, mirrored by snapshots and events                |
 | Per-peer draft generation           | Host session per connection; receiving peer's `Welcome` and `DraftReset` |
 | Submission sequence                 | Thread state at the host                                                 |
@@ -741,7 +748,7 @@ Design decisions:
 ## Protocol
 
 All traffic goes through the host. Collaborators never talk to each other.
-`protocol.rs` defines the wire messages; the current version is **23** and
+`protocol.rs` defines the wire messages; the current version is **24** and
 versions must match exactly. `Join` keeps its variant index and version as
 its only field; `Rejected` keeps its variant index and string payload so a
 version mismatch can still be reported. Runtime permission denials use the
@@ -766,7 +773,7 @@ separate `PermissionDenied`, never this stable handshake rejection.
 
 | Message                                      | Purpose                                                                                                                                                                                                                                                                     |
 | -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Welcome`                                    | Participant UUID, timeline and transcript snapshot (models, run state, prompt names, project folder names), draft and receiving peer's `draft_generation`, participants, profiles, presence, stored attachment IDs, and peer permissions; submission count comes from the timeline; peer-specific |
+| `Welcome`                                    | Participant UUID, timeline and transcript snapshot (models, run state, prompt names, project folder names and mode), draft and receiving peer's `draft_generation`, participants, profiles, presence, stored attachment IDs, and peer permissions; submission count comes from the timeline; peer-specific |
 | `Rejected`                                   | Join refused (e.g. protocol version); stable handshake encoding, then disconnect; peer-specific                                                                                                                                                                             |
 | `PermissionDenied`                           | Runtime denial with participant UUID, operation, and reason (`NotParticipant`, `InsufficientMode`, `HostOnly`, or `StaleDraftGeneration`); peer-specific, connection stays open                                                                                             |
 | `DraftReset`                                 | `{ generation, state }`: peer-specific authoritative draft; matching epoch merges, newer epoch replaces, older epoch is ignored                                                                                                                                             |
@@ -781,6 +788,7 @@ separate `PermissionDenied`, never this stable handshake rejection.
 | `ModelSelected`                              | The thread's model changed                                                                                                                                                                                                                                                  |
 | `ModelCatalogChanged`                        | Replaces the thread's model catalog (including with an empty one)                                                                                                                                                                                                           |
 | `ProjectFoldersChanged`                      | Replaces the names of the project's folders, in order; paths are never sent                                                                                                                                                                                                 |
+| `ProjectModeChanged`                         | The project is now open for `Write` or only `Read`                                                                                                                                                                                                                          |
 | `UserMessage`                                | An accepted submission with creators and attachment references instead of bytes; advances the submission count                                                                                                                                                              |
 | `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and whether it completed, was stopped, or failed (with a message)                                                                                                                                 |
 | `AgentEvent`                                 | What the host's agent loop reported during a run, which everyone folds into the agent message and transcript                                                                                                                                                                |
