@@ -6,10 +6,13 @@
 //! call, and the host tells everyone the call is waiting. Anyone who may
 //! approve tool calls (the host, and `Admin` peers) then allows or denies it
 //! through the same checked path; the first decision wins and the run goes on.
-//! Calls of [`HOST_ONLY`] tools, which run something on the host's computer,
-//! only the host may decide. `run_command` is asked about in every project
-//! mode: its commands use the host's own tools, so even in a read-only
-//! project they act on the host's computer.
+//! Calls of [`HOST_ONLY`] tools, which act on the host's computer, only the
+//! host may decide. `run_command` is asked about in every project mode: its
+//! commands use the host's own tools, so even in a read-only project they
+//! act on the host's computer. `write_file` is asked about too, even when it
+//! writes the scratch folder. Listing and reading need no approval: they
+//! reach only the folders the host shared with the thread, and its scratch
+//! folder.
 //!
 //! A scheduled run may have nobody around to answer, so it doesn't wait the
 //! first time: a call that needs approval fails at once, telling the model
@@ -25,7 +28,7 @@ use rig::{
     message::{CallId, ToolCall},
     tool::Tool as _,
 };
-use sandbox::RunCommand;
+use sandbox::{ListDirectory, ReadFile, RunCommand, WriteFile};
 use tokio::sync::{mpsc, oneshot};
 use tools::RespondToComment;
 use uuid::Uuid;
@@ -36,10 +39,12 @@ use crate::{
     thread::{ApproveTools, Thread, ThreadSharing},
 };
 
-/// Tools whose calls always run, as they only act within the thread.
-/// Every other tool's calls wait for approval, so a tool added without a
-/// thought about it is asked about rather than trusted.
-pub(crate) const ALWAYS_ALLOWED: &[&str] = &[RespondToComment::NAME];
+/// Tools whose calls always run, as they only act within the thread or
+/// read what the host shared with it. Every other tool's calls wait for
+/// approval, so a tool added without a thought about it is asked about
+/// rather than trusted.
+pub(crate) const ALWAYS_ALLOWED: &[&str] =
+    &[RespondToComment::NAME, ListDirectory::NAME, ReadFile::NAME];
 
 /// What the model is told about a call someone denied.
 const DENIED: &str = "The user denied this tool call.";
@@ -53,9 +58,9 @@ const UNDECIDED: &str = "The tool call was not approved.";
 pub(crate) const UNATTENDED: &str = "This tool call was not run: it needs the user's permission, and this is a scheduled run that nobody may be watching. Carry on without it if you can. If the call is necessary, make it again with exactly the same arguments: the user will then be notified and asked, and the run waits for their answer.";
 
 /// Tools whose calls only the host may allow: they act on the host's computer
-/// (its shell and tools, for `run_command`), so an `Admin` peer may not
-/// decide for it.
-pub(crate) const HOST_ONLY: &[&str] = &[RunCommand::NAME];
+/// (its shell and tools, for `run_command`, and its files, for `write_file`),
+/// so an `Admin` peer may not decide for it.
+pub(crate) const HOST_ONLY: &[&str] = &[RunCommand::NAME, WriteFile::NAME];
 
 pub(crate) fn needs_approval(tool: &str) -> bool {
     !ALWAYS_ALLOWED.contains(&tool)
@@ -271,6 +276,9 @@ mod tests {
     #[test]
     fn only_listed_tools_run_without_approval() {
         assert!(!needs_approval(RespondToComment::NAME));
+        assert!(!needs_approval(ListDirectory::NAME));
+        assert!(!needs_approval(ReadFile::NAME));
+        assert!(needs_approval(WriteFile::NAME));
         assert!(needs_approval(tools::Calculate::NAME));
         assert!(needs_approval(RunCommand::NAME));
         assert!(needs_approval("a_tool_nobody_listed"));
@@ -290,6 +298,7 @@ mod tests {
         assert!(host.may_decide(RunCommand::NAME));
         assert!(host.may_decide(tools::Calculate::NAME));
         assert!(!admin.may_decide(RunCommand::NAME));
+        assert!(!admin.may_decide(WriteFile::NAME));
         assert!(admin.may_decide(tools::Calculate::NAME));
         assert!(!writer.may_decide(tools::Calculate::NAME));
     }

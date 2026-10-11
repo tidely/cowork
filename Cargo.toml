@@ -33,7 +33,7 @@ iroh = "1.2.0"
 itertools = "0.14"
 libc = "0.2"
 # Contains the agent's commands with the operating system's own sandbox:
-# Seatbelt on macOS, Bubblewrap on Linux, an AppContainer on Windows. No
+# Seatbelt on macOS, Bubblewrap on Linux, a process container on Windows. No
 # optional backends; telemetry stays off as no request opts in.
 mxc-sdk = "1.0.0"
 nucleo-matcher = "0.3"
@@ -49,4 +49,6 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 unicode-segmentation = "1"
 uuid = { version = "1", features = ["v4", "v5"] }
+# Lists the Windows drives commands may read; see `sandbox::settings`.
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 yrs = "0.28"

@@ -138,7 +138,7 @@ A run whose model the catalog doesn't offer fails, and the queue goes on.
 Scheduled runs keep the usual approval rules (see
 [Tool approval](collaboration.md#tool-approval)): tools on the always-allowed
 list run, and every other call needs the host or an `Admin` peer to allow it
-(`run_command` only the host). Since no one may be around, a scheduled run
+(`run_command` and `write_file` only the host). Since no one may be around, a scheduled run
 doesn't wait the first time:
 
 1. A call that needs approval fails at once. Its result tells the model that

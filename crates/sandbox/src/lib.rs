@@ -4,16 +4,23 @@
 //! Every setting is in [`settings`]. In short: the user's own shell, tools,
 //! and environment; the thread's project folders at their real paths,
 //! read-only unless the project is writable (see [`Project`]); a scratch
-//! folder per thread; no other user files; and no network.
+//! folder per thread; no other user files, except that on Windows commands
+//! read every drive, credentials aside; and no network.
 //!
 //! Each command is a sandbox of its own, made from the thread's project as
 //! it is when the command starts, so a thread's commands may run at the same
 //! time and a project change needs no restart. Nothing runs before the first
 //! command: the login shell environment is captured then, and the scratch
 //! folders are created as threads first need them.
+//!
+//! The file tools ([`files`]) reach the same folders from the host process
+//! itself, with every path they accept mapped in [`paths`].
 
 pub mod environment;
+pub mod files;
+
 mod output;
+pub mod paths;
 mod project;
 pub mod settings;
 mod tool;
@@ -37,7 +44,9 @@ use mxc_sdk::v1::{
 };
 
 pub use environment::{EnvironmentSource, PRINT_ENV_FLAG, print_env};
+pub use files::{ListDirectory, ReadFile, WriteFile};
 pub use output::CommandOutput;
+pub use paths::FileError;
 pub use project::{Project, ProjectFolder, folder_name};
 pub use tool::{RunCommand, RunCommandArgs};
 
@@ -94,6 +103,8 @@ pub struct Sandboxes {
     source: EnvironmentSource,
     /// Set by the first command; see [`Sandboxes::ready`].
     ready: OnceLock<Result<(), SandboxError>>,
+    /// Set by the first command or file write; see [`Sandboxes::claim`].
+    claimed: OnceLock<Result<(), SandboxError>>,
     /// Held while this instance runs, so another instance does not take its
     /// scratch folders for leftovers.
     lock: Mutex<Option<File>>,
@@ -113,6 +124,7 @@ impl Sandboxes {
             instance: instance.into(),
             source,
             ready: OnceLock::new(),
+            claimed: OnceLock::new(),
             lock: Mutex::new(None),
             environment: tokio::sync::OnceCell::new(),
             projects: Mutex::new(HashMap::new()),
@@ -163,12 +175,23 @@ impl Sandboxes {
             });
         }
         note.push_str(&format!(
-            "Commands start in {}. Their HOME and TMPDIR are the scratch folder {}.\n\
+            "Commands start in {}. Their HOME and TMPDIR are the scratch folder {}, which \
+             the file tools call `{}`.\n\
              This replaces any earlier environment note.\n</environment>",
             working_directory(&folders, &scratch).display(),
             scratch.display(),
+            paths::SCRATCH,
         ));
         note
+    }
+
+    /// The places `thread`'s file tools reach now; see [`paths`].
+    pub(crate) fn places(&self, thread: &str) -> paths::Places {
+        paths::Places::new(
+            &self.project(thread),
+            &self.scratch_dir(thread),
+            std::env::home_dir().as_deref(),
+        )
     }
 
     /// Runs `command` with the platform's shell, contained by `thread`'s
@@ -230,9 +253,8 @@ impl Sandboxes {
         self.root.join(format!("{instance}.lock"))
     }
 
-    /// Checks, once, that this computer has a sandbox, takes this
-    /// instance's lock, and removes the scratch folders of instances that did
-    /// not quit cleanly.
+    /// Checks, once, that this computer has a sandbox, and claims the
+    /// scratch folders.
     fn ready(&self) -> Result<(), SandboxError> {
         self.ready
             .get_or_init(|| {
@@ -244,6 +266,18 @@ impl Sandboxes {
                             .unwrap_or_else(|| "mxc-sdk supports no sandbox here".into()),
                     ));
                 }
+                self.claim()
+            })
+            .clone()
+    }
+
+    /// Takes, once, this instance's lock, so its scratch folders are
+    /// removed when it quits rather than taken for leftovers, and removes
+    /// the scratch folders of instances that did not quit cleanly. Needed
+    /// before anything creates a scratch folder.
+    pub(crate) fn claim(&self) -> Result<(), SandboxError> {
+        self.claimed
+            .get_or_init(|| {
                 let setup = |error: std::io::Error| SandboxError::Setup(error.to_string());
                 std::fs::create_dir_all(&self.root).map_err(setup)?;
                 // Locked before the folder exists, so a folder without a lock
@@ -386,6 +420,7 @@ fn request(
         }
     }
     readonly.extend(tool_paths(&environment, home.as_deref()));
+    readonly.extend(drive_paths());
     readonly.sort();
     readonly.dedup();
     // The sandbox lets read-only win over read-write for the same path, so a
@@ -427,8 +462,35 @@ fn request(
                 .into_owned(),
         ),
         environment: Some(environment),
+        ui: Some(v1::UiPolicy {
+            disable: false,
+            ..Default::default()
+        }),
         ..ContainerRequest::new(command)
     }
+}
+
+/// Windows: every drive's root and its entries as they are now, all read-only;
+/// see [`settings`]. Drives that can't be listed, such as an empty card
+/// reader, are left out. Elsewhere, nothing.
+fn drive_paths() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        // SAFETY: takes no arguments and only returns a bit mask.
+        let drives = unsafe { windows_sys::Win32::Storage::FileSystem::GetLogicalDrives() };
+        let mut paths = Vec::new();
+        for letter in (0..26u8).filter(|index| drives & (1 << index) != 0) {
+            let root = PathBuf::from(format!("{}:\\", char::from(b'A' + letter)));
+            let Ok(entries) = std::fs::read_dir(&root) else {
+                continue;
+            };
+            paths.extend(entries.flatten().map(|entry| entry.path()));
+            paths.push(root);
+        }
+        paths
+    }
+    #[cfg(not(windows))]
+    Vec::new()
 }
 
 /// The folders holding the user's tools, resolved; see [`settings`].
@@ -648,6 +710,82 @@ mod tests {
         project.writable = true;
         sandboxes.set_project("thread", project);
         assert!(sandboxes.environment_note("thread").contains("writable"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_commands_read_every_drive_but_write_only_the_project() {
+        let root = TestRoot::new();
+        let zed = folder(&root.0, "zed");
+        let scratch = root.0.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let project = Project {
+            folders: vec![zed.clone()],
+            writable: true,
+        };
+        let request = request("dir", &project, &scratch, &HashMap::new());
+        let filesystem = request.filesystem.unwrap();
+        let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
+        for path in [format!("{system}\\"), format!("{system}\\Users")] {
+            assert!(filesystem.readonly_paths.contains(&path), "{path}");
+            assert!(!filesystem.readwrite_paths.contains(&path), "{path}");
+        }
+        let zed_path = resolved(&zed.path).unwrap().to_string_lossy().into_owned();
+        assert!(filesystem.readwrite_paths.contains(&zed_path));
+        assert!(!filesystem.readonly_paths.contains(&zed_path));
+    }
+
+    /// Git resolves its folder through every folder above it, which is why
+    /// Windows commands read every drive; see `settings`.
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn git_works_in_a_windows_project() {
+        if !v1::platform_support().is_supported {
+            return;
+        }
+        let git = |arguments: &[&str], folder: &Path| {
+            std::process::Command::new("git")
+                .args(arguments)
+                .current_dir(folder)
+                .output()
+                .is_ok_and(|output| output.status.success())
+        };
+        let root = TestRoot::new();
+        let repo = folder(&root.0, "repo");
+        std::fs::write(repo.path.join("notes.txt"), "one\n").unwrap();
+        if !git(&["init", "-q"], &repo.path) {
+            return;
+        }
+        let sandboxes = Sandboxes::new(root.0.join("scratch"), "test", EnvironmentSource::Process);
+        sandboxes.set_project(
+            "thread",
+            Project {
+                folders: vec![repo.clone()],
+                writable: true,
+            },
+        );
+        let status = sandboxes
+            .run("thread", "git --no-optional-locks status --short")
+            .await
+            .unwrap();
+        assert_eq!(status.exit_code, 0, "{status:?}");
+        assert!(status.stdout.contains("notes.txt"), "{status:?}");
+        let added = sandboxes.run("thread", "git add notes.txt").await.unwrap();
+        assert_eq!(added.exit_code, 0, "{added:?}");
+
+        let ssh = std::env::home_dir().unwrap().join(".ssh");
+        if let Some(key) = std::fs::read_dir(&ssh)
+            .ok()
+            .and_then(|mut entries| entries.find_map(|entry| Some(entry.ok()?.path())))
+            .filter(|path| path.is_file())
+        {
+            let read = sandboxes
+                .run("thread", &format!("cmd /c type \"{}\"", key.display()))
+                .await
+                .unwrap();
+            assert_ne!(read.exit_code, 0, "credentials stay denied: {read:?}");
+        }
+        sandboxes.shutdown();
     }
 
     #[test]

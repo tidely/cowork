@@ -49,6 +49,7 @@ mod composer_attachments;
 mod draft_editing;
 
 mod highlight;
+
 mod model_picker;
 mod models;
 mod participant;
@@ -138,7 +139,8 @@ struct Cowork {
     /// Watches the open profile name dialog's input.
     profile_name_subscription: Option<Subscription>,
     tokio_handle: tokio::runtime::Handle,
-    /// Where the agent's shell commands run, one microVM per hosted thread.
+    /// Where the agent's shell commands run and its file tools reach, with
+    /// each hosted thread's project and scratch folder.
     sandboxes: Arc<sandbox::Sandboxes>,
     active_generations: HashMap<Uuid, ActiveGeneration>,
     /// Tokens used across local threads, excluding ones joined from someone

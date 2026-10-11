@@ -35,16 +35,37 @@ impl RunCommand {
     }
 }
 
-const DESCRIPTION: &str = "Run a shell command on the user's computer, inside a sandbox, and get \
-its exit code, stdout, and stderr. The shell is the platform's own (the system prompt names the \
-platform), and the user's installed tools and toolchains are available. Every call waits for the \
-user to allow it, except in a scheduled run, where the first such call is refused with an \
-explanation. Which project folders commands can read, whether they can change them, and the \
-folder commands start in are given in the latest <environment> note in the conversation. \
-Commands cannot read the user's other files and have no network access, so nothing can be \
-downloaded or installed. Each command can write a scratch folder, its HOME and TMPDIR, kept \
-for this conversation. Anything a command leaves running in the background is ended when it \
-exits.";
+const DESCRIPTION: &str = concat!(
+    "Run a shell command on the user's computer, inside a sandbox, and get its exit code, \
+     stdout, and stderr. The shell is the platform's own (the system prompt names the platform), \
+     and the user's installed tools and toolchains are available. Every call waits for the user \
+     to allow it, except in a scheduled run, where the first such call is refused with an \
+     explanation. Which project folders commands can use, whether they can change them, and the \
+     folder commands start in are given in the latest <environment> note in the conversation. ",
+    // Fixed per platform, so the definition stays the same within a session.
+    // See `settings` for why Windows differs.
+    reads!(),
+    " Commands have no network access, so nothing can be downloaded or installed. Each command \
+     can write a scratch folder, its HOME and TMPDIR, kept for this conversation. Anything a \
+     command leaves running in the background is ended when it exits."
+);
+
+#[cfg(windows)]
+macro_rules! reads {
+    () => {
+        "Commands can read the user's other files too, except credentials, but change nothing \
+         outside the project and the scratch folder; don't read outside the project unless the \
+         user asks."
+    };
+}
+
+#[cfg(not(windows))]
+macro_rules! reads {
+    () => {
+        "Commands cannot read the user's other files."
+    };
+}
+use reads;
 
 impl Tool for RunCommand {
     const NAME: &'static str = "run_command";

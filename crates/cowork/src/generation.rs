@@ -14,7 +14,7 @@ use agent::{Agent as StreamingAgent, AgentEvent, ToolDecision};
 use anyhow::Context as _;
 use gpui::{App, Context, Entity};
 use rig::{completion::Usage, message::CallId, providers::ollama::Ollama, tool::ToolSet};
-use sandbox::RunCommand;
+use sandbox::{ListDirectory, ReadFile, RunCommand, WriteFile};
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tools::{Calculate, RespondToComment};
@@ -63,6 +63,26 @@ fn platform_prompt() -> String {
          computer ({arch}): {shell}.",
         arch = std::env::consts::ARCH,
     )
+}
+
+/// The tools of a run of `thread`. The same definitions, in the same order,
+/// on every run, whatever the turn's comments, the thread, or its project:
+/// they are part of the prompt prefix, so changing them would invalidate the
+/// model's prompt cache. What changes reaches the model in the environment
+/// note instead.
+fn tool_set(
+    sandboxes: &Arc<sandbox::Sandboxes>,
+    thread: &str,
+    turn_comments: Arc<tools::TurnComments>,
+) -> ToolSet {
+    let mut tools = ToolSet::default();
+    tools.add_tool(RespondToComment::new(turn_comments));
+    tools.add_tool(Calculate);
+    tools.add_tool(RunCommand::new(sandboxes.clone(), thread));
+    tools.add_tool(ListDirectory::new(sandboxes.clone(), thread));
+    tools.add_tool(ReadFile::new(sandboxes.clone(), thread));
+    tools.add_tool(WriteFile::new(sandboxes.clone(), thread));
+    tools
 }
 
 /// What a finished run took, for the usage statistics.
@@ -176,7 +196,7 @@ impl Cowork {
             );
         });
         let (sender, mut receiver) = mpsc::unbounded_channel();
-        let run_command = RunCommand::new(self.sandboxes.clone(), thread_id.to_string());
+        let tools = tool_set(&self.sandboxes, &thread_id.to_string(), turn_comments);
         let gate = ApprovalGate::new(sender.clone(), scheduled);
         let cancelled = Arc::new(AtomicBool::new(false));
         let generation_task = self.tokio_handle.spawn(async move {
@@ -187,13 +207,6 @@ impl Cowork {
                 // accepts; the OpenAI-compatible route refuses the request.
                 ModelProvider::Ollama => Ollama::new().native_completion(selected_model.id),
             };
-            // The same tools on every run, whether or not a turn has comments:
-            // the definitions are part of the prompt prefix, so changing them
-            // would invalidate the model's prompt cache.
-            let mut tools = ToolSet::default();
-            tools.add_tool(RespondToComment::new(turn_comments));
-            tools.add_tool(Calculate);
-            tools.add_tool(run_command);
             StreamingAgent::new(model.erase(), tools)
                 .tool_hook(gate)
                 .preamble(system_prompt())
@@ -490,6 +503,77 @@ impl Cowork {
             .is_ok()
         {
             cx.notify();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rig::tool::Tool as _;
+
+    use super::*;
+
+    /// The definitions are the prompt prefix's, so nothing a conversation
+    /// changes may reach them: not the thread, its comments, its project's
+    /// folders or mode, nor where the scratch folders are.
+    #[test]
+    fn tool_definitions_never_change_within_a_session() {
+        let sandboxes = crate::test_support::unused_sandboxes();
+        let definitions = |sandboxes: &Arc<sandbox::Sandboxes>, thread: &str, comments| {
+            tool_set(
+                sandboxes,
+                thread,
+                Arc::new(tools::TurnComments::new(comments)),
+            )
+            .tool_definitions()
+        };
+        let first = definitions(&sandboxes, "thread-0f1e", 0);
+
+        let folder = std::env::temp_dir().join(format!(
+            "cowork-tool-definitions-{}",
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&folder).unwrap();
+        sandboxes.set_project(
+            "thread-0f1e",
+            sandbox::Project {
+                folders: vec![sandbox::ProjectFolder {
+                    name: "folder-5c2d".into(),
+                    path: folder.clone(),
+                }],
+                writable: true,
+            },
+        );
+        let changed = [
+            definitions(&sandboxes, "thread-0f1e", 0),
+            definitions(&sandboxes, "thread-0f1e", 3),
+            definitions(&sandboxes, "thread-9a8b", 1),
+            definitions(&crate::test_support::unused_sandboxes(), "thread-0f1e", 0),
+        ];
+        std::fs::remove_dir_all(&folder).unwrap();
+
+        for definitions in changed {
+            assert_eq!(definitions, first);
+        }
+        let names = first
+            .iter()
+            .map(|definition| definition.name.to_string())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            [
+                RespondToComment::NAME,
+                Calculate::NAME,
+                RunCommand::NAME,
+                ListDirectory::NAME,
+                ReadFile::NAME,
+                WriteFile::NAME,
+            ],
+            "in the same order every time"
+        );
+        let text = serde_json::to_string(&first).unwrap();
+        for host_specific in ["thread-0f1e", "folder-5c2d", &folder.to_string_lossy()] {
+            assert!(!text.contains(host_specific), "names {host_specific}");
         }
     }
 }

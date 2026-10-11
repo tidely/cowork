@@ -24,6 +24,7 @@ pub const PRINT_ENV_FLAG: &str = "--printenv";
 /// How long the login shell may take to print its environment before
 /// Cowork's own is used instead, so that a startup file waiting on input
 /// cannot stall every command.
+#[cfg(unix)]
 const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Variables of the captured environment that describe the capturing shell
@@ -262,6 +263,7 @@ fn passwd_shell() -> Option<std::path::PathBuf> {
 
 /// The first JSON object of strings in `output`, skipping whatever a shell
 /// printed around it.
+#[cfg(any(unix, test))]
 fn parse_noisy(output: &str) -> Option<HashMap<String, String>> {
     output.match_indices('{').find_map(|(position, _)| {
         let mut deserializer = serde_json::Deserializer::from_str(&output[position..]);

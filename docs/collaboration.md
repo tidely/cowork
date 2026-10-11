@@ -25,8 +25,8 @@ clearing membership. Denial feedback is routed to the originating thread.
 Agent events are checked on arrival in the order Rig's stream could produce
 them.
 Tool calls outside a short always-allowed list wait for the host or an
-`Admin` peer to allow or deny them, and `run_command` for the host alone; see
-[Tool approval](#tool-approval).
+`Admin` peer to allow or deny them, and `run_command` and `write_file` for the
+host alone; see [Tool approval](#tool-approval).
 The agent's commands run on the host's computer, contained by its operating
 system's sandbox, with the host's project folders read-only unless the project
 is in `Write` mode; collaborators see the folders by name with that mode, and
@@ -542,13 +542,17 @@ marked as stopped, so everyone can tell it apart from one that completed.
 
 The agent's calls to most tools wait for someone to allow them before they
 run. `tool_approval.rs` lists the tools whose calls always run
-(`ALWAYS_ALLOWED`, currently `respond_to_comment`, which only acts within the
-thread); every other tool's calls wait, so a newly added tool is asked about
-rather than trusted. `calculate` waits.
+(`ALWAYS_ALLOWED`: `respond_to_comment`, which only acts within the thread,
+and `list_directory` and `read_file`, which only read the folders the host
+shared with the thread and its scratch folder); every other tool's calls
+wait, so a newly added tool is asked about rather than trusted. `calculate`
+waits.
 
-`run_command` calls wait in either project mode, and only the host may
-decide them (`HOST_ONLY`): their commands use the host's own shell and tools,
-so even in `Read` mode they act on the host's computer.
+`run_command` and `write_file` calls wait in either project mode, and only
+the host may decide them (`HOST_ONLY`): `run_command`'s commands use the
+host's own shell and tools, so even in `Read` mode they act on the host's
+computer, and `write_file` changes the host's files, even when it writes the
+scratch folder.
 
 The agent loop asks a hook about each call before its tool runs (calls whose
 arguments could not be read never run, so are never asked about). The host's
@@ -638,15 +642,24 @@ returned; see `ROADMAP.md`.
   once, and that a malicious agent may be able to escape the sandbox.
 - The agent's commands run on the host's computer with its own shell,
   tools, and login shell environment, each contained by the operating
-  system's sandbox (Seatbelt, Bubblewrap, or an AppContainer, through
-  mxc-sdk). They see the folders at their real paths, the host's real files
-  live: read-only in `Read`, enforced by the sandbox, and in `Write` the
-  agent's changes apply to the host at once. They start in the first
-  folder. Each thread also has a scratch folder, its commands' `HOME` and
-  `TMPDIR`, kept until the thread is deleted or Cowork quits. Commands
-  cannot read the host's other files, nor credentials such as `~/.ssh` even
-  inside granted folders, and have no network. Every setting is in the
-  sandbox crate's `settings.rs`.
+  system's sandbox (Seatbelt, Bubblewrap, or a Windows process container,
+  through mxc-sdk). They see the folders at their real paths, the host's
+  real files live: read-only in `Read`, enforced by the sandbox, and in
+  `Write` the agent's changes apply to the host at once. They start in the
+  first folder, or the scratch folder without one. Each thread also has a
+  scratch folder, its commands' `HOME` and `TMPDIR`, kept until the thread
+  is deleted or Cowork quits. On macOS and Linux commands cannot read the
+  host's other files; on Windows they can read every drive, as Codex's
+  sandbox does, since `git` and others resolve the folders above a project.
+  Nowhere can they read credentials such as `~/.ssh`, even inside granted
+  folders, and they have no network. Every setting is in the sandbox
+  crate's `settings.rs`.
+- The file tools `list_directory`, `read_file`, and `write_file` reach the
+  same folders from the host process rather than a sandboxed command, by
+  folder name (`myproject/src/main.rs`) or `scratch://` for the scratch
+  folder. `write_file` writes project folders only in `Write` mode, and
+  scratch always. Every path they accept is mapped in the sandbox crate's
+  `paths.rs`.
 - Each command is contained by the project as it is when the command
   starts, so a change applies from the next command, with nothing to
   restart or confirm; commands already running keep the access they started
@@ -654,8 +667,8 @@ returned; see `ROADMAP.md`.
 - The agent learns the folders' paths, the mode, where commands start, and
   the scratch folder from an `<environment>` note the host puts first in a
   run's prompt whenever it differs from the latest one in the transcript.
-  The note, not the `run_command` definition, carries what changes, so the
-  tools and system prompt stay a stable prompt prefix. The system prompt
+  The note, not the tool definitions, carries what changes, so the tools
+  and system prompt stay a stable prompt prefix. The system prompt
   names the host's platform, which decides the shell.
 
 This is independent of the draft document and is the first feature to build.

@@ -5,8 +5,9 @@
 //! Commands run on the host, in the host's own shell (`/bin/sh` on macOS and
 //! Linux, the command line as given on Windows), contained by the operating
 //! system's own sandbox through [mxc-sdk]: Seatbelt on macOS, Bubblewrap on
-//! Linux (the `bwrap` program must be installed), and an AppContainer on
-//! Windows. Each command is its own sandbox, made from the thread's project
+//! Linux (the `bwrap` program must be installed), and a process container on
+//! Windows (a BaseContainer where Windows supports it, an AppContainer
+//! otherwise). Each command is its own sandbox, made from the thread's project
 //! as it is when the command starts; nothing is booted or kept between them.
 //!
 //! What a command may do, with each sandbox denying everything not granted:
@@ -19,10 +20,23 @@
 //!   backend), every folder on the user's `PATH` with its prefix (see
 //!   [`TOOL_PREFIX_DIRS`]), the toolchain folders named by well-known variables
 //!   such as `CARGO_HOME` or `GOROOT`, and [`TOOLCHAIN_HOMES`].
+//! - On Windows only, read every file on every drive, as Codex's sandbox
+//!   does: each drive's root and, as root grants may not reach below it, each
+//!   of its entries when the command starts. Programs there resolve their
+//!   folder's full path through every folder above it, so without this `git`,
+//!   PowerShell, and others fail in any project. This includes the user's
+//!   other files; macOS and Linux don't need it, and stay limited to the
+//!   folders above. In a read-only project, `git` commands that need the
+//!   work tree, such as `status` and `diff`, still fail ("must be run in a
+//!   work tree"), while `log` and `show` work: the sandbox denies changing
+//!   back to a read-only folder (`git --work-tree=. status` says "cannot come
+//!   back to cwd"). Codex's read-only sandbox fails the same way.
 //! - Nothing in [`DENIED_PATHS`], even inside a folder granted above.
 //! - No network: neither outbound nor inbound connections, loopback
 //!   included.
-//! - No windows, clipboard, or input injection.
+//! - No clipboard or input injection. The desktop is not disabled: on
+//!   Windows, a console program in a sandbox without one fails to start (`0xC0000142`), and that includes `git`, `cargo`, and
+//!   PowerShell.
 //!
 //! Environment: the user's login shell environment, captured once the way
 //! Zed does (see [`crate::environment`]), with `HOME` and `TMPDIR` pointing at
