@@ -13,7 +13,7 @@ Cowork is a GPUI desktop app for collaborating on LLM agent threads (Ollama via 
   - Other: `attachments.rs` (reading and classifying files), `usage.rs` (token usage and the activity chart), `statistics.rs` (saving the profile page's statistics to `~/.cowork/statistics.json`; threads aren't saved, as Rig's encoding of their transcripts still changes, so a chat from an earlier session counts as a deleted one).
 - `crates/draft` — the collaborative draft as a Yrs CRDT document (prompt blocks, comments, attachment records) plus `verify_change` validation. No GPUI or networking dependencies; keep it that way.
 - `crates/agent` — minimal multi-turn agent loop on Rig's low-level completion stream (see its `README.md` for why it exists instead of Rig's agent). Its `AgentEvent`s fully describe a run, and `TurnFold` folds them into history; the host forwards them and every participant folds them. Replies are built only from the content Rig's part ends carry, in the parts' positions; fragments only feed the in-progress preview. `TurnFold` checks model events with Rig's `Transcript::push` and refuses out-of-order ones. Test turns are scripted with `agent::test_support::turn`, which runs Rig's mock model so the events are exactly Rig's; `Part` has no public constructor, so tests needing hand-written events read them from JSON.
-- `crates/tools` — Rig tools exposed to the model (`respond_to_comment`).
+- `crates/tools` — Rig tools exposed to the model (`respond_to_comment`, `calculate`).
 - `crates/sandbox` — the `run_command` tool: the agent's shell commands run in a microsandbox microVM per hosted thread. Every setting (no network, no host files but the project's folders at `/projects`, read-only unless writable, unprivileged user, pinned image digest, limits) is a documented constant in `src/settings.rs`; keep it the single place to read them. `src/project.rs` has the mounted `Project` and folder naming; a changed project restarts the thread's VM before its next command. Only the host may allow its calls (`tool_approval::HOST_ONLY`). `cargo test -p sandbox --test vm -- --ignored` boots real VMs.
 - `docs/collaboration.md` — the spec for collaborative drafts, the document layout, protocol, and host validation. Read the relevant section before touching draft sync, presence, submission, or attachment transfer, and update it (including its "Status" section) when behavior changes.
 - `TODO.md` — the owner's feature notes; don't edit unless asked.
@@ -49,7 +49,7 @@ For Python scripting, use the `uv` package manager.
 ## Making Changes
 
 - **Protocol**: bump `PROTOCOL_VERSION` in `crates/cowork/src/protocol.rs` on any change to wire messages or to model identifier semantics, and on every Rig upgrade: transcript messages and agent events travel in Rig's serde encoding. Never change the encoding of `CollaboratorMessage::Join` or `HostMessage::Rejected`: keep their variant index, and keep `Join`'s version as its only field. `version_handshake_encoding_is_stable` checks this. Nothing is persisted, so there's no backward compatibility to maintain beyond that.
-- **GPUI pins**: `gpui`/`gpui_platform` are pinned `=0.3.7` to match the snapshot the upstream gpui-kit (`longbridge/gpui-kit`) revision uses. Upgrade them together, never one alone.
+- **GPUI pins**: `gpui`/`gpui_platform` (the `gpui-pre`/`gpui-pre-platform` packages) are pinned `=0.3.8` to match the GPUI snapshot the gpui-kit release (`gpui-component` and friends) pins. Upgrade them together, never one alone.
 
 ## Testing
 

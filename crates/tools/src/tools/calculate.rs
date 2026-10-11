@@ -58,7 +58,10 @@ impl Tool for Calculate {
     type Output = Calculation;
 
     fn description(&self) -> String {
-        "Calculate the sum, difference, product, or quotient of two numbers. Use for arithmetic rather than estimating.".into()
+        "Calculate the sum, difference, product, or quotient of two numbers. Use for arithmetic rather than estimating. \
+         Operands and the result are 64-bit floating-point numbers, so very large integers and decimal fractions may be rounded. \
+         It returns an error, and no result, for non-finite operands, a zero divisor, or a result that overflows."
+            .into()
     }
 
     fn parameters(&self) -> serde_json::Value {

@@ -87,7 +87,8 @@ impl Tool for RunCommand {
         format!(
             "Run a shell command with /bin/sh -c in an isolated Alpine Linux virtual machine, \
              and get its exit code, stdout, and stderr. While the project is read-only calls run \
-                          at once; when the user allowed writing, every call waits for a person to allow it. \
+             at once; when the user allowed writing, every call waits for a person to allow it, \
+             except in a scheduled run, where the first such call is refused with an explanation. \
              Use POSIX sh (BusyBox ash), not Bash. Basic BusyBox utilities are available, \
              including ls, cat, printf, grep, sed, awk, find, sort, and tar. Bash, git, Python, \
              Node.js, and Rust toolchains are not installed. Check other commands with \
@@ -99,15 +100,19 @@ impl Tool for RunCommand {
              Commands run as an unprivileged user starting in {workdir}; besides a writable \
              project, only {scratch} and similar scratch locations are writable, so put other \
              files there. Files persist between calls \
-             in this conversation until the machine has been idle for {idle} minutes, or until \
-             the user changes the project, which starts a fresh machine (the output then says \
-             `sandbox_restarted`). A command is killed after {timeout} seconds, or once it \
+             in this conversation until the machine has been idle for {idle} minutes or has run \
+             for {lifetime} hours in total, either of which discards it, or until the user changes \
+             the project, which starts a fresh machine (the output then says \
+             `sandbox_restarted`). A command longer than {max_command} KiB is refused. \
+             A command is killed after {timeout} seconds, or once it \
              writes more than {limit} KiB to stdout or stderr. Nothing can be installed, as \
              there is no network.",
             projects = settings::PROJECTS_DIR,
             workdir = settings::WORKDIR,
             scratch = settings::SCRATCH_DIR,
             idle = settings::IDLE_TIMEOUT.as_secs() / 60,
+            lifetime = settings::MAX_DURATION.as_secs() / 3600,
+            max_command = settings::MAX_COMMAND_BYTES / 1024,
             timeout = settings::COMMAND_TIMEOUT.as_secs(),
             limit = settings::OUTPUT_LIMIT / 1024,
         )

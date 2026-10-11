@@ -339,31 +339,6 @@ pub(super) struct BenchRoot {
     draws: usize,
 }
 
-impl BenchRoot {
-    /// The same production stage and phase instrumentation for live profiling.
-    pub(super) fn stage(cowork: Entity<Cowork>) -> Self {
-        Self {
-            cowork,
-            reply_views: Vec::new(),
-            count: 0,
-            mode: Mode::Stage,
-            construction: None,
-            phases: Rc::new(Cell::new(EditorPhases::default())),
-            profile_totals: Some(Rc::new(Cell::new(EditorPhases::default()))),
-            draws: 0,
-        }
-    }
-
-    pub(super) fn draws(&self) -> usize {
-        self.draws
-    }
-
-    /// Inclusive phase totals across scheduled draws, even when an element is cached.
-    pub(super) fn profile_phases(&self) -> EditorPhases {
-        self.profile_totals.as_ref().expect("profile stage").get()
-    }
-}
-
 impl Render for BenchRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.draws += 1;
