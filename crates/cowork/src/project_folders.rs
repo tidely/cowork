@@ -39,6 +39,7 @@ pub(crate) struct ProjectFolder {
 impl ProjectFolder {
     /// A folder on this machine, named by its last component; see
     /// [`add_folders`] for the names a project gives its folders.
+    #[cfg(test)]
     pub(crate) fn local(path: PathBuf) -> Self {
         Self {
             name: sandbox::folder_name(&path).into(),

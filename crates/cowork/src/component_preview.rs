@@ -1,21 +1,21 @@
-//! A window showing components in their states, side by side in a grid, to
-//! review them before anything in the app puts them in those states. `cargo
-//! run -p cowork --example component_preview` opens it.
+//! A window showing the tool call card for each kind of call the agent can
+//! make, in each project mode, as the host sees it: a row per call and a
+//! column per mode. Combinations that run without asking show that instead
+//! of a card. `cargo run -p cowork --example component_preview` opens it.
 
 use gpui::{
-    App, Context, IntoElement, Pixels, QuitMode, Render, SharedString, Window, WindowBounds,
-    WindowOptions, div, prelude::*, px, size,
+    AnyElement, App, Context, FontWeight, IntoElement, Pixels, QuitMode, Render, SharedString,
+    Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 use gpui_component::{ActiveTheme as _, Root};
-use rig::message::{CallId, ToolCall, ToolFunction, ToolName};
+use rig::{
+    message::{CallId, ToolCall, ToolFunction, ToolName},
+    tool::Tool as _,
+};
+use sandbox::{Access, RunCommand};
 use serde_json::json;
 
-use std::path::PathBuf;
-
-use crate::{
-    project_folders::{ProjectFolder, ProjectFolders},
-    tool_call_card::ToolCallCard,
-};
+use crate::{project_mode::ProjectMode, tool_call_card::ToolCallCard};
 
 /// Runs the preview until its window closes, as the app's own run does.
 pub fn run() -> anyhow::Result<()> {
@@ -34,9 +34,8 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The narrowest a grid cell may be, about the width of a card in a
-/// thread; the grid fits as many columns as allow it.
-const MIN_CELL_WIDTH: Pixels = px(460.);
+/// The columns, least access first.
+const MODES: [ProjectMode; 3] = [ProjectMode::Read, ProjectMode::Write, ProjectMode::Network];
 /// Gaps between cells and around the grid.
 const SPACING: Pixels = px(24.);
 
@@ -67,214 +66,224 @@ struct ComponentPreview {
 }
 
 impl ComponentPreview {
-    fn section(
-        title: &'static str,
-        card: impl IntoElement,
+    /// `call`'s card in a project with `mode`, or a note that it runs
+    /// without asking there.
+    fn cell(
+        &self,
+        key: &str,
+        call: &ToolCall,
+        mode: ProjectMode,
         cx: &Context<Self>,
-    ) -> impl IntoElement {
-        div()
-            .min_w_0()
-            .flex()
-            .flex_col()
-            .gap_1p5()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(title),
+    ) -> AnyElement {
+        if !asks(call, mode.access()) {
+            return div()
+                .px_3()
+                .py_2p5()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().border.opacity(0.5))
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child("Runs without asking")
+                .into_any_element();
+        }
+        let label = format!("{} in {}", call.function.name, mode.label());
+        let allowed = SharedString::from(format!("Allowed {label}"));
+        let denied = SharedString::from(format!("Denied {label}"));
+        ToolCallCard::new(format!("preview-{key}-{}", mode.key()), call.clone())
+            .project_access(mode.access())
+            .host_only()
+            .decide(
+                cx.listener(move |this, _, _, cx| {
+                    this.last_click = Some(allowed.clone());
+                    cx.notify();
+                }),
+                cx.listener(move |this, _, _, cx| {
+                    this.last_click = Some(denied.clone());
+                    cx.notify();
+                }),
             )
-            .child(card)
-    }
-
-    /// The host's project, whose button and menus report clicks in the
-    /// header.
-    fn project(&self, id: &'static str, folders: &[&str], cx: &Context<Self>) -> ProjectFolders {
-        let folders = folders
-            .iter()
-            .map(|path| ProjectFolder::local(PathBuf::from(path)))
-            .collect();
-        ProjectFolders::new(id, folders).editable(
-            cx.listener(|this, _, _, cx| {
-                this.last_click = Some("Add a folder".into());
-                cx.notify();
-            }),
-            cx.listener(|this, path: &std::path::Path, _, cx| {
-                this.last_click = Some(format!("Open {}", path.display()).into());
-                cx.notify();
-            }),
-            cx.listener(|this, path: &std::path::Path, _, cx| {
-                this.last_click = Some(format!("Remove {}", path.display()).into());
-                cx.notify();
-            }),
-        )
-    }
-
-    /// A card offering a decision that reports clicks in the header.
-    fn deciding(&self, id: &'static str, call: ToolCall, cx: &Context<Self>) -> ToolCallCard {
-        let name = call.function.name.to_string();
-        let allowed = SharedString::from(format!("Allowed {name}"));
-        let denied = SharedString::from(format!("Denied {name}"));
-        ToolCallCard::new(id, call).decide(
-            cx.listener(move |this, _, _, cx| {
-                this.last_click = Some(allowed.clone());
-                cx.notify();
-            }),
-            cx.listener(move |this, _, _, cx| {
-                this.last_click = Some(denied.clone());
-                cx.notify();
-            }),
-        )
+            .into_any_element()
     }
 }
 
 impl Render for ComponentPreview {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let width = window.viewport_size().width - SPACING * 2.;
-        let columns = ((width + SPACING) / (MIN_CELL_WIDTH + SPACING)).floor() as u16;
-        let grid = || {
-            div()
-                .grid()
-                .grid_cols(columns.max(1))
-                .gap(SPACING)
-                .items_start()
-        };
-        div()
-            .id("component-preview")
-            .size_full()
-            .overflow_y_scroll()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let cx = &*cx;
+        let muted = cx.theme().muted_foreground;
+        let grid = || div().grid().grid_cols(3).gap(SPACING).items_start();
+        // Above the scrolling rows, so the columns stay named.
+        let header = div()
+            .flex_none()
+            .px(SPACING)
+            .pt(SPACING)
+            .pb_3()
+            .flex()
+            .flex_col()
+            .gap_4()
+            .border_b_1()
+            .border_color(cx.theme().border)
             .child(
                 div()
-                    .p(SPACING)
                     .flex()
-                    .flex_col()
-                    .gap(SPACING)
+                    .justify_between()
+                    .child(div().text_lg().child("Tool call cards by project mode"))
+                    .child(
+                        div().text_sm().text_color(muted).child(
+                            self.last_click
+                                .clone()
+                                .unwrap_or_else(|| "Nothing clicked yet".into()),
+                        ),
+                    ),
+            )
+            .child(grid().children(MODES.map(|mode| {
+                div()
+                    .text_sm()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(format!("{} project", mode.label()))
+            })));
+        let rows = combinations().into_iter().map(|(key, title, call)| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .child(div().text_xs().text_color(muted).child(title))
+                .child(grid().children(MODES.map(|mode| self.cell(key, &call, mode, cx))))
+        });
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .child(header)
+            .child(
+                div()
+                    .id("component-preview")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
                     .child(
                         div()
+                            .p(SPACING)
                             .flex()
-                            .justify_between()
-                            .child(div().text_lg().child("Tool call card"))
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(
-                                        self.last_click
-                                            .clone()
-                                            .unwrap_or_else(|| "Nothing clicked yet".into()),
-                                    ),
-                            ),
-                    )
-                    .child(grid()
-                    .child(Self::section(
-                        "An admin, who may decide",
-                        self.deciding("preview-calculate", calculate(), cx),
-                        cx,
-                    ))
-                    .child(Self::section(
-                        "Anyone else, who waits",
-                        ToolCallCard::new("preview-calculate-waiting", calculate()),
-                        cx,
-                    ))
-                    .child(Self::section(
-                        "A sandbox command, which only the host may allow",
-                        self.deciding("preview-command", run_command(), cx)
-                            .host_only(),
-                        cx,
-                    ))
-                    .child(Self::section(
-                        "A sandbox command waiting for the host",
-                        ToolCallCard::new("preview-command-waiting", run_command()).host_only(),
-                        cx,
-                    ))
-                    .child(Self::section(
-                        "A command asking for network access in a Read project",
-                        self.deciding("preview-command-network", network_command(), cx)
-                            .project_access(sandbox::Access::Read)
-                            .host_only(),
-                        cx,
-                    ))
-                    .child(Self::section(
-                        "A command asking to change a folder outside the project",
-                        self.deciding("preview-command-folders", folder_command(), cx)
-                            .project_access(sandbox::Access::Read)
-                            .host_only(),
-                        cx,
-                    ))
-                    .child(Self::section(
-                        "The agent asking for permissions for the rest of its turn",
-                        self.deciding("preview-request-permissions", permission_request(), cx)
-                            .project_access(sandbox::Access::Read)
-                            .host_only(),
-                        cx,
-                    ))
-                    .child(Self::section(
-                        "A long command with a visible scrolling hint",
-                        self.deciding("preview-long-command", long_command(), cx)
-                            .host_only(),
-                        cx,
-                    ))
-                    .child(Self::section(
-                        "Long and nested arguments",
-                        self.deciding("preview-long", long_arguments(), cx),
-                        cx,
-                    ))
-                    .child(Self::section(
-                        "No arguments",
-                        self.deciding("preview-empty", no_arguments(), cx),
-                        cx,
-                    ))
-                    .child(Self::section(
-                        "A custom body, as a tool's own card would pass",
-                        self.deciding("preview-custom", respond_to_comment(), cx)
-                            .body(custom_body(cx)),
-                        cx,
-                    )))
-                    .child(div().text_lg().child("Project folders"))
-                    .child(grid()
-                    .child(Self::section(
-                        "No folders yet",
-                        self.project("preview-project-empty", &[], cx),
-                        cx,
-                    ))
-                    .child(Self::section(
-                        "One folder",
-                        self.project("preview-project-one", &["/home/me/src/zed"], cx),
-                        cx,
-                    ))
-                    .child(Self::section(
-                        "Several folders, named by the first",
-                        self.project(
-                            "preview-project-several",
-                            &[
-                                "/home/me/src/zed",
-                                "/home/me/src/cowork",
-                                "/home/me/src/rig",
-                            ],
-                            cx,
-                        ),
-                        cx,
-                    ))
-                    .child(Self::section(
-                        "A long folder name",
-                        self.project(
-                            "preview-project-long",
-                            &["/home/me/src/a-folder-whose-name-is-far-too-long-to-show-in-full"],
-                            cx,
-                        ),
-                        cx,
-                    ))
-                    .child(Self::section(
-                        "A collaborator's view, with names only",
-                        ProjectFolders::new(
-                            "preview-project-mirrored",
-                            ProjectFolder::mirrored(vec!["zed".into(), "cowork".into()]),
-                        ),
-                        cx,
-                    ))),
+                            .flex_col()
+                            .gap(SPACING)
+                            .children(rows),
+                    ),
             )
     }
+}
+
+/// Whether `call` waits for the host in a project with `project` access,
+/// as `tool_approval` decides at the start of a run: a command with read
+/// access and no folders runs at once, and every other call asks.
+fn asks(call: &ToolCall, project: Access) -> bool {
+    if call.function.name.as_str() != RunCommand::NAME {
+        return true;
+    }
+    let arguments = call.function.arguments_value();
+    let access = RunCommand::requested_access(&arguments).unwrap_or(project);
+    let (read, write) = RunCommand::named_folders(&arguments);
+    access > Access::Read || !read.is_empty() || !write.is_empty()
+}
+
+/// The rows: each kind of call the agent can make about permissions.
+fn combinations() -> Vec<(&'static str, &'static str, ToolCall)> {
+    vec![
+        (
+            "command",
+            "A command using the project's mode",
+            tool_call("run_command", json!({"command": "cargo test"})),
+        ),
+        (
+            "command-read",
+            "A command asking for Read",
+            tool_call(
+                "run_command",
+                json!({"command": "git log --oneline -5", "access": "read"}),
+            ),
+        ),
+        (
+            "command-write",
+            "A command asking for Write",
+            tool_call(
+                "run_command",
+                json!({"command": "cargo fmt", "access": "write"}),
+            ),
+        ),
+        (
+            "command-network",
+            "A command asking for Write + Network",
+            tool_call(
+                "run_command",
+                json!({"command": "cargo fetch", "access": "network"}),
+            ),
+        ),
+        (
+            "command-read-folder",
+            "A command reading a folder outside the project",
+            tool_call(
+                "run_command",
+                json!({"command": "ls /opt/shared/docs", "read_folders": ["/opt/shared/docs"]}),
+            ),
+        ),
+        (
+            "command-write-folder",
+            "A command changing a folder outside the project",
+            tool_call(
+                "run_command",
+                json!({
+                    "command": "cargo new ~/github/agent",
+                    "write_folders": ["~/github"],
+                }),
+            ),
+        ),
+        (
+            "command-network-folder",
+            "A command asking for Write + Network and a folder outside the project",
+            tool_call(
+                "run_command",
+                json!({
+                    "command": "cargo fetch",
+                    "access": "network",
+                    "write_folders": ["~/.cargo"],
+                }),
+            ),
+        ),
+        (
+            "permissions-write",
+            "Permissions for the turn: Write",
+            tool_call(
+                "request_permissions",
+                json!({"reason": "Format the code and fix the lints.", "access": "write"}),
+            ),
+        ),
+        (
+            "permissions-network",
+            "Permissions for the turn: Write + Network and folders",
+            tool_call(
+                "request_permissions",
+                json!({
+                    "reason": "Download the project's dependencies and build it.",
+                    "access": "network",
+                    "write_folders": ["~/.cargo", "~/.rustup"],
+                    "read_folders": ["/opt/shared/docs"],
+                }),
+            ),
+        ),
+        (
+            "permissions-read-folder",
+            "Permissions for the turn: reading a folder outside the project",
+            tool_call(
+                "request_permissions",
+                json!({
+                    "reason": "Check the shared docs for the API's conventions.",
+                    "read_folders": ["/opt/shared/docs"],
+                }),
+            ),
+        ),
+    ]
 }
 
 fn tool_call(name: &str, arguments: serde_json::Value) -> ToolCall {
@@ -282,111 +291,4 @@ fn tool_call(name: &str, arguments: serde_json::Value) -> ToolCall {
         CallId::from_wire(format!("preview_{name}")),
         ToolFunction::new(ToolName::new(name).expect("a valid name"), arguments),
     )
-}
-
-fn calculate() -> ToolCall {
-    tool_call(
-        "calculate",
-        json!({"a": 12, "b": 30, "operation": "multiply"}),
-    )
-}
-
-fn network_command() -> ToolCall {
-    tool_call(
-        "run_command",
-        json!({"command": "cargo fetch", "access": "network"}),
-    )
-}
-
-fn folder_command() -> ToolCall {
-    tool_call(
-        "run_command",
-        json!({
-            "command": "cargo fetch",
-            "access": "network",
-            "write_folders": ["~/.cargo"],
-        }),
-    )
-}
-
-fn permission_request() -> ToolCall {
-    tool_call(
-        "request_permissions",
-        json!({
-            "reason": "Download the project's dependencies and build it.",
-            "access": "network",
-            "write_folders": ["~/.cargo", "~/.rustup"],
-            "read_folders": ["/opt/shared/docs"],
-        }),
-    )
-}
-
-fn run_command() -> ToolCall {
-    tool_call(
-        "run_command",
-        json!({"command": "# Inspect Rust sources\nfor file in src/*.rs; do\n    printf '%s\\n' \"$file\"\n    grep -n 'TODO' \"$file\" | sort -n\ndone"}),
-    )
-}
-
-fn long_command() -> ToolCall {
-    let command = (1..=30)
-        .map(|line| format!("printf '%s\\n' 'Step {line}'"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    tool_call("run_command", json!({"command": command}))
-}
-
-fn respond_to_comment() -> ToolCall {
-    tool_call(
-        "respond_to_comment",
-        json!({
-            "comment_id": "comment_2",
-            "response": "Good catch: the retry loop never resets its backoff, so after one slow \
-                response every later request waits the full maximum. Resetting it on success fixes \
-                that.",
-        }),
-    )
-}
-
-fn long_arguments() -> ToolCall {
-    tool_call(
-        "search_files",
-        json!({
-            "query": "PROTOCOL_VERSION",
-            "include": ["crates/**/*.rs", "docs/**/*.md"],
-            "options": {"case_sensitive": true, "max_results": 50},
-            "explanation": "Every place the protocol version is read or bumped, to check that the \
-                handshake test still covers the variants this change touches.",
-        }),
-    )
-}
-
-fn no_arguments() -> ToolCall {
-    tool_call("list_models", json!({}))
-}
-
-/// What a `respond_to_comment` card might show instead of raw arguments.
-fn custom_body(cx: &Context<ComponentPreview>) -> impl IntoElement {
-    div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .text_sm()
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child("Reply to comment 2"),
-        )
-        .child(
-            div()
-                .pl_3()
-                .border_l_2()
-                .border_color(cx.theme().border)
-                .child(
-                    "Good catch: the retry loop never resets its backoff, so after one slow \
-                     response every later request waits the full maximum. Resetting it on success \
-                     fixes that.",
-                ),
-        )
 }

@@ -26,6 +26,7 @@
 //!   backend), every folder on the user's `PATH` with its prefix (see
 //!   [`TOOL_PREFIX_DIRS`]), the toolchain folders named by well-known variables
 //!   such as `CARGO_HOME` or `GOROOT`, and [`TOOLCHAIN_HOMES`].
+//! - Read the user's git settings in [`READABLE_CONFIG`].
 //! - On Windows only, read every file on every drive, as Codex's sandbox
 //!   does: each drive's root and, as root grants may not reach below it, each
 //!   of its entries when the command starts. Programs there resolve their
@@ -82,6 +83,15 @@ pub const TOOL_PREFIX_DIRS: &[&str] = &["bin", "sbin"];
 /// `~/.cargo/bin` need `~/.rustup`, which isn't on `PATH`.
 pub const TOOLCHAIN_HOMES: &[(&str, &str)] =
     &[("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")];
+
+/// The user's own settings commands may read, relative to the user's home,
+/// granted read-only when they exist: git's global config, and its other
+/// config, global ignore, and attributes files in `.config/git`. With the
+/// real `HOME`, git finds `~/.gitconfig` and fails outright when it may not
+/// read it, and without it commits lack the user's identity. Files these
+/// include from elsewhere are not granted. Never writable, and the
+/// credentials git may use stay in [`DENIED_PATHS`].
+pub const READABLE_CONFIG: &[&str] = &[".gitconfig", ".config/git"];
 
 /// Credentials commands may not read even where a granted folder holds
 /// them, relative to the user's home. Only paths that exist are passed on, as

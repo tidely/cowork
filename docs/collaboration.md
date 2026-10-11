@@ -26,7 +26,8 @@ Agent events are checked on arrival in the order Rig's stream could produce
 them.
 Tool calls outside a short always-allowed list wait for the host or an
 `Admin` peer to allow or deny them, and `run_command`, `write_file`, and `request_permissions` for the
-host alone; commands with read access run without asking, a command may
+host alone; commands with read access run without asking, as does
+`write_file` in `Write` and `Write + Network`, a command may
 ask for more access than the mode, or for folders outside the project, for
 itself alone, and `request_permissions` asks for either for the rest of the
 run. See [Tool approval](#tool-approval).
@@ -569,6 +570,12 @@ whichever is more, and the granted folders are added to any they name.
 Grants are kept by the run's hook and end with the run; nothing is mirrored
 or saved. They reach only `run_command`, not the file tools.
 
+A `write_file` call runs at once when the project's mode is `Write` or
+`Write + Network`: the mode is the host saying the agent may change the
+project, and the tool can only write the project's folders and the scratch
+folder. It checks the mode again when it writes, so a mode lowered in
+between refuses the write. In `Read` it waits, even for the scratch folder.
+
 The host's hook resolves the folders a call names before anyone is asked:
 they must exist, and none may be in the sandbox's denied credential paths. A
 call naming one that can't be granted, or a request asking for nothing
@@ -592,9 +599,10 @@ folders it names, those it would change in the warning color. A
 for, and that later commands in the turn get them without asking.
 
 `run_command`, `write_file`, and `request_permissions` calls (in any mode)
-only the host may decide (`HOST_ONLY`): `run_command`'s commands use the
-host's own shell and tools on the host's computer, `write_file` changes the
-host's files, even when it writes the scratch folder, and
+only the host may decide (`HOST_ONLY`), when they wait: `run_command`'s
+commands use the host's own shell and tools on the host's computer,
+`write_file` changes the host's files, even when it writes the scratch
+folder, and
 `request_permissions` decides what later commands may do there. On Windows, commands read every drive except
 credentials (see `sandbox/src/settings.rs`), so a collaborator who may submit
 can have the agent read the host's other files into the transcript without

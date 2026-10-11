@@ -424,9 +424,10 @@ impl Tool for WriteFile {
              only when the latest <environment> note says the project's mode is write or \
              network, and changes \
              apply to the user's computer at once; the scratch folder can always be written, \
-             and suits notes and intermediate results that are not part of the project. Every \
-             call waits for the user to allow it, except in a scheduled run, where the first \
-             such call is refused with an explanation. {PATHS}"
+             and suits notes and intermediate results that are not part of the project. In write \
+             or network mode, calls run at once. In read mode, every call waits for the user \
+             to allow it, except in a scheduled run, where the first such call is refused with \
+             an explanation. {PATHS}"
         )
     }
 

@@ -5,7 +5,8 @@
 //! Kept in [`Thread::project_mode`] and, before the thread exists,
 //! [`Cowork::new_thread_project_mode`]. It is the access a command runs
 //! with unless it asks for other access of its own; commands with read
-//! access run without asking, and others wait for the host; see
+//! access run without asking, and others wait for the host. In `Write` and
+//! `Write + Network`, the agent's file writes run without asking too; see
 //! `tool_approval.rs`.
 
 use gpui::{Anchor, App, Context, IntoElement, SharedString, WeakEntity, div, prelude::*, px};
@@ -22,15 +23,12 @@ use serde::{Deserialize, Serialize};
 use crate::{Cowork, thread::Thread};
 
 /// Shown while hovering the Write option.
-pub(crate) const WRITE_WARNING: &str = "Commands you allow can change these folders on your \
-     computer at once, with your own tools. While they are sandboxed, a malicious agent may be \
-     able to run commands outside of the sandbox.";
+pub(crate) const WRITE_WARNING: &str = "The agent can edit files in your project folders. \
+     Its commands are sandboxed, but a malicious agent may be able to escape the sandbox.";
 
 /// Shown while hovering the Write + Network option.
-pub(crate) const NETWORK_WARNING: &str = "Commands you allow can change these folders on your \
-     computer at once, with your own tools, and reach the internet: they can download code and \
-     send out anything they can read. While they are sandboxed, a malicious agent may be able \
-     to run commands outside of the sandbox.";
+pub(crate) const NETWORK_WARNING: &str = "The agent can edit files in your project folders \
+     and access the internet. A malicious agent may leak your files, or run arbitrary code in a sandboxed environment.";
 
 /// What the agent's commands may do with the project. Its variant indices
 /// are its wire encoding: add new modes at the end.

@@ -460,6 +460,7 @@ fn request(
     readwrite.extend(granted.write.iter().cloned());
     readonly.extend(granted.read.iter().cloned());
     readonly.extend(tool_paths(&environment, home.as_deref()));
+    readonly.extend(config_paths(home.as_deref()));
     readonly.extend(drive_paths());
     readonly.sort();
     readonly.dedup();
@@ -575,6 +576,17 @@ fn tool_paths(environment: &[(String, String)], home: Option<&Path>) -> Vec<Path
         paths.extend(path.as_deref().and_then(resolved));
     }
     paths
+}
+
+/// The user's settings in [`settings::READABLE_CONFIG`] that exist, resolved.
+fn config_paths(home: Option<&Path>) -> Vec<PathBuf> {
+    home.into_iter()
+        .flat_map(|home| {
+            settings::READABLE_CONFIG
+                .iter()
+                .filter_map(move |path| resolved(&home.join(path)))
+        })
+        .collect()
 }
 
 /// Runs `request` to its end, or until `stopped`.
@@ -752,6 +764,53 @@ mod tests {
             ],
             "{output:?}"
         );
+        sandboxes.shutdown();
+    }
+
+    #[test]
+    fn git_settings_are_readable_when_they_exist() {
+        let home = TestRoot::new();
+        assert!(config_paths(Some(&home.0)).is_empty(), "none exist yet");
+        std::fs::write(home.0.join(".gitconfig"), "[user]\n\tname = Me\n").unwrap();
+        std::fs::create_dir_all(home.0.join(".config/git")).unwrap();
+        assert_eq!(
+            config_paths(Some(&home.0)),
+            [
+                resolved(&home.0.join(".gitconfig")).unwrap(),
+                resolved(&home.0.join(".config/git")).unwrap(),
+            ]
+        );
+        assert!(config_paths(None).is_empty());
+    }
+
+    /// git reads the user's identity from their real `~/.gitconfig`, when
+    /// this computer has one, but can't change it.
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn git_reads_the_users_config_but_cannot_change_it() {
+        let config = std::env::home_dir().unwrap().join(".gitconfig");
+        if !v1::platform_support().is_supported || !config.is_file() {
+            return;
+        }
+        let (sandboxes, _root) = test_sandboxes();
+        let read = sandboxes
+            .run(
+                "thread",
+                "git config --global --list >/dev/null && echo read",
+            )
+            .await
+            .unwrap();
+        assert_eq!(read.stdout, "read\n", "{read:?}");
+        let before = std::fs::read(&config).unwrap();
+        let write = sandboxes
+            .run(
+                "thread",
+                "git config --global cowork.sandboxtest yes 2>/dev/null || echo denied",
+            )
+            .await
+            .unwrap();
+        assert_eq!(write.stdout, "denied\n", "{write:?}");
+        assert_eq!(std::fs::read(&config).unwrap(), before);
         sandboxes.shutdown();
     }
 

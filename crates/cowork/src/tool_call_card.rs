@@ -94,6 +94,7 @@ impl ToolCallCard {
 
     /// Shows `body` instead of the arguments: a tool's own presentation of
     /// what the call would do.
+    #[expect(dead_code, reason = "for tools' own cards; none passes one yet")]
     pub(crate) fn body(mut self, body: impl IntoElement) -> Self {
         self.body = Some(body.into_any_element());
         self

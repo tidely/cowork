@@ -28,9 +28,14 @@
 //! it. An allowed call's grant is worked out when it is decided, as the card
 //! shows it then. Folders are resolved on the host before anyone is asked,
 //! and a call naming one that can't be granted is refused with why.
-//! `write_file` is asked about too, even when it writes the scratch folder.
-//! Listing and reading need no approval: they reach only the folders the
-//! host shared with the thread, and its scratch folder.
+//! `write_file` runs at once when the project's mode is write or network,
+//! as that mode is the host saying the agent may change the project: it can
+//! write only the project's folders and the scratch folder (see
+//! `sandbox::paths`), and checks the mode again when it writes, so a mode
+//! lowered in between refuses the write. In read mode it is asked about,
+//! even when it writes the scratch folder. Listing and reading need no
+//! approval: they reach only the folders the host shared with the thread,
+//! and its scratch folder.
 //!
 //! A scheduled run may have nobody around to answer, so it doesn't wait the
 //! first time: a call that needs approval fails at once, telling the model
@@ -221,7 +226,7 @@ impl ToolHook for ApprovalGate {
     fn before_tool_call<'a>(&'a self, call: &'a ToolCall) -> BoxFuture<'a, ToolDecision> {
         Box::pin(async move {
             let tool = call.function.name.as_str();
-            if !needs_approval(tool) {
+            if !needs_approval(tool) || self.writes_writable_project(tool) {
                 return ToolDecision::Allow;
             }
             let asked = match Self::asked(call) {
@@ -267,6 +272,12 @@ impl ToolHook for ApprovalGate {
 }
 
 impl ApprovalGate {
+    /// Whether `tool` is `write_file` in a project whose mode lets it
+    /// change the project's folders; see the module documentation.
+    fn writes_writable_project(&self, tool: &str) -> bool {
+        tool == WriteFile::NAME && self.sandboxes.project(&self.thread).writable()
+    }
+
     /// What `call` asks for, if it is a call of a tool that grants
     /// permissions, or why it can't be granted.
     fn asked(call: &ToolCall) -> Result<Option<Asked>, String> {
@@ -714,14 +725,36 @@ mod tests {
         }
     }
 
-    /// Writing a file is asked about in every mode.
+    /// Writing a file runs at once in write and network mode, even in a
+    /// scheduled run, and is asked about in read mode.
     #[tokio::test]
-    async fn writing_a_file_is_asked_about_in_read_mode_too() {
-        let (gate, mut asked, _) = gate_in(false, Access::Read);
-        assert_eq!(
-            decide_allowing(&gate, &call(WriteFile::NAME), &mut asked).await,
-            (ToolDecision::Allow, Some(WriteFile::NAME.to_owned()))
-        );
+    async fn writing_a_file_is_asked_about_only_in_read_mode() {
+        for (mode, asks) in [
+            (Access::Read, true),
+            (Access::Write, false),
+            (Access::Network, false),
+        ] {
+            let expected = (
+                ToolDecision::Allow,
+                asks.then(|| WriteFile::NAME.to_owned()),
+            );
+            let (gate, mut asked, _) = gate_in(false, mode);
+            assert_eq!(
+                decide_allowing(&gate, &call(WriteFile::NAME), &mut asked).await,
+                expected,
+                "{mode:?}"
+            );
+            let (gate, mut asked, _) = gate_in(true, mode);
+            let decided = decide_allowing(&gate, &call(WriteFile::NAME), &mut asked).await;
+            if asks {
+                assert!(
+                    matches!(decided, (ToolDecision::Deny { .. }, None)),
+                    "{mode:?}"
+                );
+            } else {
+                assert_eq!(decided, (ToolDecision::Allow, None), "{mode:?}");
+            }
+        }
     }
 
     /// A waiting command is allowed with the access its card shows when
