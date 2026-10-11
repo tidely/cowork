@@ -7,12 +7,19 @@
 //! approve tool calls (the host, and `Admin` peers) then allows or denies it
 //! through the same checked path; the first decision wins and the run goes on.
 //! Calls of [`HOST_ONLY`] tools, which act on the host's computer, only the
-//! host may decide. `run_command` runs at once while the project is
-//! read-only, as Codex's read-only mode does: the sandbox lets such a command
-//! change only the thread's scratch folder, and it stays read-only even if
-//! the project becomes writable before it starts. While the project is
-//! writable, every command is asked about. `write_file` is asked about too,
-//! even when it writes the scratch folder. Listing and reading need no
+//! host may decide.
+//!
+//! A `run_command` call runs with the project's mode's access unless it asks
+//! for other access of its own, for that command only (see
+//! [`RunCommand::access`]). A command with read access runs at once, as in
+//! Codex's read-only mode: the sandbox lets it change only the thread's
+//! scratch folder. Every other command is asked about, including one asking
+//! for more than the mode, which is how the agent asks for higher
+//! permissions for one command. Either way the command is granted exactly
+//! the access it was let through or allowed with, so a mode changed before
+//! it starts changes nothing for it. An allowed call's access is worked out
+//! when it is decided, as the card shows it then. `write_file` is asked about
+//! too, even when it writes the scratch folder. Listing and reading need no
 //! approval: they reach only the folders the host shared with the thread, and
 //! its scratch folder.
 //!
@@ -30,7 +37,7 @@ use rig::{
     message::{CallId, ToolCall},
     tool::Tool as _,
 };
-use sandbox::{ListDirectory, ReadFile, RunCommand, Sandboxes, WriteFile};
+use sandbox::{Access, ListDirectory, ReadFile, RunCommand, Sandboxes, WriteFile};
 use tokio::sync::{mpsc, oneshot};
 use tools::RespondToComment;
 use uuid::Uuid;
@@ -38,6 +45,7 @@ use uuid::Uuid;
 use crate::{
     Cowork,
     participant::ParticipantId,
+    project_mode::ProjectMode,
     thread::{ApproveTools, Thread, ThreadSharing},
 };
 
@@ -72,13 +80,17 @@ pub(crate) fn host_only(tool: &str) -> bool {
     HOST_ONLY.contains(&tool)
 }
 
-/// Which waiting calls the local user may decide in a thread.
+/// Which waiting calls the local user may decide in a thread, and what
+/// their cards show.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ApprovalRights {
     /// May approve tool calls at all: the host, or an `Admin` peer.
     approves_tools: bool,
     /// Is the host, who alone decides [`HOST_ONLY`] tools.
     is_host: bool,
+    /// The project's mode, whose access a waiting command is allowed with
+    /// unless it asks for its own.
+    pub(crate) project_mode: ProjectMode,
 }
 
 impl ApprovalRights {
@@ -86,6 +98,7 @@ impl ApprovalRights {
         Self {
             approves_tools: thread.can_approve_tools(),
             is_host: thread.is_host(),
+            project_mode: thread.project_mode(),
         }
     }
 
@@ -176,9 +189,9 @@ impl ToolHook for ApprovalGate {
             if !needs_approval(tool) {
                 return ToolDecision::Allow;
             }
-            if tool == RunCommand::NAME && !self.sandboxes.project(&self.thread).writable {
+            if tool == RunCommand::NAME && self.command_access(call) == Access::Read {
                 return ToolDecision::AllowWith {
-                    context: RunCommand::read_only_context(),
+                    context: RunCommand::context(Access::Read),
                 };
             }
             if self.refuses_unattended(call) {
@@ -201,8 +214,24 @@ impl ToolHook for ApprovalGate {
             {
                 return undecided();
             }
-            decision.await.unwrap_or_else(|_| undecided())
+            match decision.await.unwrap_or_else(|_| undecided()) {
+                ToolDecision::Allow if tool == RunCommand::NAME => ToolDecision::AllowWith {
+                    context: RunCommand::context(self.command_access(call)),
+                },
+                decision => decision,
+            }
         })
+    }
+}
+
+impl ApprovalGate {
+    /// The access `call` of `run_command` runs with now: its own, or the
+    /// project's mode.
+    fn command_access(&self, call: &ToolCall) -> Access {
+        RunCommand::access(
+            &call.function.arguments_value(),
+            self.sandboxes.project(&self.thread).access,
+        )
     }
 }
 
@@ -308,10 +337,12 @@ mod tests {
         let host = ApprovalRights {
             approves_tools: true,
             is_host: true,
+            ..ApprovalRights::default()
         };
         let admin = ApprovalRights {
             approves_tools: true,
             is_host: false,
+            ..ApprovalRights::default()
         };
         let writer = ApprovalRights::default();
         assert!(host.may_decide(RunCommand::NAME));
@@ -336,16 +367,16 @@ mod tests {
         )
     }
 
-    /// A gate for a run someone started, or a scheduled one, in a writable
-    /// project unless [`gate_in`] says otherwise.
+    /// A gate for a run someone started, or a scheduled one, in a project in
+    /// write mode unless [`gate_in`] says otherwise.
     fn gate(scheduled: bool) -> (Arc<ApprovalGate>, mpsc::UnboundedReceiver<RunUpdate>) {
-        let (gate, asked, _) = gate_in(scheduled, true);
+        let (gate, asked, _) = gate_in(scheduled, Access::Write);
         (gate, asked)
     }
 
     fn gate_in(
         scheduled: bool,
-        writable: bool,
+        access: Access,
     ) -> (
         Arc<ApprovalGate>,
         mpsc::UnboundedReceiver<RunUpdate>,
@@ -353,61 +384,100 @@ mod tests {
     ) {
         let (updates, asked) = mpsc::unbounded_channel();
         let sandboxes = crate::test_support::unused_sandboxes();
-        sandboxes.set_project(
-            "thread",
-            sandbox::Project {
-                folders: Vec::new(),
-                writable,
-            },
-        );
+        set_mode(&sandboxes, access);
         let gate = ApprovalGate::new(updates, sandboxes.clone(), "thread", scheduled);
         (gate, asked, sandboxes)
     }
 
-    /// In a read-only project, commands run at once, held read-only, even in
-    /// a scheduled run; once the project is writable, they are asked about.
+    fn set_mode(sandboxes: &Sandboxes, access: Access) {
+        sandboxes.set_project(
+            "thread",
+            sandbox::Project {
+                folders: Vec::new(),
+                access,
+            },
+        );
+    }
+
+    /// A `run_command` call, asking for `access` of its own if given.
+    fn command(access: Option<&str>) -> ToolCall {
+        let mut arguments = serde_json::json!({ "command": "ls" });
+        if let Some(access) = access {
+            arguments["access"] = access.into();
+        }
+        call_with(RunCommand::NAME, arguments)
+    }
+
+    fn granted(access: Access) -> ToolDecision {
+        ToolDecision::AllowWith {
+            context: RunCommand::context(access),
+        }
+    }
+
+    /// Commands with read access, the mode's or their own, run at once,
+    /// even in a scheduled run. Every other command is asked about, and
+    /// allowed with exactly its access: the mode's, or more of its own.
     #[tokio::test]
-    async fn commands_in_a_read_only_project_run_at_once() {
-        let held = ToolDecision::AllowWith {
-            context: RunCommand::read_only_context(),
-        };
-        for scheduled in [false, true] {
-            let (gate, mut asked, sandboxes) = gate_in(scheduled, false);
-            let command = call_with(RunCommand::NAME, serde_json::json!({ "command": "ls" }));
+    async fn commands_are_asked_about_unless_they_only_read() {
+        let asked_for = Some(RunCommand::NAME.to_owned());
+        let cases = [
+            (Access::Read, None, Access::Read, false),
+            (Access::Read, Some("write"), Access::Write, true),
+            (Access::Read, Some("network"), Access::Network, true),
+            (Access::Write, None, Access::Write, true),
+            (Access::Write, Some("read"), Access::Read, false),
+            (Access::Network, None, Access::Network, true),
+            (Access::Network, Some("read"), Access::Read, false),
+            (Access::Network, Some("write"), Access::Write, true),
+        ];
+        for (mode, requested, access, asks) in cases {
+            let call = command(requested);
+            let (gate, mut asked, _) = gate_in(false, mode);
+            let expected = (granted(access), asks.then(|| asked_for.clone()).flatten());
             assert_eq!(
-                decide_allowing(&gate, &command, &mut asked).await,
-                (held.clone(), None)
+                decide_allowing(&gate, &call, &mut asked).await,
+                expected,
+                "{mode:?} mode, asking for {requested:?}"
             );
 
-            // Writing a file is still asked about, or refused the first time
-            // in a scheduled run.
-            let write = call(WriteFile::NAME);
-            let decided = decide_allowing(&gate, &write, &mut asked).await;
-            if scheduled {
+            // A scheduled run refuses a call that asks the first time.
+            let (gate, mut asked, _) = gate_in(true, mode);
+            let decided = decide_allowing(&gate, &call, &mut asked).await;
+            if asks {
                 assert!(matches!(decided, (ToolDecision::Deny { .. }, None)));
             } else {
-                assert_eq!(
-                    decided,
-                    (ToolDecision::Allow, Some(WriteFile::NAME.to_owned()))
-                );
+                assert_eq!(decided, (granted(access), None));
             }
+        }
+    }
 
-            sandboxes.set_project(
-                "thread",
-                sandbox::Project {
-                    folders: Vec::new(),
-                    writable: true,
-                },
-            );
-            let decided = decide_allowing(&gate, &command, &mut asked).await;
-            if scheduled {
-                assert!(matches!(decided, (ToolDecision::Deny { .. }, None)));
-            } else {
-                assert_eq!(
-                    decided,
-                    (ToolDecision::Allow, Some(RunCommand::NAME.to_owned()))
-                );
-            }
+    /// Writing a file is asked about in every mode.
+    #[tokio::test]
+    async fn writing_a_file_is_asked_about_in_read_mode_too() {
+        let (gate, mut asked, _) = gate_in(false, Access::Read);
+        assert_eq!(
+            decide_allowing(&gate, &call(WriteFile::NAME), &mut asked).await,
+            (ToolDecision::Allow, Some(WriteFile::NAME.to_owned()))
+        );
+    }
+
+    /// A waiting command is allowed with the access its card shows when
+    /// it is decided: the mode's at that moment, unless it asked for its own.
+    #[tokio::test]
+    async fn an_allowed_command_gets_the_access_shown_when_deciding() {
+        for (requested, access) in [(None, Access::Read), (Some("write"), Access::Write)] {
+            let (gate, mut asked, sandboxes) = gate_in(false, Access::Write);
+            let call = command(requested);
+            let decision = gate.before_tool_call(&call);
+            let answer = async {
+                let Some(RunUpdate::Approval { decide, .. }) = asked.recv().await else {
+                    panic!("the command asks");
+                };
+                set_mode(&sandboxes, Access::Read);
+                decide.send(ToolDecision::Allow).expect("the gate waits");
+            };
+            let (decision, ()) = tokio::join!(decision, answer);
+            assert_eq!(decision, granted(access), "asking for {requested:?}");
         }
     }
 

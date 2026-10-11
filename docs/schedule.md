@@ -25,7 +25,7 @@ Not yet implemented:
 | Name        | Shown in the list, and the title of the threads it creates. Defaults to the start of the prompt, like a thread title.                                 |
 | When        | An [interval](#interval) or a [schedule](#schedule).                                                                                                  |
 | Model       | Any model in the host's catalog. Starts as the model new threads start with.                                                                          |
-| Project     | Folders on the host's machine each run's thread works in, and whether they are open for **Read** (the default) or **Write**. See [Project](#project). |
+| Project     | Folders on the host's machine each run's thread works in, and its mode: **Read** (default), **Write**, or **Write + Network**. See [Project](#project). |
 | Thread      | **New thread each run**, or **continue the last thread**.                                                                                             |
 | Missed runs | **Run once when available**, or **skip**.                                                                                                             |
 | Status      | Active or paused, with the switch on the task's row.                                                                                                  |
@@ -62,7 +62,8 @@ is given exactly the task's folders and mode, so the run's commands use them
 from the first one, and its prompt carries an environment note naming them
 when they changed. An edit applies from the next run, also in a continued
 thread, whose folders someone may have changed meanwhile. The user's own
-new-thread project is left alone.
+new-thread project is left alone. The mode can be picked before any folder is
+added, as **Write + Network** also opens the network to runs without folders.
 
 A run whose folder no longer exists fails without making a thread, and the
 queue goes on.
@@ -137,9 +138,10 @@ A run whose model the catalog doesn't offer fails, and the queue goes on.
 
 Scheduled runs keep the usual approval rules (see
 [Tool approval](collaboration.md#tool-approval)): tools on the always-allowed
-list run, as do commands while the project is in `Read` mode, and every other
-call needs the host or an `Admin` peer to allow it (`run_command` and
-`write_file` only the host). Since no one may be around, a scheduled run
+list run, as do commands with read access (the mode's, or their own), and
+every other call needs the host or an `Admin` peer to allow it (`run_command`
+and `write_file` only the host), including a command asking for more access
+than the mode. Since no one may be around, a scheduled run
 doesn't wait the first time:
 
 1. A call that needs approval fails at once. Its result tells the model that
@@ -154,7 +156,7 @@ doesn't wait the first time:
 The model can therefore carry on without the call, or decide the call is
 worth waiting for. Calls made in the thread outside a scheduled run, such as
 someone chatting in a **continue the last thread** thread, are approved as
-usual. In `Write` mode, `run_command` is no exception.
+usual. A command that needs more than read access is no exception.
 
 ## Managing tasks
 

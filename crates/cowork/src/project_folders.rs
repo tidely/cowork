@@ -95,8 +95,8 @@ pub(crate) fn add_folders(
     project.len() != before
 }
 
-/// The project `thread`'s commands use: its folders on this machine, open
-/// for writing in [`ProjectMode::Write`].
+/// The project `thread`'s commands use: its folders on this machine, with
+/// the access its [`ProjectMode`] gives.
 pub(crate) fn sandbox_project(thread: &Thread) -> sandbox::Project {
     sandbox::Project {
         folders: thread
@@ -109,7 +109,7 @@ pub(crate) fn sandbox_project(thread: &Thread) -> sandbox::Project {
                 })
             })
             .collect(),
-        writable: thread.project_mode() == ProjectMode::Write,
+        access: thread.project_mode().access(),
     }
 }
 

@@ -1,10 +1,12 @@
-//! Whether the thread's project is open for writing or only reading, and
-//! the menu in the bottom bar choosing it.
+//! What the agent's commands may do with the thread's project (read it,
+//! change it, or change it and reach the network), and the menu in the
+//! bottom bar choosing it.
 //!
 //! Kept in [`Thread::project_mode`] and, before the thread exists,
-//! [`Cowork::new_thread_project_mode`]. The agent's commands may only read
-//! the folders unless it is [`ProjectMode::Write`], and run without asking
-//! until then; see `tool_approval.rs`.
+//! [`Cowork::new_thread_project_mode`]. It is the access a command runs
+//! with unless it asks for other access of its own; commands with read
+//! access run without asking, and others wait for the host; see
+//! `tool_approval.rs`.
 
 use gpui::{Anchor, App, Context, IntoElement, SharedString, WeakEntity, div, prelude::*, px};
 use gpui_component::{
@@ -24,30 +26,78 @@ pub(crate) const WRITE_WARNING: &str = "Commands you allow can change these fold
      computer at once, with your own tools. While they are sandboxed, a malicious agent may be \
      able to run commands outside of the sandbox.";
 
-/// How the project's folders are open.
+/// Shown while hovering the Write + Network option.
+pub(crate) const NETWORK_WARNING: &str = "Commands you allow can change these folders on your \
+     computer at once, with your own tools, and reach the internet: they can download code and \
+     send out anything they can read. While they are sandboxed, a malicious agent may be able \
+     to run commands outside of the sandbox.";
+
+/// What the agent's commands may do with the project. Its variant indices
+/// are its wire encoding: add new modes at the end.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ProjectMode {
     Write,
     /// The default, so nothing is changed until someone asks for it.
     #[default]
     Read,
+    /// Write, and reach the network; labelled "Write + Network".
+    Network,
 }
 
 impl ProjectMode {
-    /// In the order the menu lists them.
-    pub(crate) const ALL: [Self; 2] = [Self::Write, Self::Read];
+    /// In the order the menu lists them, most access first.
+    pub(crate) const ALL: [Self; 3] = [Self::Network, Self::Write, Self::Read];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Self::Network => "Write + Network",
             Self::Write => "Write",
             Self::Read => "Read",
         }
     }
 
+    /// The mode in ids and debug selectors, which the label's spaces and
+    /// `+` would make awkward.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            Self::Network => "network",
+            Self::Write => "write",
+            Self::Read => "read",
+        }
+    }
+
     fn icon(self) -> IconName {
         match self {
+            Self::Network => IconName::Globe,
             Self::Write => IconName::Pencil,
             Self::Read => IconName::Eye,
+        }
+    }
+
+    /// What commands may do in this mode, unless they ask for other access.
+    pub(crate) fn access(self) -> sandbox::Access {
+        match self {
+            Self::Read => sandbox::Access::Read,
+            Self::Write => sandbox::Access::Write,
+            Self::Network => sandbox::Access::Network,
+        }
+    }
+
+    /// The mode giving `access`.
+    pub(crate) fn with_access(access: sandbox::Access) -> Self {
+        match access {
+            sandbox::Access::Read => Self::Read,
+            sandbox::Access::Write => Self::Write,
+            sandbox::Access::Network => Self::Network,
+        }
+    }
+
+    /// What choosing this mode allows, for the modes that change things.
+    pub(crate) fn warning(self) -> Option<&'static str> {
+        match self {
+            Self::Network => Some(NETWORK_WARNING),
+            Self::Write => Some(WRITE_WARNING),
+            Self::Read => None,
         }
     }
 }
@@ -93,13 +143,11 @@ impl Cowork {
                     .fold(menu.check_side(Side::Right), |menu, option| {
                         let cowork = cowork.clone();
                         let target = target.clone();
-                        let item = match option {
-                            ProjectMode::Write => {
-                                PopupMenuItem::element(|_, cx| Self::render_write_option(cx))
-                            }
-                            ProjectMode::Read => {
-                                PopupMenuItem::new(SharedString::from(option.label()))
-                            }
+                        let item = match option.warning() {
+                            Some(warning) => PopupMenuItem::element(move |_, cx| {
+                                Self::render_warned_option(option, warning, cx)
+                            }),
+                            None => PopupMenuItem::new(SharedString::from(option.label())),
                         };
                         menu.item(
                             item.icon(Icon::new(option.icon()))
@@ -115,25 +163,34 @@ impl Cowork {
             .into_any_element()
     }
 
-    /// The Write option, warning while hovered what writing allows.
-    fn render_write_option(cx: &App) -> impl IntoElement + use<> {
+    /// An option that changes things, warning while hovered what it allows.
+    fn render_warned_option(
+        option: ProjectMode,
+        text: &'static str,
+        cx: &App,
+    ) -> impl IntoElement + use<> {
         let warning = cx.theme().warning;
+        let selector = format!("project-mode-{}", option.key());
+        let warning_selector = format!("{selector}-warning");
         h_flex()
-            .id("project-mode-write")
-            .debug_selector(|| "project-mode-write".to_owned())
+            .id(SharedString::from(selector.clone()))
+            .debug_selector(move || selector.clone())
             .flex_1()
             .gap_2()
             .justify_between()
-            .child(ProjectMode::Write.label())
+            .child(option.label())
             .child(
                 Icon::new(IconName::TriangleAlert)
                     .size_3p5()
                     .text_color(warning),
             )
             .tooltip(move |window, cx| {
+                let warning_selector = warning_selector.clone();
                 Tooltip::element(move |_, _| {
+                    let text_selector = format!("{warning_selector}-text");
+                    let warning_selector = warning_selector.clone();
                     h_flex()
-                        .debug_selector(|| "project-mode-write-warning".to_owned())
+                        .debug_selector(move || warning_selector.clone())
                         .items_start()
                         .gap_2()
                         // A fixed width: sized by its content, the text would
@@ -148,11 +205,11 @@ impl Cowork {
                         )
                         .child(
                             div()
-                                .debug_selector(|| "project-mode-write-warning-text".to_owned())
+                                .debug_selector(move || text_selector.clone())
                                 .flex_1()
                                 .min_w_0()
                                 .whitespace_normal()
-                                .child(WRITE_WARNING),
+                                .child(text),
                         )
                 })
                 .build(window, cx)

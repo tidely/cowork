@@ -12,7 +12,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use sandbox::{CommandOutput, EnvironmentSource, Project, ProjectFolder, Sandboxes};
+use sandbox::{Access, CommandOutput, EnvironmentSource, Project, ProjectFolder, Sandboxes};
 
 /// A fresh folder for one test, removed when dropped.
 struct Root(PathBuf);
@@ -66,7 +66,11 @@ fn project(folders: &[(&str, &Path)], writable: bool) -> Project {
                 path: path.to_path_buf(),
             })
             .collect(),
-        writable,
+        access: if writable {
+            Access::Write
+        } else {
+            Access::Read
+        },
     }
 }
 

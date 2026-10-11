@@ -531,16 +531,16 @@ fn runs_work_in_the_project_folders_chosen_in_the_dialog(cx: &mut gpui::TestAppC
         })
         .expect("the dialog opens");
     draw(cx);
-    // The mode only shows once there are folders.
+    // The mode shows before there are folders, as the network needs none.
     assert!(cx.debug_bounds("schedule-folders-add").is_some());
-    assert!(cx.debug_bounds("schedule-project-Write").is_none());
+    assert!(cx.debug_bounds("schedule-project-network").is_some());
     // As picking them in the folder picker does.
     editor.update(cx, |editor, cx| editor.add_folders(folders.clone(), cx));
     draw(cx);
     assert!(cx.debug_bounds("schedule-folders-folder-1").is_some());
     cx.simulate_input("Review the code");
     click("thread-mode-1", cx);
-    click("schedule-project-Write", cx);
+    click("schedule-project-write", cx);
     click("save-schedule", cx);
     assert!(!dialog_open(cx));
 
@@ -554,7 +554,7 @@ fn runs_work_in_the_project_folders_chosen_in_the_dialog(cx: &mut gpui::TestAppC
     let (paths, mode, mounted) = thread_project(&cowork, thread_id, cx);
     assert_eq!(paths, folders);
     assert_eq!(mode, ProjectMode::Write);
-    assert!(mounted.writable);
+    assert!(mounted.writable());
     assert_eq!(mounted.folders.len(), 2);
     // The user's own next thread keeps its own project.
     cowork.read_with(cx, |cowork, _| {
@@ -576,7 +576,7 @@ fn runs_work_in_the_project_folders_chosen_in_the_dialog(cx: &mut gpui::TestAppC
     let (paths, mode, mounted) = thread_project(&cowork, thread_id, cx);
     assert_eq!(paths, [folders[1].clone()]);
     assert_eq!(mode, ProjectMode::Read);
-    assert!(!mounted.writable);
+    assert!(!mounted.writable());
     _ = std::fs::remove_dir_all(folders[0].parent().unwrap());
 }
 

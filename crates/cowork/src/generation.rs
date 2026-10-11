@@ -546,7 +546,7 @@ mod tests {
                     name: "folder-5c2d".into(),
                     path: folder.clone(),
                 }],
-                writable: true,
+                access: sandbox::Access::Write,
             },
         );
         let changed = [

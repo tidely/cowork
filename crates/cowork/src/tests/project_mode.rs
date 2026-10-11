@@ -60,6 +60,30 @@ fn the_write_option_warns_while_hovered(cx: &mut gpui::TestAppContext) {
     assert!(text.size.height > px(30.), "more than one line: {text:?}");
 }
 
+/// Network warns while hovered like Write, and picking it applies it.
+#[gpui::test]
+fn the_network_option_warns_and_opens_the_network(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let trigger = cx.debug_bounds("project-mode").expect("mode toggle");
+    cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let network = cx
+        .debug_bounds("project-mode-network")
+        .expect("the menu lists Network");
+    cx.simulate_mouse_move(network.center(), None, gpui::Modifiers::none());
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds("project-mode-network-warning").is_some(),
+        "hovering Network shows its warning"
+    );
+    cx.simulate_click(network.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    cowork.read_with(cx, |cowork, cx| {
+        assert_eq!(cowork.active_project_mode(cx).0, ProjectMode::Network);
+    });
+}
+
 #[gpui::test]
 fn picking_write_from_the_menu_applies_it_without_asking(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);

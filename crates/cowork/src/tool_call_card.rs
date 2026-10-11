@@ -22,9 +22,9 @@ use gpui_component::{
 };
 use gpui_kit_assets::IconName;
 use rig::{message::ToolCall, tool::Tool as _};
-use sandbox::RunCommand;
+use sandbox::{Access, RunCommand};
 
-use crate::highlight::highlight_code_block_in_mode;
+use crate::{highlight::highlight_code_block_in_mode, project_mode::ProjectMode};
 
 type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
@@ -52,6 +52,9 @@ pub(crate) struct ToolCallCard {
     body: Option<AnyElement>,
     decision: Decision,
     waiting_for: &'static str,
+    /// The project's mode's access, which a command runs with unless it
+    /// asks for its own; `None` when the card isn't shown for a thread.
+    project_access: Option<Access>,
 }
 
 impl ToolCallCard {
@@ -64,7 +67,15 @@ impl ToolCallCard {
             body: None,
             decision: Decision::Waiting,
             waiting_for: DECIDERS,
+            project_access: None,
         }
+    }
+
+    /// Shows what a command would be allowed to do in a project with
+    /// `access`, and when it asks for more.
+    pub(crate) fn project_access(mut self, access: Access) -> Self {
+        self.project_access = Some(access);
+        self
     }
 
     /// Names only the host in the waiting note, for a tool only the host may
@@ -161,10 +172,12 @@ impl RenderOnce for ToolCallCard {
             }
         };
         let body = self.body.unwrap_or_else(|| {
+            let arguments = self.call.function.arguments_value();
             if self.call.function.name.as_str() == RunCommand::NAME
-                && let Some(command) = self.call.function.arguments_value()["command"].as_str()
+                && let Some(command) = arguments["command"].as_str()
             {
-                command_view(&id, command, cx)
+                let requested = RunCommand::requested_access(&arguments);
+                command_view(&id, command, requested, self.project_access, cx)
             } else {
                 arguments_view(&id, &self.call, cx)
             }
@@ -197,9 +210,63 @@ fn arguments_view(id: &SharedString, call: &ToolCall, cx: &App) -> AnyElement {
     code_block(format!("{id}-arguments"), json, cx)
 }
 
+/// What a command with `access` may do, as its card says it.
+fn access_text(access: Access) -> &'static str {
+    match access {
+        Access::Read => "reads the project",
+        Access::Write => "can change the project",
+        Access::Network => "can change the project and reach the network",
+    }
+}
+
+/// The line above a command: where it runs, and the access it would be
+/// allowed with, warning when it asks for more than the project's mode.
+fn command_header(
+    id: &SharedString,
+    requested: Option<Access>,
+    project: Option<Access>,
+    cx: &App,
+) -> AnyElement {
+    let muted = cx.theme().muted_foreground;
+    let access = requested.or(project);
+    let escalated = requested
+        .zip(project)
+        .filter(|(requested, project)| requested > project);
+    let access_selector = format!("{id}-access");
+    h_flex()
+        .gap_1()
+        .min_w_0()
+        .text_color(muted)
+        .child("/bin/sh · sandbox")
+        .children(access.map(|access| {
+            div()
+                .debug_selector(move || access_selector.clone())
+                .child(format!("· {}", access_text(access)))
+        }))
+        .children(escalated.map(|(_, project)| {
+            let selector = format!("{id}-escalation");
+            h_flex()
+                .debug_selector(move || selector.clone())
+                .gap_1()
+                .text_color(cx.theme().warning)
+                .child(Icon::new(IconName::TriangleAlert).size_3())
+                .child(format!(
+                    "more than the project's {} mode, for this command only",
+                    ProjectMode::with_access(project).label()
+                ))
+        }))
+        .into_any_element()
+}
+
 /// Highlights the exact command, without adding a prompt that could change
 /// how the shell syntax is parsed or what someone copies from the card.
-fn command_view(id: &SharedString, command: &str, cx: &App) -> AnyElement {
+fn command_view(
+    id: &SharedString,
+    command: &str,
+    requested: Option<Access>,
+    project: Option<Access>,
+    cx: &App,
+) -> AnyElement {
     let block = CodeBlock::from_code(command, Some("sh"));
     let highlights = highlight_code_block_in_mode(&block, cx.theme().is_dark());
     let line_count = command.lines().count();
@@ -207,11 +274,7 @@ fn command_view(id: &SharedString, command: &str, cx: &App) -> AnyElement {
         .flex()
         .flex_col()
         .gap_1()
-        .child(
-            div()
-                .text_color(cx.theme().muted_foreground)
-                .child("/bin/sh · sandbox"),
-        )
+        .child(command_header(id, requested, project, cx))
         .child(code_block(
             format!("{id}-command"),
             StyledText::new(command.to_owned()).with_highlights(highlights),
@@ -294,6 +357,57 @@ mod tests {
             };
             div().w(px(480.)).child(card)
         }
+    }
+
+    /// A command's card in a project with `project` access.
+    struct AccessView {
+        call: ToolCall,
+        project: Access,
+    }
+
+    impl Render for AccessView {
+        fn render(&mut self, _: &mut Window, _: &mut gpui::Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(640.))
+                .child(ToolCallCard::new("card", self.call.clone()).project_access(self.project))
+        }
+    }
+
+    /// The card says what the command could do, and warns only when it
+    /// asks for more than the project's mode.
+    #[gpui::test]
+    fn command_cards_show_their_access(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        for (project, arguments, escalated) in [
+            (Access::Write, json!({"command": "ls"}), false),
+            (
+                Access::Write,
+                json!({"command": "ls", "access": "read"}),
+                false,
+            ),
+            (
+                Access::Read,
+                json!({"command": "cargo fetch", "access": "network"}),
+                true,
+            ),
+        ] {
+            let call = command_call(arguments);
+            let (_, cx) = cx.add_window_view(|_, _| AccessView { call, project });
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("card-access").is_some());
+            assert_eq!(
+                cx.debug_bounds("card-escalation").is_some(),
+                escalated,
+                "{project:?}"
+            );
+        }
+        assert_eq!(
+            access_text(Access::Network),
+            "can change the project and reach the network"
+        );
     }
 
     fn render_card(

@@ -893,7 +893,8 @@ impl Cowork {
     ) -> gpui::AnyElement {
         let id = format!("tool-approval-{message_id}-{step_index}");
         let tool = call.call.function.name.to_string();
-        let mut card = ToolCallCard::new(id, call.call.clone());
+        let mut card =
+            ToolCallCard::new(id, call.call.clone()).project_access(rights.project_mode.access());
         if tool_approval::host_only(&tool) {
             card = card.host_only();
         }

@@ -421,7 +421,8 @@ impl Tool for WriteFile {
         format!(
             "Create a file, or replace a file's entire content, in the user's project or the \
              scratch folder. Missing parent folders are created. Project folders can be written \
-             only when the latest <environment> note says the project is writable, and changes \
+             only when the latest <environment> note says the project's mode is write or \
+             network, and changes \
              apply to the user's computer at once; the scratch folder can always be written, \
              and suits notes and intermediate results that are not part of the project. Every \
              call waits for the user to allow it, except in a scheduled run, where the first \
@@ -503,7 +504,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{Project, ProjectFolder, TestRoot, test_sandboxes};
+    use crate::{Access, Project, ProjectFolder, TestRoot, test_sandboxes};
 
     fn places(root: &TestRoot, writable: bool) -> Places {
         let zed = root.0.join("zed");
@@ -513,7 +514,11 @@ mod tests {
                 name: "zed".into(),
                 path: zed,
             }],
-            writable,
+            access: if writable {
+                Access::Write
+            } else {
+                Access::Read
+            },
         };
         Places::new(&project, &root.0.join("scratch"), None)
     }

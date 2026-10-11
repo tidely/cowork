@@ -160,7 +160,7 @@ impl Places {
         Self {
             folders,
             scratch,
-            writable: project.writable,
+            writable: project.writable(),
             denied,
         }
     }
@@ -356,7 +356,7 @@ fn real_path(path: &Path) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ProjectFolder, TestRoot};
+    use crate::{Access, ProjectFolder, TestRoot};
 
     struct Fixture {
         root: TestRoot,
@@ -376,7 +376,11 @@ mod tests {
                 name: "zed".into(),
                 path: zed,
             }],
-            writable,
+            access: if writable {
+                Access::Write
+            } else {
+                Access::Read
+            },
         };
         let places = Places::new(&project, &root.0.join("scratch"), Some(&home));
         Fixture { root, places }
@@ -477,7 +481,7 @@ mod tests {
                 name: "home".into(),
                 path: home.clone(),
             }],
-            writable: true,
+            access: Access::Write,
         };
         let places = Places::new(&project, &root.0.join("scratch"), Some(&home));
         assert!(matches!(

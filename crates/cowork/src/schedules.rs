@@ -33,7 +33,7 @@ use crate::{
     Cowork, MainStage,
     models::ModelRef,
     project_folders::{ProjectFolder, ProjectFolders, add_folders, remove_folder},
-    project_mode::{ProjectMode, WRITE_WARNING},
+    project_mode::{NETWORK_WARNING, ProjectMode, WRITE_WARNING},
     scheduled_task::{
         IntervalUnit, MissedRuns, RunRecord, RunResult, ScheduledTask, SkipReason, TaskSettings,
         ThreadMode, Trigger, When,
@@ -369,9 +369,14 @@ impl Cowork {
                 .collect::<Vec<_>>()
                 .join(", ");
             match settings.project_mode {
+                ProjectMode::Network => format!("{names} (write, network)"),
                 ProjectMode::Write => format!("{names} (write)"),
                 ProjectMode::Read => names,
             }
+        });
+        // The network is open to runs with no folders too.
+        let project = project.or_else(|| {
+            (settings.project_mode == ProjectMode::Network).then(|| "network".to_owned())
         });
         let details = [
             Some(settings.when.describe()),
@@ -816,10 +821,10 @@ impl ScheduleEditor {
             .outline()
             .small()
             .children(ProjectMode::ALL.into_iter().map(|mode| {
-                Button::new(mode.label())
+                Button::new(mode.key())
                     .label(mode.label())
                     .selected(self.project_mode == mode)
-                    .debug_selector(move || format!("schedule-project-{}", mode.label()))
+                    .debug_selector(move || format!("schedule-project-{}", mode.key()))
             }))
             .on_click(cx.listener(|this, clicked: &Vec<usize>, _, cx| {
                 if let Some(mode) = clicked.first().and_then(|ix| ProjectMode::ALL.get(*ix)) {
@@ -827,12 +832,23 @@ impl ScheduleEditor {
                     cx.notify();
                 }
             }));
-        let hint = if self.folders.is_empty() {
-            "Folders each run's agent can work in with your tools, in a sandbox.".to_owned()
-        } else if self.project_mode == ProjectMode::Write {
-            format!("Runs can change these folders. {WRITE_WARNING}")
-        } else {
-            "Runs can read these folders, but not change them.".to_owned()
+        let (hint, warned) = match (self.folders.is_empty(), self.project_mode) {
+            (_, ProjectMode::Network) => (
+                format!("Runs can change these folders and reach the network. {NETWORK_WARNING}"),
+                true,
+            ),
+            (true, _) => (
+                "Folders each run's agent can work in with your tools, in a sandbox.".to_owned(),
+                false,
+            ),
+            (false, ProjectMode::Write) => (
+                format!("Runs can change these folders. {WRITE_WARNING}"),
+                true,
+            ),
+            (false, ProjectMode::Read) => (
+                "Runs can read these folders, but not change them.".to_owned(),
+                false,
+            ),
         };
         Self::field("Project", cx)
             .child(
@@ -840,18 +856,16 @@ impl ScheduleEditor {
                     .gap_3()
                     .justify_between()
                     .child(div().min_w_0().flex_1().child(folders))
-                    .when(!self.folders.is_empty(), |this| this.child(modes)),
+                    .child(modes),
             )
             .child(
                 div()
                     .text_xs()
-                    .text_color(
-                        if self.project_mode == ProjectMode::Write && !self.folders.is_empty() {
-                            cx.theme().warning
-                        } else {
-                            cx.theme().muted_foreground
-                        },
-                    )
+                    .text_color(if warned {
+                        cx.theme().warning
+                    } else {
+                        cx.theme().muted_foreground
+                    })
                     .child(hint),
             )
     }

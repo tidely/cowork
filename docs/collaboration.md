@@ -26,14 +26,15 @@ Agent events are checked on arrival in the order Rig's stream could produce
 them.
 Tool calls outside a short always-allowed list wait for the host or an
 `Admin` peer to allow or deny them, and `run_command` and `write_file` for the
-host alone; commands run without asking while the project is in `Read` mode.
-See [Tool approval](#tool-approval).
+host alone; commands with read access run without asking, and a command may
+ask for more access than the mode for itself alone. See
+[Tool approval](#tool-approval).
 The agent's commands run on the host's computer, contained by its operating
 system's sandbox, with the host's project folders read-only unless the project
-is in `Write` mode; collaborators see the folders by name with that mode, and
+is in `Write` or `Write + Network` mode, and with the network only in `Write + Network` mode;
+collaborators see the folders by name with that mode, and
 the agent learns their paths from an environment note in its prompt; see
 [Project folders](#project-folders).
-The protocol version is **24**.
 
 Not yet implemented:
 
@@ -549,23 +550,35 @@ shared with the thread and its scratch folder); every other tool's calls
 wait, so a newly added tool is asked about rather than trusted. `calculate`
 waits.
 
-`run_command` calls run at once while the project is in `Read` mode, as in
-Codex's read-only mode, whoever's prompt started the run: the sandbox lets
-them read, and change only the thread's scratch folder. The hook allows such
-a call with a context telling the tool to run it read-only, so a command
-stays read-only even if the host switches to `Write` between the decision and
-the command starting. In `Write` mode, `run_command` calls wait. They and
-`write_file` calls (in either mode) only the host may decide (`HOST_ONLY`):
-`run_command`'s commands use the host's own shell and tools on the host's
-computer, and `write_file` changes the host's files, even when it writes the
-scratch folder. On Windows, commands read every drive except credentials
-(see `sandbox/src/settings.rs`), so in `Read` mode a collaborator who may
-submit can have the agent read the host's other files into the transcript
-without the host allowing it.
+A `run_command` call runs with the access of the project's mode (`read`,
+`write`, or `network`) unless its optional `access` argument asks for other
+access, for that command only. This is how the agent asks for higher
+permissions for one command, such as `network` to fetch dependencies in a
+`Read` project, and how it runs a command that only reads without waiting in
+a `Write` or `Write + Network` project.
+
+A command with read access runs at once, as in Codex's read-only mode,
+whoever's prompt started the run: the sandbox lets it read, and change only
+the thread's scratch folder. Every other command waits, including one asking
+for more than the mode. The hook allows a call with a context naming the
+access it was granted, and the tool runs the command with exactly that, so a
+mode the host changes before the command starts changes nothing for it. For
+a call that waited, the access is worked out when it is decided, from its
+own `access` or the mode at that moment, matching what its card shows then.
+The card says what the command could do and, in the warning color, when it
+asks for more than the mode.
+
+`run_command` and `write_file` calls (in any mode) only the host may decide
+(`HOST_ONLY`): `run_command`'s commands use the host's own shell and tools on
+the host's computer, and `write_file` changes the host's files, even when it
+writes the scratch folder. On Windows, commands read every drive except
+credentials (see `sandbox/src/settings.rs`), so a collaborator who may submit
+can have the agent read the host's other files into the transcript without
+the host allowing it.
 
 The agent loop asks a hook about each call before its tool runs (calls whose
 arguments could not be read never run, so are never asked about). The host's
-hook lets listed tools, and `run_command` in `Read` mode, through and
+hook lets listed tools, and `run_command` with read access, through and
 otherwise asks the thread, on the same channel as the run's events, so the
 request always follows the reply that made the call. The host then emits
 `ToolApprovalRequested`, naming the agent message and the call, and the run
@@ -643,35 +656,42 @@ returned; see `ROADMAP.md`.
   host's user name where a path holds it.
 - Collaborators see the names but cannot change them; there is no
   collaborator message for it.
-- The project has a mode, `Write` or `Read`, picked from a menu in the
-  bottom bar between the context indicator and the model picker. Every
-  thread starts in `Read`. Only the host can change it; collaborators see
-  it in the `Welcome` snapshot and follow `ProjectModeChanged`. A mode
-  picked before the thread exists moves into it with the folders. Hovering
-  `Write` in the menu warns that allowed commands change the folders at
-  once, and that a malicious agent may be able to escape the sandbox.
+- The project has a mode, `Read`, `Write`, or `Write + Network`, picked from a menu
+  in the bottom bar between the context indicator and the model picker.
+  `Write + Network` is `Write` with network access. Every thread starts in `Read`.
+  Only the host can change it; collaborators see it in the `Welcome`
+  snapshot and follow `ProjectModeChanged`. A mode picked before the thread
+  exists moves into it with the folders. Hovering `Write` or `Write + Network` in
+  the menu warns that allowed commands change the folders at once (and, for
+  `Write + Network`, can download code and send out what they read), and that a
+  malicious agent may be able to escape the sandbox. The mode is the access
+  commands run with unless they ask for their own; see
+  [Tool approval](#tool-approval).
 - The agent's commands run on the host's computer with its own shell,
   tools, and login shell environment, each contained by the operating
   system's sandbox (Seatbelt, Bubblewrap, or a Windows process container,
   through mxc-sdk). They see the folders at their real paths, the host's
   real files live: read-only in `Read`, enforced by the sandbox, and in
-  `Write` the agent's changes apply to the host at once. They start in the
-  first folder, or the scratch folder without one. Each thread also has a
+  `Write` and `Write + Network` the agent's changes apply to the host at
+  once. They start in the first folder, or the scratch folder without one. Each thread also has a
   scratch folder, its commands' `HOME` and `TMPDIR`, kept until the thread
   is deleted or Cowork quits. On macOS and Linux commands cannot read the
   host's other files; on Windows they can read every drive, as Codex's
   sandbox does, since `git` and others resolve the folders above a project.
   Nowhere can they read credentials such as `~/.ssh`, even inside granted
-  folders, and they have no network. Every setting is in the sandbox
-  crate's `settings.rs`.
+  folders. They have no network except with `network` access (what
+  `Write + Network` gives), which allows outbound connections but never
+  inbound ones or the host's own loopback services. Every setting is in
+  the sandbox crate's `settings.rs`.
 - The file tools `list_directory`, `read_file`, and `write_file` reach the
   same folders from the host process rather than a sandboxed command, by
   folder name (`myproject/src/main.rs`) or `scratch://` for the scratch
-  folder. `write_file` writes project folders only in `Write` mode, and
-  scratch always. Every path they accept is mapped in the sandbox crate's
-  `paths.rs`.
+  folder. `write_file` writes project folders only in `Write` and
+  `Write + Network` mode, and scratch always. Every path they accept is
+  mapped in the sandbox crate's `paths.rs`.
 - Each command is contained by the project as it is when the command
-  starts, so a change applies from the next command, with nothing to
+  starts, with the access it was granted, so a change applies from the next
+  command, with nothing to
   restart or confirm; commands already running keep the access they started
   with.
 - The agent learns the folders' paths, the mode, where commands start, and
@@ -812,11 +832,11 @@ Design decisions:
 ## Protocol
 
 All traffic goes through the host. Collaborators never talk to each other.
-`protocol.rs` defines the wire messages; the current version is **24** and
-versions must match exactly. `Join` keeps its variant index and version as
-its only field; `Rejected` keeps its variant index and string payload so a
-version mismatch can still be reported. Runtime permission denials use the
-separate `PermissionDenied`, never this stable handshake rejection.
+`protocol.rs` defines the wire messages; versions must match exactly.
+`Join` keeps its variant index and version as its only field;
+`Rejected` keeps its variant index and string payload so a version mismatch
+can still be reported. Runtime permission denials use the separate
+`PermissionDenied`, never this stable handshake rejection.
 
 **Collaborator to host**
 
@@ -852,7 +872,7 @@ separate `PermissionDenied`, never this stable handshake rejection.
 | `ModelSelected`                              | The thread's model changed                                                                                                                                                                                                                                                                                 |
 | `ModelCatalogChanged`                        | Replaces the thread's model catalog (including with an empty one)                                                                                                                                                                                                                                          |
 | `ProjectFoldersChanged`                      | Replaces the names of the project's folders, in order; paths are never sent                                                                                                                                                                                                                                |
-| `ProjectModeChanged`                         | The project is now open for `Write` or only `Read`                                                                                                                                                                                                                                                         |
+| `ProjectModeChanged`                         | The project's mode is now `Read`, `Write`, or `Write + Network`                                                                                                                                                                                                                                            |
 | `UserMessage`                                | An accepted submission with creators and attachment references instead of bytes; advances the submission count                                                                                                                                                                                             |
 | `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and whether it completed, was stopped, or failed (with a message)                                                                                                                                                                |
 | `AgentEvent`                                 | What the host's agent loop reported during a run, which everyone folds into the agent message and transcript                                                                                                                                                                                               |

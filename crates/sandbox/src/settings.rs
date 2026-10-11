@@ -10,9 +10,11 @@
 //! otherwise). Each command is its own sandbox, made from the thread's project
 //! as it is when the command starts; nothing is booted or kept between them.
 //!
-//! What a command may do, with each sandbox denying everything not granted:
+//! What a command may do, with each sandbox denying everything not granted.
+//! Its [`Access`](crate::Access) is the project's mode unless it was granted
+//! its own:
 //!
-//! - Read, and write when the project is writable, the thread's project
+//! - Read, and write with `Write` or `Network` access, the thread's project
 //!   folders at their real paths.
 //! - Read and write its thread's scratch folder ([`SCRATCH_DIR`]), which is
 //!   its `HOME` and `TMPDIR`.
@@ -32,8 +34,10 @@
 //!   back to a read-only folder (`git --work-tree=. status` says "cannot come
 //!   back to cwd"). Codex's read-only sandbox fails the same way.
 //! - Nothing in [`DENIED_PATHS`], even inside a folder granted above.
-//! - No network: neither outbound nor inbound connections, loopback
-//!   included.
+//! - No network, unless it has `Network` access: then outbound connections
+//!   to any address. Never inbound connections, nor connections to the
+//!   host's own loopback services (Bubblewrap cannot allow those, and they
+//!   include local daemons that trust anything on the machine).
 //! - No clipboard or input injection. The desktop is not disabled: on
 //!   Windows, a console program in a sandbox without one fails to start (`0xC0000142`), and that includes `git`, `cargo`, and
 //!   PowerShell.

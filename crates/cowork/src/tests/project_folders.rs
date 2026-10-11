@@ -105,7 +105,7 @@ fn the_sandbox_mounts_what_the_host_chose(cx: &mut gpui::TestAppContext) {
                     name: "src".into(),
                     path: "/a/src".into(),
                 }],
-                writable: true,
+                access: sandbox::Access::Write,
             }
         );
     });
@@ -117,7 +117,7 @@ fn the_sandbox_mounts_what_the_host_chose(cx: &mut gpui::TestAppContext) {
         cowork.remove_project_folder(target.clone(), Path::new("/a/src"), cx);
         cowork.set_project_mode(target, ProjectMode::Read, cx);
         let project = mounted(cowork);
-        assert!(!project.writable);
+        assert!(!project.writable());
         assert_eq!(
             project.folders,
             [sandbox::ProjectFolder {
@@ -125,6 +125,8 @@ fn the_sandbox_mounts_what_the_host_chose(cx: &mut gpui::TestAppContext) {
                 path: "/b/src".into(),
             }]
         );
+        cowork.set_project_mode(Some(thread.downgrade()), ProjectMode::Network, cx);
+        assert_eq!(mounted(cowork).access, sandbox::Access::Network);
     });
 }
 

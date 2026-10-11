@@ -36,7 +36,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 24;
+pub(crate) const PROTOCOL_VERSION: u32 = 25;
 
 /// A request from a collaborator to the host.
 ///
@@ -200,7 +200,7 @@ pub(crate) enum HostMessage {
     /// order the host added them. Only names travel: the folders are on the
     /// host's machine, and their paths would reveal how it is laid out.
     ProjectFoldersChanged(Vec<String>),
-    /// The host opened the project for writing or only for reading.
+    /// The host changed what the agent's commands may do with the project.
     ProjectModeChanged(ProjectMode),
     /// A Yrs update to the draft, made by the host or a collaborator.
     DraftUpdate(Vec<u8>),
@@ -910,6 +910,7 @@ mod tests {
             HostMessage::ProjectFoldersChanged(vec!["zed".into(), "cowork".into()]),
             HostMessage::ProjectModeChanged(ProjectMode::Write),
             HostMessage::ProjectModeChanged(ProjectMode::Read),
+            HostMessage::ProjectModeChanged(ProjectMode::Network),
             HostMessage::ParticipantJoined {
                 participant: [1; 16],
                 profile: sample_profile(),

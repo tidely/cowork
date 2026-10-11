@@ -5,7 +5,8 @@
 //! and environment; the thread's project folders at their real paths,
 //! read-only unless the project is writable (see [`Project`]); a scratch
 //! folder per thread; no other user files, except that on Windows commands
-//! read every drive, credentials aside; and no network.
+//! read every drive, credentials aside; and no network unless the command's
+//! [`Access`] is `Network`.
 //!
 //! Each command is a sandbox of its own, made from the thread's project as
 //! it is when the command starts, so a thread's commands may run at the same
@@ -47,7 +48,7 @@ pub use environment::{EnvironmentSource, PRINT_ENV_FLAG, print_env};
 pub use files::{ListDirectory, ReadFile, WriteFile};
 pub use output::CommandOutput;
 pub use paths::FileError;
-pub use project::{Project, ProjectFolder, folder_name};
+pub use project::{Access, Project, ProjectFolder, folder_name};
 pub use tool::{RunCommand, RunCommandArgs};
 
 /// How the environment note sent to the model starts; see
@@ -167,13 +168,23 @@ impl Sandboxes {
             for (name, path) in &folders {
                 note.push_str(&format!("- {name}: {}\n", path.display()));
             }
-            note.push_str(if project.writable {
-                "The project is writable: commands may change these folders, and their changes \
-                 apply to the user's computer at once.\n"
-            } else {
-                "The project is read-only: commands can read these folders but not change them.\n"
-            });
         }
+        note.push_str(match project.access {
+            Access::Read => {
+                "The project's mode is read: commands can read the project folders but not \
+                 change them, and have no network access. They run without asking the user.\n"
+            }
+            Access::Write => {
+                "The project's mode is write: commands can change the project folders, and \
+                 their changes apply to the user's computer at once. They have no network \
+                 access.\n"
+            }
+            Access::Network => {
+                "The project's mode is network: commands can change the project folders, and \
+                 their changes apply to the user's computer at once, and they can reach the \
+                 network.\n"
+            }
+        });
         note.push_str(&format!(
             "Commands start in {}. Their HOME and TMPDIR are the scratch folder {}, which \
              the file tools call `{}`.\n\
@@ -199,25 +210,18 @@ impl Sandboxes {
     /// its scratch folder. Dropping the future kills the command and whatever
     /// it started.
     pub async fn run(&self, thread: &str, command: &str) -> Result<CommandOutput, SandboxError> {
-        self.run_in(thread, command, false).await
+        self.run_with(thread, command, None).await
     }
 
-    /// Like [`Sandboxes::run`], with the project read-only even if it is
-    /// writable by the time the command starts, as for a command allowed
-    /// without asking because the project was read-only.
-    pub async fn run_read_only(
+    /// Like [`Sandboxes::run`], with `access` in place of the project's own
+    /// when given, whatever the project's is by the time the command starts:
+    /// the access someone allowed, or that a command needing no approval was
+    /// let through with.
+    pub async fn run_with(
         &self,
         thread: &str,
         command: &str,
-    ) -> Result<CommandOutput, SandboxError> {
-        self.run_in(thread, command, true).await
-    }
-
-    async fn run_in(
-        &self,
-        thread: &str,
-        command: &str,
-        read_only: bool,
+        access: Option<Access>,
     ) -> Result<CommandOutput, SandboxError> {
         if command.trim().is_empty() {
             return Err(SandboxError::InvalidCommand("the command is empty"));
@@ -236,8 +240,8 @@ impl Sandboxes {
             ))
         })?;
         let mut project = self.project(thread);
-        if read_only {
-            project.writable = false;
+        if let Some(access) = access {
+            project.access = access;
         }
         let request = request(command, &project, &scratch, &environment);
         let stop = StopOnDrop(Arc::new(AtomicBool::new(false)));
@@ -437,7 +441,7 @@ fn request(
     let mut readwrite = vec![scratch.clone()];
     let mut readonly = Vec::new();
     for (_, path) in &folders {
-        if project.writable {
+        if project.writable() {
             readwrite.push(path.clone());
         } else {
             readonly.push(path.clone());
@@ -471,9 +475,15 @@ fn request(
         }),
         network: Some(NetworkPolicy {
             egress: Some(NetworkEgressPolicy {
-                default: Some(NetworkAction::Deny),
+                default: Some(if project.access.networked() {
+                    NetworkAction::Allow
+                } else {
+                    NetworkAction::Deny
+                }),
                 ..Default::default()
             }),
+            // Never inbound, nor the host's own loopback services, which
+            // Bubblewrap cannot open in any case; see `settings`.
             ingress: Some(NetworkIngressPolicy {
                 default: Some(NetworkAction::Deny),
                 host_loopback: Some(NetworkAction::Deny),
@@ -688,7 +698,7 @@ mod tests {
         let (sandboxes, _root) = test_sandboxes();
         let writable = Project {
             folders: Vec::new(),
-            writable: true,
+            access: Access::Write,
         };
         sandboxes.set_project("thread", writable.clone());
         sandboxes.set_project("other", writable.clone());
@@ -715,7 +725,7 @@ mod tests {
             "thread",
             Project {
                 folders: vec![zed],
-                writable: false,
+                access: Access::Read,
             },
         );
         let read_only = sandboxes.environment_note("thread");
@@ -723,17 +733,23 @@ mod tests {
             read_only.contains(&format!("- zed: {}", resolved_zed.display())),
             "{read_only}"
         );
-        assert!(read_only.contains("read-only"), "{read_only}");
+        assert!(read_only.contains("mode is read"), "{read_only}");
         assert!(
             read_only.contains(&format!("Commands start in {}.", resolved_zed.display())),
             "{read_only}"
         );
         assert_eq!(read_only, sandboxes.environment_note("thread"), "stable");
 
-        let mut project = sandboxes.project("thread");
-        project.writable = true;
-        sandboxes.set_project("thread", project);
-        assert!(sandboxes.environment_note("thread").contains("writable"));
+        for (access, says) in [
+            (Access::Write, "mode is write"),
+            (Access::Network, "mode is network"),
+        ] {
+            let mut project = sandboxes.project("thread");
+            project.access = access;
+            sandboxes.set_project("thread", project);
+            let note = sandboxes.environment_note("thread");
+            assert!(note.contains(says), "{note}");
+        }
     }
 
     #[cfg(windows)]
@@ -745,7 +761,7 @@ mod tests {
         std::fs::create_dir_all(&scratch).unwrap();
         let project = Project {
             folders: vec![zed.clone()],
-            writable: true,
+            access: Access::Write,
         };
         let request = request("dir", &project, &scratch, &HashMap::new());
         let filesystem = request.filesystem.unwrap();
@@ -785,7 +801,7 @@ mod tests {
             "thread",
             Project {
                 folders: vec![repo.clone()],
-                writable: true,
+                access: Access::Write,
             },
         );
         let status = sandboxes
@@ -813,7 +829,7 @@ mod tests {
     }
 
     #[test]
-    fn requests_grant_the_project_by_mode_and_deny_the_network() {
+    fn requests_grant_the_project_and_the_network_by_mode() {
         let root = TestRoot::new();
         let zed = folder(&root.0, "zed");
         let scratch = root.0.join("scratch");
@@ -822,14 +838,14 @@ mod tests {
             ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
             ("HOME".to_owned(), "/somewhere/else".to_owned()),
         ]);
-        let project = |writable| Project {
+        let project = |access| Project {
             folders: vec![zed.clone()],
-            writable,
+            access,
         };
         let zed_path = resolved(&zed.path).unwrap().to_string_lossy().into_owned();
         let scratch_path = resolved(&scratch).unwrap().to_string_lossy().into_owned();
 
-        let read_only = request("ls", &project(false), &scratch, &environment);
+        let read_only = request("ls", &project(Access::Read), &scratch, &environment);
         let filesystem = read_only.filesystem.clone().unwrap();
         assert!(filesystem.readonly_paths.contains(&zed_path));
         assert_eq!(
@@ -862,8 +878,19 @@ mod tests {
         assert_eq!(network.egress.unwrap().default, Some(NetworkAction::Deny));
         assert_eq!(network.ingress.unwrap().default, Some(NetworkAction::Deny));
 
-        let writable = request("ls", &project(true), &scratch, &environment);
+        let writable = request("ls", &project(Access::Write), &scratch, &environment);
+        let network = writable.network.clone().unwrap();
+        assert_eq!(network.egress.unwrap().default, Some(NetworkAction::Deny));
         let filesystem = writable.filesystem.unwrap();
+        assert!(filesystem.readwrite_paths.contains(&zed_path));
+
+        let networked = request("ls", &project(Access::Network), &scratch, &environment);
+        let network = networked.network.unwrap();
+        assert_eq!(network.egress.unwrap().default, Some(NetworkAction::Allow));
+        let ingress = network.ingress.unwrap();
+        assert_eq!(ingress.default, Some(NetworkAction::Deny));
+        assert_eq!(ingress.host_loopback, Some(NetworkAction::Deny));
+        let filesystem = networked.filesystem.unwrap();
         assert!(filesystem.readwrite_paths.contains(&zed_path));
         assert!(!filesystem.readonly_paths.contains(&zed_path));
     }

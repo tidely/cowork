@@ -3,11 +3,15 @@
 //! They are the host's real folders at their real paths: commands see the
 //! host's changes as they happen, and when the project is writable the host
 //! sees theirs, immediately and without review. Each command is contained by
-//! the project as it is when the command starts, so a change applies from the
-//! next command on, and commands already running keep the access they started
-//! with.
+//! the project as it is when the command starts, with the access it was
+//! granted in place of the project's when it has one (see
+//! [`Sandboxes::run_with`](crate::Sandboxes::run_with)), so a change applies
+//! from the next command on, and commands already running keep the access
+//! they started with.
 
 use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
 
 /// A thread's project, as its commands see it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -15,9 +19,62 @@ pub struct Project {
     /// The folders, in the order the host added them. Names are unique; see
     /// [`folder_name`].
     pub folders: Vec<ProjectFolder>,
-    /// Whether commands may change the folders. Read-only is enforced by the
-    /// operating system's sandbox.
-    pub writable: bool,
+    /// What commands may do with the folders and the network, unless a
+    /// command is granted other access of its own. Enforced by the operating
+    /// system's sandbox.
+    pub access: Access,
+}
+
+impl Project {
+    /// Whether commands, and the file tools, may change the folders.
+    pub fn writable(&self) -> bool {
+        self.access.writable()
+    }
+}
+
+/// What a command may do, each level including the one before it. The
+/// scratch folder is always writable, and credentials always denied.
+#[derive(
+    Clone,
+    Copy,
+    Debug,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize,
+    schemars::JsonSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum Access {
+    /// Read the project folders.
+    #[default]
+    Read,
+    /// Read and change the project folders.
+    Write,
+    /// Read and change the project folders, and reach the network.
+    Network,
+}
+
+impl Access {
+    pub fn writable(self) -> bool {
+        self >= Self::Write
+    }
+
+    pub fn networked(self) -> bool {
+        self == Self::Network
+    }
+
+    /// As the model and the `access` argument name it.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::Write => "write",
+            Self::Network => "network",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

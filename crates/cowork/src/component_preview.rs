@@ -161,6 +161,13 @@ impl Render for ComponentPreview {
                         cx,
                     ))
                     .child(Self::section(
+                        "A command asking for network access in a Read project",
+                        self.deciding("preview-command-network", network_command(), cx)
+                            .project_access(sandbox::Access::Read)
+                            .host_only(),
+                        cx,
+                    ))
+                    .child(Self::section(
                         "A long command with a visible scrolling hint",
                         self.deciding("preview-long-command", long_command(), cx)
                             .host_only(),
@@ -238,6 +245,13 @@ fn calculate() -> ToolCall {
     tool_call(
         "calculate",
         json!({"a": 12, "b": 30, "operation": "multiply"}),
+    )
+}
+
+fn network_command() -> ToolCall {
+    tool_call(
+        "run_command",
+        json!({"command": "cargo fetch", "access": "network"}),
     )
 }
 
