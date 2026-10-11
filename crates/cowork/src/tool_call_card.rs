@@ -3,8 +3,14 @@
 //! someone who may.
 //!
 //! The card is the shared shell. A tool that wants to show its calls in its
-//! own terms passes its own [`ToolCallCard::body`]; every other tool gets its
-//! arguments listed.
+//! own terms passes its own [`ToolCallCard::body`]; `run_command` and
+//! `request_permissions` are shown in theirs here, and every other tool gets
+//! its arguments listed.
+//!
+//! It keeps to a title, what the call would do, and the decision: the access
+//! a command gets is the project mode's name beside the title, in the
+//! warning color when that is more than the project's mode, and how long
+//! such access lasts is a quiet note beside the decision.
 
 use std::rc::Rc;
 
@@ -15,14 +21,15 @@ use gpui::{
 use gpui_base::text::CodeBlock;
 use gpui_component::{
     ActiveTheme as _, Icon, Sizable as _,
-    button::Button,
+    button::{Button, ButtonVariants as _},
     group_box::{GroupBox, GroupBoxVariants as _},
     h_flex,
     shimmer::ShimmerText,
+    tooltip::Tooltip,
 };
 use gpui_kit_assets::IconName;
 use rig::{message::ToolCall, tool::Tool as _};
-use sandbox::{Access, RunCommand};
+use sandbox::{Access, RequestPermissions, RunCommand};
 
 use crate::{highlight::highlight_code_block_in_mode, project_mode::ProjectMode};
 
@@ -107,43 +114,96 @@ impl ToolCallCard {
     }
 }
 
+/// What the card shows for the access a call would get.
+struct AccessShown {
+    access: Access,
+    /// Starts the badge's tooltip, before the mode's name.
+    tooltip: &'static str,
+    /// Whether the call asks for more than the project's mode, which the
+    /// badge's warning color says without words.
+    escalated: bool,
+    /// How long extra access lasts, as the note beside the decision says
+    /// it; `None` when the title already says.
+    scope: Option<&'static str>,
+}
+
 impl RenderOnce for ToolCallCard {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let id = self.id;
         let muted = cx.theme().muted_foreground;
-        let title = h_flex()
+        let tool = self.call.function.name.as_str();
+        let (icon, title) = title(tool);
+        let mut access = None;
+        let body = self.body.unwrap_or_else(|| {
+            let arguments = self.call.function.arguments_value();
+            if tool == RunCommand::NAME
+                && let Some(command) = arguments["command"].as_str()
+            {
+                let requested = RunCommand::requested_access(&arguments);
+                access = requested.or(self.project_access).map(|shown| AccessShown {
+                    access: shown,
+                    tooltip: "Runs with",
+                    escalated: escalated(requested, self.project_access),
+                    scope: Some("For this command only"),
+                });
+                command_view(&id, command, &arguments, cx)
+            } else if tool == RequestPermissions::NAME
+                && let Some(reason) = arguments["reason"].as_str()
+            {
+                let requested = RunCommand::requested_access(&arguments)
+                    .filter(|access| *access > Access::Read);
+                // The title already says the access lasts for the turn.
+                access = requested.map(|shown| AccessShown {
+                    access: shown,
+                    tooltip: "Later commands in this turn run with",
+                    escalated: escalated(requested, self.project_access),
+                    scope: None,
+                });
+                permissions_view(&id, reason, &arguments, cx)
+            } else {
+                arguments_view(&id, &self.call, cx)
+            }
+        });
+
+        let header = h_flex()
             .min_w_0()
-            .gap_1p5()
-            .child(Icon::new(IconName::Wrench).size_3().text_color(muted))
+            .gap_2()
+            .justify_between()
             .child(
-                div()
-                    .flex_none()
-                    .font_weight(FontWeight::MEDIUM)
-                    .child(self.call.function.name.to_string()),
+                h_flex()
+                    .min_w_0()
+                    .gap_1p5()
+                    .child(Icon::new(icon).size_3p5().text_color(muted).flex_none())
+                    .child(
+                        div()
+                            .truncate()
+                            .text_sm()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(title),
+                    ),
             )
-            .child(div().truncate().text_color(muted).child("wants to run"));
+            .children(access.as_ref().map(|shown| access_badge(&id, shown, cx)));
+
         let decision = match self.decision {
             Decision::Offered { on_allow, on_deny } => {
                 let deny = format!("{id}-deny");
                 let allow = format!("{id}-allow");
                 h_flex()
-                    .justify_end()
+                    .flex_none()
                     .gap_1()
                     .child(
                         Button::new(SharedString::from(deny.clone()))
                             .debug_selector(move || deny.clone())
-                            .outline()
+                            .ghost()
                             .xsmall()
-                            .icon(Icon::new(IconName::X).text_color(cx.theme().danger))
                             .label("Deny")
                             .on_click(move |event, window, cx| on_deny(event, window, cx)),
                     )
                     .child(
                         Button::new(SharedString::from(allow.clone()))
                             .debug_selector(move || allow.clone())
-                            .outline()
+                            .primary()
                             .xsmall()
-                            .icon(Icon::new(IconName::Check).text_color(cx.theme().success))
                             .label("Allow")
                             .on_click(move |event, window, cx| on_allow(event, window, cx)),
                     )
@@ -151,52 +211,103 @@ impl RenderOnce for ToolCallCard {
             }
             Decision::Waiting => {
                 let waiting = format!("{id}-waiting");
-                h_flex()
+                div()
+                    .flex_none()
                     .debug_selector({
                         let waiting = waiting.clone();
                         move || waiting.clone()
                     })
-                    .gap_1()
                     .text_color(muted)
-                    .child(Icon::new(IconName::Hourglass).size_3())
                     // Shimmering like the "Working for" line, as both are
                     // something still under way.
                     .child(
-                        ShimmerText::new(format!(
-                            "Waiting for {} to allow this call…",
-                            self.waiting_for
-                        ))
-                        .id(SharedString::from(waiting)),
+                        ShimmerText::new(format!("Waiting for {}…", self.waiting_for))
+                            .id(SharedString::from(waiting)),
                     )
                     .into_any_element()
             }
         };
-        let body = self.body.unwrap_or_else(|| {
-            let arguments = self.call.function.arguments_value();
-            if self.call.function.name.as_str() == RunCommand::NAME
-                && let Some(command) = arguments["command"].as_str()
-            {
-                let requested = RunCommand::requested_access(&arguments);
-                command_view(&id, command, requested, self.project_access, cx)
-            } else {
-                arguments_view(&id, &self.call, cx)
-            }
-        });
+        let warning = access
+            .filter(|shown| shown.escalated)
+            .and_then(|shown| shown.scope)
+            .map(|scope| escalation_note(&id, scope, cx));
+        let footer = h_flex()
+            .min_w_0()
+            .gap_2()
+            .justify_between()
+            .child(div().flex_1().min_w_0().children(warning))
+            .child(decision);
+
         div().debug_selector(move || id.to_string()).child(
             GroupBox::new()
                 .outline()
-                .content_style(
-                    StyleRefinement::default()
-                        .px_2p5()
-                        .py_2()
-                        .gap_1p5()
-                        .text_xs(),
-                )
-                .child(title)
+                .content_style(StyleRefinement::default().px_3().py_2p5().gap_2().text_xs())
+                .child(header)
                 .child(body)
-                .child(decision),
+                .child(footer),
         )
     }
+}
+
+/// The card's icon and title: what the call does in the user's words rather
+/// than the tool's identifier.
+fn title(tool: &str) -> (IconName, SharedString) {
+    match tool {
+        RunCommand::NAME => (IconName::SquareTerminal, "Terminal".into()),
+        RequestPermissions::NAME => (IconName::Shield, "Permissions for this turn".into()),
+        _ => (IconName::Wrench, humanize(tool).into()),
+    }
+}
+
+/// `search_files` as "Search files".
+fn humanize(tool: &str) -> String {
+    let words = tool.replace('_', " ");
+    let mut chars = words.trim().chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => tool.to_owned(),
+    }
+}
+
+/// Whether `requested` is more than the project's access.
+fn escalated(requested: Option<Access>, project: Option<Access>) -> bool {
+    requested
+        .zip(project)
+        .is_some_and(|(requested, project)| requested > project)
+}
+
+/// The access a call gets, as the project mode giving it, in the warning
+/// color when that is more than the project's mode.
+fn access_badge(id: &SharedString, shown: &AccessShown, cx: &App) -> AnyElement {
+    let mode = ProjectMode::with_access(shown.access);
+    let selector = format!("{id}-access");
+    let tooltip = SharedString::from(format!("{} {} access", shown.tooltip, mode.label()));
+    h_flex()
+        .id(SharedString::from(selector.clone()))
+        .debug_selector(move || selector.clone())
+        .flex_none()
+        .gap_1()
+        .text_color(if shown.escalated {
+            cx.theme().warning
+        } else {
+            cx.theme().muted_foreground
+        })
+        .child(Icon::new(mode.icon()).size_3())
+        .child(mode.label())
+        .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
+        .into_any_element()
+}
+
+/// The quiet note beside the decision of how long the badge's extra access
+/// lasts; the badge's color already says it is extra.
+fn escalation_note(id: &SharedString, scope: &'static str, cx: &App) -> AnyElement {
+    let selector = format!("{id}-escalation");
+    div()
+        .debug_selector(move || selector.clone())
+        .truncate()
+        .text_color(cx.theme().muted_foreground)
+        .child(scope)
+        .into_any_element()
 }
 
 /// How tall the arguments may grow before they scroll: about seven lines, so
@@ -210,52 +321,47 @@ fn arguments_view(id: &SharedString, call: &ToolCall, cx: &App) -> AnyElement {
     code_block(format!("{id}-arguments"), json, cx)
 }
 
-/// What a command with `access` may do, as its card says it.
-fn access_text(access: Access) -> &'static str {
-    match access {
-        Access::Read => "reads the project",
-        Access::Write => "can change the project",
-        Access::Network => "can change the project and reach the network",
+/// The folders outside the project a call names, as written, one per line:
+/// those it would change in the warning color, as nothing else outside the
+/// project and scratch folder may be changed, and those it would read. The
+/// icons are the modes' own, leaving the one warning sign to the footer.
+fn folders_view(id: &SharedString, arguments: &serde_json::Value, cx: &App) -> Option<AnyElement> {
+    let (read, write) = RunCommand::named_folders(arguments);
+    if read.is_empty() && write.is_empty() {
+        return None;
     }
-}
-
-/// The line above a command: where it runs, and the access it would be
-/// allowed with, warning when it asks for more than the project's mode.
-fn command_header(
-    id: &SharedString,
-    requested: Option<Access>,
-    project: Option<Access>,
-    cx: &App,
-) -> AnyElement {
-    let muted = cx.theme().muted_foreground;
-    let access = requested.or(project);
-    let escalated = requested
-        .zip(project)
-        .filter(|(requested, project)| requested > project);
-    let access_selector = format!("{id}-access");
-    h_flex()
-        .gap_1()
-        .min_w_0()
-        .text_color(muted)
-        .child("/bin/sh · sandbox")
-        .children(access.map(|access| {
-            div()
-                .debug_selector(move || access_selector.clone())
-                .child(format!("· {}", access_text(access)))
-        }))
-        .children(escalated.map(|(_, project)| {
-            let selector = format!("{id}-escalation");
-            h_flex()
-                .debug_selector(move || selector.clone())
-                .gap_1()
-                .text_color(cx.theme().warning)
-                .child(Icon::new(IconName::TriangleAlert).size_3())
-                .child(format!(
-                    "more than the project's {} mode, for this command only",
-                    ProjectMode::with_access(project).label()
-                ))
-        }))
-        .into_any_element()
+    let line = |icon: IconName, verb: &str, path: String, color| {
+        h_flex()
+            .gap_1()
+            .min_w_0()
+            .text_color(color)
+            .child(Icon::new(icon).size_3())
+            .child(div().flex_none().child(verb.to_owned()))
+            .child(
+                div()
+                    .truncate()
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .child(path),
+            )
+    };
+    let selector = format!("{id}-folders");
+    Some(
+        div()
+            .debug_selector(move || selector.clone())
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .children(
+                write
+                    .into_iter()
+                    .map(|path| line(IconName::Pencil, "can change", path, cx.theme().warning)),
+            )
+            .children(
+                read.into_iter()
+                    .map(|path| line(IconName::Eye, "can read", path, cx.theme().muted_foreground)),
+            )
+            .into_any_element(),
+    )
 }
 
 /// Highlights the exact command, without adding a prompt that could change
@@ -263,8 +369,7 @@ fn command_header(
 fn command_view(
     id: &SharedString,
     command: &str,
-    requested: Option<Access>,
-    project: Option<Access>,
+    arguments: &serde_json::Value,
     cx: &App,
 ) -> AnyElement {
     let block = CodeBlock::from_code(command, Some("sh"));
@@ -274,7 +379,7 @@ fn command_view(
         .flex()
         .flex_col()
         .gap_1()
-        .child(command_header(id, requested, project, cx))
+        .children(folders_view(id, arguments, cx))
         .child(code_block(
             format!("{id}-command"),
             StyledText::new(command.to_owned()).with_highlights(highlights),
@@ -286,9 +391,32 @@ fn command_view(
                 div()
                     .debug_selector(move || selector.clone())
                     .text_color(cx.theme().muted_foreground)
-                    .child(format!("↓ {line_count} lines · Scroll to see more")),
+                    .child(format!("{line_count} lines, scroll for more")),
             )
         })
+        .into_any_element()
+}
+
+/// A `request_permissions` call: why the agent asks and the folders it asks
+/// for; the access is beside the title.
+fn permissions_view(
+    id: &SharedString,
+    reason: &str,
+    arguments: &serde_json::Value,
+    cx: &App,
+) -> AnyElement {
+    let reason_selector = format!("{id}-reason");
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .debug_selector(move || reason_selector.clone())
+                .text_sm()
+                .child(reason.to_owned()),
+        )
+        .children(folders_view(id, arguments, cx))
         .into_any_element()
 }
 
@@ -404,9 +532,122 @@ mod tests {
                 "{project:?}"
             );
         }
-        assert_eq!(
-            access_text(Access::Network),
-            "can change the project and reach the network"
+    }
+
+    /// The warning sits beside the decision, below the command, rather than
+    /// lengthening the line above it.
+    #[gpui::test]
+    fn escalation_warnings_sit_beside_the_decision(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let call = command_call(json!({"command": "cargo fetch", "access": "network"}));
+        let (_, cx) = cx.add_window_view(|_, _| AccessView {
+            call,
+            project: Access::Read,
+        });
+        cx.run_until_parked();
+        let card = cx.debug_bounds("card").expect("the card is shown");
+        let command = cx.debug_bounds("card-command").expect("the command");
+        let warning = cx.debug_bounds("card-escalation").expect("the warning");
+        let waiting = cx.debug_bounds("card-waiting").expect("the waiting note");
+        assert!(warning.top() >= command.bottom());
+        assert!(warning.right() <= waiting.left());
+        assert!(waiting.right() <= card.right());
+    }
+
+    #[test]
+    fn titles_name_what_calls_do() {
+        assert_eq!(title(RunCommand::NAME).1, "Terminal");
+        assert_eq!(title("search_files").1, "Search files");
+        assert_eq!(title("calculate").1, "Calculate");
+    }
+
+    /// A command naming folders outside the project lists them; one naming
+    /// none shows no list.
+    #[gpui::test]
+    fn command_cards_list_the_folders_they_name(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        for (arguments, lists) in [
+            (json!({"command": "ls"}), false),
+            (
+                json!({"command": "cargo fetch", "write_folders": ["~/.cargo"]}),
+                true,
+            ),
+        ] {
+            let call = command_call(arguments);
+            let (_, cx) = cx.add_window_view(|_, _| AccessView {
+                call,
+                project: Access::Read,
+            });
+            cx.run_until_parked();
+            assert_eq!(cx.debug_bounds("card-folders").is_some(), lists);
+            assert!(cx.debug_bounds("card-command").is_some());
+        }
+    }
+
+    /// A request for permissions shows its reason, what it asks for, and
+    /// warns when that is more than the project's mode.
+    #[gpui::test]
+    fn permission_requests_show_what_they_ask_for(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            gpui_component::init(cx);
+            crate::theme::init(cx);
+        });
+        let request = |arguments| {
+            ToolCall::new(
+                CallId::from_wire("request_1"),
+                ToolFunction::new(ToolName::new(RequestPermissions::NAME).unwrap(), arguments),
+            )
+        };
+        for (project, arguments, access, escalated, folders) in [
+            (
+                Access::Read,
+                json!({"reason": "Fetch.", "access": "network", "write_folders": ["~/.cargo"]}),
+                true,
+                true,
+                true,
+            ),
+            (
+                Access::Network,
+                json!({"reason": "Fetch.", "access": "write"}),
+                true,
+                false,
+                false,
+            ),
+            (
+                Access::Write,
+                json!({"reason": "Read docs.", "read_folders": ["/srv/docs"]}),
+                false,
+                false,
+                true,
+            ),
+        ] {
+            let call = request(arguments);
+            let (_, cx) = cx.add_window_view(|_, _| AccessView { call, project });
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("card-reason").is_some());
+            assert!(cx.debug_bounds("card-arguments").is_none());
+            assert_eq!(cx.debug_bounds("card-access").is_some(), access);
+            // The title says how long the access lasts, so the badge's
+            // color is the only sign it is extra.
+            assert!(cx.debug_bounds("card-escalation").is_none(), "{escalated}");
+            assert_eq!(cx.debug_bounds("card-folders").is_some(), folders);
+        }
+
+        let call = request(json!({"access": "write"}));
+        let (_, cx) = cx.add_window_view(|_, _| AccessView {
+            call,
+            project: Access::Read,
+        });
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("card-arguments").is_some(),
+            "without a reason, the arguments are listed"
         );
     }
 

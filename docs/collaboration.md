@@ -25,10 +25,11 @@ clearing membership. Denial feedback is routed to the originating thread.
 Agent events are checked on arrival in the order Rig's stream could produce
 them.
 Tool calls outside a short always-allowed list wait for the host or an
-`Admin` peer to allow or deny them, and `run_command` and `write_file` for the
-host alone; commands with read access run without asking, and a command may
-ask for more access than the mode for itself alone. See
-[Tool approval](#tool-approval).
+`Admin` peer to allow or deny them, and `run_command`, `write_file`, and `request_permissions` for the
+host alone; commands with read access run without asking, a command may
+ask for more access than the mode, or for folders outside the project, for
+itself alone, and `request_permissions` asks for either for the rest of the
+run. See [Tool approval](#tool-approval).
 The agent's commands run on the host's computer, contained by its operating
 system's sandbox, with the host's project folders read-only unless the project
 is in `Write` or `Write + Network` mode, and with the network only in `Write + Network` mode;
@@ -555,31 +556,54 @@ A `run_command` call runs with the access of the project's mode (`read`,
 access, for that command only. This is how the agent asks for higher
 permissions for one command, such as `network` to fetch dependencies in a
 `Read` project, and how it runs a command that only reads without waiting in
-a `Write` or `Write + Network` project.
+a `Write` or `Write + Network` project. Its optional `read_folders` and
+`write_folders` name host folders outside the project the command also
+needs, as absolute paths or under `~/` (the user's real home, not the
+command's `HOME`), such as `~/.cargo` for `cargo fetch`.
 
-A command with read access runs at once, as in Codex's read-only mode,
-whoever's prompt started the run: the sandbox lets it read, and change only
-the thread's scratch folder. Every other command waits, including one asking
-for more than the mode. The hook allows a call with a context naming the
-access it was granted, and the tool runs the command with exactly that, so a
-mode the host changes before the command starts changes nothing for it. For
-a call that waited, the access is worked out when it is decided, from its
-own `access` or the mode at that moment, matching what its card shows then.
-The card says what the command could do and, in the warning color, when it
-asks for more than the mode.
+The agent can also ask for more for the rest of its run, as Codex's agent
+does, with `request_permissions`: a `reason`, and an `access`, folders, or
+both. Once the host allows it, the run's later commands get what it granted
+automatically: their access is their own `access`, or the mode or the grant,
+whichever is more, and the granted folders are added to any they name.
+Grants are kept by the run's hook and end with the run; nothing is mirrored
+or saved. They reach only `run_command`, not the file tools.
 
-`run_command` and `write_file` calls (in any mode) only the host may decide
-(`HOST_ONLY`): `run_command`'s commands use the host's own shell and tools on
-the host's computer, and `write_file` changes the host's files, even when it
-writes the scratch folder. On Windows, commands read every drive except
+The host's hook resolves the folders a call names before anyone is asked:
+they must exist, and none may be in the sandbox's denied credential paths. A
+call naming one that can't be granted, or a request asking for nothing
+beyond reading the project, is refused with why, without asking.
+
+A command runs at once, whoever's prompt started the run, when it needs
+nothing beyond read access and what the run was granted: with no grants,
+that is read access and no folders, as in Codex's read-only mode, where the
+sandbox lets it read, and change only the thread's scratch folder. Every
+other command waits, including one asking for more than the mode or naming
+folders the run wasn't granted. A request for permissions the run already
+has runs at once too. The hook allows a command with a context naming the
+grant (access and folders) it was allowed, and the tool runs the command
+with exactly that, so a mode the host changes before the command starts
+changes nothing for it. For a call that waited, the grant is worked out when
+it is decided, from its own `access` or the mode at that moment, matching
+what its card shows then. The card says what the command could do and, in
+the warning color, when it asks for more than the mode, and lists the
+folders it names, those it would change in the warning color. A
+`request_permissions` card shows its reason, the access and folders asked
+for, and that later commands in the turn get them without asking.
+
+`run_command`, `write_file`, and `request_permissions` calls (in any mode)
+only the host may decide (`HOST_ONLY`): `run_command`'s commands use the
+host's own shell and tools on the host's computer, `write_file` changes the
+host's files, even when it writes the scratch folder, and
+`request_permissions` decides what later commands may do there. On Windows, commands read every drive except
 credentials (see `sandbox/src/settings.rs`), so a collaborator who may submit
 can have the agent read the host's other files into the transcript without
 the host allowing it.
 
 The agent loop asks a hook about each call before its tool runs (calls whose
 arguments could not be read never run, so are never asked about). The host's
-hook lets listed tools, and `run_command` with read access, through and
-otherwise asks the thread, on the same channel as the run's events, so the
+hook lets listed tools, and commands and requests the run's grants cover,
+through and otherwise asks the thread, on the same channel as the run's events, so the
 request always follows the reply that made the call. The host then emits
 `ToolApprovalRequested`, naming the agent message and the call, and the run
 waits.
@@ -603,7 +627,9 @@ card. Participants refuse a `ToolApprovalRequested`, live or in a snapshot,
 for a call the running reply did not make or that already returned.
 
 Not yet: remembering a decision for later calls ("always allow this tool
-here"), letting chosen tools run unasked in `Read` mode, keyboard shortcuts
+here"), permissions granted for the whole thread rather than one run,
+running a command outside the sandbox (Codex's `require_escalated`), letting
+chosen tools run unasked in `Read` mode, keyboard shortcuts
 for Allow and Deny, and showing a denied call differently from one that
 returned; see `ROADMAP.md`.
 

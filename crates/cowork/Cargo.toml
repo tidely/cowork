@@ -23,6 +23,7 @@ image.workspace = true
 iroh.workspace = true
 itertools.workspace = true
 nucleo-matcher.workspace = true
+parking_lot.workspace = true
 postcard.workspace = true
 rig.workspace = true
 rrule.workspace = true

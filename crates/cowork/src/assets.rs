@@ -48,6 +48,7 @@ gpui_kit_assets::icon_assets!(
         Pen,
         X,
         Wrench,
+        SquareTerminal,
         Hourglass,
         WindowMinimize,
         WindowMaximize,
@@ -108,9 +109,11 @@ mod tests {
     fn tool_call_card_icons_are_bundled() {
         for icon in [
             IconName::Wrench,
-            IconName::Hourglass,
-            IconName::Check,
-            IconName::X,
+            IconName::SquareTerminal,
+            IconName::Shield,
+            IconName::Pencil,
+            IconName::Eye,
+            IconName::TriangleAlert,
         ] {
             let path = icon.path();
             let bytes = Assets.load(&path).unwrap().expect("bundled tool call icon");

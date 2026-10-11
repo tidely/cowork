@@ -12,10 +12,14 @@
 //!
 //! What a command may do, with each sandbox denying everything not granted.
 //! Its [`Access`](crate::Access) is the project's mode unless it was granted
-//! its own:
+//! its own [`Grant`](crate::Grant):
 //!
 //! - Read, and write with `Write` or `Network` access, the thread's project
 //!   folders at their real paths.
+//! - Read, or read and write, the host folders outside the project its grant
+//!   names, at their real paths: folders the host allowed for that command,
+//!   or for the rest of its run through `request_permissions` (see
+//!   [`crate::grant`]). None unless granted.
 //! - Read and write its thread's scratch folder ([`SCRATCH_DIR`]), which is
 //!   its `HOME` and `TMPDIR`.
 //! - Read the host's tools: the system's own locations (granted by the
@@ -33,7 +37,8 @@
 //!   work tree"), while `log` and `show` work: the sandbox denies changing
 //!   back to a read-only folder (`git --work-tree=. status` says "cannot come
 //!   back to cwd"). Codex's read-only sandbox fails the same way.
-//! - Nothing in [`DENIED_PATHS`], even inside a folder granted above.
+//! - Nothing in [`DENIED_PATHS`], even inside a folder granted above, and
+//!   none of them can be granted.
 //! - No network, unless it has `Network` access: then outbound connections
 //!   to any address. Never inbound connections, nor connections to the
 //!   host's own loopback services (Bubblewrap cannot allow those, and they

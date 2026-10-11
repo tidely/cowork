@@ -6,7 +6,8 @@
 //! read-only unless the project is writable (see [`Project`]); a scratch
 //! folder per thread; no other user files, except that on Windows commands
 //! read every drive, credentials aside; and no network unless the command's
-//! [`Access`] is `Network`.
+//! [`Access`] is `Network`. A command the host granted more ([`grant`]) may
+//! also have more access to the project, and other host folders.
 //!
 //! Each command is a sandbox of its own, made from the thread's project as
 //! it is when the command starts, so a thread's commands may run at the same
@@ -19,9 +20,11 @@
 
 pub mod environment;
 pub mod files;
+pub mod grant;
 
 mod output;
 pub mod paths;
+mod permissions;
 mod project;
 pub mod settings;
 mod tool;
@@ -46,8 +49,10 @@ use mxc_sdk::v1::{
 
 pub use environment::{EnvironmentSource, PRINT_ENV_FLAG, print_env};
 pub use files::{ListDirectory, ReadFile, WriteFile};
+pub use grant::{Folders, Grant};
 pub use output::CommandOutput;
 pub use paths::FileError;
+pub use permissions::{RequestPermissions, RequestPermissionsArgs};
 pub use project::{Access, Project, ProjectFolder, folder_name};
 pub use tool::{RunCommand, RunCommandArgs};
 
@@ -75,7 +80,7 @@ pub enum SandboxError {
     /// The command could not be started or waited on.
     Failed(String),
     /// The model's command was rejected before anything ran.
-    InvalidCommand(&'static str),
+    InvalidCommand(String),
 }
 
 impl std::fmt::Display for SandboxError {
@@ -213,18 +218,18 @@ impl Sandboxes {
         self.run_with(thread, command, None).await
     }
 
-    /// Like [`Sandboxes::run`], with `access` in place of the project's own
-    /// when given, whatever the project's is by the time the command starts:
-    /// the access someone allowed, or that a command needing no approval was
-    /// let through with.
+    /// Like [`Sandboxes::run`], with `grant` in place of the project's mode
+    /// when given, whatever the mode is by the time the command starts: what
+    /// someone allowed, or what a command needing no approval was let through
+    /// with.
     pub async fn run_with(
         &self,
         thread: &str,
         command: &str,
-        access: Option<Access>,
+        grant: Option<Grant>,
     ) -> Result<CommandOutput, SandboxError> {
         if command.trim().is_empty() {
-            return Err(SandboxError::InvalidCommand("the command is empty"));
+            return Err(SandboxError::InvalidCommand("the command is empty".into()));
         }
         self.ready()?;
         let environment = self
@@ -240,10 +245,14 @@ impl Sandboxes {
             ))
         })?;
         let mut project = self.project(thread);
-        if let Some(access) = access {
-            project.access = access;
-        }
-        let request = request(command, &project, &scratch, &environment);
+        let folders = match grant {
+            Some(grant) => {
+                project.access = grant.access;
+                grant.folders
+            }
+            None => Folders::default(),
+        };
+        let request = request(command, &project, &folders, &scratch, &environment);
         let stop = StopOnDrop(Arc::new(AtomicBool::new(false)));
         let stopped = stop.0.clone();
         let result = tokio::task::spawn_blocking(move || execute(request, &stopped)).await;
@@ -410,10 +419,12 @@ fn working_directory(folders: &[(String, PathBuf)], scratch: &Path) -> PathBuf {
         .unwrap_or_else(|| resolved(scratch).unwrap_or_else(|| scratch.to_owned()))
 }
 
-/// What `command` may do, from [`settings`].
+/// What `command` may do, from [`settings`], with `folders` outside the
+/// project granted to it.
 fn request(
     command: &str,
     project: &Project,
+    folders: &Folders,
     scratch: &Path,
     environment: &HashMap<String, String>,
 ) -> ContainerRequest {
@@ -437,6 +448,7 @@ fn request(
     }
     let environment = environment.into_iter().collect::<Vec<_>>();
 
+    let granted = folders;
     let folders = resolved_folders(project);
     let mut readwrite = vec![scratch.clone()];
     let mut readonly = Vec::new();
@@ -447,6 +459,8 @@ fn request(
             readonly.push(path.clone());
         }
     }
+    readwrite.extend(granted.write.iter().cloned());
+    readonly.extend(granted.read.iter().cloned());
     readonly.extend(tool_paths(&environment, home.as_deref()));
     readonly.extend(drive_paths());
     readonly.sort();
@@ -763,7 +777,13 @@ mod tests {
             folders: vec![zed.clone()],
             access: Access::Write,
         };
-        let request = request("dir", &project, &scratch, &HashMap::new());
+        let request = request(
+            "dir",
+            &project,
+            &Folders::default(),
+            &scratch,
+            &HashMap::new(),
+        );
         let filesystem = request.filesystem.unwrap();
         let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
         for path in [format!("{system}\\"), format!("{system}\\Users")] {
@@ -845,7 +865,8 @@ mod tests {
         let zed_path = resolved(&zed.path).unwrap().to_string_lossy().into_owned();
         let scratch_path = resolved(&scratch).unwrap().to_string_lossy().into_owned();
 
-        let read_only = request("ls", &project(Access::Read), &scratch, &environment);
+        let none = Folders::default();
+        let read_only = request("ls", &project(Access::Read), &none, &scratch, &environment);
         let filesystem = read_only.filesystem.clone().unwrap();
         assert!(filesystem.readonly_paths.contains(&zed_path));
         assert_eq!(
@@ -878,13 +899,19 @@ mod tests {
         assert_eq!(network.egress.unwrap().default, Some(NetworkAction::Deny));
         assert_eq!(network.ingress.unwrap().default, Some(NetworkAction::Deny));
 
-        let writable = request("ls", &project(Access::Write), &scratch, &environment);
+        let writable = request("ls", &project(Access::Write), &none, &scratch, &environment);
         let network = writable.network.clone().unwrap();
         assert_eq!(network.egress.unwrap().default, Some(NetworkAction::Deny));
         let filesystem = writable.filesystem.unwrap();
         assert!(filesystem.readwrite_paths.contains(&zed_path));
 
-        let networked = request("ls", &project(Access::Network), &scratch, &environment);
+        let networked = request(
+            "ls",
+            &project(Access::Network),
+            &none,
+            &scratch,
+            &environment,
+        );
         let network = networked.network.unwrap();
         assert_eq!(network.egress.unwrap().default, Some(NetworkAction::Allow));
         let ingress = network.ingress.unwrap();
@@ -893,6 +920,34 @@ mod tests {
         let filesystem = networked.filesystem.unwrap();
         assert!(filesystem.readwrite_paths.contains(&zed_path));
         assert!(!filesystem.readonly_paths.contains(&zed_path));
+    }
+
+    /// Folders granted outside the project are added as asked, whatever
+    /// the project's own access.
+    #[test]
+    fn requests_add_the_folders_granted_outside_the_project() {
+        let root = TestRoot::new();
+        let zed = folder(&root.0, "zed");
+        let cache = folder(&root.0, "cache");
+        let docs = folder(&root.0, "docs");
+        let scratch = root.0.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let text = |path: &Path| resolved(path).unwrap().to_string_lossy().into_owned();
+        let project = Project {
+            folders: vec![zed.clone()],
+            access: Access::Read,
+        };
+        let folders = Folders {
+            read: vec![resolved(&docs.path).unwrap()],
+            write: vec![resolved(&cache.path).unwrap()],
+        };
+        let request = request("ls", &project, &folders, &scratch, &HashMap::new());
+        let filesystem = request.filesystem.unwrap();
+        assert!(filesystem.readwrite_paths.contains(&text(&cache.path)));
+        assert!(!filesystem.readonly_paths.contains(&text(&cache.path)));
+        assert!(filesystem.readonly_paths.contains(&text(&docs.path)));
+        assert!(filesystem.readonly_paths.contains(&text(&zed.path)));
+        assert!(!filesystem.readwrite_paths.contains(&text(&zed.path)));
     }
 
     #[test]

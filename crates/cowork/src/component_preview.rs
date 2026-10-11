@@ -1,10 +1,10 @@
-//! A window showing components in their states, to review them before
-//! anything in the app puts them in those states. `COWORK_PREVIEW=1 cargo run
-//! -p cowork` opens it instead of the app.
+//! A window showing components in their states, side by side in a grid, to
+//! review them before anything in the app puts them in those states. `cargo
+//! run -p cowork --example component_preview` opens it.
 
 use gpui::{
-    Context, IntoElement, Render, SharedString, Window, WindowBounds, WindowOptions, div,
-    prelude::*, px, size,
+    App, Context, IntoElement, Pixels, QuitMode, Render, SharedString, Window, WindowBounds,
+    WindowOptions, div, prelude::*, px, size,
 };
 use gpui_component::{ActiveTheme as _, Root};
 use rig::message::{CallId, ToolCall, ToolFunction, ToolName};
@@ -17,16 +17,35 @@ use crate::{
     tool_call_card::ToolCallCard,
 };
 
-/// Whether to open the preview instead of the app.
-pub(crate) fn requested() -> bool {
-    std::env::var_os("COWORK_PREVIEW").is_some()
+/// Runs the preview until its window closes, as the app's own run does.
+pub fn run() -> anyhow::Result<()> {
+    gpui_platform::application()
+        .with_assets(crate::assets::Assets)
+        .run(|cx: &mut App| {
+            crate::init_app(cx);
+            if let Err(error) = open(cx) {
+                eprintln!("failed to open the component preview: {error}");
+                cx.quit();
+                return;
+            }
+            cx.set_quit_mode(QuitMode::LastWindowClosed);
+            cx.activate(true);
+        });
+    Ok(())
 }
 
-pub(crate) fn open(cx: &mut gpui::App) -> anyhow::Result<()> {
+/// The narrowest a grid cell may be, about the width of a card in a
+/// thread; the grid fits as many columns as allow it.
+const MIN_CELL_WIDTH: Pixels = px(460.);
+/// Gaps between cells and around the grid.
+const SPACING: Pixels = px(24.);
+
+fn open(cx: &mut App) -> anyhow::Result<()> {
     let options = WindowOptions {
-        window_bounds: Some(WindowBounds::Windowed(gpui::Bounds::centered(
+        // Fullscreen, so that the grid shows as many states at once as fit.
+        window_bounds: Some(WindowBounds::Fullscreen(gpui::Bounds::centered(
             None,
-            size(px(720.), px(900.)),
+            size(px(1440.), px(900.)),
             cx,
         ))),
         titlebar: Some(gpui::TitlebarOptions {
@@ -54,6 +73,7 @@ impl ComponentPreview {
         cx: &Context<Self>,
     ) -> impl IntoElement {
         div()
+            .min_w_0()
             .flex()
             .flex_col()
             .gap_1p5()
@@ -108,7 +128,16 @@ impl ComponentPreview {
 }
 
 impl Render for ComponentPreview {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let width = window.viewport_size().width - SPACING * 2.;
+        let columns = ((width + SPACING) / (MIN_CELL_WIDTH + SPACING)).floor() as u16;
+        let grid = || {
+            div()
+                .grid()
+                .grid_cols(columns.max(1))
+                .gap(SPACING)
+                .items_start()
+        };
         div()
             .id("component-preview")
             .size_full()
@@ -117,12 +146,10 @@ impl Render for ComponentPreview {
             .text_color(cx.theme().foreground)
             .child(
                 div()
-                    .max_w(px(560.))
-                    .mx_auto()
-                    .py_6()
+                    .p(SPACING)
                     .flex()
                     .flex_col()
-                    .gap_5()
+                    .gap(SPACING)
                     .child(
                         div()
                             .flex()
@@ -139,6 +166,7 @@ impl Render for ComponentPreview {
                                     ),
                             ),
                     )
+                    .child(grid()
                     .child(Self::section(
                         "An admin, who may decide",
                         self.deciding("preview-calculate", calculate(), cx),
@@ -168,6 +196,20 @@ impl Render for ComponentPreview {
                         cx,
                     ))
                     .child(Self::section(
+                        "A command asking to change a folder outside the project",
+                        self.deciding("preview-command-folders", folder_command(), cx)
+                            .project_access(sandbox::Access::Read)
+                            .host_only(),
+                        cx,
+                    ))
+                    .child(Self::section(
+                        "The agent asking for permissions for the rest of its turn",
+                        self.deciding("preview-request-permissions", permission_request(), cx)
+                            .project_access(sandbox::Access::Read)
+                            .host_only(),
+                        cx,
+                    ))
+                    .child(Self::section(
                         "A long command with a visible scrolling hint",
                         self.deciding("preview-long-command", long_command(), cx)
                             .host_only(),
@@ -188,8 +230,9 @@ impl Render for ComponentPreview {
                         self.deciding("preview-custom", respond_to_comment(), cx)
                             .body(custom_body(cx)),
                         cx,
-                    ))
+                    )))
                     .child(div().text_lg().child("Project folders"))
+                    .child(grid()
                     .child(Self::section(
                         "No folders yet",
                         self.project("preview-project-empty", &[], cx),
@@ -229,7 +272,7 @@ impl Render for ComponentPreview {
                             ProjectFolder::mirrored(vec!["zed".into(), "cowork".into()]),
                         ),
                         cx,
-                    )),
+                    ))),
             )
     }
 }
@@ -252,6 +295,29 @@ fn network_command() -> ToolCall {
     tool_call(
         "run_command",
         json!({"command": "cargo fetch", "access": "network"}),
+    )
+}
+
+fn folder_command() -> ToolCall {
+    tool_call(
+        "run_command",
+        json!({
+            "command": "cargo fetch",
+            "access": "network",
+            "write_folders": ["~/.cargo"],
+        }),
+    )
+}
+
+fn permission_request() -> ToolCall {
+    tool_call(
+        "request_permissions",
+        json!({
+            "reason": "Download the project's dependencies and build it.",
+            "access": "network",
+            "write_folders": ["~/.cargo", "~/.rustup"],
+            "read_folders": ["/opt/shared/docs"],
+        }),
     )
 }
 

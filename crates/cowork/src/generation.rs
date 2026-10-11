@@ -14,7 +14,7 @@ use agent::{Agent as StreamingAgent, AgentEvent, ToolDecision};
 use anyhow::Context as _;
 use gpui::{App, Context, Entity};
 use rig::{completion::Usage, message::CallId, providers::ollama::Ollama, tool::ToolSet};
-use sandbox::{ListDirectory, ReadFile, RunCommand, WriteFile};
+use sandbox::{ListDirectory, ReadFile, RequestPermissions, RunCommand, WriteFile};
 use serde_json::json;
 use tokio::sync::{mpsc, oneshot};
 use tools::{Calculate, RespondToComment};
@@ -79,6 +79,7 @@ fn tool_set(
     tools.add_tool(RespondToComment::new(turn_comments));
     tools.add_tool(Calculate);
     tools.add_tool(RunCommand::new(sandboxes.clone(), thread));
+    tools.add_tool(RequestPermissions);
     tools.add_tool(ListDirectory::new(sandboxes.clone(), thread));
     tools.add_tool(ReadFile::new(sandboxes.clone(), thread));
     tools.add_tool(WriteFile::new(sandboxes.clone(), thread));
@@ -570,6 +571,7 @@ mod tests {
                 RespondToComment::NAME,
                 Calculate::NAME,
                 RunCommand::NAME,
+                RequestPermissions::NAME,
                 ListDirectory::NAME,
                 ReadFile::NAME,
                 WriteFile::NAME,

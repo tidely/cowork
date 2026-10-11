@@ -66,7 +66,7 @@ impl ProjectMode {
         }
     }
 
-    fn icon(self) -> IconName {
+    pub(crate) fn icon(self) -> IconName {
         match self {
             Self::Network => IconName::Globe,
             Self::Write => IconName::Pencil,
