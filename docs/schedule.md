@@ -19,20 +19,20 @@ Not yet implemented:
 
 ## Task options
 
-| Option | Choices |
-|---|---|
-| Prompt | The text submitted on each run. |
-| Name | Shown in the list, and the title of the threads it creates. Defaults to the start of the prompt, like a thread title. |
-| When | An [interval](#interval) or a [schedule](#schedule). |
-| Model | Any model in the host's catalog. Starts as the model new threads start with. |
-| Project | Folders on the host's machine each run's thread works in, and whether they are open for **Read** (the default) or **Write**. See [Project](#project). |
-| Thread | **New thread each run**, or **continue the last thread**. |
-| Missed runs | **Run once when available**, or **skip**. |
-| Status | Active or paused, with the switch on the task's row. |
+| Option      | Choices                                                                                                                                               |
+| ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Prompt      | The text submitted on each run.                                                                                                                       |
+| Name        | Shown in the list, and the title of the threads it creates. Defaults to the start of the prompt, like a thread title.                                 |
+| When        | An [interval](#interval) or a [schedule](#schedule).                                                                                                  |
+| Model       | Any model in the host's catalog. Starts as the model new threads start with.                                                                          |
+| Project     | Folders on the host's machine each run's thread works in, and whether they are open for **Read** (the default) or **Write**. See [Project](#project). |
+| Thread      | **New thread each run**, or **continue the last thread**.                                                                                             |
+| Missed runs | **Run once when available**, or **skip**.                                                                                                             |
+| Status      | Active or paused, with the switch on the task's row.                                                                                                  |
 
 ### Interval
 
-Every *N* minutes, hours, or days, starting from a chosen time. Occurrences
+Every _N_ minutes, hours, or days, starting from a chosen time. Occurrences
 are counted from that start time, not from when the last run finished, so a
 slow run doesn't push the later ones back.
 
@@ -58,11 +58,11 @@ passed, it shows no more runs; editing its time schedules it again.
 The same folders and mode a thread's bottom bar sets (see
 [Project folders](collaboration.md#project-folders)), chosen in the task's
 dialog with the same folder picker. Before each run is submitted, its thread
-is given exactly the task's folders and mode, so the run's sandbox mounts
-them from its first command. An edit applies from the next run, also in a
-continued thread, whose folders someone may have changed meanwhile; a changed
-project restarts the thread's sandbox without asking, as nothing runs in it
-then. The user's own new-thread project is left alone.
+is given exactly the task's folders and mode, so the run's commands use them
+from the first one, and its prompt carries an environment note naming them
+when they changed. An edit applies from the next run, also in a continued
+thread, whose folders someone may have changed meanwhile. The user's own
+new-thread project is left alone.
 
 A run whose folder no longer exists fails without making a thread, and the
 queue goes on.
@@ -153,8 +153,7 @@ doesn't wait the first time:
 The model can therefore carry on without the call, or decide the call is
 worth waiting for. Calls made in the thread outside a scheduled run, such as
 someone chatting in a **continue the last thread** thread, are approved as
-usual. `run_command` in a read-only project runs without asking, as it does
-outside scheduled runs.
+usual. `run_command` is no exception, in either project mode.
 
 ## Managing tasks
 

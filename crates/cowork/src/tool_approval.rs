@@ -7,13 +7,9 @@
 //! approve tool calls (the host, and `Admin` peers) then allows or denies it
 //! through the same checked path; the first decision wins and the run goes on.
 //! Calls of [`HOST_ONLY`] tools, which run something on the host's computer,
-//! only the host may decide.
-//!
-//! `run_command` calls run without asking while the thread's project is
-//! read-only, as they cannot change anything outside the sandbox then; in a
-//! writable project they are asked about like any other.
-//! [`sandbox::ReadOnlyPass`] makes sure such a call never runs in a project
-//! made writable after it was let through.
+//! only the host may decide. `run_command` is asked about in every project
+//! mode: its commands use the host's own tools, so even in a read-only
+//! project they act on the host's computer.
 //!
 //! A scheduled run may have nobody around to answer, so it doesn't wait the
 //! first time: a call that needs approval fails at once, telling the model
@@ -29,7 +25,7 @@ use rig::{
     message::{CallId, ToolCall},
     tool::Tool as _,
 };
-use sandbox::{ReadOnlyPass, RunCommand};
+use sandbox::RunCommand;
 use tokio::sync::{mpsc, oneshot};
 use tools::RespondToComment;
 use uuid::Uuid;
@@ -57,8 +53,8 @@ const UNDECIDED: &str = "The tool call was not approved.";
 pub(crate) const UNATTENDED: &str = "This tool call was not run: it needs the user's permission, and this is a scheduled run that nobody may be watching. Carry on without it if you can. If the call is necessary, make it again with exactly the same arguments: the user will then be notified and asked, and the run waits for their answer.";
 
 /// Tools whose calls only the host may allow: they act on the host's computer
-/// (a sandbox there, for `run_command`), so an `Admin` peer may not decide
-/// for it.
+/// (its shell and tools, for `run_command`), so an `Admin` peer may not
+/// decide for it.
 pub(crate) const HOST_ONLY: &[&str] = &[RunCommand::NAME];
 
 pub(crate) fn needs_approval(tool: &str) -> bool {
@@ -111,9 +107,6 @@ pub(crate) enum RunUpdate {
 /// request always arrives after the reply whose call it is.
 pub(crate) struct ApprovalGate {
     updates: mpsc::UnboundedSender<RunUpdate>,
-    /// Lets the run's `run_command` calls through while the project is
-    /// read-only.
-    read_only: ReadOnlyPass,
     /// For a scheduled run, the calls already refused once, by tool and
     /// arguments; `None` for a run someone started.
     unattended: Option<Mutex<Vec<CallKey>>>,
@@ -128,14 +121,9 @@ type CallKey = (
 );
 
 impl ApprovalGate {
-    pub(crate) fn new(
-        updates: mpsc::UnboundedSender<RunUpdate>,
-        read_only: ReadOnlyPass,
-        scheduled: bool,
-    ) -> Arc<Self> {
+    pub(crate) fn new(updates: mpsc::UnboundedSender<RunUpdate>, scheduled: bool) -> Arc<Self> {
         Arc::new(Self {
             updates,
-            read_only,
             unattended: scheduled.then(Mutex::default),
         })
     }
@@ -166,9 +154,7 @@ impl ToolHook for ApprovalGate {
     fn before_tool_call<'a>(&'a self, call: &'a ToolCall) -> BoxFuture<'a, ToolDecision> {
         Box::pin(async move {
             let tool = call.function.name.as_str();
-            if !needs_approval(tool)
-                || (tool == RunCommand::NAME && self.read_only.grant_if_read_only())
-            {
+            if !needs_approval(tool) {
                 return ToolDecision::Allow;
             }
             if self.refuses_unattended(call) {
@@ -322,47 +308,15 @@ mod tests {
         )
     }
 
-    /// A gate for a run whose project is writable or read-only, and the
-    /// sandboxes holding that project.
-    fn gate(
-        writable: bool,
-    ) -> (
-        Arc<ApprovalGate>,
-        mpsc::UnboundedReceiver<RunUpdate>,
-        Arc<sandbox::Sandboxes>,
-    ) {
-        gate_for(writable, false)
-    }
-
-    fn gate_for(
-        writable: bool,
-        scheduled: bool,
-    ) -> (
-        Arc<ApprovalGate>,
-        mpsc::UnboundedReceiver<RunUpdate>,
-        Arc<sandbox::Sandboxes>,
-    ) {
-        let sandboxes = crate::test_support::unused_sandboxes();
-        let thread = Uuid::new_v4().to_string();
-        sandboxes.set_project(
-            &thread,
-            sandbox::Project {
-                folders: Vec::new(),
-                writable,
-            },
-        );
-        let tool = RunCommand::new(sandboxes.clone(), thread);
+    /// A gate for a run someone started, or a scheduled one.
+    fn gate(scheduled: bool) -> (Arc<ApprovalGate>, mpsc::UnboundedReceiver<RunUpdate>) {
         let (updates, asked) = mpsc::unbounded_channel();
-        (
-            ApprovalGate::new(updates, tool.read_only_pass(), scheduled),
-            asked,
-            sandboxes,
-        )
+        (ApprovalGate::new(updates, scheduled), asked)
     }
 
     #[tokio::test]
     async fn a_scheduled_run_asks_only_when_a_call_is_repeated() {
-        let (gate, mut asked, _sandboxes) = gate_for(true, true);
+        let (gate, mut asked) = gate(true);
         let first = call_with(
             tools::Calculate::NAME,
             serde_json::json!({ "a": 1, "b": 2 }),
@@ -398,31 +352,24 @@ mod tests {
         let (decision, ()) = tokio::join!(decision, answer);
         assert_eq!(decision, ToolDecision::Allow);
 
-        // Calls that need no approval still run at once.
+        // Calls that need no approval still run at once, while a command is
+        // refused the first time like any other call.
         let comment = call(RespondToComment::NAME);
         assert_eq!(gate.before_tool_call(&comment).await, ToolDecision::Allow);
-        let (read_only, _asked, _sandboxes) = gate_for(false, true);
-        assert_eq!(
-            read_only.before_tool_call(&call(RunCommand::NAME)).await,
-            ToolDecision::Allow
-        );
+        assert!(matches!(
+            gate.before_tool_call(&call(RunCommand::NAME)).await,
+            ToolDecision::Deny { .. }
+        ));
     }
 
     #[tokio::test]
-    async fn commands_run_unasked_only_in_a_read_only_project() {
+    async fn every_command_is_asked_about() {
         let command = call(RunCommand::NAME);
-        let (read_only, mut asked, _sandboxes) = gate(false);
-        assert_eq!(
-            read_only.before_tool_call(&command).await,
-            ToolDecision::Allow
-        );
-        assert!(asked.try_recv().is_err(), "nobody was asked");
-
-        let (writable, mut asked, _sandboxes) = gate(true);
-        let decision = writable.before_tool_call(&command);
+        let (gate, mut asked) = gate(false);
+        let decision = gate.before_tool_call(&command);
         let answer = async {
             let Some(RunUpdate::Approval { tool, decide, .. }) = asked.recv().await else {
-                panic!("a writable project asks");
+                panic!("a command asks");
             };
             assert_eq!(tool, RunCommand::NAME);
             decide
@@ -437,7 +384,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_gate_asks_only_about_calls_that_need_approval() {
-        let (gate, mut asked, _sandboxes) = gate(true);
+        let (gate, mut asked) = gate(false);
 
         let comment = call(RespondToComment::NAME);
         assert_eq!(gate.before_tool_call(&comment).await, ToolDecision::Allow);
@@ -461,7 +408,7 @@ mod tests {
     /// rather than leaving the run waiting.
     #[tokio::test]
     async fn an_abandoned_request_denies_the_call() {
-        let (gate, mut asked, _sandboxes) = gate(true);
+        let (gate, mut asked) = gate(false);
         let calculation = call(tools::Calculate::NAME);
         let decision = gate.before_tool_call(&calculation);
         let abandon = async {

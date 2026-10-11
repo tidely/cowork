@@ -278,11 +278,12 @@ impl Cowork {
         });
     }
 
-    /// Stops the sandbox of a thread that left the sidebar, and keeps a
-    /// deleted one's longest stretch of generating for the profile's
-    /// statistics. Also called when a run of such a thread ends, which adds
-    /// that run's time and stops a sandbox the run may have started while it
-    /// was being stopped.
+    /// Keeps a deleted thread's longest stretch of generating for the
+    /// profile's statistics, and removes its commands' scratch folder. Also
+    /// called for a thread that left the sidebar and when a run of such a
+    /// thread ends, which adds that run's time. An archived thread keeps its
+    /// scratch folder, so restoring it continues where it was; its commands
+    /// end with its run.
     pub(crate) fn settle_retired_thread(&mut self, thread: &Entity<Thread>, cx: &App) {
         let thread = thread.read(cx);
         let thread_id = thread.instance_id;
@@ -290,10 +291,11 @@ impl Cowork {
             .thread_store
             .read(cx)
             .archived_thread(thread_id, cx)
-            .is_none()
+            .is_some()
         {
-            self.longest_deleted_chat = self.longest_deleted_chat.max(thread.generation_time());
+            return;
         }
+        self.longest_deleted_chat = self.longest_deleted_chat.max(thread.generation_time());
         let sandboxes = self.sandboxes.clone();
         self.tokio_handle.spawn(async move {
             sandboxes.remove(&thread_id.to_string()).await;

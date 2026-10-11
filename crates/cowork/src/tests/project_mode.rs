@@ -61,7 +61,7 @@ fn the_write_option_warns_while_hovered(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
-fn picking_write_from_the_menu_applies_it_without_a_sandbox(cx: &mut gpui::TestAppContext) {
+fn picking_write_from_the_menu_applies_it_without_asking(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     let trigger = cx.debug_bounds("project-mode").expect("mode toggle");
     cx.simulate_click(trigger.center(), gpui::Modifiers::none());
@@ -69,7 +69,7 @@ fn picking_write_from_the_menu_applies_it_without_a_sandbox(cx: &mut gpui::TestA
     let write = cx.debug_bounds("project-mode-write").expect("Write");
     cx.simulate_click(write.center(), gpui::Modifiers::none());
     cx.run_until_parked();
-    // Nothing runs yet, so there is nothing to restart and no question.
+    // A change applies from the next command on, with nothing to confirm.
     cx.update(|window, cx| assert!(!window.has_active_dialog(cx)));
     cowork.read_with(cx, |cowork, cx| {
         assert_eq!(cowork.active_project_mode(cx).0, ProjectMode::Write);

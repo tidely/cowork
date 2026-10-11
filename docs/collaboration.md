@@ -25,11 +25,13 @@ clearing membership. Denial feedback is routed to the originating thread.
 Agent events are checked on arrival in the order Rig's stream could produce
 them.
 Tool calls outside a short always-allowed list wait for the host or an
-`Admin` peer to allow or deny them, except `run_command` in a read-only
-project; see [Tool approval](#tool-approval).
-The host's project folders are mounted in its sandbox for the thread, read-only
-unless the project is in `Write` mode, and shown to collaborators by name with
-that mode; see [Project folders](#project-folders).
+`Admin` peer to allow or deny them, and `run_command` for the host alone; see
+[Tool approval](#tool-approval).
+The agent's commands run on the host's computer, contained by its operating
+system's sandbox, with the host's project folders read-only unless the project
+is in `Write` mode; collaborators see the folders by name with that mode, and
+the agent learns their paths from an environment note in its prompt; see
+[Project folders](#project-folders).
 The protocol version is **24**.
 
 Not yet implemented:
@@ -544,12 +546,9 @@ run. `tool_approval.rs` lists the tools whose calls always run
 thread); every other tool's calls wait, so a newly added tool is asked about
 rather than trusted. `calculate` waits.
 
-`run_command` calls run without asking while the thread's project is in
-`Read` mode, since their commands cannot change anything outside the
-sandbox then, and wait like any other in `Write` mode. The mode is checked
-when the hook is asked, and again as the command starts: a call let through
-as read-only is refused unrun, and the model told to call again, if the host
-switched to `Write` in between.
+`run_command` calls wait in either project mode, and only the host may
+decide them (`HOST_ONLY`): their commands use the host's own shell and tools,
+so even in `Read` mode they act on the host's computer.
 
 The agent loop asks a hook about each call before its tool runs (calls whose
 arguments could not be read never run, so are never asked about). The host's
@@ -577,8 +576,9 @@ card. Participants refuse a `ToolApprovalRequested`, live or in a snapshot,
 for a call the running reply did not make or that already returned.
 
 Not yet: remembering a decision for later calls ("always allow this tool
-here"), keyboard shortcuts for Allow and Deny, and showing a denied call
-differently from one that returned.
+here"), letting chosen tools run unasked in `Read` mode, keyboard shortcuts
+for Allow and Deny, and showing a denied call differently from one that
+returned; see `ROADMAP.md`.
 
 ### Model selection
 
@@ -616,15 +616,17 @@ differently from one that returned.
   order they were added. Only the host adds or removes them, from the
   bottom bar; a folder added twice is kept once. Folders added before the
   thread exists move into it with the draft.
-- Each folder is named by its last path component, with characters a mount
-  path cannot hold (`/ \ : ; ,` and control characters) replaced by `_`,
-  and `root` for a filesystem root. A name already in the project gets a
+- Each folder is named by its last path component, with path and list
+  separators (`/ \ : ; ,`) and control characters replaced by `_`, and
+  `root` for a filesystem root. A name already in the project gets a
   `-2`, `-3`, ... suffix (`src`, `src-2`), and names never change once
   given, so removing a folder leaves the others where they are.
-- Collaborators only learn each folder's name. Paths stay on the host,
-  since they reveal how its machine is laid out. The names arrive in the
-  `Welcome` snapshot and are replaced as a whole by `ProjectFoldersChanged`
-  after every change, so a removal needs no message of its own.
+- The project UI shows collaborators only each folder's name. The names
+  arrive in the `Welcome` snapshot and are replaced as a whole by
+  `ProjectFoldersChanged` after every change, so a removal needs no message
+  of its own. The paths do reach collaborators in the transcript: the
+  agent's environment note and its commands name them, along with the
+  host's user name where a path holds it.
 - Collaborators see the names but cannot change them; there is no
   collaborator message for it.
 - The project has a mode, `Write` or `Read`, picked from a menu in the
@@ -632,21 +634,29 @@ differently from one that returned.
   thread starts in `Read`. Only the host can change it; collaborators see
   it in the `Welcome` snapshot and follow `ProjectModeChanged`. A mode
   picked before the thread exists moves into it with the folders. Hovering
-  `Write` in the menu warns that a malicious agent may be able to run
-  commands outside the sandbox.
-- The host's sandbox for the thread mounts each folder at
-  `/projects/<name>`, the host's real files shared live: read-only in
-  `Read` (refused by both the host's file server and the guest kernel),
-  and in `Write` the agent's changes apply to the host at once. Without
-  folders, `/projects` is empty. The mount settings are in the sandbox
-  crate's `settings.rs`.
-- A running sandbox cannot change its mounts. After a change to the
-  folders or mode, the agent's next command runs in a fresh sandbox with
-  the new project, losing the files commands made outside `/projects`;
-  its output says `sandbox_restarted`. When the thread already has a
-  sandbox, adding or removing a folder or switching the mode first asks
-  the host to confirm the restart. A change that would leave the project
-  as it is asks nothing.
+  `Write` in the menu warns that allowed commands change the folders at
+  once, and that a malicious agent may be able to escape the sandbox.
+- The agent's commands run on the host's computer with its own shell,
+  tools, and login shell environment, each contained by the operating
+  system's sandbox (Seatbelt, Bubblewrap, or an AppContainer, through
+  mxc-sdk). They see the folders at their real paths, the host's real files
+  live: read-only in `Read`, enforced by the sandbox, and in `Write` the
+  agent's changes apply to the host at once. They start in the first
+  folder. Each thread also has a scratch folder, its commands' `HOME` and
+  `TMPDIR`, kept until the thread is deleted or Cowork quits. Commands
+  cannot read the host's other files, nor credentials such as `~/.ssh` even
+  inside granted folders, and have no network. Every setting is in the
+  sandbox crate's `settings.rs`.
+- Each command is contained by the project as it is when the command
+  starts, so a change applies from the next command, with nothing to
+  restart or confirm; commands already running keep the access they started
+  with.
+- The agent learns the folders' paths, the mode, where commands start, and
+  the scratch folder from an `<environment>` note the host puts first in a
+  run's prompt whenever it differs from the latest one in the transcript.
+  The note, not the `run_command` definition, carries what changes, so the
+  tools and system prompt stay a stable prompt prefix. The system prompt
+  names the host's platform, which decides the shell.
 
 This is independent of the draft document and is the first feature to build.
 
@@ -802,30 +812,30 @@ separate `PermissionDenied`, never this stable handshake rejection.
 
 **Host to collaborators**
 
-| Message                                      | Purpose                                                                                                                                                                                                                                                                     |
-| -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Message                                      | Purpose                                                                                                                                                                                                                                                                                                    |
+| -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `Welcome`                                    | Participant UUID, timeline and transcript snapshot (models, run state, prompt names, project folder names and mode), draft and receiving peer's `draft_generation`, participants, profiles, presence, stored attachment IDs, and peer permissions; submission count comes from the timeline; peer-specific |
-| `Rejected`                                   | Join refused (e.g. protocol version); stable handshake encoding, then disconnect; peer-specific                                                                                                                                                                             |
-| `PermissionDenied`                           | Runtime denial with participant UUID, operation, and reason (`NotParticipant`, `InsufficientMode`, `HostOnly`, or `StaleDraftGeneration`); peer-specific, connection stays open                                                                                             |
-| `DraftReset`                                 | `{ generation, state }`: peer-specific authoritative draft; matching epoch merges, newer epoch replaces, older epoch is ignored                                                                                                                                             |
-| `DefaultPeerModeChanged`                     | Host-owned live default changed; inheriting peers immediately follow it                                                                                                                                                                                                     |
-| `PeerModeOverrideChanged`                    | Host-owned per-connection override changed; `None` resumes inheritance                                                                                                                                                                                                      |
-| `DraftUpdate`                                | Untagged Yrs update from another participant or the host; per-peer generations tag only collaborator requests                                                                                                                                                               |
-| `ParticipantJoined` / `ParticipantLeft`      | Membership changes; joining carries the participant's profile                                                                                                                                                                                                               |
-| `ProfileChanged`                             | A participant's new profile                                                                                                                                                                                                                                                 |
-| `Presence`                                   | A participant's latest presence                                                                                                                                                                                                                                             |
-| `AttachmentData`                             | Relayed attachment bytes                                                                                                                                                                                                                                                    |
-| `AttachmentStored`                           | The host holds every byte of an attachment                                                                                                                                                                                                                                  |
-| `ModelSelected`                              | The thread's model changed                                                                                                                                                                                                                                                  |
-| `ModelCatalogChanged`                        | Replaces the thread's model catalog (including with an empty one)                                                                                                                                                                                                           |
-| `ProjectFoldersChanged`                      | Replaces the names of the project's folders, in order; paths are never sent                                                                                                                                                                                                 |
-| `ProjectModeChanged`                         | The project is now open for `Write` or only `Read`                                                                                                                                                                                                                          |
-| `UserMessage`                                | An accepted submission with creators and attachment references instead of bytes; advances the submission count                                                                                                                                                              |
-| `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and whether it completed, was stopped, or failed (with a message)                                                                                                                                 |
-| `AgentEvent`                                 | What the host's agent loop reported during a run, which everyone folds into the agent message and transcript                                                                                                                                                                |
-| `PromptNamed`                                | A participant's prompt name, fixed on their first submitted item                                                                                                                                                                                                            |
-| `ToolApprovalRequested`                      | A run waits for the named call of its last reply to be allowed or denied                                                                                                                                                                                                    |
-| `ToolApprovalResolved`                       | The waiting call was decided; its result follows as an `AgentEvent`                                                                                                                                                                                                         |
+| `Rejected`                                   | Join refused (e.g. protocol version); stable handshake encoding, then disconnect; peer-specific                                                                                                                                                                                                            |
+| `PermissionDenied`                           | Runtime denial with participant UUID, operation, and reason (`NotParticipant`, `InsufficientMode`, `HostOnly`, or `StaleDraftGeneration`); peer-specific, connection stays open                                                                                                                            |
+| `DraftReset`                                 | `{ generation, state }`: peer-specific authoritative draft; matching epoch merges, newer epoch replaces, older epoch is ignored                                                                                                                                                                            |
+| `DefaultPeerModeChanged`                     | Host-owned live default changed; inheriting peers immediately follow it                                                                                                                                                                                                                                    |
+| `PeerModeOverrideChanged`                    | Host-owned per-connection override changed; `None` resumes inheritance                                                                                                                                                                                                                                     |
+| `DraftUpdate`                                | Untagged Yrs update from another participant or the host; per-peer generations tag only collaborator requests                                                                                                                                                                                              |
+| `ParticipantJoined` / `ParticipantLeft`      | Membership changes; joining carries the participant's profile                                                                                                                                                                                                                                              |
+| `ProfileChanged`                             | A participant's new profile                                                                                                                                                                                                                                                                                |
+| `Presence`                                   | A participant's latest presence                                                                                                                                                                                                                                                                            |
+| `AttachmentData`                             | Relayed attachment bytes                                                                                                                                                                                                                                                                                   |
+| `AttachmentStored`                           | The host holds every byte of an attachment                                                                                                                                                                                                                                                                 |
+| `ModelSelected`                              | The thread's model changed                                                                                                                                                                                                                                                                                 |
+| `ModelCatalogChanged`                        | Replaces the thread's model catalog (including with an empty one)                                                                                                                                                                                                                                          |
+| `ProjectFoldersChanged`                      | Replaces the names of the project's folders, in order; paths are never sent                                                                                                                                                                                                                                |
+| `ProjectModeChanged`                         | The project is now open for `Write` or only `Read`                                                                                                                                                                                                                                                         |
+| `UserMessage`                                | An accepted submission with creators and attachment references instead of bytes; advances the submission count                                                                                                                                                                                             |
+| `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and whether it completed, was stopped, or failed (with a message)                                                                                                                                                                |
+| `AgentEvent`                                 | What the host's agent loop reported during a run, which everyone folds into the agent message and transcript                                                                                                                                                                                               |
+| `PromptNamed`                                | A participant's prompt name, fixed on their first submitted item                                                                                                                                                                                                                                           |
+| `ToolApprovalRequested`                      | A run waits for the named call of its last reply to be allowed or denied                                                                                                                                                                                                                                   |
+| `ToolApprovalResolved`                       | The waiting call was decided; its result follows as an `AgentEvent`                                                                                                                                                                                                                                        |
 
 The host is itself a participant. Its local edits, submissions, stops, and
 model changes go through the same authorization paths as a collaborator's,

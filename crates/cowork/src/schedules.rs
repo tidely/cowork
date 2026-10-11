@@ -828,7 +828,7 @@ impl ScheduleEditor {
                 }
             }));
         let hint = if self.folders.is_empty() {
-            "Folders each run's agent can work in, in its sandbox at /projects.".to_owned()
+            "Folders each run's agent can work in with your tools, in a sandbox.".to_owned()
         } else if self.project_mode == ProjectMode::Write {
             format!("Runs can change these folders. {WRITE_WARNING}")
         } else {

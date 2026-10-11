@@ -2,8 +2,8 @@
 //! the menu in the bottom bar choosing it.
 //!
 //! Kept in [`Thread::project_mode`] and, before the thread exists,
-//! [`Cowork::new_thread_project_mode`]. The thread's sandbox mounts the
-//! folders read-only unless it is [`ProjectMode::Write`].
+//! [`Cowork::new_thread_project_mode`]. The agent's commands may only read
+//! the folders unless it is [`ProjectMode::Write`].
 
 use gpui::{Anchor, App, Context, IntoElement, SharedString, WeakEntity, div, prelude::*, px};
 use gpui_component::{
@@ -16,11 +16,12 @@ use gpui_component::{
 use gpui_kit_assets::IconName;
 use serde::{Deserialize, Serialize};
 
-use crate::{Cowork, project_folders::ProjectChange, thread::Thread};
+use crate::{Cowork, thread::Thread};
 
 /// Shown while hovering the Write option.
-pub(crate) const WRITE_WARNING: &str = "While there is still sandboxing, a malicious agent may be \
-     able to run commands outside of it.";
+pub(crate) const WRITE_WARNING: &str = "Commands you allow can change these folders on your \
+     computer at once, with your own tools. While they are sandboxed, a malicious agent may be \
+     able to run commands outside of the sandbox.";
 
 /// How the project's folders are open.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -102,14 +103,9 @@ impl Cowork {
                         menu.item(
                             item.icon(Icon::new(option.icon()))
                                 .checked(option == mode)
-                                .on_click(move |_, window, cx| {
+                                .on_click(move |_, _, cx| {
                                     _ = cowork.update(cx, |cowork, cx| {
-                                        cowork.request_project_change(
-                                            target.clone(),
-                                            ProjectChange::Mode(option),
-                                            window,
-                                            cx,
-                                        );
+                                        cowork.set_project_mode(target.clone(), option, cx);
                                     });
                                 }),
                         )

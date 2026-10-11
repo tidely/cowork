@@ -26,15 +26,44 @@ use crate::{
     Cowork,
     models::ModelProvider,
     participant::ParticipantId,
-    protocol,
+    prompt, protocol,
     thread::{ControlGeneration, Thread, ThreadOwnership, ThreadSharing},
     tool_approval::{self, ApprovalGate, RunUpdate},
     usage::{TokenActivity, usage_tokens},
 };
 
-/// The system prompt every run starts with. Kept in its own file so it reads
-/// and diffs as prose; it is static, so it needs no templating.
+/// The system prompt every run starts with, before [`platform_prompt`]. Kept
+/// in its own file so it reads and diffs as prose.
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
+
+/// The system prompt with the platform the host's commands run on, which
+/// decides their shell and tools. The same for every run on this computer, so
+/// it keeps the prompt prefix cacheable.
+fn system_prompt() -> &'static str {
+    static PROMPT: std::sync::LazyLock<String> =
+        std::sync::LazyLock::new(|| format!("{SYSTEM_PROMPT}\n{}\n", platform_prompt()));
+    &PROMPT
+}
+
+fn platform_prompt() -> String {
+    let platform = match std::env::consts::OS {
+        "macos" => "macOS",
+        "linux" => "Linux",
+        "windows" => "Windows",
+        other => other,
+    };
+    let shell = if cfg!(windows) {
+        "the command line is started as a program, not through a shell, so run shell \
+         commands through `cmd /c` or `powershell -Command`"
+    } else {
+        "commands run with /bin/sh -c"
+    };
+    format!(
+        "The `run_command` tool runs on the computer of the thread's host, a {platform} \
+         computer ({arch}): {shell}.",
+        arch = std::env::consts::ARCH,
+    )
+}
 
 /// What a finished run took, for the usage statistics.
 pub(crate) struct RunTotals {
@@ -108,7 +137,7 @@ impl Cowork {
     ) -> Option<Uuid> {
         let GenerationPlan {
             thread_id,
-            prompt,
+            mut prompt,
             mut history,
             comment_group_id,
             turn_comments,
@@ -123,6 +152,16 @@ impl Cowork {
             .read(cx)
             .runnable_model()
             .map(|(model, info)| (model.clone(), info.max_tokens));
+        // Only the host runs agents, so commands run on the host's computer
+        // with its project for this thread, whoever asked for the run. Later
+        // project changes reach it through `Cowork::sync_sandbox_project`,
+        // and the model through the next run's note.
+        self.sync_sandbox_project(&thread, cx);
+        prompt = prompt::with_environment_note(
+            prompt,
+            &history,
+            self.sandboxes.environment_note(&thread_id.to_string()),
+        );
         thread.update(cx, |thread, cx| {
             // Recorded before the run starts, so a prompt stays in the
             // transcript even when the run is stopped before sending it.
@@ -137,12 +176,8 @@ impl Cowork {
             );
         });
         let (sender, mut receiver) = mpsc::unbounded_channel();
-        // Only the host runs agents, so commands run in the host's sandbox
-        // for this thread, whoever asked for the run. Later project changes
-        // reach it through `Cowork::sync_sandbox_project`.
-        self.sync_sandbox_project(&thread, cx);
         let run_command = RunCommand::new(self.sandboxes.clone(), thread_id.to_string());
-        let gate = ApprovalGate::new(sender.clone(), run_command.read_only_pass(), scheduled);
+        let gate = ApprovalGate::new(sender.clone(), scheduled);
         let cancelled = Arc::new(AtomicBool::new(false));
         let generation_task = self.tokio_handle.spawn(async move {
             let (selected_model, max_tokens) =
@@ -161,7 +196,7 @@ impl Cowork {
             tools.add_tool(run_command);
             StreamingAgent::new(model.erase(), tools)
                 .tool_hook(gate)
-                .preamble(SYSTEM_PROMPT)
+                .preamble(system_prompt())
                 .additional_params(json!({
                     "num_ctx": max_tokens,
                     "think": "medium"

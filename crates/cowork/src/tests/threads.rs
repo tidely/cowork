@@ -1484,10 +1484,10 @@ fn renaming_never_changes_what_the_agent_was_sent(cx: &mut gpui::TestAppContext)
         assert_eq!(thread.transcript.len(), 1);
         thread.transcript[0].clone()
     });
-    assert_eq!(
-        prompt_texts(&first_prompt),
-        [format!("{derived_name}:\nfirst")]
-    );
+    // The first prompt tells the agent where its commands run.
+    let [note, first] = prompt_texts(&first_prompt).try_into().expect("two parts");
+    assert!(note.starts_with(sandbox::ENVIRONMENT_NOTE_START), "{note}");
+    assert_eq!(first, format!("{derived_name}:\nfirst"));
 
     cowork.update(cx, |cowork, cx| {
         cowork.set_profile(
@@ -1519,6 +1519,7 @@ fn renaming_never_changes_what_the_agent_was_sent(cx: &mut gpui::TestAppContext)
             prompt_texts(&thread.transcript[0]),
             prompt_texts(&first_prompt)
         );
+        // The project did not change, so the note is not repeated.
         assert_eq!(
             prompt_texts(&thread.transcript[1]),
             [format!("{derived_name}:\nsecond")]

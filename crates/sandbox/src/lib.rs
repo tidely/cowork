@@ -1,652 +1,576 @@
-//! Running the agent's shell commands in a microVM per thread, with
-//! microsandbox.
+//! Running the agent's shell commands on the host, contained by the
+//! operating system's own sandbox, with mxc-sdk.
 //!
-//! Every setting is in [`settings`]. In short: no network, nothing from the
-//! host shared but the thread's project folders (read-only unless the project
-//! is writable; see [`Project`]), an unprivileged user, a pinned image,
-//! memory-only writes elsewhere, and limits on each command's time, output,
-//! and resources.
+//! Every setting is in [`settings`]. In short: the user's own shell, tools,
+//! and environment; the thread's project folders at their real paths,
+//! read-only unless the project is writable (see [`Project`]); a scratch
+//! folder per thread; no other user files; and no network.
 //!
-//! Nothing here runs until the first command: no runtime download, no image
-//! pull, no files. The runtime (`msb` and `libkrunfw`) is then installed into
-//! Cowork's own microsandbox home, downloaded from the microsandbox GitHub
-//! release matching the crate's version, so a user's own microsandbox
-//! installation and configuration are never used. A runtime of another
-//! version there is replaced.
-//!
-//! Each VM runs in a child `msb` process. microsandbox stops it if Cowork
-//! exits, and as the sandboxes are ephemeral the runtime then discards them.
-//!
-//! Sandboxes are independent of each other, and a thread's commands may run
-//! at the same time in its one sandbox: the map of sandboxes is only locked to
-//! look a thread's slot up or change it, never while a VM boots or a command
-//! runs.
+//! Each command is a sandbox of its own, made from the thread's project as
+//! it is when the command starts, so a thread's commands may run at the same
+//! time and a project change needs no restart. Nothing runs before the first
+//! command: the login shell environment is captured then, and the scratch
+//! folders are created as threads first need them.
 
+pub mod environment;
 mod output;
 mod project;
 pub mod settings;
 mod tool;
 
 use std::{
-    path::PathBuf,
+    collections::HashMap,
+    fs::File,
+    io::Read,
+    path::{Path, PathBuf},
     sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+        Arc, Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
     },
+    time::Duration,
 };
 
-use dashmap::{DashMap, mapref::entry::Entry};
-use futures::{
-    FutureExt,
-    future::{BoxFuture, Shared},
+use mxc_sdk::v1::{
+    self, ContainerRequest, FilesystemPolicy, MxcProcess, NetworkAction, NetworkEgressPolicy,
+    NetworkIngressPolicy, NetworkPolicy, StreamCloser, policy::filesystem,
 };
-use microsandbox::{
-    ExecControl, ExecEvent, LocalBackend, Sandbox,
-    sandbox::{
-        DeploymentProfile, PullPolicy, RlimitResource, SandboxStatus, SecurityProfile,
-        StatVirtualization,
-    },
-    setup::{InstallOptions, Version, install_runtime, resolve_runtime, resolve_runtime_version},
-};
-use output::CappedStream;
-pub use output::{CommandOutput, Killed};
+
+pub use environment::{EnvironmentSource, PRINT_ENV_FLAG, print_env};
+pub use output::CommandOutput;
 pub use project::{Project, ProjectFolder, folder_name};
-pub use tool::{ReadOnlyPass, RunCommand, RunCommandArgs};
+pub use tool::{RunCommand, RunCommandArgs};
 
-/// The platforms, as `std::env::consts` `(OS, ARCH)`, microsandbox publishes
-/// a runtime for.
-const RUNTIME_PLATFORMS: &[(&str, &str)] = &[
-    ("macos", "aarch64"),
-    ("linux", "x86_64"),
-    ("linux", "aarch64"),
-    ("windows", "x86_64"),
-    ("windows", "aarch64"),
-];
+/// How the environment note sent to the model starts; see
+/// [`Sandboxes::environment_note`].
+pub const ENVIRONMENT_NOTE_START: &str = "<environment>";
 
-/// The label every Cowork sandbox carries, so leftovers can be found.
-const APP_LABEL: (&str, &str) = ("app", "cowork");
+/// How often a running command is checked for having exited or been
+/// stopped. mxc-sdk's processes are waited on synchronously and cannot be
+/// killed while a wait blocks, so the wait is a poll.
+const POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// How long a command's output may stay open once the command and what it
+/// left in the background have been ended, before reading it stops.
+const OUTPUT_GRACE: Duration = Duration::from_secs(1);
 
 /// Why a command could not run.
 #[derive(Debug, Clone)]
 pub enum SandboxError {
-    /// microsandbox publishes no runtime for this platform (Intel Macs, for
-    /// one).
-    Unsupported,
-    /// The runtime, the image, or the VM could not be set up.
+    /// This computer has no sandbox mxc-sdk can use, such as Linux without
+    /// `bwrap`, with why.
+    Unsupported(String),
+    /// The scratch folders could not be set up.
     Setup(String),
-    /// The sandbox failed while running the command. It has been discarded.
+    /// The command could not be started or waited on.
     Failed(String),
-    /// The command could not be started, but the sandbox is still running
-    /// and keeps its files, as when other commands use up its process limit.
-    NotStarted(String),
-    /// The model's command was rejected before reaching the sandbox.
+    /// The model's command was rejected before anything ran.
     InvalidCommand(&'static str),
-    /// The command was let through without asking because the project was
-    /// read-only, but it became writable before the command started, so it
-    /// was not run.
-    NeedsApproval,
 }
 
 impl std::fmt::Display for SandboxError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unsupported => {
-                formatter.write_str("sandboxes are not supported on this computer")
-            }
-            Self::Setup(error) => write!(formatter, "the sandbox could not be started: {error}"),
-            Self::Failed(error) => write!(
+            Self::Unsupported(reason) => write!(
                 formatter,
-                "the sandbox failed and was discarded, losing its files; \
-                 the next command starts a fresh one: {error}"
+                "commands cannot run on this computer, as it has no supported sandbox: {reason}"
             ),
-            Self::NotStarted(error) => write!(formatter, "the command did not start: {error}"),
+            Self::Setup(error) => write!(formatter, "the sandbox could not be set up: {error}"),
+            Self::Failed(error) => write!(formatter, "the command failed to run: {error}"),
             Self::InvalidCommand(reason) => formatter.write_str(reason),
-            Self::NeedsApproval => formatter.write_str(
-                "the project became writable before the command started, so it was not run; \
-                 call the tool again to ask the user to allow it",
-            ),
         }
     }
 }
 
 impl std::error::Error for SandboxError {}
 
-/// A boot's outcome, which every command waiting on it gets a copy of.
-type Boot = Shared<BoxFuture<'static, Result<Arc<Sandbox>, SandboxError>>>;
-
-/// One thread's sandbox, from the moment its first command reserves it,
-/// with the project it mounts.
-enum Slot {
-    /// Its first command started a boot; commands arriving meanwhile wait
-    /// for the same one. The boot runs in its own task, so it finishes even if
-    /// every command waiting for it is stopped, and then replaces this slot
-    /// with [`Slot::Running`], or removes it if the boot failed. `id` tells
-    /// this reservation from a later one for the same thread. `restart` is
-    /// whether it replaces a sandbox whose project changed.
-    Booting {
-        id: u64,
-        ready: Boot,
-        project: Project,
-        restart: bool,
-    },
-    /// Commands run in it at the same time, each with its own clone.
-    Running {
-        sandbox: Arc<Sandbox>,
-        project: Project,
-    },
-}
-
-impl Slot {
-    fn is_boot(&self, boot: u64) -> bool {
-        matches!(self, Self::Booting { id, .. } if *id == boot)
-    }
-
-    fn holds(&self, held: &Arc<Sandbox>) -> bool {
-        matches!(self, Self::Running { sandbox, .. } if Arc::ptr_eq(sandbox, held))
-    }
-}
-
-/// The sandboxes of this app instance, one per thread, by thread id.
+/// The commands of this app instance, with each thread's project and scratch
+/// folder, by thread id.
 pub struct Sandboxes {
-    home: PathBuf,
-    /// Tells this instance's sandboxes from another running instance's.
+    /// Every instance's scratch folders: `<root>/<instance>/<thread>`, and
+    /// the lock `<root>/<instance>.lock` that a running instance holds.
+    root: PathBuf,
     instance: String,
-    /// Set once the runtime is installed and the backend is microsandbox's
-    /// default, after which every call goes to Cowork's home.
-    ready: tokio::sync::OnceCell<()>,
-    /// Sharded, so threads look up and change their slots without waiting
-    /// on each other. Shared with boot tasks, which settle their own slot.
-    /// A shard is never locked across an `await`.
-    slots: Arc<DashMap<String, Slot>>,
-    /// The project each thread's next command should see. A sandbox that
-    /// mounts another one is replaced before that command runs.
-    projects: DashMap<String, Project>,
-    next_boot: AtomicU64,
+    source: EnvironmentSource,
+    /// Set by the first command; see [`Sandboxes::ready`].
+    ready: OnceLock<Result<(), SandboxError>>,
+    /// Held while this instance runs, so another instance does not take its
+    /// scratch folders for leftovers.
+    lock: Mutex<Option<File>>,
+    environment: tokio::sync::OnceCell<Arc<HashMap<String, String>>>,
+    /// The project each thread's next command sees. Never locked across an
+    /// `await`.
+    projects: Mutex<HashMap<String, Project>>,
 }
 
 impl Sandboxes {
-    /// Sandboxes kept under `home`, which should be short: microsandbox puts
-    /// Unix sockets beneath it, whose paths are limited to about 100 bytes.
-    /// `instance` must be unique among running Cowork instances.
-    pub fn new(home: PathBuf, instance: impl Into<String>) -> Self {
+    /// Commands whose scratch folders are kept under `root`, with their
+    /// environment from `source`. `instance` must be unique among running
+    /// Cowork instances.
+    pub fn new(root: PathBuf, instance: impl Into<String>, source: EnvironmentSource) -> Self {
         Self {
-            home,
+            root,
             instance: instance.into(),
-            ready: tokio::sync::OnceCell::new(),
-            slots: Arc::new(DashMap::new()),
-            projects: DashMap::new(),
-            next_boot: AtomicU64::new(0),
+            source,
+            ready: OnceLock::new(),
+            lock: Mutex::new(None),
+            environment: tokio::sync::OnceCell::new(),
+            projects: Mutex::new(HashMap::new()),
         }
     }
 
     /// Sets the project `thread`'s commands see from its next command on.
-    /// A sandbox already running with another project keeps running until
-    /// then, and is replaced by a fresh one, losing the files commands made
-    /// outside the project, when that command starts.
+    /// Commands already running keep the project they started with.
     pub fn set_project(&self, thread: &str, project: Project) {
+        let mut projects = lock(&self.projects);
         if project == Project::default() {
-            self.projects.remove(thread);
+            projects.remove(thread);
         } else {
-            self.projects.insert(thread.to_owned(), project);
+            projects.insert(thread.to_owned(), project);
         }
     }
 
     /// The project `thread`'s next command will see.
     pub fn project(&self, thread: &str) -> Project {
-        self.projects
+        lock(&self.projects)
             .get(thread)
-            .map(|project| project.clone())
+            .cloned()
             .unwrap_or_default()
     }
 
-    /// Whether `thread` has a sandbox, running or starting, that a change
-    /// to its project would replace.
-    pub fn has_sandbox(&self, thread: &str) -> bool {
-        self.slots.contains_key(thread)
+    /// What the model is told about where `thread`'s commands run: the
+    /// project's folders at the paths commands see them, whether commands may
+    /// change them, where they start, and the scratch folder. Starts with
+    /// [`ENVIRONMENT_NOTE_START`]. The same project always gives the same
+    /// note, so it only needs sending when it changed.
+    pub fn environment_note(&self, thread: &str) -> String {
+        let project = self.project(thread);
+        let scratch = self.scratch_dir(thread);
+        let folders = resolved_folders(&project);
+        let mut note = format!("{ENVIRONMENT_NOTE_START}\n");
+        if folders.is_empty() {
+            note.push_str("The user has added no project folders.\n");
+        } else {
+            note.push_str("The user's project folders, by name and path:\n");
+            for (name, path) in &folders {
+                note.push_str(&format!("- {name}: {}\n", path.display()));
+            }
+            note.push_str(if project.writable {
+                "The project is writable: commands may change these folders, and their changes \
+                 apply to the user's computer at once.\n"
+            } else {
+                "The project is read-only: commands can read these folders but not change them.\n"
+            });
+        }
+        note.push_str(&format!(
+            "Commands start in {}. Their HOME and TMPDIR are the scratch folder {}.\n\
+             This replaces any earlier environment note.\n</environment>",
+            working_directory(&folders, &scratch).display(),
+            scratch.display(),
+        ));
+        note
     }
 
-    /// Runs `command` with `/bin/sh -c` in `thread`'s sandbox, starting one
-    /// if it has none. Commands of the same thread may run at the same time,
-    /// sharing the sandbox's files and limits.
+    /// Runs `command` with the platform's shell, contained by `thread`'s
+    /// project. Commands of the same thread may run at the same time, sharing
+    /// its scratch folder. Dropping the future kills the command and whatever
+    /// it started.
     pub async fn run(&self, thread: &str, command: &str) -> Result<CommandOutput, SandboxError> {
-        self.run_with(thread, command, false).await
-    }
-
-    /// Like [`Sandboxes::run`], but only in a read-only project: refuses the
-    /// command, without running it, when `thread`'s project is writable by
-    /// the time it would start. For commands let through without asking
-    /// because the project was read-only; see [`ReadOnlyPass`].
-    pub async fn run_read_only(
-        &self,
-        thread: &str,
-        command: &str,
-    ) -> Result<CommandOutput, SandboxError> {
-        self.run_with(thread, command, true).await
-    }
-
-    async fn run_with(
-        &self,
-        thread: &str,
-        command: &str,
-        read_only: bool,
-    ) -> Result<CommandOutput, SandboxError> {
         if command.trim().is_empty() {
             return Err(SandboxError::InvalidCommand("the command is empty"));
         }
-        if command.len() > settings::MAX_COMMAND_BYTES {
-            return Err(SandboxError::InvalidCommand(
-                "the command is longer than 8 KiB",
-            ));
-        }
-        self.ready().await?;
-        let (sandbox, restarted) = self.sandbox(thread, read_only).await?;
-        let result = run_command(&sandbox, command).await.map(|mut output| {
-            output.sandbox_restarted = restarted;
-            output
-        });
-        if let Err(SandboxError::Failed(error)) = &result {
-            if matches!(sandbox.status().await, Ok(SandboxStatus::Running)) {
-                // Only this command failed, so the sandbox and the commands
-                // running beside it are kept.
-                return Err(SandboxError::NotStarted(error.clone()));
-            }
-            // Stopped by its idle or lifetime limit, or crashed: commands
-            // running beside this one fail too. A later boot may already have
-            // taken the slot, so it is left alone.
-            self.slots.remove_if(thread, |_, slot| slot.holds(&sandbox));
-            _ = sandbox.kill().await;
-        }
-        result
+        self.ready()?;
+        let environment = self
+            .environment
+            .get_or_init(|| async { Arc::new(environment::load(self.source).await) })
+            .await
+            .clone();
+        let scratch = self.scratch_dir(thread);
+        std::fs::create_dir_all(&scratch).map_err(|error| {
+            SandboxError::Setup(format!(
+                "could not create the scratch folder {}: {error}",
+                scratch.display()
+            ))
+        })?;
+        let request = request(command, &self.project(thread), &scratch, &environment);
+        let stop = StopOnDrop(Arc::new(AtomicBool::new(false)));
+        let stopped = stop.0.clone();
+        let result = tokio::task::spawn_blocking(move || execute(request, &stopped)).await;
+        drop(stop);
+        result.unwrap_or_else(|error| Err(SandboxError::Failed(error.to_string())))
     }
 
-    /// Stops `thread`'s sandbox and forgets its project, as when the thread
-    /// is deleted. A boot in progress loses its slot, so it stops its sandbox
-    /// once started, like on [`Sandboxes::shutdown`].
+    /// Forgets `thread`'s project and removes its scratch folder, as when the
+    /// thread is deleted. Its commands end with its run.
     pub async fn remove(&self, thread: &str) {
-        self.projects.remove(thread);
-        if let Some((_, Slot::Running { sandbox, .. })) = self.slots.remove(thread) {
-            _ = sandbox.kill().await;
+        lock(&self.projects).remove(thread);
+        let scratch = self.scratch_dir(thread);
+        _ = tokio::task::spawn_blocking(move || remove_dir(&scratch)).await;
+    }
+
+    /// Removes this instance's scratch folders, as when Cowork quits.
+    pub fn shutdown(&self) {
+        if lock(&self.lock).is_none() {
+            // Never started, or already shut down: nothing of this instance's
+            // is there, and another instance with the same name, as in tests,
+            // keeps its folders.
+            return;
+        }
+        remove_dir(&self.root.join(&self.instance));
+        if lock(&self.lock).take().is_some() {
+            _ = std::fs::remove_file(self.lock_path(&self.instance));
         }
     }
 
-    /// Stops every sandbox of this instance, as when Cowork quits. Boots in
-    /// progress lose their slots, so they stop their sandboxes once started,
-    /// without being waited for: an image pull can take minutes.
-    pub async fn shutdown(&self) {
-        for sandbox in self.take_running() {
-            _ = sandbox.kill().await;
-        }
+    fn scratch_dir(&self, thread: &str) -> PathBuf {
+        self.root.join(&self.instance).join(thread)
     }
 
-    /// Empties the map, returning the sandboxes that had started.
-    fn take_running(&self) -> Vec<Arc<Sandbox>> {
-        let mut running = Vec::new();
-        self.slots.retain(|_, slot| {
-            if let Slot::Running { sandbox, .. } = slot {
-                running.push(sandbox.clone());
-            }
-            false
-        });
-        running
+    fn lock_path(&self, instance: &str) -> PathBuf {
+        self.root.join(format!("{instance}.lock"))
     }
 
-    /// `thread`'s sandbox, once it has started, starting it if no command
-    /// has yet or its project changed. Also returns whether it replaces one
-    /// whose project changed.
-    /// With `read_only`, fails instead when the project is writable: the
-    /// project checked is the one the command runs with.
-    async fn sandbox(
-        &self,
-        thread: &str,
-        read_only: bool,
-    ) -> Result<(Arc<Sandbox>, bool), SandboxError> {
-        let project = self.project(thread);
-        if read_only && project.writable {
-            return Err(SandboxError::NeedsApproval);
-        }
-        let mut replaced = None;
-        let (id, ready, restart) = match self.slots.entry(thread.to_owned()) {
-            Entry::Occupied(mut slot) => match slot.get() {
-                Slot::Running {
-                    sandbox,
-                    project: mounted,
-                } if *mounted == project => return Ok((sandbox.clone(), false)),
-                Slot::Booting {
-                    id,
-                    ready,
-                    project: mounting,
-                    restart,
-                } if *mounting == project => (*id, ready.clone(), *restart),
-                // The project changed since this sandbox started. A boot it
-                // replaces stops its sandbox itself, once it finds its
-                // reservation gone.
-                _ => {
-                    let id = self.next_boot.fetch_add(1, Ordering::Relaxed);
-                    let ready = self.boot(thread, id, project.clone());
-                    let old = slot.insert(Slot::Booting {
-                        id,
-                        ready: ready.clone(),
-                        project,
-                        restart: true,
-                    });
-                    if let Slot::Running { sandbox, .. } = old {
-                        replaced = Some(sandbox);
-                    }
-                    (id, ready, true)
-                }
-            },
-            Entry::Vacant(slot) => {
-                let id = self.next_boot.fetch_add(1, Ordering::Relaxed);
-                let ready = self.boot(thread, id, project.clone());
-                slot.insert(Slot::Booting {
-                    id,
-                    ready: ready.clone(),
-                    project,
-                    restart: false,
-                });
-                (id, ready, false)
-            }
-        };
-        if let Some(replaced) = replaced {
-            // Commands still running in it fail.
-            _ = replaced.kill().await;
-        }
-        let booted = ready.await;
-        if booted.is_err() {
-            // The boot task normally removes its failed reservation itself;
-            // this covers it having panicked before it could.
-            self.slots.remove_if(thread, |_, slot| slot.is_boot(id));
-        }
-        booted.map(|sandbox| (sandbox, restart))
-    }
-
-    /// Starts a task booting `thread`'s sandbox with `project` for its
-    /// reservation `id`.
-    fn boot(&self, thread: &str, id: u64, project: Project) -> Boot {
-        let slots = self.slots.clone();
-        let thread = thread.to_owned();
-        // Unique per boot, as a replaced sandbox may not be gone yet.
-        let name = format!("cowork-{}-{thread}-{id}", self.instance);
-        let instance = self.instance.clone();
-        let task = tokio::spawn(async move {
-            let created = create(name, &instance, &project).await;
-            let sandbox = match created {
-                Ok(sandbox) => Arc::new(sandbox),
-                Err(error) => {
-                    slots.remove_if(&thread, |_, slot| slot.is_boot(id));
-                    return Err(error);
-                }
-            };
-            let kept = match slots.get_mut(&thread) {
-                Some(mut slot) if slot.is_boot(id) => {
-                    *slot = Slot::Running {
-                        sandbox: sandbox.clone(),
-                        project,
-                    };
-                    true
-                }
-                _ => false,
-            };
-            if !kept {
-                // Its reservation is gone: Cowork is shutting down, or the
-                // project changed while it started.
-                _ = sandbox.kill().await;
-                return Err(SandboxError::Setup(
-                    "the sandbox was stopped while it started".into(),
-                ));
-            }
-            Ok(sandbox)
-        });
-        task.map(|joined| {
-            joined.unwrap_or_else(|error| {
-                Err(SandboxError::Setup(format!("starting it failed: {error}")))
-            })
-        })
-        .boxed()
-        .shared()
-    }
-
-    /// Installs the runtime and selects Cowork's home, once.
-    async fn ready(&self) -> Result<(), SandboxError> {
+    /// Checks, once, that this computer has a sandbox, takes this
+    /// instance's lock, and removes the scratch folders of instances that did
+    /// not quit cleanly.
+    fn ready(&self) -> Result<(), SandboxError> {
         self.ready
-            .get_or_try_init(|| async {
-                if !runtime_published() {
-                    return Err(SandboxError::Unsupported);
+            .get_or_init(|| {
+                let support = v1::platform_support();
+                if !support.is_supported {
+                    return Err(SandboxError::Unsupported(
+                        support
+                            .reason
+                            .unwrap_or_else(|| "mxc-sdk supports no sandbox here".into()),
+                    ));
                 }
-                // Reading `config.json` from Cowork's home, which Cowork never
-                // writes, keeps the defaults of a user's own microsandbox
-                // configuration from loosening these sandboxes.
-                let backend = LocalBackend::builder()
-                    .home(&self.home)
-                    .config_path(self.home.join("config.json"))
-                    .build()
-                    .await
-                    .map_err(setup)?;
-                let options = InstallOptions::default();
-                // microsandbox launches only a runtime of its own version and
-                // never replaces a complete installation by itself, so one
-                // left by an earlier Cowork is replaced here.
-                let wanted = Version::parse(&options.version).ok();
-                let installed = resolve_runtime(backend.config())
-                    .ok()
-                    .and_then(|runtime| resolve_runtime_version(runtime.msb_path).ok().flatten());
-                if installed.is_none() || installed != wanted {
-                    install_runtime(
-                        backend.config(),
-                        InstallOptions {
-                            force: true,
-                            ..options
-                        },
-                    )
-                    .await
-                    .map_err(setup)?;
-                }
-                // Process-wide, as parts of microsandbox look the backend up
-                // rather than being handed it. Cowork has no other use for it.
-                microsandbox::set_default_backend(backend);
-                remove_leftovers().await;
+                let setup = |error: std::io::Error| SandboxError::Setup(error.to_string());
+                std::fs::create_dir_all(&self.root).map_err(setup)?;
+                // Locked before the folder exists, so a folder without a lock
+                // file is always a leftover.
+                let held = File::create(self.lock_path(&self.instance)).map_err(setup)?;
+                held.try_lock().map_err(|error| {
+                    SandboxError::Setup(format!("the scratch lock is taken: {error}"))
+                })?;
+                *lock(&self.lock) = Some(held);
+                self.remove_leftovers();
                 Ok(())
             })
-            .await
-            .copied()
+            .clone()
     }
-}
 
-async fn create(name: String, instance: &str, project: &Project) -> Result<Sandbox, SandboxError> {
-    use settings::*;
-    project.validate()?;
-    let mut builder = Sandbox::builder(name);
-    for folder in &project.folders {
-        builder = builder.volume(Project::guest_path(folder), |mount| {
-            let mount = mount
-                .bind(&folder.path)
-                .owner(PROJECT_OWNER.0, PROJECT_OWNER.1)
-                .stat_virtualization(StatVirtualization::Relaxed)
-                .nosuid()
-                .nodev();
-            if project.writable {
-                mount
-            } else {
-                mount.readonly()
+    fn remove_leftovers(&self) {
+        let Ok(entries) = std::fs::read_dir(&self.root) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let instance = name.strip_suffix(".lock").unwrap_or(name);
+            if instance == self.instance {
+                continue;
             }
-        });
+            let lock_path = self.lock_path(instance);
+            let abandoned = match File::open(&lock_path) {
+                // Unlocked on drop, before the lock file is removed.
+                Ok(file) => file.try_lock().is_ok(),
+                Err(_) => true,
+            };
+            if abandoned {
+                remove_dir(&self.root.join(instance));
+                _ = std::fs::remove_file(lock_path);
+            }
+        }
     }
-    if project.folders.is_empty() {
-        builder = builder.volume(PROJECTS_DIR, |mount| mount.tmpfs().size(1).readonly());
-    }
-    builder
-        .label(APP_LABEL.0, APP_LABEL.1)
-        .label("instance", instance)
-        .image(IMAGE)
-        .root_disk_with(|disk| disk.tmpfs().size(ROOT_DISK_MIB))
-        .pull_policy(PullPolicy::IfMissing)
-        .cpus(CPUS)
-        .max_cpus(CPUS)
-        .memory(MEMORY_MIB)
-        .max_memory(MEMORY_MIB)
-        .user(USER)
-        .workdir(WORKDIR)
-        .hostname(HOSTNAME)
-        .security(SecurityProfile::Restricted)
-        .deployment_profile(DeploymentProfile::MultiTenant)
-        .disable_network()
-        .idle_timeout(IDLE_TIMEOUT.as_secs())
-        .max_duration(MAX_DURATION.as_secs())
-        .ephemeral(true)
-        .detached(false)
-        .quiet_logs()
-        .disable_metrics_sample()
-        .create()
-        .await
-        .map_err(setup)
 }
 
 impl Drop for Sandboxes {
     fn drop(&mut self) {
-        // microsandbox stops the VMs when Cowork exits; this covers dropping
-        // the manager earlier, as tests do.
-        let running = self.take_running();
-        if running.is_empty() {
-            return;
-        }
-        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move {
-                for sandbox in running {
-                    _ = sandbox.kill().await;
-                }
-            });
-        }
+        self.shutdown();
     }
 }
 
-/// Whether microsandbox publishes a runtime for this platform.
-fn runtime_published() -> bool {
-    RUNTIME_PLATFORMS.contains(&(std::env::consts::OS, std::env::consts::ARCH))
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-fn setup(error: microsandbox::MicrosandboxError) -> SandboxError {
-    SandboxError::Setup(error.to_string())
-}
-
-/// Removes stopped Cowork sandboxes a crashed instance left behind. Running
-/// ones belong to a live instance (microsandbox stops a VM whose parent
-/// died), so they are left alone.
-async fn remove_leftovers() {
-    let mut cursor = None;
-    loop {
-        let page = Sandbox::list_with(|list| {
-            let list = list
-                .limit(microsandbox::sandbox::MAX_SANDBOX_LIST_LIMIT)
-                .label(APP_LABEL.0, APP_LABEL.1);
-            match cursor.take() {
-                Some(cursor) => list.cursor(cursor),
-                None => list,
-            }
-        })
-        .await;
-        let Ok(page) = page else {
-            return;
-        };
-        for handle in page.sandboxes {
-            if matches!(
-                handle.status_snapshot(),
-                SandboxStatus::Stopped | SandboxStatus::Crashed | SandboxStatus::Created
-            ) {
-                _ = handle.remove().await;
-            }
-        }
-        match page.next_cursor {
-            Some(next) => cursor = Some(next),
-            None => return,
-        }
+fn remove_dir(path: &Path) {
+    if let Err(error) = std::fs::remove_dir_all(path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        eprintln!("could not remove {}: {error}", path.display());
     }
 }
 
-/// Runs `command` in `sandbox`, keeping its output up to the limit and
-/// killing it past the time or output limit.
-async fn run_command(sandbox: &Sandbox, command: &str) -> Result<CommandOutput, SandboxError> {
-    use settings::rlimits;
-    let mut handle = sandbox
-        .shell_stream_with(command, |exec| {
-            exec.cwd(settings::WORKDIR)
-                .stdin_null()
-                .tty(false)
-                .rlimit(RlimitResource::Cpu, rlimits::CPU_SECONDS)
-                .rlimit(RlimitResource::Nproc, rlimits::PROCESSES)
-                .rlimit(RlimitResource::Nofile, rlimits::OPEN_FILES)
-                .rlimit(RlimitResource::Fsize, rlimits::FILE_SIZE)
-                .rlimit(RlimitResource::Core, rlimits::CORE_SIZE)
-        })
-        .await
-        .map_err(|error| SandboxError::Failed(error.to_string()))?;
-    // Kills the command if the run is stopped while it executes, as dropping
-    // the handle alone would leave it running.
-    let mut guard = KillOnDrop(Some(handle.control()));
-    let mut stdout = CappedStream::new(settings::OUTPUT_LIMIT);
-    let mut stderr = CappedStream::new(settings::OUTPUT_LIMIT);
-    let mut killed = None;
-    let mut exit_code = None;
-    // Until the command is killed, its time limit; then how long it has to
-    // report its exit.
-    let deadline = tokio::time::sleep(settings::COMMAND_TIMEOUT);
-    tokio::pin!(deadline);
-    let mut in_grace = false;
-    loop {
-        let kill_for = tokio::select! {
-            event = handle.recv() => match event {
-                Some(ExecEvent::Stdout(chunk)) => {
-                    stdout.push(&chunk).then_some(Killed::OutputLimit)
-                }
-                Some(ExecEvent::Stderr(chunk)) => {
-                    stderr.push(&chunk).then_some(Killed::OutputLimit)
-                }
-                Some(ExecEvent::Exited { code }) => {
-                    exit_code = Some(code);
-                    break;
-                }
-                Some(ExecEvent::Failed(failure)) => {
-                    guard.0 = None;
-                    return Err(SandboxError::Failed(format!(
-                        "the shell did not start: {failure:?}"
-                    )));
-                }
-                Some(ExecEvent::Started { .. } | ExecEvent::StdinError(_)) => None,
-                None => break,
-            },
-            () = &mut deadline => {
-                if in_grace {
-                    break;
-                }
-                Some(Killed::TimedOut)
-            }
-        };
-        if let Some(reason) = kill_for
-            && !in_grace
-        {
-            killed = Some(reason);
-            in_grace = true;
-            _ = handle.kill().await;
-            deadline
-                .as_mut()
-                .reset(tokio::time::Instant::now() + settings::KILL_GRACE);
-        }
-    }
-    if exit_code.is_some() {
-        guard.0 = None;
-    }
-    Ok(CommandOutput::new(exit_code, stdout, stderr, killed))
-}
+/// Tells a command's blocking task, when its run is stopped, to kill it.
+struct StopOnDrop(Arc<AtomicBool>);
 
-// Replace with `DropGuard` after Rust 1.100
-struct KillOnDrop(Option<ExecControl>);
-
-impl Drop for KillOnDrop {
+impl Drop for StopOnDrop {
     fn drop(&mut self) {
-        if let Some(control) = self.0.take()
-            && let Ok(runtime) = tokio::runtime::Handle::try_current()
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+/// `path` as the sandbox matches it: Seatbelt compares fully resolved paths,
+/// and Bubblewrap mounts a folder at the path it is given. `None` when it
+/// does not exist.
+fn resolved(path: &Path) -> Option<PathBuf> {
+    let path = std::fs::canonicalize(path).ok()?;
+    // Windows' verbatim `\\?\C:\` prefix is not a path its sandbox matches.
+    #[cfg(windows)]
+    let path = path
+        .to_str()
+        .and_then(|text| text.strip_prefix(r"\\?\"))
+        .map(PathBuf::from)
+        .unwrap_or(path);
+    Some(path)
+}
+
+/// The project's folders that exist, by name and resolved path.
+fn resolved_folders(project: &Project) -> Vec<(String, PathBuf)> {
+    project
+        .folders
+        .iter()
+        .filter_map(|folder| Some((folder.name.clone(), resolved(&folder.path)?)))
+        .collect()
+}
+
+/// Where commands start: the project's first folder, or the scratch folder
+/// without one.
+fn working_directory(folders: &[(String, PathBuf)], scratch: &Path) -> PathBuf {
+    folders
+        .first()
+        .map(|(_, path)| path.clone())
+        .unwrap_or_else(|| resolved(scratch).unwrap_or_else(|| scratch.to_owned()))
+}
+
+/// What `command` may do, from [`settings`].
+fn request(
+    command: &str,
+    project: &Project,
+    scratch: &Path,
+    environment: &HashMap<String, String>,
+) -> ContainerRequest {
+    let home = std::env::home_dir();
+    let scratch = resolved(scratch).unwrap_or_else(|| scratch.to_owned());
+    let mut environment = environment.clone();
+    for (variable, default) in settings::TOOLCHAIN_HOMES {
+        if !environment.contains_key(*variable)
+            && let Some(home) = &home
+            && home.join(default).is_dir()
         {
-            runtime.spawn(async move { _ = control.kill().await });
+            environment.insert(
+                (*variable).to_owned(),
+                home.join(default).to_string_lossy().into_owned(),
+            );
         }
+    }
+    let scratch_text = scratch.to_string_lossy().into_owned();
+    for variable in ["HOME", "TMPDIR", "TMP", "TEMP"] {
+        environment.insert(variable.to_owned(), scratch_text.clone());
+    }
+    let environment = environment.into_iter().collect::<Vec<_>>();
+
+    let folders = resolved_folders(project);
+    let mut readwrite = vec![scratch.clone()];
+    let mut readonly = Vec::new();
+    for (_, path) in &folders {
+        if project.writable {
+            readwrite.push(path.clone());
+        } else {
+            readonly.push(path.clone());
+        }
+    }
+    readonly.extend(tool_paths(&environment, home.as_deref()));
+    readonly.sort();
+    readonly.dedup();
+    // The sandbox lets read-only win over read-write for the same path, so a
+    // writable project folder that is also a tool folder stays writable.
+    readonly.retain(|path| !readwrite.contains(path));
+    let denied = home
+        .iter()
+        .flat_map(|home| settings::DENIED_PATHS.iter().map(|path| home.join(path)))
+        .filter_map(|path| resolved(&path))
+        .collect::<Vec<_>>();
+
+    let text = |paths: Vec<PathBuf>| {
+        paths
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    };
+    ContainerRequest {
+        filesystem: Some(FilesystemPolicy {
+            readwrite_paths: text(readwrite),
+            readonly_paths: text(readonly),
+            denied_paths: text(denied),
+            ..Default::default()
+        }),
+        network: Some(NetworkPolicy {
+            egress: Some(NetworkEgressPolicy {
+                default: Some(NetworkAction::Deny),
+                ..Default::default()
+            }),
+            ingress: Some(NetworkIngressPolicy {
+                default: Some(NetworkAction::Deny),
+                host_loopback: Some(NetworkAction::Deny),
+            }),
+            runtime_config: None,
+        }),
+        working_directory: Some(
+            working_directory(&folders, &scratch)
+                .to_string_lossy()
+                .into_owned(),
+        ),
+        environment: Some(environment),
+        ..ContainerRequest::new(command)
+    }
+}
+
+/// The folders holding the user's tools, resolved; see [`settings`].
+fn tool_paths(environment: &[(String, String)], home: Option<&Path>) -> Vec<PathBuf> {
+    let tools = filesystem::available_tools_policy(Some(environment), Default::default());
+    let profile = filesystem::user_profile_policy(Some(environment));
+    let mut paths = Vec::new();
+    for path in [tools, profile].into_iter().flat_map(|found| {
+        found
+            .readonly_paths
+            .into_iter()
+            .chain(found.readwrite_paths)
+    }) {
+        let Some(path) = resolved(Path::new(&path)) else {
+            continue;
+        };
+        let prefix = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| settings::TOOL_PREFIX_DIRS.contains(name))
+            .and_then(|_| path.parent())
+            .filter(|parent| {
+                parent.parent().is_some()
+                    && Some(*parent) != home
+                    && Some(*parent) != home.map(|home| home.join(".local")).as_deref()
+            })
+            .map(Path::to_owned);
+        paths.push(path);
+        paths.extend(prefix);
+    }
+    for (variable, _) in settings::TOOLCHAIN_HOMES {
+        if let Some((_, value)) = environment.iter().find(|(name, _)| name == variable) {
+            paths.extend(resolved(Path::new(value)));
+        }
+    }
+    paths
+}
+
+/// Runs `request` to its end, or until `stopped`.
+fn execute(request: ContainerRequest, stopped: &AtomicBool) -> Result<CommandOutput, SandboxError> {
+    let mut process = v1::spawn(request, Default::default())
+        .map_err(|error| SandboxError::Failed(error.to_string()))?;
+    let stdout = Output::read(&mut process, Stream::Stdout);
+    let stderr = Output::read(&mut process, Stream::Stderr);
+    let exit_code = loop {
+        if stopped.load(Ordering::Acquire) {
+            _ = process.kill();
+            return Err(SandboxError::Failed("the command was stopped".into()));
+        }
+        match process.try_wait() {
+            Ok(Some(code)) => break code,
+            Ok(None) => std::thread::sleep(POLL_INTERVAL),
+            Err(error) => {
+                _ = process.kill();
+                return Err(SandboxError::Failed(error.to_string()));
+            }
+        }
+    };
+    // Ends what the command left running in the background, which may also
+    // hold its output open.
+    _ = process.kill();
+    drop(process);
+    Ok(CommandOutput::new(
+        exit_code,
+        &stdout.collect(),
+        &stderr.collect(),
+    ))
+}
+
+enum Stream {
+    Stdout,
+    Stderr,
+}
+
+/// One of a command's output streams, read on a thread of its own so that
+/// neither can fill up and block the command.
+struct Output {
+    read: mpsc::Receiver<Vec<u8>>,
+    closer: Option<StreamCloser>,
+}
+
+impl Output {
+    fn read(process: &mut MxcProcess, stream: Stream) -> Self {
+        let (stream, closer) = match stream {
+            Stream::Stdout => (process.take_stdout(), process.stdout_closer()),
+            Stream::Stderr => (process.take_stderr(), process.stderr_closer()),
+        };
+        let (sender, read) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut stream) = stream {
+                // What was read before an error is kept.
+                _ = stream.read_to_end(&mut bytes);
+            }
+            _ = sender.send(bytes);
+        });
+        Self { read, closer }
+    }
+
+    /// Everything the stream carried, once it closed, or what it had carried
+    /// after [`OUTPUT_GRACE`].
+    fn collect(self) -> Vec<u8> {
+        self.read.recv_timeout(OUTPUT_GRACE).unwrap_or_else(|_| {
+            if let Some(closer) = &self.closer {
+                closer.close();
+            }
+            self.read.recv().unwrap_or_default()
+        })
+    }
+}
+
+/// Sandboxes under a fresh temporary root, with this process's environment,
+/// and the root's guard.
+#[cfg(test)]
+pub(crate) fn test_sandboxes() -> (Arc<Sandboxes>, TestRoot) {
+    let root = TestRoot::new();
+    let sandboxes = Sandboxes::new(root.0.clone(), "test", EnvironmentSource::Process);
+    (Arc::new(sandboxes), root)
+}
+
+/// A temporary folder removed on drop.
+#[cfg(test)]
+pub(crate) struct TestRoot(pub(crate) PathBuf);
+
+#[cfg(test)]
+impl TestRoot {
+    pub(crate) fn new() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "cowork-sandbox-unit-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&path).unwrap();
+        Self(path)
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestRoot {
+    fn drop(&mut self) {
+        _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
@@ -654,35 +578,177 @@ impl Drop for KillOnDrop {
 mod tests {
     use super::*;
 
+    fn folder(root: &Path, name: &str) -> ProjectFolder {
+        let path = root.join(name);
+        std::fs::create_dir_all(&path).unwrap();
+        ProjectFolder {
+            name: name.to_owned(),
+            path,
+        }
+    }
+
     #[tokio::test]
-    async fn bad_commands_are_rejected_before_anything_starts() {
-        let sandboxes = Sandboxes::new(PathBuf::from("/nonexistent"), "test");
+    async fn empty_commands_are_rejected_before_anything_starts() {
+        let (sandboxes, _root) = test_sandboxes();
         assert!(matches!(
             sandboxes.run("thread", "  ").await,
-            Err(SandboxError::InvalidCommand(_))
-        ));
-        let long = "x".repeat(settings::MAX_COMMAND_BYTES + 1);
-        assert!(matches!(
-            sandboxes.run("thread", &long).await,
             Err(SandboxError::InvalidCommand(_))
         ));
         assert!(sandboxes.ready.get().is_none(), "nothing was set up");
     }
 
     #[tokio::test]
-    async fn removing_a_thread_forgets_its_project() {
-        let sandboxes = Sandboxes::new(PathBuf::from("/nonexistent"), "test");
+    async fn removing_a_thread_forgets_its_project_and_scratch() {
+        let (sandboxes, _root) = test_sandboxes();
         let writable = Project {
             folders: Vec::new(),
             writable: true,
         };
         sandboxes.set_project("thread", writable.clone());
         sandboxes.set_project("other", writable.clone());
+        let scratch = sandboxes.scratch_dir("thread");
+        std::fs::create_dir_all(&scratch).unwrap();
 
         sandboxes.remove("thread").await;
 
         assert_eq!(sandboxes.project("thread"), Project::default());
         assert_eq!(sandboxes.project("other"), writable);
-        assert!(!sandboxes.has_sandbox("thread"));
+        assert!(!scratch.exists());
+    }
+
+    #[test]
+    fn the_note_names_the_folders_mode_and_scratch() {
+        let (sandboxes, root) = test_sandboxes();
+        let empty = sandboxes.environment_note("thread");
+        assert!(empty.starts_with(ENVIRONMENT_NOTE_START), "{empty}");
+        assert!(empty.contains("no project folders"), "{empty}");
+
+        let zed = folder(&root.0, "zed");
+        let resolved_zed = resolved(&zed.path).unwrap();
+        sandboxes.set_project(
+            "thread",
+            Project {
+                folders: vec![zed],
+                writable: false,
+            },
+        );
+        let read_only = sandboxes.environment_note("thread");
+        assert!(
+            read_only.contains(&format!("- zed: {}", resolved_zed.display())),
+            "{read_only}"
+        );
+        assert!(read_only.contains("read-only"), "{read_only}");
+        assert!(
+            read_only.contains(&format!("Commands start in {}.", resolved_zed.display())),
+            "{read_only}"
+        );
+        assert_eq!(read_only, sandboxes.environment_note("thread"), "stable");
+
+        let mut project = sandboxes.project("thread");
+        project.writable = true;
+        sandboxes.set_project("thread", project);
+        assert!(sandboxes.environment_note("thread").contains("writable"));
+    }
+
+    #[test]
+    fn requests_grant_the_project_by_mode_and_deny_the_network() {
+        let root = TestRoot::new();
+        let zed = folder(&root.0, "zed");
+        let scratch = root.0.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let environment = HashMap::from([
+            ("PATH".to_owned(), "/usr/bin:/bin".to_owned()),
+            ("HOME".to_owned(), "/somewhere/else".to_owned()),
+        ]);
+        let project = |writable| Project {
+            folders: vec![zed.clone()],
+            writable,
+        };
+        let zed_path = resolved(&zed.path).unwrap().to_string_lossy().into_owned();
+        let scratch_path = resolved(&scratch).unwrap().to_string_lossy().into_owned();
+
+        let read_only = request("ls", &project(false), &scratch, &environment);
+        let filesystem = read_only.filesystem.clone().unwrap();
+        assert!(filesystem.readonly_paths.contains(&zed_path));
+        assert_eq!(
+            filesystem.readwrite_paths,
+            std::slice::from_ref(&scratch_path)
+        );
+        assert_eq!(read_only.working_directory.as_deref(), Some(&*zed_path));
+        let environment_of = |request: &ContainerRequest, name: &str| {
+            request
+                .environment
+                .as_ref()
+                .unwrap()
+                .iter()
+                .find(|(key, _)| key == name)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(
+            environment_of(&read_only, "HOME"),
+            Some(scratch_path.clone())
+        );
+        assert_eq!(
+            environment_of(&read_only, "TMPDIR"),
+            Some(scratch_path.clone())
+        );
+        assert_eq!(
+            environment_of(&read_only, "PATH").as_deref(),
+            Some("/usr/bin:/bin")
+        );
+        let network = read_only.network.unwrap();
+        assert_eq!(network.egress.unwrap().default, Some(NetworkAction::Deny));
+        assert_eq!(network.ingress.unwrap().default, Some(NetworkAction::Deny));
+
+        let writable = request("ls", &project(true), &scratch, &environment);
+        let filesystem = writable.filesystem.unwrap();
+        assert!(filesystem.readwrite_paths.contains(&zed_path));
+        assert!(!filesystem.readonly_paths.contains(&zed_path));
+    }
+
+    #[test]
+    fn tool_folders_bring_their_prefix_but_not_home() {
+        let root = TestRoot::new();
+        let prefix = root.0.join("prefix");
+        let bin = prefix.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let home_bin = root.0.join("bin");
+        std::fs::create_dir_all(&home_bin).unwrap();
+        let path = format!("{}:{}", bin.display(), home_bin.display());
+        let environment = [("PATH".to_owned(), path)];
+        let paths = tool_paths(&environment, Some(&resolved(&root.0).unwrap()));
+        assert!(paths.contains(&resolved(&bin).unwrap()));
+        assert!(paths.contains(&resolved(&prefix).unwrap()));
+        assert!(paths.contains(&resolved(&home_bin).unwrap()));
+        assert!(
+            !paths.contains(&resolved(&root.0).unwrap()),
+            "home is not a prefix: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn leftovers_of_other_instances_are_removed_but_not_live_ones() {
+        let root = TestRoot::new();
+        if !v1::platform_support().is_supported {
+            return;
+        }
+        let stale = root.0.join("stale");
+        std::fs::create_dir_all(stale.join("thread")).unwrap();
+        std::fs::write(root.0.join("stale.lock"), "").unwrap();
+        let live = Sandboxes::new(root.0.clone(), "live", EnvironmentSource::Process);
+        live.ready().unwrap();
+        let live_scratch = live.scratch_dir("thread");
+        std::fs::create_dir_all(&live_scratch).unwrap();
+
+        let current = Sandboxes::new(root.0.clone(), "current", EnvironmentSource::Process);
+        current.ready().unwrap();
+
+        assert!(!stale.exists(), "an unlocked instance's folders go");
+        assert!(!root.0.join("stale.lock").exists());
+        assert!(live_scratch.exists(), "a running instance's stay");
+
+        live.shutdown();
+        assert!(!root.0.join("live").exists());
+        assert!(!root.0.join("live.lock").exists());
     }
 }

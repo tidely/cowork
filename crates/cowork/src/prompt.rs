@@ -54,6 +54,43 @@ pub(crate) fn agent_message(
     RigMessage::User { content }
 }
 
+/// `prompt` with `note`, where the agent's commands run (see
+/// [`sandbox::Sandboxes::environment_note`]), as its first part, unless the
+/// latest note in `history` already says the same. The note travels in the
+/// prompt rather than in the tool's definition or the system prompt, which
+/// are part of the prompt prefix the model caches, and it stays in the
+/// transcript, so later runs see what earlier ones were told.
+pub(crate) fn with_environment_note(
+    prompt: RigMessage,
+    history: &[RigMessage],
+    note: String,
+) -> RigMessage {
+    if latest_environment_note(history) == Some(note.as_str()) {
+        return prompt;
+    }
+    match prompt {
+        RigMessage::User { mut content } => {
+            content.insert(0, UserContent::text(note));
+            RigMessage::User { content }
+        }
+        other => other,
+    }
+}
+
+fn latest_environment_note(history: &[RigMessage]) -> Option<&str> {
+    history.iter().rev().find_map(|message| {
+        let RigMessage::User { content } = message else {
+            return None;
+        };
+        content.iter().find_map(|part| match part {
+            UserContent::Text(text) if text.text.starts_with(sandbox::ENVIRONMENT_NOTE_START) => {
+                Some(text.text.as_str())
+            }
+            _ => None,
+        })
+    })
+}
+
 /// `participant`'s name in prompts; see [`Thread::prompt_names`].
 pub(crate) fn prompt_name(
     names: &HashMap<ParticipantId, SharedString>,
@@ -128,6 +165,33 @@ mod tests {
         assert!(matches!(&content[2], UserContent::Image(image)
             if image.data == rig::message::DocumentSourceKind::Base64("AQID".into())
                 && image.media_type == Some(ImageMediaType::PNG)));
+    }
+
+    #[test]
+    fn the_environment_note_is_sent_only_when_it_changed() {
+        let note = |text: &str| format!("{}{text}", sandbox::ENVIRONMENT_NOTE_START);
+        let texts = |message: &RigMessage| {
+            let RigMessage::User { content } = message else {
+                panic!("expected a user message");
+            };
+            content
+                .iter()
+                .map(|part| match part {
+                    UserContent::Text(text) => text.text.clone(),
+                    _ => panic!("expected only text parts"),
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let first = with_environment_note(RigMessage::user("Hi"), &[], note("a"));
+        assert_eq!(texts(&first), [note("a"), "Hi".into()]);
+
+        let history = [first, RigMessage::user("later, without a note")];
+        let same = with_environment_note(RigMessage::user("Again"), &history, note("a"));
+        assert_eq!(texts(&same), ["Again"]);
+
+        let changed = with_environment_note(RigMessage::user("Now"), &history, note("b"));
+        assert_eq!(texts(&changed), [note("b"), "Now".into()]);
     }
 
     /// Comments come first, then each block under its creator's name with its

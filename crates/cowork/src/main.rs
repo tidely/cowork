@@ -636,6 +636,12 @@ fn bind_app_keys(cx: &mut App) {
 }
 
 fn main() -> anyhow::Result<()> {
+    // Run by the user's login shell to read its environment for the agent's
+    // commands; see `sandbox::environment`.
+    if std::env::args().nth(1).as_deref() == Some(sandbox::PRINT_ENV_FLAG) {
+        sandbox::print_env();
+        return Ok(());
+    }
     let worker_threads = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(4)
@@ -651,8 +657,9 @@ fn main() -> anyhow::Result<()> {
         "the agent runtime was already initialized",
     );
     let sandboxes = Arc::new(sandbox::Sandboxes::new(
-        sandbox_home()?,
+        scratch_root()?,
         Uuid::new_v4().simple().to_string(),
+        command_environment(),
     ));
 
     gpui_platform::application()
@@ -691,16 +698,16 @@ fn main() -> anyhow::Result<()> {
                 ..TitleBar::window_options()
             };
 
-            // microsandbox also stops the VMs once Cowork has exited; this
-            // stops them sooner where quitting leaves time for it.
+            // Removes this instance's scratch folders. Ones left by a crash
+            // are removed by the next instance.
             cx.on_app_quit({
                 let sandboxes = sandboxes.clone();
                 let tokio_handle = tokio_handle.clone();
                 move |_| {
                     let sandboxes = sandboxes.clone();
-                    let stopped = tokio_handle.spawn(async move { sandboxes.shutdown().await });
+                    let removed = tokio_handle.spawn_blocking(move || sandboxes.shutdown());
                     async move {
-                        _ = stopped.await;
+                        _ = removed.await;
                     }
                 }
             })
@@ -790,11 +797,22 @@ fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Cowork's own microsandbox home, apart from any of the user's. Short, as
-/// microsandbox puts Unix sockets beneath it.
-fn sandbox_home() -> anyhow::Result<std::path::PathBuf> {
+/// Where the agent's commands keep their threads' scratch folders.
+fn scratch_root() -> anyhow::Result<std::path::PathBuf> {
     let home = std::env::home_dir().context("the home directory is unknown")?;
-    Ok(home.join(".cowork").join("microsandbox"))
+    Ok(home.join(".cowork").join(sandbox::settings::SCRATCH_DIR))
+}
+
+/// Where the agent's commands get their environment, as Zed decides it: an
+/// app started from a terminal already has the user's shell environment,
+/// while one started from the Dock or a launcher reads it from a login shell.
+fn command_environment() -> sandbox::EnvironmentSource {
+    use std::io::IsTerminal as _;
+    if cfg!(unix) && !std::io::stdout().is_terminal() {
+        sandbox::EnvironmentSource::LoginShell
+    } else {
+        sandbox::EnvironmentSource::Process
+    }
 }
 
 #[cfg(test)]

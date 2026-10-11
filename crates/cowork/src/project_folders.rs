@@ -3,7 +3,9 @@
 //!
 //! The folders are kept in [`Thread::project_folders`] and, before the
 //! thread exists, [`Cowork::new_thread_project_folders`]. Collaborators only
-//! ever learn their names. Nothing gives them to the agent yet.
+//! ever learn their names; the agent's commands use them on the host's
+//! computer, and the agent learns their paths from the environment note in
+//! its prompt (see `prompt::with_environment_note`).
 
 use std::{
     path::{Path, PathBuf},
@@ -15,7 +17,7 @@ use gpui::{
     WeakEntity, Window, div, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, Sizable as _, WindowExt as _,
+    ActiveTheme as _, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     menu::{DropdownMenu as _, PopupMenuItem},
@@ -59,10 +61,11 @@ impl ProjectFolder {
 /// Appends the folders not already in the project, keeping the order they
 /// were added in. Returns whether any was added.
 ///
-/// Each is named by its last component, made mountable by
+/// Each is named by its last component, cleaned up by
 /// [`sandbox::folder_name`], and given a `-2`, `-3`, ... suffix when another
-/// folder already has the name, so that the name is also where the sandbox
-/// mounts it. Names stay as they are when other folders are removed.
+/// folder already has the name, so that names tell folders apart for
+/// collaborators and the agent. Names stay as they are when other folders are
+/// removed.
 pub(crate) fn add_folders(
     project: &mut Vec<ProjectFolder>,
     paths: impl IntoIterator<Item = PathBuf>,
@@ -92,7 +95,7 @@ pub(crate) fn add_folders(
     project.len() != before
 }
 
-/// The project `thread`'s sandbox mounts: its folders on this machine, open
+/// The project `thread`'s commands use: its folders on this machine, open
 /// for writing in [`ProjectMode::Write`].
 pub(crate) fn sandbox_project(thread: &Thread) -> sandbox::Project {
     sandbox::Project {
@@ -107,32 +110,6 @@ pub(crate) fn sandbox_project(thread: &Thread) -> sandbox::Project {
             })
             .collect(),
         writable: thread.project_mode() == ProjectMode::Write,
-    }
-}
-
-/// A change to a project's folders the host asked for.
-#[derive(Clone)]
-pub(crate) enum ProjectChange {
-    Add(Vec<PathBuf>),
-    Remove(PathBuf),
-    Mode(ProjectMode),
-}
-
-impl ProjectChange {
-    /// Whether making it would change `thread`'s project, and so restart its
-    /// sandbox.
-    fn changes(&self, thread: &Thread) -> bool {
-        let has = |path: &Path| {
-            thread
-                .project_folders()
-                .iter()
-                .any(|folder| folder.path.as_deref() == Some(path))
-        };
-        match self {
-            Self::Add(paths) => paths.iter().any(|path| !has(path)),
-            Self::Remove(path) => has(path),
-            Self::Mode(mode) => thread.project_mode() != *mode,
-        }
     }
 }
 
@@ -331,13 +308,8 @@ impl Cowork {
                 }
             }),
             |path, _, cx| cx.open_with_system(path),
-            cx.listener(move |this, path: &Path, window, cx| {
-                this.request_project_change(
-                    target.clone(),
-                    ProjectChange::Remove(path.to_owned()),
-                    window,
-                    cx,
-                )
+            cx.listener(move |this, path: &Path, _, cx| {
+                this.remove_project_folder(target.clone(), path, cx)
             }),
         )
     }
@@ -363,71 +335,17 @@ impl Cowork {
                     return;
                 }
             };
-            _ = this.update_in(cx, |this, window, cx| {
-                this.request_project_change(target, ProjectChange::Add(paths), window, cx);
+            _ = this.update(cx, |this, cx| {
+                this.add_project_folders(target, paths, cx);
             });
         })
         .detach();
     }
 
-    /// Makes a change the host asked for, first asking to confirm it when it
-    /// would restart the thread's sandbox.
-    pub(crate) fn request_project_change(
-        &mut self,
-        target: Option<WeakEntity<Thread>>,
-        change: ProjectChange,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let thread = target.as_ref().and_then(WeakEntity::upgrade);
-        let restarts = thread.as_ref().is_some_and(|thread| {
-            let thread = thread.read(cx);
-            thread.is_host()
-                && change.changes(thread)
-                && self.sandboxes.has_sandbox(&thread.instance_id.to_string())
-        });
-        if !restarts {
-            self.apply_project_change(target, change, cx);
-            return;
-        }
-        let folders = thread
-            .map(|thread| thread.read(cx).project_folders().to_vec())
-            .unwrap_or_default();
-        let description = restart_description(&change, &folders);
-        let cowork = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let cowork = cowork.clone();
-            let target = target.clone();
-            let change = change.clone();
-            alert
-                .title("Restart the sandbox?")
-                .description(description.clone())
-                .ok_text("Restart Sandbox")
-                .show_cancel(true)
-                .on_ok(move |_, _, cx| {
-                    _ = cowork.update(cx, |cowork, cx| {
-                        cowork.apply_project_change(target.clone(), change.clone(), cx);
-                    });
-                    true
-                })
-        });
-    }
-
-    fn apply_project_change(
-        &mut self,
-        target: Option<WeakEntity<Thread>>,
-        change: ProjectChange,
-        cx: &mut Context<Self>,
-    ) {
-        match change {
-            ProjectChange::Add(paths) => self.add_project_folders(target, paths, cx),
-            ProjectChange::Remove(path) => self.remove_project_folder(target, &path, cx),
-            ProjectChange::Mode(mode) => self.set_project_mode(target, mode, cx),
-        }
-    }
-
     /// Tells the sandboxes the project `thread`'s next command should see.
-    /// Only the host runs commands, in its own sandbox for the thread.
+    /// Only the host runs commands, on its own computer. Commands already
+    /// running keep the project they started with, and the model learns of
+    /// the change from the next run's environment note.
     pub(crate) fn sync_sandbox_project(&self, thread: &gpui::Entity<Thread>, cx: &App) {
         let thread = thread.read(cx);
         if thread.is_host() {
@@ -476,8 +394,6 @@ impl Cowork {
 
     /// Gives a thread exactly `paths` as its project, in that order where
     /// they are new, with `mode`, as a scheduled run does before it starts.
-    /// Without asking first: nothing runs in the thread then, and its
-    /// sandbox only restarts if the project changed.
     pub(crate) fn set_thread_project(
         &mut self,
         thread: &gpui::Entity<Thread>,
@@ -515,32 +431,6 @@ impl Cowork {
         });
         self.sync_sandbox_project(thread, cx);
     }
-}
-
-/// What the confirmation before restarting a sandbox says will happen.
-fn restart_description(change: &ProjectChange, folders: &[ProjectFolder]) -> String {
-    let what = match change {
-        ProjectChange::Add(paths) => match paths.as_slice() {
-            [path] => format!("Adding “{}”", sandbox::folder_name(path)),
-            paths => format!("Adding {} folders", paths.len()),
-        },
-        ProjectChange::Remove(path) => {
-            let name = folders
-                .iter()
-                .find(|folder| folder.path.as_deref() == Some(path.as_path()))
-                .map_or_else(
-                    || sandbox::folder_name(path),
-                    |folder| folder.name.to_string(),
-                );
-            format!("Removing “{name}”")
-        }
-        ProjectChange::Mode(mode) => format!("Switching to {}", mode.label()),
-    };
-    format!(
-        "{what} restarts this thread's sandbox before the agent's next command. Files the \
-         agent made outside {} are lost, and commands still running then are stopped.",
-        sandbox::settings::PROJECTS_DIR
-    )
 }
 
 #[cfg(test)]
@@ -604,49 +494,10 @@ mod tests {
             ],
         );
         assert_eq!(names(&project), ["src", "src-2", "src-3", "root"]);
-        // Removing one keeps the others' names, which may be mounted, and
-        // its name is free again.
+        // Removing one keeps the others' names, which the agent may have
+        // been told, and its name is free again.
         remove_folder(&mut project, Path::new("/a/src"));
         add_folders(&mut project, ["/d/src".into()]);
         assert_eq!(names(&project), ["src-2", "src-3", "root", "src"]);
-    }
-
-    #[test]
-    fn only_changes_to_the_project_restart_its_sandbox() {
-        let mut thread = Thread::new_local(
-            "test".into(),
-            Vec::new(),
-            crate::thread_draft::ThreadDraft::new(crate::participant::ParticipantId::new()),
-            crate::participant::ParticipantId::new(),
-            Default::default(),
-            None,
-        );
-        thread.add_project_folders(vec!["/a/src".into()]);
-        let restarts = |change: ProjectChange, thread: &Thread| change.changes(thread);
-        assert!(restarts(ProjectChange::Mode(ProjectMode::Write), &thread));
-        assert!(!restarts(ProjectChange::Mode(ProjectMode::Read), &thread));
-        assert!(restarts(ProjectChange::Add(vec!["/b/zed".into()]), &thread));
-        assert!(!restarts(
-            ProjectChange::Add(vec!["/a/src".into()]),
-            &thread
-        ));
-        assert!(restarts(ProjectChange::Remove("/a/src".into()), &thread));
-        assert!(!restarts(ProjectChange::Remove("/b/zed".into()), &thread));
-    }
-
-    #[test]
-    fn the_restart_confirmation_names_the_folder() {
-        let mut project = Vec::new();
-        add_folders(&mut project, ["/a/src".into(), "/b/src".into()]);
-        let removing = restart_description(&ProjectChange::Remove("/b/src".into()), &project);
-        assert!(
-            removing.starts_with("Removing “src-2” restarts"),
-            "{removing}"
-        );
-        let adding = restart_description(&ProjectChange::Add(vec!["/c/zed".into()]), &project);
-        assert!(adding.starts_with("Adding “zed” restarts"), "{adding}");
-        assert!(adding.contains("outside /projects are lost"), "{adding}");
-        let mode = restart_description(&ProjectChange::Mode(ProjectMode::Write), &project);
-        assert!(mode.starts_with("Switching to Write restarts"), "{mode}");
     }
 }
