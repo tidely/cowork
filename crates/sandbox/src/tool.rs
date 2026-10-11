@@ -18,7 +18,7 @@ pub struct RunCommandArgs {
     /// A command line for the platform's shell, for example `ls -la`.
     pub command: String,
     /// The access this one command needs, when it differs from the project's
-    /// mode: `read` to read the project, `write` to also change it,
+    /// mode: `read` to read host files, `write` to also change the project,
     /// `network` to also reach the network. Leave it out to use the mode.
     /// Asking for `read` lets a command that only reads run at once in any
     /// mode; asking for more than the mode waits for the user to allow it.
@@ -26,12 +26,12 @@ pub struct RunCommandArgs {
     pub access: Option<Access>,
     /// Folders outside the project this one command also needs to read, as
     /// absolute paths on the user's computer, or starting with `~/` for the
-    /// user's home folder. Waits for the user to allow it.
+    /// user's home folder. Optional: host files are already readable except credentials.
     #[serde(default)]
     pub read_folders: Vec<String>,
     /// Folders outside the project this one command also needs to change,
     /// such as `~/.cargo` for `cargo fetch`, written like `read_folders`.
-    /// Waits for the user to allow it.
+    /// Waits unless already covered by the project or run.
     #[serde(default)]
     pub write_folders: Vec<String>,
 }
@@ -95,18 +95,18 @@ const DESCRIPTION: &str = concat!(
      and the user's installed tools and toolchains are available. The project's mode (read, \
      write, or network), its folders, and the folder commands start in are given in the latest \
      <environment> note in the conversation. A command runs with the mode's access unless its \
-     `access` argument asks for other access, for this command only. Commands with read access \
-     run at once; every other command waits for the user to allow it, except in a scheduled \
+     `access` argument asks for other access, for this command only. Commands covered by the \
+     project's auto-approval level and this run's grants run at once; extra access or writable folders \
+     wait for the user to allow them, except in a scheduled \
      run, where the first such call is refused with an explanation. Ask for `read` when a \
      command only reads, and for more than the mode only when the command needs it, such as \
      `network` to download dependencies. A command that needs folders outside the project, \
-     such as a package manager's cache, names them in `read_folders` or `write_folders`; \
+     such as a package manager's cache, names them in `write_folders`; \
      to keep extra access for later commands, ask for it once with `request_permissions`. \
      Permissions granted that way apply to later commands automatically. If the user denies \
      something, carry on without it. ",
-    // Fixed per platform, so the definition stays the same within a session.
-    // See `settings` for why Windows differs.
-    reads!(),
+    "Commands can read the host filesystem except denied credentials. Writes stay within the \
+     project and scratch folders unless extra writable folders are granted. ",
     " Without network access, nothing can be downloaded or installed. Even with it, commands \
      cannot accept connections from outside or reach services listening on the user's own \
      computer. Each command \
@@ -115,23 +115,6 @@ const DESCRIPTION: &str = concat!(
      same in a command as in `read_folders` and `write_folders`. Anything a command leaves \
      running in the background is ended when it exits."
 );
-
-#[cfg(windows)]
-macro_rules! reads {
-    () => {
-        "Commands can read the user's other files too, except credentials, but change nothing \
-         outside the project and the scratch folder; don't read outside the project unless the \
-         user asks."
-    };
-}
-
-#[cfg(not(windows))]
-macro_rules! reads {
-    () => {
-        "Commands cannot read the user's other files."
-    };
-}
-use reads;
 
 impl Tool for RunCommand {
     const NAME: &'static str = "run_command";

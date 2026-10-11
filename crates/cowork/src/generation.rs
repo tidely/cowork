@@ -97,6 +97,8 @@ pub(crate) struct ActiveGeneration {
     message_id: Uuid,
     abort_handle: tokio::task::AbortHandle,
     cancelled: Arc<AtomicBool>,
+    /// The host's live run grants, used to show only new permissions in cards.
+    gate: Option<std::sync::Weak<ApprovalGate>>,
     /// How to answer each call the run is waiting on a decision for.
     /// Dropping one, as when the run ends, denies its call.
     approvals: HashMap<CallId, PendingApproval>,
@@ -110,6 +112,13 @@ struct PendingApproval {
 }
 
 impl ActiveGeneration {
+    pub(crate) fn granted(&self) -> Option<sandbox::Grant> {
+        self.gate
+            .as_ref()
+            .and_then(|gate| gate.upgrade())
+            .map(|gate| gate.granted())
+    }
+
     pub(crate) fn message_id(&self) -> Uuid {
         self.message_id
     }
@@ -143,6 +152,7 @@ impl ActiveGeneration {
             message_id,
             abort_handle,
             cancelled,
+            gate: None,
             approvals: HashMap::new(),
         }
     }
@@ -205,6 +215,7 @@ impl Cowork {
             scheduled,
         );
         let cancelled = Arc::new(AtomicBool::new(false));
+        let active_gate = Arc::downgrade(&gate);
         let generation_task = self.tokio_handle.spawn(async move {
             let (selected_model, max_tokens) =
                 selected_model.context("No available model selected")?;
@@ -232,6 +243,7 @@ impl Cowork {
                 message_id,
                 abort_handle: generation_task.abort_handle(),
                 cancelled: cancelled.clone(),
+                gate: Some(active_gate),
                 approvals: HashMap::new(),
             },
         );
@@ -518,6 +530,32 @@ mod tests {
     use rig::tool::Tool as _;
 
     use super::*;
+
+    /// Displaying grants must not keep the update channel alive after the
+    /// agent finishes; the receiver closing is what completes the run.
+    #[tokio::test]
+    async fn displaying_run_grants_does_not_keep_the_run_alive() {
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let gate = ApprovalGate::new(
+            sender,
+            crate::test_support::unused_sandboxes(),
+            "thread",
+            false,
+        );
+        let task = tokio::spawn(async {});
+        let generation = ActiveGeneration {
+            message_id: Uuid::new_v4(),
+            abort_handle: task.abort_handle(),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            gate: Some(Arc::downgrade(&gate)),
+            approvals: HashMap::new(),
+        };
+        assert!(generation.granted().is_some());
+        drop(gate);
+        assert!(generation.granted().is_none());
+        assert!(receiver.recv().await.is_none());
+        task.await.unwrap();
+    }
 
     /// The definitions are the prompt prefix's, so nothing a conversation
     /// changes may reach them: not the thread, its comments, its project's

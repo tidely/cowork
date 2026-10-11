@@ -33,3 +33,9 @@ Frequency: Once or repeating
 Missed schedules behavior: Rerun when available, skip, notify
 
 We should also add a `schedule` tool, which provides a rich interface to the user, who may accept the agents recommended prompt schedule
+
+## Sandbox helper for restricted file writes
+
+Keep file tools app-managed, but route restricted writes through an
+OS-sandboxed helper, following Codex. This should protect against hard links
+and paths changing between validation and writing.

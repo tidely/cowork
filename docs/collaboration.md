@@ -26,15 +26,15 @@ Agent events are checked on arrival in the order Rig's stream could produce
 them.
 Tool calls outside a short always-allowed list wait for the host or an
 `Admin` peer to allow or deny them, and `run_command`, `write_file`, and `request_permissions` for the
-host alone; commands with read access run without asking, as does
+host alone; commands within the project auto-approval level run without asking, as does
 `write_file` in `Write` and `Write + Network`, a command may
 ask for more access than the mode, or for folders outside the project, for
 itself alone, and `request_permissions` asks for either for the rest of the
 run. See [Tool approval](#tool-approval).
 The agent's commands run on the host's computer, contained by its operating
-system's sandbox, with the host's project folders read-only unless the project
-is in `Write` or `Write + Network` mode, and with the network only in `Write + Network` mode;
-collaborators see the folders by name with that mode, and
+system's sandbox. The project auto-approval level provides the default
+access; each command may request narrower access or approval for more.
+Collaborators see the folders by name with that level, and
 the agent learns their paths from an environment note in its prompt; see
 [Project folders](#project-folders).
 
@@ -544,102 +544,19 @@ marked as stopped, so everyone can tell it apart from one that completed.
 
 ### Tool approval
 
-The agent's calls to most tools wait for someone to allow them before they
-run. `tool_approval.rs` lists the tools whose calls always run
-(`ALWAYS_ALLOWED`: `respond_to_comment`, which only acts within the thread,
-and `list_directory` and `read_file`, which only read the folders the host
-shared with the thread and its scratch folder); every other tool's calls
-wait, so a newly added tool is asked about rather than trusted. `calculate`
-waits.
+See [Permissions](permissions.md) for command scope, auto-approval, file
+tools, and run grants. Reads span the host filesystem on every platform,
+except denied credentials; a submitting collaborator can therefore have
+the agent read other host files into the transcript.
 
-A `run_command` call runs with the access of the project's mode (`read`,
-`write`, or `network`) unless its optional `access` argument asks for other
-access, for that command only. This is how the agent asks for higher
-permissions for one command, such as `network` to fetch dependencies in a
-`Read` project, and how it runs a command that only reads without waiting in
-a `Write` or `Write + Network` project. Its optional `read_folders` and
-`write_folders` name host folders outside the project the command also
-needs, as absolute paths or under `~/` (the user's real home, which is also
-the command's `HOME`), such as `~/.cargo` for `cargo fetch`.
-
-The agent can also ask for more for the rest of its run, as Codex's agent
-does, with `request_permissions`: a `reason`, and an `access`, folders, or
-both. Once the host allows it, the run's later commands get what it granted
-automatically: their access is their own `access`, or the mode or the grant,
-whichever is more, and the granted folders are added to any they name.
-Grants are kept by the run's hook and end with the run; nothing is mirrored
-or saved. They reach only `run_command`, not the file tools.
-
-A `write_file` call runs at once when the project's mode is `Write` or
-`Write + Network`: the mode is the host saying the agent may change the
-project, and the tool can only write the project's folders and the scratch
-folder. It checks the mode again when it writes, so a mode lowered in
-between refuses the write. In `Read` it waits, even for the scratch folder.
-
-The host's hook resolves the folders a call names before anyone is asked:
-they must exist, and none may be in the sandbox's denied credential paths. A
-call naming one that can't be granted, or a request asking for nothing
-beyond reading the project, is refused with why, without asking.
-
-A command runs at once, whoever's prompt started the run, when it needs
-nothing beyond read access and what the run was granted: with no grants,
-that is read access and no folders, as in Codex's read-only mode, where the
-sandbox lets it read, and change only the thread's scratch folder. Every
-other command waits, including one asking for more than the mode or naming
-folders the run wasn't granted. A request for permissions the run already
-has runs at once too. The hook allows a command with a context naming the
-grant (access and folders) it was allowed, and the tool runs the command
-with exactly that, so a mode the host changes before the command starts
-changes nothing for it. For a call that waited, the grant is worked out when
-it is decided, from its own `access` or the mode at that moment, matching
-what its card shows then. The card says what the command could do and, in
-the warning color, when it asks for more than the mode, and lists the
-folders it names, those it would change in the warning color. A
-`request_permissions` card shows its reason, the access and folders asked
-for, and that later commands in the turn get them without asking.
-
-`run_command`, `write_file`, and `request_permissions` calls (in any mode)
-only the host may decide (`HOST_ONLY`), when they wait: `run_command`'s
-commands use the host's own shell and tools on the host's computer,
-`write_file` changes the host's files, even when it writes the scratch
-folder, and
-`request_permissions` decides what later commands may do there. On Windows, commands read every drive except
-credentials (see `sandbox/src/settings.rs`), so a collaborator who may submit
-can have the agent read the host's other files into the transcript without
-the host allowing it.
-
-The agent loop asks a hook about each call before its tool runs (calls whose
-arguments could not be read never run, so are never asked about). The host's
-hook lets listed tools, and commands and requests the run's grants cover,
-through and otherwise asks the thread, on the same channel as the run's events, so the
-request always follows the reply that made the call. The host then emits
-`ToolApprovalRequested`, naming the agent message and the call, and the run
-waits.
-
-Everyone shows the waiting call as a card in the agent's work, which shows
-even if the work is collapsed. The host and `Admin` peers get Allow and Deny;
-everyone else sees that the call waits for the host or an admin. Deciding
-requires the `ApproveTools` permission, which only `Admin` has; the host is
-always `Admin`. A collaborator sends `DecideToolCall`; the host's own clicks
-go through the same checked path. The first decision wins: the host hands it
-to the run and emits `ToolApprovalResolved`, and a later or stale decision,
-or one for a run that has ended, changes nothing. An allowed call runs; a
-denied one is answered with Rig's skipped result, telling the model the user
-denied it, and the run continues. Either way its result follows as an
-`AgentEvent`, which also clears the waiting state.
-
-A run that ends while a call waits, as when someone stops it, drops the
-request and no longer shows the call waiting. Snapshots carry the waiting
-call (`awaiting_approval` on the agent message), so someone joining sees the
-card. Participants refuse a `ToolApprovalRequested`, live or in a snapshot,
-for a call the running reply did not make or that already returned.
-
-Not yet: remembering a decision for later calls ("always allow this tool
-here"), permissions granted for the whole thread rather than one run,
-running a command outside the sandbox (Codex's `require_escalated`), letting
-chosen tools run unasked in `Read` mode, keyboard shortcuts
-for Allow and Deny, and showing a denied call differently from one that
-returned; see `ROADMAP.md`.
+The host emits `ToolApprovalRequested` for a waiting call. Only the host
+may decide commands, file writes, and permission grants; Admin peers may
+decide other tools. Local clicks and `DecideToolCall` use the same checked
+path. The first decision wins and emits `ToolApprovalResolved`; stale
+requests change nothing. A denial returns a skipped tool result and the
+run continues. Ending a run drops outstanding requests. Snapshots include
+the waiting call; participants reject requests for calls the reply did not
+make or that already returned.
 
 ### Model selection
 
@@ -690,7 +607,7 @@ returned; see `ROADMAP.md`.
   host's user name where a path holds it.
 - Collaborators see the names but cannot change them; there is no
   collaborator message for it.
-- The project has a mode, `Read`, `Write`, or `Write + Network`, picked from a menu
+- The project has an auto-approval level, `Read`, `Write`, or `Write + Network`, picked from a menu
   in the bottom bar between the context indicator and the model picker.
   `Write + Network` is `Write` with network access. Every thread starts in `Read`.
   Only the host can change it; collaborators see it in the `Welcome`
@@ -698,33 +615,16 @@ returned; see `ROADMAP.md`.
   exists moves into it with the folders. Hovering `Write` or `Write + Network` in
   the menu warns that allowed commands change the folders at once (and, for
   `Write + Network`, can download code and send out what they read), and that a
-  malicious agent may be able to escape the sandbox. The mode is the access
+  malicious agent may be able to escape the sandbox. The control is labelled
+  `Auto-approve`, and its level is the default access
   commands run with unless they ask for their own; see
   [Tool approval](#tool-approval).
-- The agent's commands run on the host's computer with its own shell,
-  tools, and login shell environment, each contained by the operating
-  system's sandbox (Seatbelt, Bubblewrap, or a Windows process container,
-  through mxc-sdk). They see the folders at their real paths, the host's
-  real files live: read-only in `Read`, enforced by the sandbox, and in
-  `Write` and `Write + Network` the agent's changes apply to the host at
-  once. They start in the first folder, or the scratch folder without one. Each thread also has a
-  scratch folder, its commands' `TMPDIR`, kept until the thread is deleted
-  or Cowork quits. Their `HOME` is the host's real home, so `~` is the same
-  folder in a command as in its granted folders; only what is granted
-  there is reachable. On macOS and Linux commands cannot read the
-  host's other files; on Windows they can read every drive, as Codex's
-  sandbox does, since `git` and others resolve the folders above a project.
-  Nowhere can they read credentials such as `~/.ssh`, even inside granted
-  folders. They have no network except with `network` access (what
-  `Write + Network` gives), which allows outbound connections but never
-  inbound ones or the host's own loopback services. Every setting is in
-  the sandbox crate's `settings.rs`.
-- The file tools `list_directory`, `read_file`, and `write_file` reach the
-  same folders from the host process rather than a sandboxed command, by
-  folder name (`myproject/src/main.rs`) or `scratch://` for the scratch
-  folder. `write_file` writes project folders only in `Write` and
-  `Write + Network` mode, and scratch always. Every path they accept is
-  mapped in the sandbox crate's `paths.rs`.
+- Commands use the host's shell and environment in an OS sandbox. They
+  start in the first project folder or scratch, with the real HOME and
+  scratch as TMPDIR. File tools are app-managed; `paths.rs` maps their
+  paths. Read scope and write limits are described in
+  [Permissions](permissions.md); `sandbox/src/settings.rs` is the low-level
+  policy reference.
 - Each command is contained by the project as it is when the command
   starts, with the access it was granted, so a change applies from the next
   command, with nothing to

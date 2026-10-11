@@ -136,27 +136,11 @@ A run whose model the catalog doesn't offer fails, and the queue goes on.
 
 ## Tool approval
 
-Scheduled runs keep the usual approval rules (see
-[Tool approval](collaboration.md#tool-approval)): tools on the always-allowed
-list run, as do commands with read access (the mode's, or their own), and
-every other call needs the host or an `Admin` peer to allow it (`run_command`
-and `write_file` only the host), including a command asking for more access
-than the mode. Since no one may be around, a scheduled run
-doesn't wait the first time:
-
-1. A call that needs approval fails at once. Its result tells the model that
-   the call needs the user's permission, and that calling it again with the
-   same arguments will ask the user.
-2. If the model makes the call again in the same run, with the same tool and
-   identical arguments (their keys in any order), the call waits for approval
-   as usual, and the user is notified: in the app, and through the operating
-   system's notifications where they work. Clicking the notification opens
-   the thread.
-
-The model can therefore carry on without the call, or decide the call is
-worth waiting for. Calls made in the thread outside a scheduled run, such as
-someone chatting in a **continue the last thread** thread, are approved as
-usual. A command that needs more than read access is no exception.
+Scheduled runs use the same [permissions](permissions.md) as interactive
+runs. A call needing approval fails the first time, telling the agent that
+an identical repeat will ask the user. The repeat waits and notifies the
+user in the app and through available OS notifications. Clicking the
+notification opens the thread. Calls within auto-approve run immediately.
 
 ## Managing tasks
 

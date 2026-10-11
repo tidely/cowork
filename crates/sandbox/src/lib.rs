@@ -4,8 +4,7 @@
 //! Every setting is in [`settings`]. In short: the user's own shell, tools,
 //! and environment; the thread's project folders at their real paths,
 //! read-only unless the project is writable (see [`Project`]); a scratch
-//! folder per thread; no other user files, except that on Windows commands
-//! read every drive, credentials aside; and no network unless the command's
+//! folder per thread; global reads except denied credentials; no network unless the command's
 //! [`Access`] is `Network`. A command the host granted more ([`grant`]) may
 //! also have more access to the project, and other host folders.
 //!
@@ -44,7 +43,7 @@ use std::{
 
 use mxc_sdk::v1::{
     self, ContainerRequest, FilesystemPolicy, MxcProcess, NetworkAction, NetworkEgressPolicy,
-    NetworkIngressPolicy, NetworkPolicy, StreamCloser, policy::filesystem,
+    NetworkIngressPolicy, NetworkPolicy, StreamCloser,
 };
 
 pub use environment::{EnvironmentSource, PRINT_ENV_FLAG, print_env};
@@ -176,20 +175,21 @@ impl Sandboxes {
         }
         note.push_str(match project.access {
             Access::Read => {
-                "The project's mode is read: commands can read the project folders but not \
+                "The project's auto-approval level is read: commands can read the host filesystem but not \
                  change them, and have no network access. They run without asking the user.\n"
             }
             Access::Write => {
-                "The project's mode is write: commands can change the project folders, and \
+                "The project's auto-approval level is write: commands can change the project folders, and \
                  their changes apply to the user's computer at once. They have no network \
-                 access.\n"
+                 access. Commands within this level run without asking the user.\n"
             }
             Access::Network => {
-                "The project's mode is network: commands can change the project folders, and \
+                "The project's auto-approval level is network: commands can change the project folders, and \
                  their changes apply to the user's computer at once, and they can reach the \
-                 network.\n"
+                 network. Commands within this level run without asking the user.\n"
             }
         });
+        note.push_str("Reads span the host filesystem except denied credentials. Explicit command access may be narrower than this level. Higher access or extra writable folders require approval unless already granted for this run. Approving a file write in read mode permits that call only.\n");
         note.push_str(&format!(
             "Commands start in {}. Their TMPDIR is the scratch folder {}, which the file \
              tools call `{}`. Their HOME is the user's home folder{}, so `~` means the same \
@@ -449,6 +449,8 @@ fn request(
     let granted = folders;
     let folders = resolved_folders(project);
     let mut readwrite = vec![scratch.clone()];
+    #[cfg(unix)]
+    readwrite.extend(settings::WRITABLE_DEVICES.iter().map(PathBuf::from));
     let mut readonly = Vec::new();
     for (_, path) in &folders {
         if project.writable() {
@@ -459,9 +461,7 @@ fn request(
     }
     readwrite.extend(granted.write.iter().cloned());
     readonly.extend(granted.read.iter().cloned());
-    readonly.extend(tool_paths(&environment, home.as_deref()));
-    readonly.extend(config_paths(home.as_deref()));
-    readonly.extend(drive_paths());
+    readonly.extend(system_read_paths());
     readonly.sort();
     readonly.dedup();
     // The sandbox lets read-only win over read-write for the same path, so a
@@ -517,10 +517,9 @@ fn request(
     }
 }
 
-/// Windows: every drive's root and its entries as they are now, all read-only;
-/// see [`settings`]. Drives that can't be listed, such as an empty card
-/// reader, are left out. Elsewhere, nothing.
-fn drive_paths() -> Vec<PathBuf> {
+/// Read the host filesystem, as Codex does; see [`settings`]. Windows
+/// needs each drive and its entries, while Unix has one filesystem root.
+fn system_read_paths() -> Vec<PathBuf> {
     #[cfg(windows)]
     {
         // SAFETY: takes no arguments and only returns a bit mask.
@@ -537,56 +536,7 @@ fn drive_paths() -> Vec<PathBuf> {
         paths
     }
     #[cfg(not(windows))]
-    Vec::new()
-}
-
-/// The folders holding the user's tools, resolved; see [`settings`].
-fn tool_paths(environment: &[(String, String)], home: Option<&Path>) -> Vec<PathBuf> {
-    let tools = filesystem::available_tools_policy(Some(environment), Default::default());
-    let profile = filesystem::user_profile_policy(Some(environment));
-    let mut paths = Vec::new();
-    for path in [tools, profile].into_iter().flat_map(|found| {
-        found
-            .readonly_paths
-            .into_iter()
-            .chain(found.readwrite_paths)
-    }) {
-        let Some(path) = resolved(Path::new(&path)) else {
-            continue;
-        };
-        let prefix = path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .filter(|name| settings::TOOL_PREFIX_DIRS.contains(name))
-            .and_then(|_| path.parent())
-            .filter(|parent| {
-                parent.parent().is_some()
-                    && Some(*parent) != home
-                    && Some(*parent) != home.map(|home| home.join(".local")).as_deref()
-            })
-            .map(Path::to_owned);
-        paths.push(path);
-        paths.extend(prefix);
-    }
-    for (variable, default) in settings::TOOLCHAIN_HOMES {
-        let path = match environment.iter().find(|(name, _)| name == variable) {
-            Some((_, value)) => Some(PathBuf::from(value)),
-            None => home.map(|home| home.join(default)),
-        };
-        paths.extend(path.as_deref().and_then(resolved));
-    }
-    paths
-}
-
-/// The user's settings in [`settings::READABLE_CONFIG`] that exist, resolved.
-fn config_paths(home: Option<&Path>) -> Vec<PathBuf> {
-    home.into_iter()
-        .flat_map(|home| {
-            settings::READABLE_CONFIG
-                .iter()
-                .filter_map(move |path| resolved(&home.join(path)))
-        })
-        .collect()
+    vec![PathBuf::from("/")]
 }
 
 /// Runs `request` to its end, or until `stopped`.
@@ -768,53 +718,6 @@ mod tests {
     }
 
     #[test]
-    fn git_settings_are_readable_when_they_exist() {
-        let home = TestRoot::new();
-        assert!(config_paths(Some(&home.0)).is_empty(), "none exist yet");
-        std::fs::write(home.0.join(".gitconfig"), "[user]\n\tname = Me\n").unwrap();
-        std::fs::create_dir_all(home.0.join(".config/git")).unwrap();
-        assert_eq!(
-            config_paths(Some(&home.0)),
-            [
-                resolved(&home.0.join(".gitconfig")).unwrap(),
-                resolved(&home.0.join(".config/git")).unwrap(),
-            ]
-        );
-        assert!(config_paths(None).is_empty());
-    }
-
-    /// git reads the user's identity from their real `~/.gitconfig`, when
-    /// this computer has one, but can't change it.
-    #[cfg(not(windows))]
-    #[tokio::test(flavor = "multi_thread")]
-    async fn git_reads_the_users_config_but_cannot_change_it() {
-        let config = std::env::home_dir().unwrap().join(".gitconfig");
-        if !v1::platform_support().is_supported || !config.is_file() {
-            return;
-        }
-        let (sandboxes, _root) = test_sandboxes();
-        let read = sandboxes
-            .run(
-                "thread",
-                "git config --global --list >/dev/null && echo read",
-            )
-            .await
-            .unwrap();
-        assert_eq!(read.stdout, "read\n", "{read:?}");
-        let before = std::fs::read(&config).unwrap();
-        let write = sandboxes
-            .run(
-                "thread",
-                "git config --global cowork.sandboxtest yes 2>/dev/null || echo denied",
-            )
-            .await
-            .unwrap();
-        assert_eq!(write.stdout, "denied\n", "{write:?}");
-        assert_eq!(std::fs::read(&config).unwrap(), before);
-        sandboxes.shutdown();
-    }
-
-    #[test]
     fn the_note_names_the_folders_mode_and_scratch() {
         let (sandboxes, root) = test_sandboxes();
         let empty = sandboxes.environment_note("thread");
@@ -843,7 +746,10 @@ mod tests {
             read_only.contains(&format!("- zed: {}", resolved_zed.display())),
             "{read_only}"
         );
-        assert!(read_only.contains("mode is read"), "{read_only}");
+        assert!(
+            read_only.contains("auto-approval level is read"),
+            "{read_only}"
+        );
         assert!(
             read_only.contains(&format!("Commands start in {}.", resolved_zed.display())),
             "{read_only}"
@@ -851,8 +757,8 @@ mod tests {
         assert_eq!(read_only, sandboxes.environment_note("thread"), "stable");
 
         for (access, says) in [
-            (Access::Write, "mode is write"),
-            (Access::Network, "mode is network"),
+            (Access::Write, "auto-approval level is write"),
+            (Access::Network, "auto-approval level is network"),
         ] {
             let mut project = sandboxes.project("thread");
             project.access = access;
@@ -965,10 +871,21 @@ mod tests {
         let read_only = request("ls", &project(Access::Read), &none, &scratch, &environment);
         let filesystem = read_only.filesystem.clone().unwrap();
         assert!(filesystem.readonly_paths.contains(&zed_path));
-        assert_eq!(
-            filesystem.readwrite_paths,
-            std::slice::from_ref(&scratch_path)
+        let mut writable_paths = vec![scratch_path.clone()];
+        #[cfg(unix)]
+        writable_paths.extend(
+            settings::WRITABLE_DEVICES
+                .iter()
+                .map(|path| (*path).to_owned()),
         );
+        assert_eq!(filesystem.readwrite_paths, writable_paths);
+        for path in system_read_paths() {
+            assert!(
+                filesystem
+                    .readonly_paths
+                    .contains(&path.to_string_lossy().into_owned())
+            );
+        }
         assert_eq!(read_only.working_directory.as_deref(), Some(&*zed_path));
         let environment_of = |request: &ContainerRequest, name: &str| {
             request
@@ -1045,26 +962,6 @@ mod tests {
         assert!(filesystem.readonly_paths.contains(&text(&docs.path)));
         assert!(filesystem.readonly_paths.contains(&text(&zed.path)));
         assert!(!filesystem.readwrite_paths.contains(&text(&zed.path)));
-    }
-
-    #[test]
-    fn tool_folders_bring_their_prefix_but_not_home() {
-        let root = TestRoot::new();
-        let prefix = root.0.join("prefix");
-        let bin = prefix.join("bin");
-        std::fs::create_dir_all(&bin).unwrap();
-        let home_bin = root.0.join("bin");
-        std::fs::create_dir_all(&home_bin).unwrap();
-        let path = format!("{}:{}", bin.display(), home_bin.display());
-        let environment = [("PATH".to_owned(), path)];
-        let paths = tool_paths(&environment, Some(&resolved(&root.0).unwrap()));
-        assert!(paths.contains(&resolved(&bin).unwrap()));
-        assert!(paths.contains(&resolved(&prefix).unwrap()));
-        assert!(paths.contains(&resolved(&home_bin).unwrap()));
-        assert!(
-            !paths.contains(&resolved(&root.0).unwrap()),
-            "home is not a prefix: {paths:?}"
-        );
     }
 
     #[test]

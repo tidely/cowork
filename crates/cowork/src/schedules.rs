@@ -834,7 +834,7 @@ impl ScheduleEditor {
             }));
         let (hint, warned) = match (self.folders.is_empty(), self.project_mode) {
             (_, ProjectMode::Network) => (
-                format!("Runs can change these folders and reach the network. {NETWORK_WARNING}"),
+                format!("Auto-approve project writes and network access. {NETWORK_WARNING}"),
                 true,
             ),
             (true, _) => (
@@ -842,11 +842,11 @@ impl ScheduleEditor {
                 false,
             ),
             (false, ProjectMode::Write) => (
-                format!("Runs can change these folders. {WRITE_WARNING}"),
+                format!("Auto-approve project writes. {WRITE_WARNING}"),
                 true,
             ),
             (false, ProjectMode::Read) => (
-                "Runs can read these folders, but not change them.".to_owned(),
+                "Auto-approve reads. Project writes and network access need approval.".to_owned(),
                 false,
             ),
         };

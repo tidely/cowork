@@ -121,7 +121,7 @@ async fn commands_are_confined() {
     .await;
     assert!(
         home_write.stdout.ends_with("denied\n") && !home.join(&marker).exists(),
-        "the real home stays out of reach without a grant: {home_write:?}"
+        "the real home stays read-only without a write grant: {home_write:?}"
     );
 
     let writes = run(
@@ -133,15 +133,26 @@ async fn commands_are_confined() {
     assert!(!outside.exists());
 
     let home = std::env::home_dir().unwrap();
-    let private = run(
+    let readable = run(
         &sandboxes,
         &format!("ls '{}' >/dev/null 2>&1 || echo denied", home.display()),
     )
     .await;
     assert_eq!(
-        private.stdout, "denied\n",
-        "the real home is closed: {private:?}"
+        readable.stdout, "",
+        "the real home can be listed: {readable:?}"
     );
+    for credential in [".ssh", ".aws", ".gnupg"] {
+        let path = home.join(credential);
+        if path.exists() {
+            let denied = run(
+                &sandboxes,
+                &format!("ls '{}' >/dev/null 2>&1 || echo denied", path.display()),
+            )
+            .await;
+            assert_eq!(denied.stdout, "denied\n", "credentials stay denied");
+        }
+    }
 
     let network = run(
         &sandboxes,
@@ -227,14 +238,15 @@ async fn project_folders_follow_the_mode() {
     let removed = run(
         &sandboxes,
         &format!(
-            "cat '{}/notes.txt' 2>/dev/null || echo denied",
+            "cat '{}/notes.txt'; touch '{}/new' 2>/dev/null || echo denied",
+            zed.display(),
             zed.display()
         ),
     )
     .await;
     assert_eq!(
-        removed.stdout, "denied\n",
-        "a removed folder closes: {removed:?}"
+        removed.stdout, "agent\ndenied\n",
+        "a removed folder remains readable but loses write access: {removed:?}"
     );
 }
 

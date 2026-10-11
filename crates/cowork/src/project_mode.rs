@@ -4,10 +4,10 @@
 //!
 //! Kept in [`Thread::project_mode`] and, before the thread exists,
 //! [`Cowork::new_thread_project_mode`]. It is the access a command runs
-//! with unless it asks for other access of its own; commands with read
-//! access run without asking, and others wait for the host. In `Write` and
-//! `Write + Network`, the agent's file writes run without asking too; see
-//! `tool_approval.rs`.
+//! with unless it asks for other access of its own; commands within that
+//! auto-approval level run without asking, and higher access waits for the
+//! host. In `Write` and `Write + Network`, the agent's file writes run
+//! without asking too; see `tool_approval.rs`.
 
 use gpui::{Anchor, App, Context, IntoElement, SharedString, WeakEntity, div, prelude::*, px};
 use gpui_component::{
@@ -30,7 +30,7 @@ pub(crate) const WRITE_WARNING: &str = "The agent can edit files in your project
 pub(crate) const NETWORK_WARNING: &str = "The agent can edit files in your project folders \
      and access the internet. A malicious agent may leak your files, or run arbitrary code in a sandboxed environment.";
 
-/// What the agent's commands may do with the project. Its variant indices
+/// The project's automatic approval level and default command access. Its variant indices
 /// are its wire encoding: add new modes at the end.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ProjectMode {
@@ -81,15 +81,6 @@ impl ProjectMode {
         }
     }
 
-    /// The mode giving `access`.
-    pub(crate) fn with_access(access: sandbox::Access) -> Self {
-        match access {
-            sandbox::Access::Read => Self::Read,
-            sandbox::Access::Write => Self::Write,
-            sandbox::Access::Network => Self::Network,
-        }
-    }
-
     /// What choosing this mode allows, for the modes that change things.
     pub(crate) fn warning(self) -> Option<&'static str> {
         match self {
@@ -118,16 +109,16 @@ impl Cowork {
         let (mode, editable) = self.active_project_mode(cx);
         let trigger = Button::new("project-mode")
             .debug_selector(|| "project-mode".to_owned())
-            .label(mode.label())
+            .label(format!("Auto-approve: {}", mode.label()))
             .dropdown_caret(true)
             .ghost()
             .small()
             .flex_none()
-            .accessibility_label(format!("Project mode: {}", mode.label()));
+            .accessibility_label(format!("Auto-approve: {}", mode.label()));
         if !editable {
             return trigger
                 .disabled(true)
-                .tooltip("Only the host can change the project mode")
+                .tooltip("Only the host can change auto-approval")
                 .into_any_element();
         }
         // Applies to the thread the menu was opened for, even if another one

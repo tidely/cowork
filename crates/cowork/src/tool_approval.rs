@@ -1,46 +1,11 @@
-//! Which of the agent's tool calls wait for someone to allow them, asking
-//! while the run waits, and deciding.
+//! Auto-approve calls within the project's level and the run's grants;
+//! ask for more, granting each approved command its exact sandbox scope.
+//! Explicit narrower access is respected, and reads are global except
+//! denied credentials. File writes get a target-specific approval context.
 //!
-//! The host's run asks through [`ApprovalGate`], its agent hook. The request
-//! reaches the thread on the run's own channel, after the reply that made the
-//! call, and the host tells everyone the call is waiting. Anyone who may
-//! approve tool calls (the host, and `Admin` peers) then allows or denies it
-//! through the same checked path; the first decision wins and the run goes on.
-//! Calls of [`HOST_ONLY`] tools, which act on the host's computer, only the
-//! host may decide.
-//!
-//! A `run_command` call runs with the project's mode's access unless it asks
-//! for other access of its own, for that command only, and may name folders
-//! outside the project it also needs to read or write. A command with read
-//! access and no folders runs at once, as in Codex's read-only mode: the
-//! sandbox lets it change only the thread's scratch folder. Every other
-//! command is asked about, including one asking for more than the mode,
-//! which is how the agent asks for higher permissions for one command.
-//!
-//! `request_permissions` asks for more for the rest of the run, as Codex's
-//! tool of that name: once the host allows it, the run's later commands get
-//! it without asking (see [`ApprovalGate::granted`]), so a command runs at
-//! once when it asks for nothing beyond read access and the run's grants.
-//! Grants end with the run.
-//!
-//! Either way a command is granted exactly the [`Grant`] it was let through
-//! or allowed with, so a mode changed before it starts changes nothing for
-//! it. An allowed call's grant is worked out when it is decided, as the card
-//! shows it then. Folders are resolved on the host before anyone is asked,
-//! and a call naming one that can't be granted is refused with why.
-//! `write_file` runs at once when the project's mode is write or network,
-//! as that mode is the host saying the agent may change the project: it can
-//! write only the project's folders and the scratch folder (see
-//! `sandbox::paths`), and checks the mode again when it writes, so a mode
-//! lowered in between refuses the write. In read mode it is asked about,
-//! even when it writes the scratch folder. Listing and reading need no
-//! approval: they reach only the folders the host shared with the thread,
-//! and its scratch folder.
-//!
-//! A scheduled run may have nobody around to answer, so it doesn't wait the
-//! first time: a call that needs approval fails at once, telling the model
-//! that making it again with the same arguments asks the user. The repeat
-//! waits as usual, and the user is notified; see `docs/schedule.md`.
+//! Only the host may approve commands, file writes, and run permissions;
+//! Admin peers may approve other tools. Scheduled calls needing approval
+//! fail once, then an identical repeat asks. See `docs/permissions.md`.
 
 use std::sync::Arc;
 
@@ -212,6 +177,8 @@ impl ApprovalGate {
 /// What a call of a tool that grants permissions asks for, resolved before
 /// anyone is asked.
 enum Asked {
+    /// A file write, approved for this target only.
+    WriteFile(String),
     /// A command: the access it asks for of its own, if any, and the folders
     /// outside the project it names.
     Command {
@@ -226,7 +193,7 @@ impl ToolHook for ApprovalGate {
     fn before_tool_call<'a>(&'a self, call: &'a ToolCall) -> BoxFuture<'a, ToolDecision> {
         Box::pin(async move {
             let tool = call.function.name.as_str();
-            if !needs_approval(tool) || self.writes_writable_project(tool) {
+            if !needs_approval(tool) {
                 return ToolDecision::Allow;
             }
             let asked = match Self::asked(call) {
@@ -236,6 +203,9 @@ impl ToolHook for ApprovalGate {
             if let Some(asked) = &asked
                 && self.already_granted(asked)
             {
+                if let Asked::Permissions(requested) = asked {
+                    self.granted.lock().extend(requested);
+                }
                 return self.allow(asked);
             }
             if self.refuses_unattended(call) {
@@ -283,6 +253,12 @@ impl ApprovalGate {
     fn asked(call: &ToolCall) -> Result<Option<Asked>, String> {
         let arguments = call.function.arguments_value();
         Ok(match call.function.name.as_str() {
+            WriteFile::NAME => Some(Asked::WriteFile(
+                arguments["path"]
+                    .as_str()
+                    .ok_or("A file path is required.")?
+                    .to_owned(),
+            )),
             RunCommand::NAME => Some(Asked::Command {
                 access: RunCommand::requested_access(&arguments),
                 folders: RunCommand::requested_folders(&arguments)?,
@@ -295,16 +271,42 @@ impl ApprovalGate {
     }
 
     /// Whether what `asked` asks for needs nobody's approval: for a command,
-    /// that it needs nothing beyond read access and the run's grants, and
+    /// that it needs nothing beyond the project level and the run's grants, and
     /// for more permissions, that the run has them already.
     fn already_granted(&self, asked: &Asked) -> bool {
-        let granted = self.granted();
+        let mut granted = self.granted();
+        let project = self.sandboxes.project(&self.thread);
+        granted.access = granted.access.max(project.access);
+        // Naming a folder already in the project does not ask for more.
+        // Only resolve existing roots; the sandbox and file tools still
+        // enforce their credential and symlink restrictions.
+        for folder in project.folders {
+            if let Ok(path) = std::fs::canonicalize(folder.path) {
+                if granted.access.writable() {
+                    granted.folders.write.push(path);
+                } else {
+                    granted.folders.read.push(path);
+                }
+            }
+        }
         match asked {
+            Asked::WriteFile(_) => self.writes_writable_project(WriteFile::NAME),
             Asked::Command { access, folders } => granted.covers(&Grant {
                 access: self.command_access(*access, &granted),
-                folders: folders.clone(),
+                // Reads are already allowed across the host filesystem.
+                // Resolution above still rejects denied credential paths.
+                folders: Folders {
+                    read: Vec::new(),
+                    write: folders.write.clone(),
+                },
             }),
-            Asked::Permissions(requested) => granted.covers(requested),
+            Asked::Permissions(requested) => granted.covers(&Grant {
+                access: requested.access,
+                folders: Folders {
+                    read: Vec::new(),
+                    write: requested.folders.write.clone(),
+                },
+            }),
         }
     }
 
@@ -313,6 +315,7 @@ impl ApprovalGate {
         let granted = self.granted();
         ToolDecision::AllowWith {
             context: match asked {
+                Asked::WriteFile(path) => WriteFile::context(path.clone()),
                 Asked::Command { access, folders } => {
                     let mut grant = Grant {
                         access: self.command_access(*access, &granted),
@@ -459,7 +462,14 @@ mod tests {
     }
 
     fn call(name: &str) -> ToolCall {
-        call_with(name, serde_json::json!({}))
+        call_with(
+            name,
+            if name == WriteFile::NAME {
+                serde_json::json!({"path": "scratch://approved.txt", "content": "hello"})
+            } else {
+                serde_json::json!({})
+            },
+        )
     }
 
     fn call_with(name: &str, arguments: serde_json::Value) -> ToolCall {
@@ -572,6 +582,18 @@ mod tests {
         );
         assert_eq!(gate.granted(), Grant::default(), "for that command only");
 
+        for mode in [Access::Write, Access::Network] {
+            let (gate, mut asked, _) = gate_in(false, mode);
+            assert_eq!(
+                decide_allowing(&gate, &call, &mut asked).await,
+                (
+                    granted_with(mode, writing(&cache)),
+                    Some(RunCommand::NAME.to_owned())
+                ),
+                "even {mode:?} needs approval for extra folders"
+            );
+        }
+
         let missing = call_with(
             RunCommand::NAME,
             serde_json::json!({ "command": "ls", "read_folders": ["/no/such/folder"] }),
@@ -637,7 +659,7 @@ mod tests {
             (ToolDecision::AllowWith { .. }, None)
         ));
 
-        // A command needing a folder the run wasn't granted still asks.
+        // Global reads need no new grant; an extra write still asks.
         let other = Outside::new();
         let beyond = call_with(
             RunCommand::NAME,
@@ -647,10 +669,18 @@ mod tests {
         both.read.push(other.0.clone());
         assert_eq!(
             decide_allowing(&gate, &beyond, &mut asked).await,
-            (
-                granted_with(Access::Network, both),
-                Some(RunCommand::NAME.to_owned())
-            )
+            (granted_with(Access::Network, both), None)
+        );
+        let beyond = call_with(
+            RunCommand::NAME,
+            serde_json::json!({"command": "touch", "write_folders": [other.text()]}),
+        );
+        assert_eq!(
+            decide_allowing(&gate, &beyond, &mut asked)
+                .await
+                .1
+                .as_deref(),
+            Some(RunCommand::NAME)
         );
     }
 
@@ -688,21 +718,23 @@ mod tests {
         ));
     }
 
-    /// Commands with read access, the mode's or their own, run at once,
-    /// even in a scheduled run. Every other command is asked about, and
-    /// allowed with exactly its access: the mode's, or more of its own.
+    /// The project mode is prior approval, while explicit narrower access
+    /// still restricts the command. Escalations ask even in scheduled runs.
     #[tokio::test]
-    async fn commands_are_asked_about_unless_they_only_read() {
+    async fn commands_ask_only_beyond_the_auto_approval_level() {
         let asked_for = Some(RunCommand::NAME.to_owned());
         let cases = [
             (Access::Read, None, Access::Read, false),
             (Access::Read, Some("write"), Access::Write, true),
             (Access::Read, Some("network"), Access::Network, true),
-            (Access::Write, None, Access::Write, true),
+            (Access::Write, None, Access::Write, false),
             (Access::Write, Some("read"), Access::Read, false),
-            (Access::Network, None, Access::Network, true),
+            (Access::Write, Some("write"), Access::Write, false),
+            (Access::Write, Some("network"), Access::Network, true),
+            (Access::Network, None, Access::Network, false),
             (Access::Network, Some("read"), Access::Read, false),
-            (Access::Network, Some("write"), Access::Write, true),
+            (Access::Network, Some("write"), Access::Write, false),
+            (Access::Network, Some("network"), Access::Network, false),
         ];
         for (mode, requested, access, asks) in cases {
             let call = command(requested);
@@ -735,7 +767,9 @@ mod tests {
             (Access::Network, false),
         ] {
             let expected = (
-                ToolDecision::Allow,
+                ToolDecision::AllowWith {
+                    context: WriteFile::context("scratch://approved.txt".into()),
+                },
                 asks.then(|| WriteFile::NAME.to_owned()),
             );
             let (gate, mut asked, _) = gate_in(false, mode);
@@ -752,9 +786,92 @@ mod tests {
                     "{mode:?}"
                 );
             } else {
-                assert_eq!(decided, (ToolDecision::Allow, None), "{mode:?}");
+                assert_eq!(decided, expected, "{mode:?}");
             }
         }
+    }
+
+    /// Allowing a Read-mode write grants that call, without changing the
+    /// project or allowing the following write automatically.
+    #[tokio::test]
+    async fn an_approved_file_write_succeeds_in_read_mode() {
+        let project = Outside::new();
+        let (gate, mut asked, sandboxes) = gate_in(false, Access::Read);
+        sandboxes.set_project(
+            "thread",
+            sandbox::Project {
+                folders: vec![sandbox::ProjectFolder {
+                    name: "project".into(),
+                    path: project.0.clone(),
+                }],
+                access: Access::Read,
+            },
+        );
+        let args = serde_json::json!({"path": "project/new.txt", "content": "approved"});
+        let call = call_with(WriteFile::NAME, args.clone());
+        let (decision, asked_tool) = decide_allowing(&gate, &call, &mut asked).await;
+        assert_eq!(asked_tool.as_deref(), Some(WriteFile::NAME));
+        let ToolDecision::AllowWith { mut context } = decision else {
+            panic!("the write has a grant")
+        };
+        WriteFile::new(sandboxes.clone(), "thread")
+            .call(&mut context, serde_json::from_value(args.clone()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(project.0.join("new.txt")).unwrap(),
+            "approved"
+        );
+        assert_eq!(sandboxes.project("thread").access, Access::Read);
+        assert_eq!(
+            decide_allowing(&gate, &call, &mut asked).await.1.as_deref(),
+            Some(WriteFile::NAME)
+        );
+        // Approval cannot be reused for another target, nor to escape the project.
+        for path in ["project/other.txt", "../outside.txt"] {
+            let result = WriteFile::new(sandboxes.clone(), "thread")
+                .call(
+                    &mut context,
+                    serde_json::from_value(serde_json::json!({"path": path, "content": "no"}))
+                        .unwrap(),
+                )
+                .await;
+            assert!(result.is_err(), "{path}");
+        }
+    }
+
+    /// A mode reduction changes subsequent automatic approvals; it does
+    /// not erase permissions explicitly requested for the rest of the run.
+    #[tokio::test]
+    async fn lowering_auto_approval_preserves_only_run_grants() {
+        let (gate, mut asked, sandboxes) = gate_in(false, Access::Network);
+        assert_eq!(
+            decide_allowing(&gate, &command(None), &mut asked).await,
+            (granted(Access::Network), None)
+        );
+        set_mode(&sandboxes, Access::Read);
+        assert_eq!(
+            decide_allowing(&gate, &command(Some("write")), &mut asked)
+                .await
+                .1
+                .as_deref(),
+            Some(RunCommand::NAME)
+        );
+        set_mode(&sandboxes, Access::Write);
+        let request = call_with(
+            RequestPermissions::NAME,
+            serde_json::json!({"reason": "Edit the project.", "access": "write"}),
+        );
+        assert_eq!(decide_allowing(&gate, &request, &mut asked).await.1, None);
+        set_mode(&sandboxes, Access::Read);
+        assert_eq!(
+            decide_allowing(&gate, &command(None), &mut asked).await,
+            (granted(Access::Write), None)
+        );
+        assert_eq!(
+            decide_allowing(&gate, &command(Some("read")), &mut asked).await,
+            (granted(Access::Read), None)
+        );
     }
 
     /// A waiting command is allowed with the access its card shows when
@@ -763,7 +880,12 @@ mod tests {
     async fn an_allowed_command_gets_the_access_shown_when_deciding() {
         for (requested, access) in [(None, Access::Read), (Some("write"), Access::Write)] {
             let (gate, mut asked, sandboxes) = gate_in(false, Access::Write);
-            let call = command(requested);
+            // Extra folders make this wait even though Write is automatic.
+            let outside = Outside::new();
+            let mut call = command(requested);
+            call.function
+                .arguments
+                .insert("write_folders".into(), serde_json::json!([outside.text()]));
             let decision = gate.before_tool_call(&call);
             let answer = async {
                 let Some(RunUpdate::Approval { decide, .. }) = asked.recv().await else {
@@ -773,7 +895,17 @@ mod tests {
                 decide.send(ToolDecision::Allow).expect("the gate waits");
             };
             let (decision, ()) = tokio::join!(decision, answer);
-            assert_eq!(decision, granted(access), "asking for {requested:?}");
+            assert_eq!(
+                decision,
+                granted_with(
+                    access,
+                    Folders {
+                        read: vec![],
+                        write: vec![outside.0.clone()]
+                    }
+                ),
+                "asking for {requested:?}"
+            );
         }
     }
 
@@ -834,18 +966,18 @@ mod tests {
         assert_eq!(decision, ToolDecision::Allow);
 
         // Calls that need no approval still run at once, while a command is
-        // refused the first time like any other call.
+        // beyond the project level is refused the first time.
         let comment = call(RespondToComment::NAME);
         assert_eq!(gate.before_tool_call(&comment).await, ToolDecision::Allow);
         assert!(matches!(
-            gate.before_tool_call(&call(RunCommand::NAME)).await,
+            gate.before_tool_call(&command(Some("network"))).await,
             ToolDecision::Deny { .. }
         ));
     }
 
     #[tokio::test]
-    async fn every_command_in_a_writable_project_is_asked_about() {
-        let command = call(RunCommand::NAME);
+    async fn a_command_beyond_the_auto_approval_level_can_be_denied() {
+        let command = command(Some("network"));
         let (gate, mut asked) = gate(false);
         let decision = gate.before_tool_call(&command);
         let answer = async {

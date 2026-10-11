@@ -1,25 +1,7 @@
-//! Where the file tools' paths lead. This is the only place that turns a
-//! path the model wrote into a file on the host, and a file back into what
-//! the model is shown.
-//!
-//! | The model writes             | It means                                          |
-//! |------------------------------|---------------------------------------------------|
-//! | `<folder>` or `<folder>/a/b` | `a/b` in the project folder named `<folder>`      |
-//! | `scratch://` or `scratch://a/b` | `a/b` in the thread's scratch folder           |
-//! | an absolute path             | the same file, if it is inside one of the above   |
-//! | `.`, `./`, `*`, or nothing   | the list of the places above                      |
-//!
-//! Nothing else resolves: not `~`, not a relative path without a folder
-//! name, and no `..` anywhere. Folder names never contain `:` (see
-//! [`crate::folder_name`]), so [`SCRATCH`] can't be mistaken for one.
-//! Every path the tools show the model is in the first two forms, so it
-//! can be passed straight back, and the host's own paths stay out of the
-//! transcript collaborators see.
-//!
-//! A path resolves only if, with symbolic links resolved, it is still inside
-//! the place it names, and not in one of the credential locations of
-//! [`crate::settings::DENIED_PATHS`]. The project folders may be written only
-//! when the project is writable; the scratch folder always may.
+//! Map file-tool paths to host locations and enforce credential/write limits.
+//! Project names and `scratch://` retain their scoped path checks. Absolute
+//! paths may be read anywhere; only project and scratch targets are writable.
+//! Ambiguous relative paths, `~`, and parent traversal are rejected.
 
 use std::path::{Component, Path, PathBuf};
 
@@ -62,6 +44,7 @@ impl std::error::Error for FileError {}
 pub(crate) enum Root {
     Folder(String),
     Scratch,
+    System,
 }
 
 impl Root {
@@ -69,6 +52,7 @@ impl Root {
         match self {
             Self::Folder(name) => name,
             Self::Scratch => SCRATCH,
+            Self::System => "the host filesystem",
         }
     }
 }
@@ -114,6 +98,7 @@ impl Location {
             Root::Folder(name) if relative.is_empty() => name.clone(),
             Root::Folder(name) => format!("{name}/{relative}"),
             Root::Scratch => format!("{SCRATCH}{relative}"),
+            Root::System => self.real.to_string_lossy().into_owned(),
         }
     }
 
@@ -175,14 +160,24 @@ impl Places {
         match location.root {
             Root::Folder(_) => self.writable,
             Root::Scratch => true,
+            Root::System => false,
         }
+    }
+
+    /// A single approved file-tool call may write the project without
+    /// changing the thread's auto-approval setting. Path and credential
+    /// checks still apply when the call resolves its target.
+    pub(crate) fn allow_project_write(&mut self) {
+        self.writable = true;
     }
 
     /// Whether `real`, a resolved path, is in `root` and not denied, as a
     /// folder's entries must be to be listed.
     pub(crate) fn reaches(&self, root: &Root, real: &Path) -> bool {
-        self.place(root)
-            .is_some_and(|place| real.starts_with(&place.real))
+        (matches!(root, Root::System)
+            || self
+                .place(root)
+                .is_some_and(|place| real.starts_with(&place.real)))
             && !self.is_denied(real)
     }
 
@@ -267,7 +262,7 @@ impl Places {
         Ok(location)
     }
 
-    /// An absolute path, if it is in one of the places.
+    /// An absolute path, mapped to its project/scratch place or global read access.
     fn absolute(&self, input: &str) -> Result<Location, FileError> {
         let path = Path::new(input);
         if path
@@ -278,20 +273,21 @@ impl Places {
                 "`{input}`: `..` is not allowed in a path."
             )));
         }
-        let outside = || {
-            FileError::Refused(format!(
-                "`{input}` is outside the project folders and the scratch folder. {}",
-                self.how_to_write_paths()
-            ))
-        };
+        let outside = || FileError::Failed(format!("`{input}` could not be resolved on the host."));
         let real = real_path(path).ok_or_else(outside)?;
         // The innermost place, should one hold another, as when the home
         // folder is a project folder.
         let place = self
             .places()
             .filter(|place| real.starts_with(&place.real))
-            .max_by_key(|place| place.real.components().count())
-            .ok_or_else(outside)?;
+            .max_by_key(|place| place.real.components().count());
+        let Some(place) = place else {
+            return Ok(Location {
+                root: Root::System,
+                relative: vec![input.to_owned()],
+                real,
+            });
+        };
         let relative = real
             .strip_prefix(&place.real)
             .map_err(|_| outside())?
@@ -420,10 +416,9 @@ mod tests {
         assert_eq!(main.display(), "zed/src/main.rs");
 
         let outside = fixture.root.0.join("elsewhere.txt");
-        assert!(matches!(
-            fixture.places.resolve(outside.to_str().unwrap()),
-            Err(FileError::Refused(_))
-        ));
+        let outside = location(&fixture.places, outside.to_str().unwrap());
+        assert_eq!(outside.root, Root::System);
+        assert!(!fixture.places.writable(&outside));
     }
 
     #[test]
@@ -439,7 +434,7 @@ mod tests {
     }
 
     #[test]
-    fn paths_outside_the_places_do_not_resolve() {
+    fn ambiguous_paths_and_parent_traversal_are_refused() {
         let fixture = fixture(false);
         for input in [
             "~/zed/src",

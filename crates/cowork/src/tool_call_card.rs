@@ -9,7 +9,7 @@
 //!
 //! It keeps to a title, what the call would do, and the decision. Only a
 //! call asking for more than the thread's mode gets a badge beside the
-//! title, naming that access as the mode giving it, and a quiet note beside
+//! title, naming only the additional permissions, and a quiet note beside
 //! the decision of how long it lasts.
 
 use std::rc::Rc;
@@ -29,9 +29,9 @@ use gpui_component::{
 };
 use gpui_kit_assets::IconName;
 use rig::{message::ToolCall, tool::Tool as _};
-use sandbox::{Access, RequestPermissions, RunCommand};
+use sandbox::{Access, Folders, Grant, RequestPermissions, RunCommand};
 
-use crate::{highlight::highlight_code_block_in_mode, project_mode::ProjectMode};
+use crate::highlight::highlight_code_block_in_mode;
 
 type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
@@ -62,6 +62,9 @@ pub(crate) struct ToolCallCard {
     /// The project's mode's access, which a command runs with unless it
     /// asks for its own; `None` when the card isn't shown for a thread.
     project_access: Option<Access>,
+    /// Host-only resolved coverage. Collaborators don't know host paths or
+    /// live run grants and continue to show a conservative badge.
+    approved: Option<Grant>,
 }
 
 impl ToolCallCard {
@@ -75,6 +78,7 @@ impl ToolCallCard {
             decision: Decision::Waiting,
             waiting_for: DECIDERS,
             project_access: None,
+            approved: None,
         }
     }
 
@@ -82,6 +86,13 @@ impl ToolCallCard {
     /// `access`, and when it asks for more.
     pub(crate) fn project_access(mut self, access: Access) -> Self {
         self.project_access = Some(access);
+        self
+    }
+
+    /// Includes already approved project folders and live run grants when
+    /// deciding which permissions the pending call would add.
+    pub(crate) fn approved(mut self, grant: Grant) -> Self {
+        self.approved = Some(grant);
         self
     }
 
@@ -117,12 +128,39 @@ impl ToolCallCard {
 
 /// The badge for a call asking for more than the thread's mode.
 struct ExtraAccess {
-    access: Access,
+    access: ExtraRights,
     /// Starts the badge's tooltip, before the access's name.
     tooltip: &'static str,
     /// How long the access lasts, as the note beside the decision says it;
     /// `None` when the title already says.
     scope: Option<&'static str>,
+}
+
+/// Writes and network are independent when showing what an approval adds.
+/// A network command still runs with write access, but its badge must not
+/// ask the user to approve writes their project already permits.
+#[derive(Debug, PartialEq, Eq)]
+enum ExtraRights {
+    Write,
+    Network,
+    WriteAndNetwork,
+}
+
+impl ExtraRights {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Write => "Write",
+            Self::Network => "Network",
+            Self::WriteAndNetwork => "Write + Network",
+        }
+    }
+
+    fn icon(&self) -> IconName {
+        match self {
+            Self::Write => IconName::Pencil,
+            Self::Network | Self::WriteAndNetwork => IconName::Globe,
+        }
+    }
 }
 
 impl RenderOnce for ToolCallCard {
@@ -132,31 +170,34 @@ impl RenderOnce for ToolCallCard {
         let tool = self.call.function.name.as_str();
         let (icon, title) = title(tool);
         let mut access = None;
-        let body = self.body.unwrap_or_else(|| {
-            let arguments = self.call.function.arguments_value();
-            if tool == RunCommand::NAME
-                && let Some(command) = arguments["command"].as_str()
-            {
-                access = extra_access(&arguments, self.project_access).map(|access| ExtraAccess {
-                    access,
-                    tooltip: "This command asks for",
-                    scope: Some("For this command only"),
-                });
-                command_view(&id, command, &arguments, cx)
-            } else if tool == RequestPermissions::NAME
-                && let Some(reason) = arguments["reason"].as_str()
-            {
-                // The title already says the access lasts for the turn.
-                access = extra_access(&arguments, self.project_access).map(|access| ExtraAccess {
-                    access,
-                    tooltip: "Later commands in this turn get",
-                    scope: None,
-                });
-                permissions_view(&id, reason, &arguments, cx)
-            } else {
-                arguments_view(&id, &self.call, cx)
-            }
-        });
+        let body =
+            self.body.unwrap_or_else(|| {
+                let arguments = self.call.function.arguments_value();
+                if tool == RunCommand::NAME
+                    && let Some(command) = arguments["command"].as_str()
+                {
+                    access = extra_access(&arguments, self.project_access, self.approved.as_ref())
+                        .map(|access| ExtraAccess {
+                            access,
+                            tooltip: "This command asks for",
+                            scope: Some("For this command only"),
+                        });
+                    command_view(&id, command, &arguments, cx)
+                } else if tool == RequestPermissions::NAME
+                    && let Some(reason) = arguments["reason"].as_str()
+                {
+                    // The title already says the access lasts for the turn.
+                    access = extra_access(&arguments, self.project_access, self.approved.as_ref())
+                        .map(|access| ExtraAccess {
+                            access,
+                            tooltip: "Later commands in this turn get",
+                            scope: None,
+                        });
+                    permissions_view(&id, reason, &arguments, cx)
+                } else {
+                    arguments_view(&id, &self.call, cx)
+                }
+            });
 
         let header = h_flex()
             .min_w_0()
@@ -261,34 +302,51 @@ fn humanize(tool: &str) -> String {
     }
 }
 
-/// The access a call asks for beyond the thread's mode, if any: the access
-/// it names when that is more than the mode, or Write when it names folders
-/// to change outside the project. Calls staying within the mode show none,
-/// so cards don't repeat the thread's mode. Reading outside folders is
-/// shown only by their lines.
-fn extra_access(arguments: &serde_json::Value, project: Option<Access>) -> Option<Access> {
+/// Only the rights an approval adds beyond the project's automatic access.
+/// On the host, named write folders already covered by the project or run
+/// grants add no rights. Without host coverage they conservatively add writes.
+/// Reading outside folders is shown by their lines. Network and writes are independent so an
+/// approval in Write mode asks only for Network, unless it adds write folders.
+fn extra_access(
+    arguments: &serde_json::Value,
+    project: Option<Access>,
+    approved: Option<&Grant>,
+) -> Option<ExtraRights> {
     // Outside a thread there is no mode, and anything above Read is extra.
     let project = project.unwrap_or(Access::Read);
-    let requested = RunCommand::requested_access(arguments).filter(|access| *access > project);
+    let requested = RunCommand::requested_access(arguments).unwrap_or(project);
     let (_, write) = RunCommand::named_folders(arguments);
-    let writes = (!write.is_empty()).then_some(Access::Write);
-    requested.max(writes)
+    let baseline = approved.map_or(project, |grant| project.max(grant.access));
+    let extra_folders = !write.is_empty()
+        && !approved.is_some_and(|grant| {
+            Folders::resolve(&[], &write).is_ok_and(|folders| grant.folders.covers(&folders))
+        });
+    added_rights(requested, baseline, extra_folders)
 }
 
-/// The access a call asks for beyond the thread's mode, named as the mode
-/// giving it, in the warning color.
+fn added_rights(requested: Access, baseline: Access, extra_folders: bool) -> Option<ExtraRights> {
+    let writes = extra_folders || (requested >= Access::Write && baseline < Access::Write);
+    let network = requested == Access::Network && baseline < Access::Network;
+    match (writes, network) {
+        (true, true) => Some(ExtraRights::WriteAndNetwork),
+        (true, false) => Some(ExtraRights::Write),
+        (false, true) => Some(ExtraRights::Network),
+        (false, false) => None,
+    }
+}
+
+/// The rights the approval adds, in the warning color.
 fn access_badge(id: &SharedString, shown: &ExtraAccess, cx: &App) -> AnyElement {
-    let mode = ProjectMode::with_access(shown.access);
     let selector = format!("{id}-access");
-    let tooltip = SharedString::from(format!("{} {} access", shown.tooltip, mode.label()));
+    let tooltip = SharedString::from(format!("{} {} access", shown.tooltip, shown.access.label()));
     h_flex()
         .id(SharedString::from(selector.clone()))
         .debug_selector(move || selector.clone())
         .flex_none()
         .gap_1()
         .text_color(cx.theme().warning)
-        .child(Icon::new(mode.icon()).size_3())
-        .child(mode.label())
+        .child(Icon::new(shown.access.icon()).size_3())
+        .child(shown.access.label())
         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
         .into_any_element()
 }
@@ -518,12 +576,27 @@ mod tests {
             (
                 Access::Read,
                 json!({"command": "cargo fetch", "access": "network"}),
-                Some(Access::Network),
+                Some(ExtraRights::WriteAndNetwork),
+            ),
+            (
+                Access::Write,
+                json!({"command": "cargo fetch", "access": "network"}),
+                Some(ExtraRights::Network),
+            ),
+            (
+                Access::Write,
+                json!({"command": "cargo fetch", "access": "network", "write_folders": ["~/.cargo"]}),
+                Some(ExtraRights::WriteAndNetwork),
+            ),
+            (
+                Access::Network,
+                json!({"command": "cargo fetch", "access": "network", "write_folders": ["~/.cargo"]}),
+                Some(ExtraRights::Write),
             ),
             (
                 Access::Read,
                 json!({"command": "cargo new ~/github/agent", "write_folders": ["~/github"]}),
-                Some(Access::Write),
+                Some(ExtraRights::Write),
             ),
             (
                 Access::Read,
@@ -532,7 +605,7 @@ mod tests {
             ),
         ] {
             assert_eq!(
-                extra_access(&arguments, Some(project)),
+                extra_access(&arguments, Some(project), None),
                 extra,
                 "{arguments}"
             );
@@ -569,6 +642,49 @@ mod tests {
         assert!(warning.top() >= command.bottom());
         assert!(warning.right() <= waiting.left());
         assert!(waiting.right() <= card.right());
+    }
+
+    #[test]
+    fn permission_badges_account_for_existing_folder_grants() {
+        let here = std::env::current_dir().unwrap().canonicalize().unwrap();
+        let parent = here.parent().unwrap().to_path_buf();
+        let arguments = json!({"command": "fetch", "access": "network", "write_folders": [here]});
+        // A run grant for an external folder, or a writable project containing
+        // the requested folder, both leave only network permission to approve.
+        for covered in [here.clone(), parent.clone()] {
+            let approved = Grant {
+                access: Access::Write,
+                folders: Folders {
+                    read: vec![],
+                    write: vec![covered],
+                },
+            };
+            assert_eq!(
+                extra_access(&arguments, Some(Access::Write), Some(&approved)),
+                Some(ExtraRights::Network)
+            );
+        }
+        let approved = Grant {
+            access: Access::Write,
+            folders: Folders {
+                read: vec![],
+                write: vec![here],
+            },
+        };
+        let new_folder =
+            json!({"command": "fetch", "access": "network", "write_folders": [parent]});
+        assert_eq!(
+            extra_access(&new_folder, Some(Access::Write), Some(&approved)),
+            Some(ExtraRights::WriteAndNetwork)
+        );
+        let network_grant = Grant {
+            access: Access::Network,
+            ..approved
+        };
+        assert_eq!(
+            extra_access(&arguments, Some(Access::Read), Some(&network_grant)),
+            None
+        );
     }
 
     #[test]

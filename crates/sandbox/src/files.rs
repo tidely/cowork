@@ -1,5 +1,5 @@
 //! The file tools: listing folders, reading files, and writing them in the
-//! thread's project folders and scratch folder, from the host process
+//! host filesystem for reads and project/scratch folders for writes, from the host process
 //! rather than a sandboxed command. Which paths they reach is decided in
 //! [`crate::paths`] alone.
 //!
@@ -13,12 +13,12 @@ use std::{
     sync::Arc,
 };
 
-use rig::tool::{Tool, ToolContext, ToolExecutionError};
-use serde::Deserialize;
+use rig::tool::{ContextValue, Tool, ToolContext, ToolExecutionError};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     Sandboxes,
-    paths::{FileError, Location, Places, Resolved, Root, SCRATCH},
+    paths::{FileError, Location, Places, Resolved, Root},
 };
 
 /// How much of a file one `read_file` call returns, in bytes. A longer read
@@ -30,8 +30,8 @@ pub const LIST_LIMIT: usize = 500;
 
 const PATHS: &str = "Paths start with the name of a project folder, as the latest <environment> \
 note lists them, followed by a path inside it (`myproject/src/main.rs`), or with `scratch://` for \
-this conversation's scratch folder (`scratch://notes.md`). Absolute paths inside these folders are \
-accepted too. Nothing outside them can be reached.";
+this conversation's scratch folder (`scratch://notes.md`). Absolute paths anywhere on the host \
+can be listed or read, except denied credentials. Writes stay within project and scratch folders.";
 
 fn map_error(error: FileError) -> ToolExecutionError {
     match error {
@@ -81,7 +81,7 @@ pub struct ListDirectoryArgs {
     pub path: String,
 }
 
-/// Lists a folder in the thread's project folders or scratch folder.
+/// Lists a host folder, excluding denied credentials.
 pub struct ListDirectory {
     sandboxes: Arc<Sandboxes>,
     thread: String,
@@ -104,7 +104,7 @@ impl Tool for ListDirectory {
 
     fn description(&self) -> String {
         format!(
-            "List the files and folders in a folder of the user's project or of the scratch \
+            "List the files and folders in a folder on the user's computer or in scratch, \
              folder, one level deep, as paths you can pass to the other file tools. Use `.` to \
              list the project folders themselves. {PATHS}"
         )
@@ -225,7 +225,7 @@ pub struct ReadFileArgs {
     pub end_line: Option<u32>,
 }
 
-/// Reads a text file in the thread's project folders or scratch folder.
+/// Reads a host text file, excluding denied credentials.
 pub struct ReadFile {
     sandboxes: Arc<Sandboxes>,
     thread: String,
@@ -248,7 +248,7 @@ impl Tool for ReadFile {
 
     fn description(&self) -> String {
         format!(
-            "Read a text file in the user's project or the scratch folder. Each line comes back \
+            "Read a text file on the user's computer or in scratch. Each line comes back \
              as its line number, right-aligned in six characters, then a tab, then the line; the \
              number and tab are not part of the file. A file longer than about 16 KB comes back \
              in parts: the result says where it stopped, and start_line and end_line read any \
@@ -409,6 +409,21 @@ impl WriteFile {
             thread: thread.into(),
         }
     }
+
+    /// Allows this call's target to be written without changing the
+    /// project's mode. The target remains subject to all path checks.
+    pub fn context(path: String) -> ToolContext {
+        let mut context = ToolContext::new();
+        context.insert(ApprovedWrite(path)).expect("a path encodes");
+        context
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct ApprovedWrite(String);
+
+impl ContextValue for ApprovedWrite {
+    const KEY: &'static str = "sandbox.write_file.path";
 }
 
 impl Tool for WriteFile {
@@ -420,9 +435,9 @@ impl Tool for WriteFile {
     fn description(&self) -> String {
         format!(
             "Create a file, or replace a file's entire content, in the user's project or the \
-             scratch folder. Missing parent folders are created. Project folders can be written \
-             only when the latest <environment> note says the project's mode is write or \
-             network, and changes \
+             scratch folder. Missing parent folders are created. Project writes are automatically \
+             approved when the latest <environment> note says the project's auto-approval level \
+             is write or network; in read mode, approving this call permits this specific write. Changes \
              apply to the user's computer at once; the scratch folder can always be written, \
              and suits notes and intermediate results that are not part of the project. In write \
              or network mode, calls run at once. In read mode, every call waits for the user \
@@ -441,18 +456,30 @@ impl Tool for WriteFile {
 
     async fn call(
         &self,
-        _context: &mut ToolContext,
+        context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        with_places(&self.sandboxes, &self.thread, move |sandboxes, places| {
+        let approved = context
+            .get::<ApprovedWrite>()
+            .ok()
+            .flatten()
+            .is_some_and(|ApprovedWrite(path)| path == args.path);
+        let sandboxes = self.sandboxes.clone();
+        let thread = self.thread.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut places = sandboxes.places(&thread);
+            if approved {
+                places.allow_project_write();
+            }
             // Claimed first, so this instance removes a scratch folder the
             // write creates when it quits.
             sandboxes
                 .claim()
                 .map_err(|error| FileError::Failed(error.to_string()))?;
-            write_file(places, &args.path, &args.content)
+            write_file(&places, &args.path, &args.content)
         })
         .await
+        .unwrap_or_else(|error| Err(FileError::Failed(error.to_string())))
     }
 }
 
@@ -461,7 +488,7 @@ pub(crate) fn write_file(places: &Places, path: &str, content: &str) -> Result<S
     let display = file.display();
     if !places.writable(&file) {
         return Err(FileError::Refused(format!(
-            "{display} can't be written: the project is read-only. Files in `{SCRATCH}` can be."
+            "{display} can't be written: file writes require a writable project or scratch target."
         )));
     }
     if file.is_root() || file.real.is_dir() {
@@ -505,7 +532,7 @@ mod tests {
     use serde_json::json;
 
     use super::*;
-    use crate::{Access, Project, ProjectFolder, TestRoot, test_sandboxes};
+    use crate::{Access, Project, ProjectFolder, TestRoot, paths::SCRATCH, test_sandboxes};
 
     fn places(root: &TestRoot, writable: bool) -> Places {
         let zed = root.0.join("zed");
@@ -646,6 +673,25 @@ mod tests {
     fn writes_need_a_writable_project_but_scratch_always_takes_them() {
         let root = TestRoot::new();
         let read_only = places(&root, false);
+        let outside = root.0.join("outside.txt");
+        std::fs::write(&outside, "readable\n").unwrap();
+        let path = outside.to_str().unwrap();
+        assert!(
+            read_file(&read_only, path, None, None)
+                .unwrap()
+                .contains("readable")
+        );
+        assert!(
+            list_directory(&read_only, root.0.to_str().unwrap())
+                .unwrap()
+                .contains("outside.txt")
+        );
+        for places in [&read_only, &places(&root, true)] {
+            assert!(matches!(
+                write_file(places, path, "no"),
+                Err(FileError::Refused(_))
+            ));
+        }
         assert!(matches!(
             write_file(&read_only, "zed/new.txt", "hello\n"),
             Err(FileError::Refused(_))

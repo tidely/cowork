@@ -885,6 +885,8 @@ impl Cowork {
     /// Deny for those who may decide, and a note that it waits for everyone
     /// else.
     fn render_tool_approval(
+        &self,
+        thread_id: Uuid,
         message_id: Uuid,
         step_index: usize,
         call: &AgentToolCall,
@@ -895,6 +897,25 @@ impl Cowork {
         let tool = call.call.function.name.to_string();
         let mut card =
             ToolCallCard::new(id, call.call.clone()).project_access(rights.project_mode.access());
+        if let Some(mut approved) = self
+            .active_generations
+            .get(&thread_id)
+            .and_then(|generation| generation.granted())
+        {
+            let project = self.sandboxes.project(&thread_id.to_string());
+            approved.access = approved.access.max(project.access);
+            if approved.access.writable() {
+                let paths = project
+                    .folders
+                    .iter()
+                    .map(|folder| folder.path.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>();
+                if let Ok(folders) = sandbox::Folders::resolve(&[], &paths) {
+                    approved.folders.extend(&folders);
+                }
+            }
+            card = card.approved(approved);
+        }
         if tool_approval::host_only(&tool) {
             card = card.host_only();
         }
@@ -919,6 +940,7 @@ impl Cowork {
     /// Consecutive tool calls sit back to back; everything else gets the
     /// timeline's usual spacing.
     fn render_work(
+        &self,
         thread_id: Uuid,
         message: &AgentMessage,
         rights: ApprovalRights,
@@ -948,9 +970,11 @@ impl Cowork {
             };
             match (step, view) {
                 (AgentStep::ToolCall(call), _) if awaiting_step == Some(step_index) => {
-                    calls.push(Self::render_tool_approval(
-                        message.id, step_index, call, rights, cx,
-                    ));
+                    calls.push(
+                        self.render_tool_approval(
+                            thread_id, message.id, step_index, call, rights, cx,
+                        ),
+                    );
                 }
                 (AgentStep::ToolCall(call), view) => calls.push(Self::render_tool_call(
                     thread_id,
@@ -1332,7 +1356,7 @@ impl Cowork {
                 .thread(thread_id, cx)
                 .map(|thread| ApprovalRights::of(thread.read(cx)))
                 .unwrap_or_default();
-            Self::render_work(thread_id, message, rights, cx)
+            self.render_work(thread_id, message, rights, cx)
         } else {
             Vec::new()
         };

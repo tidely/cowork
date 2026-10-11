@@ -27,7 +27,7 @@ pub struct RequestPermissionsArgs {
     pub access: Option<Access>,
     /// Folders outside the project later commands need to read, as absolute
     /// paths on the user's computer, or starting with `~/` for the user's
-    /// home folder.
+    /// home folder. Optional: reads are already allowed except credentials.
     #[serde(default)]
     pub read_folders: Vec<String>,
     /// Folders outside the project later commands need to change, such as
@@ -96,8 +96,9 @@ impl std::error::Error for NotGranted {}
 const DESCRIPTION: &str = "Ask the user for more permissions for the commands you run next, \
 when several commands will need them: `access` to the project (`write` to change it, `network` to \
 also reach the network), and folders outside the project to read or to change, such as a package \
-manager's cache. The call waits for the user to allow it, except in a scheduled run, where the \
-first call is refused with an explanation. Once allowed, later `run_command` calls get these \
+manager's cache. Permissions covered by the project's auto-approval level or this run are \
+approved automatically. Extra permissions wait for the user to allow them, except in a scheduled \
+run, where the first call needing approval is refused with an explanation. Once allowed, later `run_command` calls get these \
 permissions automatically and run without asking until this turn ends; the result lists \
 everything granted. They don't apply to the file tools. For a single command, ask in its own \
 `run_command` arguments instead. If the user denies it, carry on without it.";
