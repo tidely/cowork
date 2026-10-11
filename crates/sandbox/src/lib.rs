@@ -199,6 +199,26 @@ impl Sandboxes {
     /// its scratch folder. Dropping the future kills the command and whatever
     /// it started.
     pub async fn run(&self, thread: &str, command: &str) -> Result<CommandOutput, SandboxError> {
+        self.run_in(thread, command, false).await
+    }
+
+    /// Like [`Sandboxes::run`], with the project read-only even if it is
+    /// writable by the time the command starts, as for a command allowed
+    /// without asking because the project was read-only.
+    pub async fn run_read_only(
+        &self,
+        thread: &str,
+        command: &str,
+    ) -> Result<CommandOutput, SandboxError> {
+        self.run_in(thread, command, true).await
+    }
+
+    async fn run_in(
+        &self,
+        thread: &str,
+        command: &str,
+        read_only: bool,
+    ) -> Result<CommandOutput, SandboxError> {
         if command.trim().is_empty() {
             return Err(SandboxError::InvalidCommand("the command is empty"));
         }
@@ -215,7 +235,11 @@ impl Sandboxes {
                 scratch.display()
             ))
         })?;
-        let request = request(command, &self.project(thread), &scratch, &environment);
+        let mut project = self.project(thread);
+        if read_only {
+            project.writable = false;
+        }
+        let request = request(command, &project, &scratch, &environment);
         let stop = StopOnDrop(Arc::new(AtomicBool::new(false)));
         let stopped = stop.0.clone();
         let result = tokio::task::spawn_blocking(move || execute(request, &stopped)).await;

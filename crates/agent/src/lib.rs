@@ -246,6 +246,11 @@ fn pending_calls(content: &[AssistantContent], stop: Option<&StopReason>) -> Vec
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ToolDecision {
     Allow,
+    /// The call runs with `context` as its tool's context, as when the hook
+    /// allows it only on conditions the tool itself must keep.
+    AllowWith {
+        context: ToolContext,
+    },
     /// The call is answered with `reason` instead of running, which the
     /// model reads as the call's result.
     Deny {
@@ -395,6 +400,15 @@ impl Agent {
                                     name,
                                     call.function.arguments_value().to_string(),
                                     &mut ToolContext::new(),
+                                )
+                                .await
+                        }
+                        ToolDecision::AllowWith { mut context } => {
+                            self.tools
+                                .execute(
+                                    name,
+                                    call.function.arguments_value().to_string(),
+                                    &mut context,
                                 )
                                 .await
                         }
@@ -856,6 +870,82 @@ mod tests {
             panic!("expected one result, got {content:?}");
         };
         assert_eq!(result.content[0].as_text(), Some("Not now."));
+    }
+
+    /// What a hook gives a call it allows on conditions.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct Condition(String);
+
+    impl rig::tool::ContextValue for Condition {
+        const KEY: &'static str = "agent.test.condition";
+    }
+
+    /// Allows every call on a condition.
+    struct AllowOnCondition;
+
+    impl ToolHook for AllowOnCondition {
+        fn before_tool_call<'a>(&'a self, _call: &'a ToolCall) -> BoxFuture<'a, ToolDecision> {
+            Box::pin(async {
+                let mut context = ToolContext::new();
+                context
+                    .insert(Condition("read only".into()))
+                    .expect("encodes");
+                ToolDecision::AllowWith { context }
+            })
+        }
+    }
+
+    /// Answers with the condition its call was allowed on.
+    struct ReportCondition;
+
+    impl rig::tool::Tool for ReportCondition {
+        const NAME: &'static str = "calculate";
+        type Args = serde_json::Value;
+        type Output = String;
+        type Error = rig::tool::ToolContextError;
+
+        fn description(&self) -> String {
+            "Reports its condition.".into()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object"})
+        }
+
+        async fn call(
+            &self,
+            context: &mut ToolContext,
+            _args: Self::Args,
+        ) -> Result<String, Self::Error> {
+            Ok(context
+                .get::<Condition>()?
+                .map_or_else(|| "none".into(), |condition| condition.0))
+        }
+    }
+
+    /// A call allowed with a context runs with it.
+    #[tokio::test]
+    async fn calls_allowed_with_a_context_run_with_it() {
+        let mut tools = ToolSet::default();
+        tools.add_tool(ReportCondition);
+        let mut history = Vec::new();
+        Agent::new(calculation_turns().erase(), tools)
+            .tool_hook(Arc::new(AllowOnCondition))
+            .run(Message::user("1 + 2?"), &mut history, |_| {})
+            .await
+            .expect("the run");
+        let [_, _, Message::User { content }, Message::Assistant(_)] = history.as_slice() else {
+            panic!("expected prompt, call, result, reply, got {history:?}");
+        };
+        let [UserContent::ToolResult(result)] = content.as_slice() else {
+            panic!("expected one result, got {content:?}");
+        };
+        assert!(
+            result.content[0]
+                .as_text()
+                .is_some_and(|text| text.contains("read only")),
+            "{result:?}"
+        );
     }
 
     /// What a run emits folds the same after each event crosses a JSON

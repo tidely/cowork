@@ -3,7 +3,8 @@
 //!
 //! Kept in [`Thread::project_mode`] and, before the thread exists,
 //! [`Cowork::new_thread_project_mode`]. The agent's commands may only read
-//! the folders unless it is [`ProjectMode::Write`].
+//! the folders unless it is [`ProjectMode::Write`], and run without asking
+//! until then; see `tool_approval.rs`.
 
 use gpui::{Anchor, App, Context, IntoElement, SharedString, WeakEntity, div, prelude::*, px};
 use gpui_component::{

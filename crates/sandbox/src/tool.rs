@@ -7,8 +7,8 @@
 
 use std::sync::Arc;
 
-use rig::tool::{Tool, ToolContext, ToolExecutionError};
-use serde::Deserialize;
+use rig::tool::{ContextValue, Tool, ToolContext, ToolExecutionError};
+use serde::{Deserialize, Serialize};
 
 use crate::{CommandOutput, SandboxError, Sandboxes};
 
@@ -33,14 +33,35 @@ impl RunCommand {
             thread: thread.into(),
         }
     }
+
+    /// The context for a call allowed only on the condition that it changes
+    /// nothing in the project: the command then runs with the project
+    /// read-only, even if the project became writable after the call was
+    /// allowed.
+    pub fn read_only_context() -> ToolContext {
+        let mut context = ToolContext::new();
+        context
+            .insert(ReadOnly)
+            .expect("a unit struct always encodes");
+        context
+    }
+}
+
+/// Marks a call's context as [`RunCommand::read_only_context`].
+#[derive(Serialize, Deserialize)]
+struct ReadOnly;
+
+impl ContextValue for ReadOnly {
+    const KEY: &'static str = "sandbox.run_command.read_only";
 }
 
 const DESCRIPTION: &str = concat!(
     "Run a shell command on the user's computer, inside a sandbox, and get its exit code, \
      stdout, and stderr. The shell is the platform's own (the system prompt names the platform), \
-     and the user's installed tools and toolchains are available. Every call waits for the user \
-     to allow it, except in a scheduled run, where the first such call is refused with an \
-     explanation. Which project folders commands can use, whether they can change them, and the \
+     and the user's installed tools and toolchains are available. While the project is read-only, \
+     calls run at once. While it is writable, every call waits for the user to allow it, except \
+     in a scheduled run, where the first such call is refused with an explanation. Which project \
+     folders commands can use, whether they can change them, and the \
      folder commands start in are given in the latest <environment> note in the conversation. ",
     // Fixed per platform, so the definition stays the same within a session.
     // See `settings` for why Windows differs.
@@ -93,19 +114,81 @@ impl Tool for RunCommand {
 
     async fn call(
         &self,
-        _context: &mut ToolContext,
+        context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        self.sandboxes.run(&self.thread, &args.command).await
+        if context.contains::<ReadOnly>() {
+            self.sandboxes
+                .run_read_only(&self.thread, &args.command)
+                .await
+        } else {
+            self.sandboxes.run(&self.thread, &args.command).await
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use rig::tool::ToolSet;
     use serde_json::json;
 
     use super::*;
-    use crate::test_sandboxes;
+    use crate::{Project, ProjectFolder, TestRoot, test_sandboxes};
+
+    /// A call allowed on a read-only project changes nothing even when the
+    /// project became writable before the command started.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn read_only_calls_stay_read_only() {
+        if !mxc_sdk::v1::platform_support().is_supported {
+            return;
+        }
+        let (sandboxes, _scratch) = test_sandboxes();
+        // Not under the scratch root, where it would be taken for a leftover.
+        let project = TestRoot::new();
+        let folder = project.0.clone();
+        sandboxes.set_project(
+            "thread",
+            Project {
+                folders: vec![ProjectFolder {
+                    name: "project".into(),
+                    path: folder.clone(),
+                }],
+                writable: true,
+            },
+        );
+        let mut tools = ToolSet::default();
+        tools.add_tool(RunCommand::new(sandboxes.clone(), "thread"));
+        let write = |file: &str| {
+            let command = if cfg!(windows) {
+                format!("cmd /c echo agent> {file}")
+            } else {
+                format!("echo agent > {file}")
+            };
+            json!({ "command": command }).to_string()
+        };
+
+        tools
+            .execute(
+                RunCommand::NAME,
+                write("held.txt"),
+                &mut RunCommand::read_only_context(),
+            )
+            .await;
+        assert!(!folder.join("held.txt").exists(), "held read-only");
+
+        tools
+            .execute(
+                RunCommand::NAME,
+                write("allowed.txt"),
+                &mut ToolContext::new(),
+            )
+            .await;
+        assert!(
+            folder.join("allowed.txt").exists(),
+            "the project is writable"
+        );
+        sandboxes.shutdown();
+    }
 
     #[test]
     fn the_definition_leaves_what_changes_to_the_environment_note() {

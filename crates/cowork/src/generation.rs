@@ -197,7 +197,12 @@ impl Cowork {
         });
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let tools = tool_set(&self.sandboxes, &thread_id.to_string(), turn_comments);
-        let gate = ApprovalGate::new(sender.clone(), scheduled);
+        let gate = ApprovalGate::new(
+            sender.clone(),
+            self.sandboxes.clone(),
+            thread_id.to_string(),
+            scheduled,
+        );
         let cancelled = Arc::new(AtomicBool::new(false));
         let generation_task = self.tokio_handle.spawn(async move {
             let (selected_model, max_tokens) =

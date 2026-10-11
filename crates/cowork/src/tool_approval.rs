@@ -7,12 +7,14 @@
 //! approve tool calls (the host, and `Admin` peers) then allows or denies it
 //! through the same checked path; the first decision wins and the run goes on.
 //! Calls of [`HOST_ONLY`] tools, which act on the host's computer, only the
-//! host may decide. `run_command` is asked about in every project mode: its
-//! commands use the host's own tools, so even in a read-only project they
-//! act on the host's computer. `write_file` is asked about too, even when it
-//! writes the scratch folder. Listing and reading need no approval: they
-//! reach only the folders the host shared with the thread, and its scratch
-//! folder.
+//! host may decide. `run_command` runs at once while the project is
+//! read-only, as Codex's read-only mode does: the sandbox lets such a command
+//! change only the thread's scratch folder, and it stays read-only even if
+//! the project becomes writable before it starts. While the project is
+//! writable, every command is asked about. `write_file` is asked about too,
+//! even when it writes the scratch folder. Listing and reading need no
+//! approval: they reach only the folders the host shared with the thread, and
+//! its scratch folder.
 //!
 //! A scheduled run may have nobody around to answer, so it doesn't wait the
 //! first time: a call that needs approval fails at once, telling the model
@@ -28,7 +30,7 @@ use rig::{
     message::{CallId, ToolCall},
     tool::Tool as _,
 };
-use sandbox::{ListDirectory, ReadFile, RunCommand, WriteFile};
+use sandbox::{ListDirectory, ReadFile, RunCommand, Sandboxes, WriteFile};
 use tokio::sync::{mpsc, oneshot};
 use tools::RespondToComment;
 use uuid::Uuid;
@@ -112,6 +114,10 @@ pub(crate) enum RunUpdate {
 /// request always arrives after the reply whose call it is.
 pub(crate) struct ApprovalGate {
     updates: mpsc::UnboundedSender<RunUpdate>,
+    /// Where the run's commands run, whose project decides whether they
+    /// are asked about.
+    sandboxes: Arc<Sandboxes>,
+    thread: String,
     /// For a scheduled run, the calls already refused once, by tool and
     /// arguments; `None` for a run someone started.
     unattended: Option<Mutex<Vec<CallKey>>>,
@@ -126,9 +132,17 @@ type CallKey = (
 );
 
 impl ApprovalGate {
-    pub(crate) fn new(updates: mpsc::UnboundedSender<RunUpdate>, scheduled: bool) -> Arc<Self> {
+    /// The gate of a run of `thread`, someone started or scheduled.
+    pub(crate) fn new(
+        updates: mpsc::UnboundedSender<RunUpdate>,
+        sandboxes: Arc<Sandboxes>,
+        thread: impl Into<String>,
+        scheduled: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             updates,
+            sandboxes,
+            thread: thread.into(),
             unattended: scheduled.then(Mutex::default),
         })
     }
@@ -161,6 +175,11 @@ impl ToolHook for ApprovalGate {
             let tool = call.function.name.as_str();
             if !needs_approval(tool) {
                 return ToolDecision::Allow;
+            }
+            if tool == RunCommand::NAME && !self.sandboxes.project(&self.thread).writable {
+                return ToolDecision::AllowWith {
+                    context: RunCommand::read_only_context(),
+                };
             }
             if self.refuses_unattended(call) {
                 return ToolDecision::Deny {
@@ -317,10 +336,97 @@ mod tests {
         )
     }
 
-    /// A gate for a run someone started, or a scheduled one.
+    /// A gate for a run someone started, or a scheduled one, in a writable
+    /// project unless [`gate_in`] says otherwise.
     fn gate(scheduled: bool) -> (Arc<ApprovalGate>, mpsc::UnboundedReceiver<RunUpdate>) {
+        let (gate, asked, _) = gate_in(scheduled, true);
+        (gate, asked)
+    }
+
+    fn gate_in(
+        scheduled: bool,
+        writable: bool,
+    ) -> (
+        Arc<ApprovalGate>,
+        mpsc::UnboundedReceiver<RunUpdate>,
+        Arc<Sandboxes>,
+    ) {
         let (updates, asked) = mpsc::unbounded_channel();
-        (ApprovalGate::new(updates, scheduled), asked)
+        let sandboxes = crate::test_support::unused_sandboxes();
+        sandboxes.set_project(
+            "thread",
+            sandbox::Project {
+                folders: Vec::new(),
+                writable,
+            },
+        );
+        let gate = ApprovalGate::new(updates, sandboxes.clone(), "thread", scheduled);
+        (gate, asked, sandboxes)
+    }
+
+    /// In a read-only project, commands run at once, held read-only, even in
+    /// a scheduled run; once the project is writable, they are asked about.
+    #[tokio::test]
+    async fn commands_in_a_read_only_project_run_at_once() {
+        let held = ToolDecision::AllowWith {
+            context: RunCommand::read_only_context(),
+        };
+        for scheduled in [false, true] {
+            let (gate, mut asked, sandboxes) = gate_in(scheduled, false);
+            let command = call_with(RunCommand::NAME, serde_json::json!({ "command": "ls" }));
+            assert_eq!(
+                decide_allowing(&gate, &command, &mut asked).await,
+                (held.clone(), None)
+            );
+
+            // Writing a file is still asked about, or refused the first time
+            // in a scheduled run.
+            let write = call(WriteFile::NAME);
+            let decided = decide_allowing(&gate, &write, &mut asked).await;
+            if scheduled {
+                assert!(matches!(decided, (ToolDecision::Deny { .. }, None)));
+            } else {
+                assert_eq!(
+                    decided,
+                    (ToolDecision::Allow, Some(WriteFile::NAME.to_owned()))
+                );
+            }
+
+            sandboxes.set_project(
+                "thread",
+                sandbox::Project {
+                    folders: Vec::new(),
+                    writable: true,
+                },
+            );
+            let decided = decide_allowing(&gate, &command, &mut asked).await;
+            if scheduled {
+                assert!(matches!(decided, (ToolDecision::Deny { .. }, None)));
+            } else {
+                assert_eq!(
+                    decided,
+                    (ToolDecision::Allow, Some(RunCommand::NAME.to_owned()))
+                );
+            }
+        }
+    }
+
+    /// What `gate` decides about `call`, allowing it if it asks, with the
+    /// tool it asked about.
+    async fn decide_allowing(
+        gate: &ApprovalGate,
+        call: &ToolCall,
+        asked: &mut mpsc::UnboundedReceiver<RunUpdate>,
+    ) -> (ToolDecision, Option<String>) {
+        let decision = gate.before_tool_call(call);
+        tokio::pin!(decision);
+        tokio::select! {
+            decision = &mut decision => (decision, None),
+            Some(RunUpdate::Approval { tool, decide, .. }) = asked.recv() => {
+                decide.send(ToolDecision::Allow).expect("the gate waits");
+                (decision.await, Some(tool))
+            }
+        }
     }
 
     #[tokio::test]
@@ -372,7 +478,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn every_command_is_asked_about() {
+    async fn every_command_in_a_writable_project_is_asked_about() {
         let command = call(RunCommand::NAME);
         let (gate, mut asked) = gate(false);
         let decision = gate.before_tool_call(&command);

@@ -24,4 +24,4 @@ The draft of the next prompt is a conflict-free replicated data type (CRDT), so 
 
 ### Sandbox
 
-The agent works on the host's computer with your own tools, so your shell, toolchains, and build systems work out of the box. Every command runs inside your operating system's own sandbox through [mxc](https://github.com/microsoft/mxc), so it can only change the project folders you share (and only in `Write` mode), can't touch your credentials, and has no network. Nothing runs or changes until the host allows it.
+The agent works on the host's computer with your own tools, so your shell, toolchains, and build systems work out of the box. Every command runs inside your operating system's own sandbox through [mxc](https://github.com/microsoft/mxc), so it can only change the project folders you share (and only in `Write` mode), can't touch your credentials, and has no network. In `Read` mode, commands run without asking, since they can't change the project; nothing changes until the host allows it.

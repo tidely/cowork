@@ -40,7 +40,8 @@ checked before they are folded.
 
 A `ToolHook` set with `Agent::tool_hook` decides whether each call may run
 before its tool sees it, and may take as long as it needs, such as while a
-user decides. A denied call is answered with Rig's skipped result carrying
+user decides. A hook may allow a call with a `ToolContext` for its tool,
+when it allows the call only on conditions the tool must keep. A denied call is answered with Rig's skipped result carrying
 the hook's reason, so the history stays valid and the model learns why. The
 hook plays the part of Rig's own agent's `on_dispatch`, which this loop does
 not run.

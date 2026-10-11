@@ -137,8 +137,9 @@ A run whose model the catalog doesn't offer fails, and the queue goes on.
 
 Scheduled runs keep the usual approval rules (see
 [Tool approval](collaboration.md#tool-approval)): tools on the always-allowed
-list run, and every other call needs the host or an `Admin` peer to allow it
-(`run_command` and `write_file` only the host). Since no one may be around, a scheduled run
+list run, as do commands while the project is in `Read` mode, and every other
+call needs the host or an `Admin` peer to allow it (`run_command` and
+`write_file` only the host). Since no one may be around, a scheduled run
 doesn't wait the first time:
 
 1. A call that needs approval fails at once. Its result tells the model that
@@ -153,7 +154,7 @@ doesn't wait the first time:
 The model can therefore carry on without the call, or decide the call is
 worth waiting for. Calls made in the thread outside a scheduled run, such as
 someone chatting in a **continue the last thread** thread, are approved as
-usual. `run_command` is no exception, in either project mode.
+usual. In `Write` mode, `run_command` is no exception.
 
 ## Managing tasks
 

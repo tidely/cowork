@@ -26,7 +26,8 @@ Agent events are checked on arrival in the order Rig's stream could produce
 them.
 Tool calls outside a short always-allowed list wait for the host or an
 `Admin` peer to allow or deny them, and `run_command` and `write_file` for the
-host alone; see [Tool approval](#tool-approval).
+host alone; commands run without asking while the project is in `Read` mode.
+See [Tool approval](#tool-approval).
 The agent's commands run on the host's computer, contained by its operating
 system's sandbox, with the host's project folders read-only unless the project
 is in `Write` mode; collaborators see the folders by name with that mode, and
@@ -548,18 +549,27 @@ shared with the thread and its scratch folder); every other tool's calls
 wait, so a newly added tool is asked about rather than trusted. `calculate`
 waits.
 
-`run_command` and `write_file` calls wait in either project mode, and only
-the host may decide them (`HOST_ONLY`): `run_command`'s commands use the
-host's own shell and tools, so even in `Read` mode they act on the host's
+`run_command` calls run at once while the project is in `Read` mode, as in
+Codex's read-only mode, whoever's prompt started the run: the sandbox lets
+them read, and change only the thread's scratch folder. The hook allows such
+a call with a context telling the tool to run it read-only, so a command
+stays read-only even if the host switches to `Write` between the decision and
+the command starting. In `Write` mode, `run_command` calls wait. They and
+`write_file` calls (in either mode) only the host may decide (`HOST_ONLY`):
+`run_command`'s commands use the host's own shell and tools on the host's
 computer, and `write_file` changes the host's files, even when it writes the
-scratch folder.
+scratch folder. On Windows, commands read every drive except credentials
+(see `sandbox/src/settings.rs`), so in `Read` mode a collaborator who may
+submit can have the agent read the host's other files into the transcript
+without the host allowing it.
 
 The agent loop asks a hook about each call before its tool runs (calls whose
 arguments could not be read never run, so are never asked about). The host's
-hook lets listed tools through and otherwise asks the thread, on the same
-channel as the run's events, so the request always follows the reply that
-made the call. The host then emits `ToolApprovalRequested`, naming the agent
-message and the call, and the run waits.
+hook lets listed tools, and `run_command` in `Read` mode, through and
+otherwise asks the thread, on the same channel as the run's events, so the
+request always follows the reply that made the call. The host then emits
+`ToolApprovalRequested`, naming the agent message and the call, and the run
+waits.
 
 Everyone shows the waiting call as a card in the agent's work, which shows
 even if the work is collapsed. The host and `Admin` peers get Allow and Deny;
