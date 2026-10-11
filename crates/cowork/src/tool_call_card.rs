@@ -7,10 +7,10 @@
 //! `request_permissions` are shown in theirs here, and every other tool gets
 //! its arguments listed.
 //!
-//! It keeps to a title, what the call would do, and the decision: the access
-//! a command gets is the project mode's name beside the title, in the
-//! warning color when that is more than the project's mode, and how long
-//! such access lasts is a quiet note beside the decision.
+//! It keeps to a title, what the call would do, and the decision. Only a
+//! call asking for more than the thread's mode gets a badge beside the
+//! title, naming that access as the mode giving it, and a quiet note beside
+//! the decision of how long it lasts.
 
 use std::rc::Rc;
 
@@ -114,16 +114,13 @@ impl ToolCallCard {
     }
 }
 
-/// What the card shows for the access a call would get.
-struct AccessShown {
+/// The badge for a call asking for more than the thread's mode.
+struct ExtraAccess {
     access: Access,
-    /// Starts the badge's tooltip, before the mode's name.
+    /// Starts the badge's tooltip, before the access's name.
     tooltip: &'static str,
-    /// Whether the call asks for more than the project's mode, which the
-    /// badge's warning color says without words.
-    escalated: bool,
-    /// How long extra access lasts, as the note beside the decision says
-    /// it; `None` when the title already says.
+    /// How long the access lasts, as the note beside the decision says it;
+    /// `None` when the title already says.
     scope: Option<&'static str>,
 }
 
@@ -139,24 +136,19 @@ impl RenderOnce for ToolCallCard {
             if tool == RunCommand::NAME
                 && let Some(command) = arguments["command"].as_str()
             {
-                let requested = RunCommand::requested_access(&arguments);
-                access = requested.or(self.project_access).map(|shown| AccessShown {
-                    access: shown,
-                    tooltip: "Runs with",
-                    escalated: escalated(requested, self.project_access),
+                access = extra_access(&arguments, self.project_access).map(|access| ExtraAccess {
+                    access,
+                    tooltip: "This command asks for",
                     scope: Some("For this command only"),
                 });
                 command_view(&id, command, &arguments, cx)
             } else if tool == RequestPermissions::NAME
                 && let Some(reason) = arguments["reason"].as_str()
             {
-                let requested = RunCommand::requested_access(&arguments)
-                    .filter(|access| *access > Access::Read);
                 // The title already says the access lasts for the turn.
-                access = requested.map(|shown| AccessShown {
-                    access: shown,
-                    tooltip: "Later commands in this turn run with",
-                    escalated: escalated(requested, self.project_access),
+                access = extra_access(&arguments, self.project_access).map(|access| ExtraAccess {
+                    access,
+                    tooltip: "Later commands in this turn get",
                     scope: None,
                 });
                 permissions_view(&id, reason, &arguments, cx)
@@ -228,7 +220,6 @@ impl RenderOnce for ToolCallCard {
             }
         };
         let warning = access
-            .filter(|shown| shown.escalated)
             .and_then(|shown| shown.scope)
             .map(|scope| escalation_note(&id, scope, cx));
         let footer = h_flex()
@@ -269,16 +260,23 @@ fn humanize(tool: &str) -> String {
     }
 }
 
-/// Whether `requested` is more than the project's access.
-fn escalated(requested: Option<Access>, project: Option<Access>) -> bool {
-    requested
-        .zip(project)
-        .is_some_and(|(requested, project)| requested > project)
+/// The access a call asks for beyond the thread's mode, if any: the access
+/// it names when that is more than the mode, or Write when it names folders
+/// to change outside the project. Calls staying within the mode show none,
+/// so cards don't repeat the thread's mode. Reading outside folders is
+/// shown only by their lines.
+fn extra_access(arguments: &serde_json::Value, project: Option<Access>) -> Option<Access> {
+    // Outside a thread there is no mode, and anything above Read is extra.
+    let project = project.unwrap_or(Access::Read);
+    let requested = RunCommand::requested_access(arguments).filter(|access| *access > project);
+    let (_, write) = RunCommand::named_folders(arguments);
+    let writes = (!write.is_empty()).then_some(Access::Write);
+    requested.max(writes)
 }
 
-/// The access a call gets, as the project mode giving it, in the warning
-/// color when that is more than the project's mode.
-fn access_badge(id: &SharedString, shown: &AccessShown, cx: &App) -> AnyElement {
+/// The access a call asks for beyond the thread's mode, named as the mode
+/// giving it, in the warning color.
+fn access_badge(id: &SharedString, shown: &ExtraAccess, cx: &App) -> AnyElement {
     let mode = ProjectMode::with_access(shown.access);
     let selector = format!("{id}-access");
     let tooltip = SharedString::from(format!("{} {} access", shown.tooltip, mode.label()));
@@ -287,19 +285,14 @@ fn access_badge(id: &SharedString, shown: &AccessShown, cx: &App) -> AnyElement 
         .debug_selector(move || selector.clone())
         .flex_none()
         .gap_1()
-        .text_color(if shown.escalated {
-            cx.theme().warning
-        } else {
-            cx.theme().muted_foreground
-        })
+        .text_color(cx.theme().warning)
         .child(Icon::new(mode.icon()).size_3())
         .child(mode.label())
         .tooltip(move |window, cx| Tooltip::new(tooltip.clone()).build(window, cx))
         .into_any_element()
 }
 
-/// The quiet note beside the decision of how long the badge's extra access
-/// lasts; the badge's color already says it is extra.
+/// The quiet note beside the decision of how long the badge's access lasts.
 fn escalation_note(id: &SharedString, scope: &'static str, cx: &App) -> AnyElement {
     let selector = format!("{id}-escalation");
     div()
@@ -509,27 +502,47 @@ mod tests {
             gpui_component::init(cx);
             crate::theme::init(cx);
         });
-        for (project, arguments, escalated) in [
-            (Access::Write, json!({"command": "ls"}), false),
+        for (project, arguments, extra) in [
+            (Access::Write, json!({"command": "ls"}), None),
             (
                 Access::Write,
                 json!({"command": "ls", "access": "read"}),
-                false,
+                None,
+            ),
+            (
+                Access::Network,
+                json!({"command": "cargo fetch", "access": "network"}),
+                None,
             ),
             (
                 Access::Read,
                 json!({"command": "cargo fetch", "access": "network"}),
-                true,
+                Some(Access::Network),
+            ),
+            (
+                Access::Read,
+                json!({"command": "cargo new ~/github/agent", "write_folders": ["~/github"]}),
+                Some(Access::Write),
+            ),
+            (
+                Access::Read,
+                json!({"command": "cat /srv/docs/a", "read_folders": ["/srv/docs"]}),
+                None,
             ),
         ] {
+            assert_eq!(
+                extra_access(&arguments, Some(project)),
+                extra,
+                "{arguments}"
+            );
             let call = command_call(arguments);
             let (_, cx) = cx.add_window_view(|_, _| AccessView { call, project });
             cx.run_until_parked();
-            assert!(cx.debug_bounds("card-access").is_some());
+            // Cards within the thread's mode don't repeat it.
+            assert_eq!(cx.debug_bounds("card-access").is_some(), extra.is_some());
             assert_eq!(
                 cx.debug_bounds("card-escalation").is_some(),
-                escalated,
-                "{project:?}"
+                extra.is_some()
             );
         }
     }
@@ -590,8 +603,8 @@ mod tests {
         }
     }
 
-    /// A request for permissions shows its reason, what it asks for, and
-    /// warns when that is more than the project's mode.
+    /// A request for permissions shows its reason, its folders, and a badge
+    /// only for access beyond the thread's mode.
     #[gpui::test]
     fn permission_requests_show_what_they_ask_for(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
@@ -604,25 +617,22 @@ mod tests {
                 ToolFunction::new(ToolName::new(RequestPermissions::NAME).unwrap(), arguments),
             )
         };
-        for (project, arguments, access, escalated, folders) in [
+        for (project, arguments, access, folders) in [
             (
                 Access::Read,
                 json!({"reason": "Fetch.", "access": "network", "write_folders": ["~/.cargo"]}),
-                true,
                 true,
                 true,
             ),
             (
                 Access::Network,
                 json!({"reason": "Fetch.", "access": "write"}),
-                true,
                 false,
                 false,
             ),
             (
                 Access::Write,
                 json!({"reason": "Read docs.", "read_folders": ["/srv/docs"]}),
-                false,
                 false,
                 true,
             ),
@@ -633,9 +643,8 @@ mod tests {
             assert!(cx.debug_bounds("card-reason").is_some());
             assert!(cx.debug_bounds("card-arguments").is_none());
             assert_eq!(cx.debug_bounds("card-access").is_some(), access);
-            // The title says how long the access lasts, so the badge's
-            // color is the only sign it is extra.
-            assert!(cx.debug_bounds("card-escalation").is_none(), "{escalated}");
+            // The title says how long the access lasts.
+            assert!(cx.debug_bounds("card-escalation").is_none());
             assert_eq!(cx.debug_bounds("card-folders").is_some(), folders);
         }
 

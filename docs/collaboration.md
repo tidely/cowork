@@ -558,8 +558,8 @@ permissions for one command, such as `network` to fetch dependencies in a
 `Read` project, and how it runs a command that only reads without waiting in
 a `Write` or `Write + Network` project. Its optional `read_folders` and
 `write_folders` name host folders outside the project the command also
-needs, as absolute paths or under `~/` (the user's real home, not the
-command's `HOME`), such as `~/.cargo` for `cargo fetch`.
+needs, as absolute paths or under `~/` (the user's real home, which is also
+the command's `HOME`), such as `~/.cargo` for `cargo fetch`.
 
 The agent can also ask for more for the rest of its run, as Codex's agent
 does, with `request_permissions`: a `reason`, and an `access`, folders, or
@@ -700,8 +700,10 @@ returned; see `ROADMAP.md`.
   real files live: read-only in `Read`, enforced by the sandbox, and in
   `Write` and `Write + Network` the agent's changes apply to the host at
   once. They start in the first folder, or the scratch folder without one. Each thread also has a
-  scratch folder, its commands' `HOME` and `TMPDIR`, kept until the thread
-  is deleted or Cowork quits. On macOS and Linux commands cannot read the
+  scratch folder, its commands' `TMPDIR`, kept until the thread is deleted
+  or Cowork quits. Their `HOME` is the host's real home, so `~` is the same
+  folder in a command as in its granted folders; only what is granted
+  there is reachable. On macOS and Linux commands cannot read the
   host's other files; on Windows they can read every drive, as Codex's
   sandbox does, since `git` and others resolve the folders above a project.
   Nowhere can they read credentials such as `~/.ssh`, even inside granted

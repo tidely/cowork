@@ -92,21 +92,37 @@ async fn commands_are_confined() {
 
     let scratch = run(
         &sandboxes,
-        "pwd; echo \"$HOME\"; echo kept > \"$TMPDIR/kept\"",
+        "pwd; echo \"$TMPDIR\"; echo \"$HOME\"; echo kept > \"$TMPDIR/kept\"",
     )
     .await;
     assert_eq!(scratch.exit_code, 0, "{scratch:?}");
     let lines = scratch.stdout.lines().collect::<Vec<_>>();
     assert_eq!(
         lines[0], lines[1],
-        "without folders, commands start in HOME"
+        "without folders, commands start in the scratch folder, their TMPDIR"
     );
     assert!(
         lines[0].starts_with(&root.0.to_string_lossy().into_owned()),
-        "HOME is the thread's scratch folder: {scratch:?}"
+        "TMPDIR is the thread's scratch folder: {scratch:?}"
     );
-    let kept = run(&sandboxes, "cat \"$HOME/kept\"").await;
+    let home = std::env::home_dir().unwrap();
+    assert_eq!(
+        lines[2],
+        home.to_string_lossy(),
+        "HOME is the user's real home, as `~` is in grants"
+    );
+    let kept = run(&sandboxes, "cat \"$TMPDIR/kept\"").await;
     assert_eq!(kept.stdout, "kept\n", "scratch files persist: {kept:?}");
+    let marker = format!(".cowork-sandbox-test-{}", std::process::id());
+    let home_write = run(
+        &sandboxes,
+        &format!("touch ~/{marker} 2>/dev/null || echo denied"),
+    )
+    .await;
+    assert!(
+        home_write.stdout.ends_with("denied\n") && !home.join(&marker).exists(),
+        "the real home stays out of reach without a grant: {home_write:?}"
+    );
 
     let writes = run(
         &sandboxes,
@@ -257,7 +273,7 @@ async fn stopping_a_run_kills_its_command() {
     };
     let running = sandboxes.run(
         "thread",
-        "while true; do echo tick >> \"$HOME/ticks\"; sleep 0.05; done",
+        "while true; do echo tick >> \"$TMPDIR/ticks\"; sleep 0.05; done",
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(500), running)
@@ -281,8 +297,8 @@ async fn commands_run_at_the_same_time() {
     let sandboxes = sandboxes(&root);
     let started = Instant::now();
     let (writer, reader) = tokio::join!(
-        sandboxes.run("thread", "echo shared > \"$HOME/shared\"; sleep 2"),
-        sandboxes.run("thread", "sleep 0.5; cat \"$HOME/shared\""),
+        sandboxes.run("thread", "echo shared > \"$TMPDIR/shared\"; sleep 2"),
+        sandboxes.run("thread", "sleep 0.5; cat \"$TMPDIR/shared\""),
     );
     let elapsed = started.elapsed();
     assert_eq!(writer.unwrap().exit_code, 0);
@@ -293,7 +309,7 @@ async fn commands_run_at_the_same_time() {
     );
 
     let other = sandboxes
-        .run("other", "cat \"$HOME/shared\" 2>&1 || echo missing")
+        .run("other", "cat \"$TMPDIR/shared\" 2>&1 || echo missing")
         .await;
     assert!(
         other.unwrap().stdout.ends_with("missing\n"),

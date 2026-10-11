@@ -21,7 +21,7 @@
 //!   or for the rest of its run through `request_permissions` (see
 //!   [`crate::grant`]). None unless granted.
 //! - Read and write its thread's scratch folder ([`SCRATCH_DIR`]), which is
-//!   its `HOME` and `TMPDIR`.
+//!   its `TMPDIR`, and where it starts when the project has no folders.
 //! - Read the host's tools: the system's own locations (granted by the
 //!   backend), every folder on the user's `PATH` with its prefix (see
 //!   [`TOOL_PREFIX_DIRS`]), the toolchain folders named by well-known variables
@@ -48,10 +48,13 @@
 //!   PowerShell.
 //!
 //! Environment: the user's login shell environment, captured once the way
-//! Zed does (see [`crate::environment`]), with `HOME` and `TMPDIR` pointing at
-//! the scratch folder and the toolchain homes in [`TOOLCHAIN_HOMES`] set to
-//! their real locations when the user's environment leaves them unset, so the
-//! toolchains still find themselves.
+//! Zed does (see [`crate::environment`]), with `TMPDIR` (and `TMP` and `TEMP`)
+//! pointing at the scratch folder. `HOME` is the user's real home, so that
+//! `~` in a command is the folder `~` names in `read_folders` and
+//! `write_folders`, and toolchains find themselves where the user keeps
+//! them. The home itself is reachable only as the grants above allow: tools
+//! that write caches or settings there fail unless the host grants the
+//! folder, as with `~/.cargo` for `cargo fetch`.
 //!
 //! Commands are not limited in time, output, or resources. A command stops
 //! when it exits or when its run is stopped; whatever it left running in the
@@ -74,9 +77,9 @@ pub const SCRATCH_DIR: &str = "scratch";
 pub const TOOL_PREFIX_DIRS: &[&str] = &["bin", "sbin"];
 
 /// Toolchain homes in the user's home folder, as the variable naming each
-/// and its default location relative to home. Granted read-only when they
-/// exist, and set in the environment when the user's leaves them unset,
-/// since `HOME` points elsewhere for commands.
+/// and its default location relative to home, used when the variable is
+/// unset. Granted read-only when they exist, as `rustup`'s proxies in
+/// `~/.cargo/bin` need `~/.rustup`, which isn't on `PATH`.
 pub const TOOLCHAIN_HOMES: &[(&str, &str)] =
     &[("CARGO_HOME", ".cargo"), ("RUSTUP_HOME", ".rustup")];
 

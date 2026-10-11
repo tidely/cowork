@@ -110,8 +110,10 @@ const DESCRIPTION: &str = concat!(
     " Without network access, nothing can be downloaded or installed. Even with it, commands \
      cannot accept connections from outside or reach services listening on the user's own \
      computer. Each command \
-     can write a scratch folder, its HOME and TMPDIR, kept for this conversation. Anything a \
-     command leaves running in the background is ended when it exits."
+     can write a scratch folder, its TMPDIR, kept for this conversation; commands start there \
+     when the project has no folders. HOME is the user's own home folder, so `~` means the \
+     same in a command as in `read_folders` and `write_folders`. Anything a command leaves \
+     running in the background is ended when it exits."
 );
 
 #[cfg(windows)]
@@ -368,7 +370,8 @@ mod tests {
             "<environment> note",
             "`access` argument",
             "Without network access",
-            "HOME and TMPDIR",
+            "its TMPDIR",
+            "HOME is the user's own home folder",
         ] {
             assert!(
                 description.contains(guidance),

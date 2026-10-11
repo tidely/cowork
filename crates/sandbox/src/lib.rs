@@ -191,12 +191,16 @@ impl Sandboxes {
             }
         });
         note.push_str(&format!(
-            "Commands start in {}. Their HOME and TMPDIR are the scratch folder {}, which \
-             the file tools call `{}`.\n\
+            "Commands start in {}. Their TMPDIR is the scratch folder {}, which the file \
+             tools call `{}`. Their HOME is the user's home folder{}, so `~` means the same \
+             in commands as in `read_folders` and `write_folders`.\n\
              This replaces any earlier environment note.\n</environment>",
             working_directory(&folders, &scratch).display(),
             scratch.display(),
             paths::SCRATCH,
+            std::env::home_dir()
+                .map(|home| format!(" {}", home.display()))
+                .unwrap_or_default(),
         ));
         note
     }
@@ -431,19 +435,13 @@ fn request(
     let home = std::env::home_dir();
     let scratch = resolved(scratch).unwrap_or_else(|| scratch.to_owned());
     let mut environment = environment.clone();
-    for (variable, default) in settings::TOOLCHAIN_HOMES {
-        if !environment.contains_key(*variable)
-            && let Some(home) = &home
-            && home.join(default).is_dir()
-        {
-            environment.insert(
-                (*variable).to_owned(),
-                home.join(default).to_string_lossy().into_owned(),
-            );
-        }
+    // The user's real home, so that `~` in a command is the folder `~` names
+    // in a grant; see `settings`.
+    if let Some(home) = &home {
+        environment.insert("HOME".to_owned(), home.to_string_lossy().into_owned());
     }
     let scratch_text = scratch.to_string_lossy().into_owned();
-    for variable in ["HOME", "TMPDIR", "TMP", "TEMP"] {
+    for variable in ["TMPDIR", "TMP", "TEMP"] {
         environment.insert(variable.to_owned(), scratch_text.clone());
     }
     let environment = environment.into_iter().collect::<Vec<_>>();
@@ -569,10 +567,12 @@ fn tool_paths(environment: &[(String, String)], home: Option<&Path>) -> Vec<Path
         paths.push(path);
         paths.extend(prefix);
     }
-    for (variable, _) in settings::TOOLCHAIN_HOMES {
-        if let Some((_, value)) = environment.iter().find(|(name, _)| name == variable) {
-            paths.extend(resolved(Path::new(value)));
-        }
+    for (variable, default) in settings::TOOLCHAIN_HOMES {
+        let path = match environment.iter().find(|(name, _)| name == variable) {
+            Some((_, value)) => Some(PathBuf::from(value)),
+            None => home.map(|home| home.join(default)),
+        };
+        paths.extend(path.as_deref().and_then(resolved));
     }
     paths
 }
@@ -726,12 +726,49 @@ mod tests {
         assert!(!scratch.exists());
     }
 
+    /// `~` in a command is the user's real home, as in a grant, while
+    /// temporary files and a project without folders use the scratch folder.
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn commands_keep_the_real_home_and_start_in_scratch_without_folders() {
+        if !v1::platform_support().is_supported {
+            return;
+        }
+        let (sandboxes, _root) = test_sandboxes();
+        let output = sandboxes
+            .run("thread", r#"printf '%s\n' ~ "$TMPDIR" "$(pwd -P)""#)
+            .await
+            .unwrap();
+        assert_eq!(output.exit_code, 0, "{output:?}");
+        let scratch = resolved(&sandboxes.scratch_dir("thread")).unwrap();
+        let home = std::env::home_dir().unwrap();
+        let lines = output.stdout.lines().collect::<Vec<_>>();
+        assert_eq!(
+            lines,
+            [
+                home.to_str().unwrap(),
+                scratch.to_str().unwrap(),
+                scratch.to_str().unwrap()
+            ],
+            "{output:?}"
+        );
+        sandboxes.shutdown();
+    }
+
     #[test]
     fn the_note_names_the_folders_mode_and_scratch() {
         let (sandboxes, root) = test_sandboxes();
         let empty = sandboxes.environment_note("thread");
         assert!(empty.starts_with(ENVIRONMENT_NOTE_START), "{empty}");
         assert!(empty.contains("no project folders"), "{empty}");
+        let home = std::env::home_dir().unwrap();
+        assert!(
+            empty.contains(&format!(
+                "HOME is the user's home folder {}",
+                home.display()
+            )),
+            "{empty}"
+        );
 
         let zed = folder(&root.0, "zed");
         let resolved_zed = resolved(&zed.path).unwrap();
@@ -885,7 +922,8 @@ mod tests {
         };
         assert_eq!(
             environment_of(&read_only, "HOME"),
-            Some(scratch_path.clone())
+            std::env::home_dir().map(|home| home.to_string_lossy().into_owned()),
+            "the user's real home, as grants read `~`"
         );
         assert_eq!(
             environment_of(&read_only, "TMPDIR"),

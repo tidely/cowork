@@ -8,8 +8,8 @@
 //! exactly a [`Grant`]; the sandbox never sees an unresolved path.
 //!
 //! The folders the model names are resolved here, on the host, before
-//! anyone is asked: `~` is the user's real home (commands' `HOME` is the
-//! scratch folder), paths must be absolute and exist, and none may be in
+//! anyone is asked: `~` is the user's real home (as it is for commands, whose
+//! `HOME` it is), paths must be absolute and exist, and none may be in
 //! [`settings::DENIED_PATHS`]. Credentials inside a granted folder stay
 //! denied, as inside a project folder.
 
