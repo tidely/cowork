@@ -37,16 +37,16 @@ fn continue_buttons_have_room_for_their_labels(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
 
     for (stage, selector) in [
-        (MainStage::Welcome, "welcome-continue"),
+        (MainStage::Welcome, "provider-continue"),
         (
-            MainStage::ProviderSetup(ProviderSetupStage::Ollama),
+            MainStage::ProviderSetup(ModelProvider::Ollama),
             "setup-continue",
         ),
     ] {
         cx.update(|_, cx| {
             cowork.update(cx, |cowork, cx| {
                 cowork.main_stage = stage;
-                cowork.selected_welcome_provider = Some(ModelProvider::Ollama);
+                cowork.selected_provider = Some(ModelProvider::Ollama);
                 cx.notify();
             });
         });
@@ -530,7 +530,7 @@ fn the_profile_button_opens_the_profile_page(cx: &mut gpui::TestAppContext) {
 
     assert_eq!(
         cowork.read_with(cx, |cowork, _| cowork.main_stage),
-        MainStage::Profile
+        MainStage::Settings(SettingsPage::Profile)
     );
     assert!(cx.debug_bounds("profile-page").is_some());
     assert!(cx.debug_bounds("profile-picture").is_some());
@@ -586,6 +586,48 @@ fn the_profile_button_opens_the_profile_page(cx: &mut gpui::TestAppContext) {
             assert_eq!(cowork.profile_name(), "Ada");
         });
     });
+}
+
+#[gpui::test]
+fn settings_replace_the_sidebar_until_back_to_app(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    cowork.update(cx, |cowork, cx| {
+        cowork.main_stage = MainStage::Schedules;
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("search-chats").is_some());
+    assert!(cx.debug_bounds("settings-back").is_none());
+
+    let button = cx
+        .debug_bounds("identity-button")
+        .expect("identity button should be rendered");
+    cx.simulate_click(button.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cowork.read_with(cx, |cowork, _| cowork.main_stage),
+        MainStage::Settings(SettingsPage::Profile)
+    );
+    assert!(cx.debug_bounds("profile-page").is_some());
+    assert!(cx.debug_bounds("search-chats").is_none());
+    assert!(cx.debug_bounds("identity-button").is_some());
+
+    // Opening it again from settings still goes back to where the user was.
+    let button = cx.debug_bounds("identity-button").unwrap();
+    cx.simulate_click(button.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let back = cx
+        .debug_bounds("settings-back")
+        .expect("back to app should be rendered");
+    cx.simulate_click(back.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert_eq!(
+        cowork.read_with(cx, |cowork, _| cowork.main_stage),
+        MainStage::Schedules
+    );
+    assert!(cx.debug_bounds("settings-back").is_none());
+    assert!(cx.debug_bounds("search-chats").is_some());
 }
 
 #[gpui::test]

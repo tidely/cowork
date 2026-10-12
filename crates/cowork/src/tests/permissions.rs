@@ -29,7 +29,7 @@ fn redraw_access_menu(session: &mut Collaboration<'_>) {
 // duplicate titlebar selectors cannot resolve to the wrong app's controls.
 fn show_host_access_controls(session: &mut Collaboration<'_>) {
     session.collaborator.update(session.cx, |cowork, cx| {
-        cowork.main_stage = MainStage::Profile;
+        cowork.main_stage = MainStage::Settings(SettingsPage::Profile);
         cx.notify();
     });
     let host = session.host.clone();
@@ -136,7 +136,7 @@ fn host_access_popover_changes_live_defaults_overrides_and_inheritance(
 
     // An Admin collaborator still cannot manage the host's peer policy.
     host.update(session.cx, |cowork, cx| {
-        cowork.main_stage = MainStage::Profile;
+        cowork.main_stage = MainStage::Settings(SettingsPage::Profile);
         cx.notify();
     });
     let collaborator = session.collaborator.clone();

@@ -1,4 +1,5 @@
-//! The sidebar listing threads, and its bottom bar.
+//! The sidebar listing threads, and its bottom bar. While settings are open
+//! the sidebar lists their tabs instead; see `settings.rs`.
 
 use std::rc::Rc;
 
@@ -18,6 +19,7 @@ use uuid::Uuid;
 
 use crate::{
     Cowork, MainStage,
+    settings::SettingsPage,
     thread::{ThreadSharing, ThreadSummary},
     thread_draft::ThreadDraft,
     top_bar::TOP_BAR_HEIGHT,
@@ -164,7 +166,7 @@ impl ThreadRow {
 }
 
 #[derive(Clone)]
-struct CoworkSidebarSection {
+pub(crate) struct CoworkSidebarSection {
     pub(crate) label: Option<SharedString>,
     items: SectionItems,
     pub(crate) collapsed: bool,
@@ -326,6 +328,34 @@ impl Cowork {
     }
 
     pub(crate) fn render_sidebar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let settings = matches!(self.main_stage, MainStage::Settings(_));
+        // Separate ids keep each view's scroll position to itself.
+        let sidebar = Sidebar::new(if settings {
+            "settings-sidebar"
+        } else {
+            "cowork-sidebar"
+        })
+        .w(SIDEBAR_WIDTH)
+        .bg(cx.theme().sidebar)
+        .border_r_0()
+        .collapsible(SidebarCollapsible::Offcanvas)
+        .collapsed(!self.sidebar_open)
+        .footer(self.render_sidebar_bottom_bar(cx));
+        if settings {
+            sidebar
+                .header(self.render_settings_sidebar_header(cx))
+                .child(self.settings_sidebar_tabs(cx))
+        } else {
+            self.app_sidebar(sidebar, cx)
+        }
+    }
+
+    /// The sidebar's usual content: actions and threads.
+    fn app_sidebar(
+        &self,
+        sidebar: Sidebar<CoworkSidebarSection>,
+        cx: &mut Context<Self>,
+    ) -> Sidebar<CoworkSidebarSection> {
         let mut hosting_threads = Vec::new();
         let mut collaborating_threads = Vec::new();
         let mut recent_threads = Vec::new();
@@ -410,12 +440,7 @@ impl Cowork {
             }),
         );
 
-        let sidebar = Sidebar::new("cowork-sidebar")
-            .w(SIDEBAR_WIDTH)
-            .bg(cx.theme().sidebar)
-            .border_r_0()
-            .collapsible(SidebarCollapsible::Offcanvas)
-            .collapsed(!self.sidebar_open)
+        let sidebar = sidebar
             .header(
                 // `Sidebar` puts its header in a row, so fill it for the
                 // buttons to reach the right edge.
@@ -472,7 +497,6 @@ impl Cowork {
                             ),
                     ),
             )
-            .footer(self.render_sidebar_bottom_bar(cx))
             .child(actions);
         let sidebar = if hosting_threads.is_empty() {
             sidebar
@@ -521,10 +545,9 @@ impl Cowork {
                     .debug_selector(|| "identity-button".to_owned())
                     .flex_1()
                     .px_1p5()
-                    .selected(self.main_stage == MainStage::Profile)
                     .accessibility_label("Open profile")
                     .on_click(cx.listener(|this, _, window, cx| {
-                        this.open_profile(window, cx);
+                        this.open_settings(SettingsPage::Profile, window, cx);
                     }))
                     // `Button` centers its content, so fill it with a single
                     // left-aligned row.

@@ -55,6 +55,9 @@ gpui_kit_assets::icon_assets!(
         WindowMaximize,
         WindowRestore,
         WindowClose,
+        ArrowLeft,
+        CircleUser,
+        Bot,
     ]
 );
 
@@ -174,6 +177,15 @@ mod tests {
             let path = icon.path();
             let bytes = Assets.load(&path).unwrap().expect("bundled schedule icon");
             assert!(!bytes.is_empty(), "empty schedule icon: {path}");
+        }
+    }
+
+    #[test]
+    fn settings_icons_are_bundled() {
+        for icon in [IconName::ArrowLeft, IconName::CircleUser, IconName::Bot] {
+            let path = icon.path();
+            let bytes = Assets.load(&path).unwrap().expect("bundled settings icon");
+            assert!(!bytes.is_empty(), "empty settings icon: {path}");
         }
     }
 

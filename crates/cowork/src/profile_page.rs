@@ -20,7 +20,7 @@ use gpui_kit_assets::IconName as AssetIconName;
 use itertools::Itertools;
 
 use crate::{
-    Cowork, MainStage,
+    Cowork,
     profile::{Profile, display_name_error, load_profile_picture, participant_name},
     thread::{Thread, ThreadOwnership},
     usage::{
@@ -37,14 +37,6 @@ impl Cowork {
     /// The local user's picture if they chose one, their initials otherwise.
     pub(crate) fn render_profile_avatar(&self, size: gpui::Pixels) -> gpui::Div {
         Self::render_avatar_for(self.local_participant_id, Some(&self.profile), size)
-    }
-
-    pub(crate) fn open_profile(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.main_stage = MainStage::Profile;
-        self.profile_error = None;
-        // The composer is hidden, so it must not keep taking keystrokes.
-        window.blur(cx);
-        cx.notify();
     }
 
     pub(crate) fn render_profile_page(&self, cx: &mut Context<Self>) -> impl IntoElement {

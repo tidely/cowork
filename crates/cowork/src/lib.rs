@@ -30,6 +30,8 @@ use crate::{
     profile::Profile,
     project_folders::ProjectFolder,
     project_mode::ProjectMode,
+    provider_setup::ProviderStep,
+    settings::SettingsPage,
     sharing::JoinDialog,
     sidebar::SIDEBAR_WIDTH,
     submission::ActiveGeneration,
@@ -66,10 +68,12 @@ mod project_folders;
 mod project_mode;
 mod prompt;
 mod protocol;
+mod provider_setup;
 mod scheduled_task;
 mod scheduler;
 mod schedules;
 mod search_palette;
+mod settings;
 
 mod sidebar;
 mod statistics;
@@ -104,20 +108,17 @@ actions!(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MainStage {
+    /// Choosing a provider before the first chat.
     Welcome,
-    ProviderSetup(ProviderSetupStage),
+    /// Choosing one of the provider's models before the first chat.
+    ProviderSetup(models::ModelProvider),
     Thread,
-    Profile,
+    /// A settings page, with the sidebar showing settings; see `settings.rs`.
+    Settings(SettingsPage),
     /// The archived threads, to restore or delete for good.
     Archive,
     /// The scheduled prompts.
     Schedules,
-}
-
-/// The provider whose setup page occupies the main stage.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ProviderSetupStage {
-    Ollama,
 }
 
 struct Cowork {
@@ -145,7 +146,13 @@ struct Cowork {
     join_dialog: Option<Entity<JoinDialog>>,
     /// Which page occupies the center stage.
     main_stage: MainStage,
-    selected_welcome_provider: Option<models::ModelProvider>,
+    /// Where "Back to app" returns to from settings.
+    stage_before_settings: MainStage,
+    /// The provider card selected on the welcome screen or the Providers
+    /// settings page, to continue to its models.
+    selected_provider: Option<models::ModelProvider>,
+    /// Which step the Providers settings page shows.
+    settings_provider_step: ProviderStep,
     profile: Profile,
     /// Everyone's profile as the active thread shows them, refreshed at the
     /// start of every render; see [`Cowork::profiles_for`].
@@ -641,12 +648,14 @@ impl Render for Cowork {
                                 .on_drop(cx.listener(Self::drop_attachments))
                             })
                             .map(|this| match self.main_stage {
-                                MainStage::Profile => this.child(self.render_profile_page(cx)),
+                                MainStage::Settings(page) => {
+                                    this.child(self.render_settings_page(page, cx))
+                                }
                                 MainStage::Archive => this.child(self.render_archive_page(cx)),
                                 MainStage::Schedules => this.child(self.render_schedules_page(cx)),
                                 MainStage::Welcome => this.child(self.render_welcome(cx)),
                                 MainStage::ProviderSetup(provider) => {
-                                    this.child(self.render_provider_setup(provider, cx))
+                                    this.child(self.render_welcome_models(provider, cx))
                                 }
                                 MainStage::Thread => this
                                     .child(self.render_main_editor(
@@ -807,7 +816,9 @@ pub fn run() -> anyhow::Result<()> {
                         copied_endpoint_id: None,
                         join_dialog: None,
                         main_stage: MainStage::Welcome,
-                        selected_welcome_provider: None,
+                        stage_before_settings: MainStage::Welcome,
+                        selected_provider: None,
+                        settings_provider_step: ProviderStep::default(),
                         profile: Profile::local(local_participant_id),
                         shown_profiles: HashMap::new(),
                         profile_error: None,

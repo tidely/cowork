@@ -17,7 +17,7 @@ use gpui_component::{
 use rig::providers::ollama::Ollama;
 
 use crate::{
-    Cowork, MainStage, ProviderSetupStage,
+    Cowork,
     assets::OLLAMA_AVATAR_PATH,
     models::{ModelCatalog, ModelInfo, ModelProvider, ModelRef},
     thread::{Thread, ThreadOwnership},
@@ -36,6 +36,13 @@ impl ModelProvider {
     pub(crate) fn icon_path(self) -> &'static str {
         match self {
             Self::Ollama => OLLAMA_AVATAR_PATH,
+        }
+    }
+
+    /// Shown under the name on the provider's setup card.
+    pub(crate) fn description(self) -> &'static str {
+        match self {
+            Self::Ollama => "Run models locally",
         }
     }
 }
@@ -165,13 +172,6 @@ impl Cowork {
         });
         let subscription = cx.subscribe(&picker, Self::model_picker_event);
         (picker, subscription)
-    }
-
-    pub(crate) fn discover_models(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.main_stage != MainStage::ProviderSetup(ProviderSetupStage::Ollama) {
-            return;
-        }
-        self.refresh_models(cx);
     }
 
     /// Asks Ollama which models it offers, and makes them the catalog. The
