@@ -221,7 +221,7 @@ impl Cowork {
                         return true;
                     }
                 }
-                false
+                thread.toggle_pending_comments(group_id)
             });
             if toggled {
                 break;
@@ -471,7 +471,7 @@ impl Cowork {
     }
 
     /// A submitted user message; `cards` holds each block's attachments.
-    fn render_user_message_group(
+    pub(crate) fn render_user_message_group(
         &self,
         index: usize,
         group: &UserMessageGroup,

@@ -18,6 +18,22 @@ provider closes a tool call
 This preserves valid conversation history without hiding completed calls until
 the whole model turn commits.
 
+`Agent::steering_hook` accepts a `SteeringHook` shared with the caller.
+At a finalized reasoning, text, or tool-call part the loop checks
+`has_pending`. If steering is waiting, it drops the old stream, commits only
+its finalized parts, executes any finalized tool calls, then atomically
+consumes the current batch with `take_pending`. Steering submitted while
+those tools run joins the same batch; cancellation is possible until it is
+consumed. Open parts never join history, and tool results always precede
+the injected user message. The next request continues the same run, using
+the same tools and hook permissions.
+
+`AgentEvent::Steered` records the injected prompt, so event replay includes
+it exactly once. A truncated turn's `TurnEnded` has no provider origin or
+stop reason and default usage: token usage is unavailable when the provider
+stream is cancelled before its final response. Without pending steering,
+normal replies and usage keep their provider values.
+
 A run is fully described by its events. `TurnFold` folds them into the
 messages they add to the history, and the loop records its own history by
 folding them, so anyone folding the same events, in this process or after

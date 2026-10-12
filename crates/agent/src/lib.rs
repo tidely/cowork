@@ -62,6 +62,9 @@ pub enum AgentEvent {
     /// A tool the last reply called returned. The call itself is in the
     /// reply.
     ToolResult { call: CallId, result: ToolResult },
+    /// A user prompt delivered at a boundary, after any finalized tool
+    /// calls have returned. It joins the history before the next request.
+    Steered { prompt: Message },
 }
 
 /// Folds a run's events into the messages they add to the history.
@@ -143,6 +146,22 @@ impl TurnFold {
     /// produced after the turn's events so far.
     pub fn apply(&mut self, event: &AgentEvent) -> Result<Folded, SequenceError> {
         match event {
+            AgentEvent::Steered { prompt } => {
+                if !self.calls.is_empty() || !self.ended.is_empty() || !self.streaming.is_empty() {
+                    return Err(SequenceError::Shape(
+                        "steering arrived before the turn and its tools ended".into(),
+                    ));
+                }
+                if !matches!(prompt, Message::User { content } if !content.is_empty()) {
+                    return Err(SequenceError::Shape(
+                        "steering must be a nonempty user message".into(),
+                    ));
+                }
+                Ok(Folded {
+                    message: Some(prompt.clone()),
+                    block: None,
+                })
+            }
             AgentEvent::Model(event) => {
                 self.transcript.push(Item::Event(event.clone()))?;
                 Ok(Folded {
@@ -268,6 +287,17 @@ pub trait ToolHook: Send + Sync {
     fn before_tool_call<'a>(&'a self, call: &'a ToolCall) -> BoxFuture<'a, ToolDecision>;
 }
 
+/// Supplies user steering without doing UI work in the streaming loop.
+///
+/// Checking does not consume a batch: finalized tool calls must return
+/// before delivery, and pending messages may be cancelled or added while
+/// they run. `take_pending` atomically consumes all currently pending
+/// steering into one user message, or returns `None` if it was cancelled.
+pub trait SteeringHook: Send + Sync {
+    fn has_pending(&self) -> bool;
+    fn take_pending(&self) -> Option<Message>;
+}
+
 /// A provider-independent, streaming tool loop.
 pub struct Agent {
     model: DynModel<Completion>,
@@ -276,6 +306,7 @@ pub struct Agent {
     additional_params: Option<serde_json::Value>,
     /// `None` lets every call run.
     tool_hook: Option<Arc<dyn ToolHook>>,
+    steering_hook: Option<Arc<dyn SteeringHook>>,
 }
 
 impl Agent {
@@ -286,11 +317,17 @@ impl Agent {
             preamble: None,
             additional_params: None,
             tool_hook: None,
+            steering_hook: None,
         }
     }
 
     pub fn tool_hook(mut self, hook: Arc<dyn ToolHook>) -> Self {
         self.tool_hook = Some(hook);
+        self
+    }
+
+    pub fn steering_hook(mut self, hook: Arc<dyn SteeringHook>) -> Self {
+        self.steering_hook = Some(hook);
         self
     }
 
@@ -329,9 +366,14 @@ impl Agent {
         mut emit: impl FnMut(AgentEvent),
     ) -> Result<()> {
         let mut fold = TurnFold::default();
+        let mut prompt_recorded = false;
         loop {
             let mut request = CompletionRequest::new(prompt.clone())
-                .messages(history.clone())
+                .messages(if prompt_recorded {
+                    history[..history.len() - 1].to_vec()
+                } else {
+                    history.clone()
+                })
                 .tools(self.tools.tool_definitions());
 
             if let Some(preamble) = &self.preamble {
@@ -340,51 +382,88 @@ impl Agent {
             if let Some(params) = &self.additional_params {
                 request = request.additional_params(params.clone());
             }
-            history.push(prompt.clone());
+            if !prompt_recorded {
+                history.push(prompt.clone());
+            }
+            prompt_recorded = true;
 
             let mut stream = self
                 .model
                 .stream(request)
                 .context("failed to start model stream")?;
+            let mut interrupted = false;
             while let Some(item) = stream.next().await {
                 let Item::Event(event) = item.context("model stream failed")? else {
                     continue;
                 };
+                let boundary = matches!(event, StreamEvent::End { .. });
                 let event = AgentEvent::Model(event);
                 fold.apply(&event)
                     .context("model stream yielded an event out of order")?;
                 emit(event);
+                if boundary
+                    && self
+                        .steering_hook
+                        .as_ref()
+                        .is_some_and(|hook| hook.has_pending())
+                {
+                    interrupted = true;
+                    break;
+                }
             }
-            let response = stream
-                .finish()
-                .await
-                .context("model stream ended without a complete reply")?;
-            let head = response.head();
-            let ended = AgentEvent::TurnEnded {
-                origin: head.origin,
-                stop: head.stop,
-                usage: response.usage,
+            let response = if interrupted {
+                // Dropping the provider stream cancels the old response.
+                // Only finalized parts join history; concurrent open parts
+                // remain previews and are discarded by TurnEnded.
+                drop(stream);
+                None
+            } else {
+                Some(
+                    stream
+                        .finish()
+                        .await
+                        .context("model stream ended without a complete reply")?,
+                )
+            };
+            let ended = match &response {
+                Some(response) => {
+                    let head = response.head();
+                    AgentEvent::TurnEnded {
+                        origin: head.origin,
+                        stop: head.stop,
+                        usage: response.usage,
+                    }
+                }
+                // Usage is reported only in the provider's final response,
+                // which an interrupted stream never reaches.
+                None => AgentEvent::TurnEnded {
+                    origin: None,
+                    stop: None,
+                    usage: Usage::default(),
+                },
             };
             let reply = fold.apply(&ended)?.message;
-            debug_assert_eq!(
-                reply,
-                response.message(),
-                "the folded reply is the one Rig returned"
-            );
+            if let Some(response) = &response {
+                debug_assert_eq!(
+                    reply,
+                    response.message(),
+                    "the folded reply is the one Rig returned"
+                );
+            }
             emit(ended);
             history.extend(reply);
-            if let Some(failure) = rig::message::turn_failure(
-                &response.choice,
-                Some(&response.stop()),
-                response.finish_reason().as_ref(),
-            ) {
+            if let Some(response) = &response
+                && let Some(failure) = rig::message::turn_failure(
+                    &response.choice,
+                    Some(&response.stop()),
+                    response.finish_reason().as_ref(),
+                )
+            {
                 anyhow::bail!(failure);
             }
 
             let calls = fold.pending_calls().to_vec();
-            if calls.is_empty() {
-                return Ok(());
-            }
+            let had_calls = !calls.is_empty();
             for call in calls {
                 let name = call.function.name.as_str();
                 let result = match &call.function.invalid_arguments {
@@ -421,9 +500,29 @@ impl Agent {
                     result,
                 };
                 if let Some(results) = fold.apply(&event)?.message {
+                    history.push(results.clone());
                     prompt = results;
                 }
                 emit(event);
+            }
+            if let Some(steering) = self
+                .steering_hook
+                .as_ref()
+                .and_then(|hook| hook.take_pending())
+            {
+                let event = AgentEvent::Steered {
+                    prompt: steering.clone(),
+                };
+                history.extend(fold.apply(&event)?.message);
+                emit(event);
+                prompt = steering;
+            } else if !had_calls {
+                if !interrupted {
+                    return Ok(());
+                }
+                // Cancellation can race the boundary check. Continue from
+                // the finalized reply without inventing another user prompt.
+                prompt = history.last().expect("the initial prompt exists").clone();
             }
         }
     }
@@ -439,6 +538,240 @@ mod tests {
     };
 
     use crate::test_support::turn;
+
+    #[derive(Default)]
+    struct PendingSteering(std::sync::Mutex<Vec<String>>);
+
+    impl SteeringHook for PendingSteering {
+        fn has_pending(&self) -> bool {
+            !self.0.lock().unwrap().is_empty()
+        }
+
+        fn take_pending(&self) -> Option<Message> {
+            let messages = std::mem::take(&mut *self.0.lock().unwrap());
+            (!messages.is_empty()).then(|| Message::user(messages.join("\n")))
+        }
+    }
+
+    fn assert_replayed_history(prompt: Message, events: &[AgentEvent], history: &[Message]) {
+        let mut fold = TurnFold::default();
+        let replayed = std::iter::once(prompt)
+            .chain(events.iter().filter_map(|event| {
+                let wire = serde_json::to_string(event).unwrap();
+                fold.apply(&serde_json::from_str(&wire).unwrap())
+                    .unwrap()
+                    .message
+            }))
+            .collect::<Vec<_>>();
+        assert_eq!(replayed, history);
+    }
+
+    #[tokio::test]
+    async fn steering_interrupts_after_finalized_reasoning_and_combines_pending_messages() {
+        let model = MockCompletionModel::from_stream_turns([
+            vec![
+                MockStreamEvent::Reasoning {
+                    id: "r".into(),
+                    text: "Thinking.".into(),
+                },
+                MockStreamEvent::Text("Old answer must not finish.".into()),
+                MockStreamEvent::FinalResponse(mock_final_with_total_tokens(10)),
+            ],
+            vec![
+                MockStreamEvent::Text("New answer.".into()),
+                MockStreamEvent::FinalResponse(mock_final_with_total_tokens(20)),
+            ],
+        ]);
+        let hook = Arc::new(PendingSteering::default());
+        let mut history = Vec::new();
+        let mut events = Vec::new();
+        let prompt = Message::user("Original request.");
+        Agent::new(model.clone().erase(), ToolSet::default())
+            .steering_hook(hook.clone())
+            .run(prompt.clone(), &mut history, |event| {
+                if matches!(
+                    &event,
+                    AgentEvent::Model(StreamEvent::End {
+                        content: AssistantContent::Reasoning(_),
+                        ..
+                    })
+                ) {
+                    hook.0
+                        .lock()
+                        .unwrap()
+                        .extend(["First direction.".into(), "Second direction.".into()]);
+                }
+                events.push(event);
+            })
+            .await
+            .unwrap();
+        let [
+            _,
+            Message::Assistant(interrupted),
+            steering,
+            Message::Assistant(_),
+        ] = history.as_slice()
+        else {
+            panic!("unexpected history: {history:?}");
+        };
+        assert!(
+            matches!(interrupted.content.as_slice(), [AssistantContent::Reasoning(reasoning)] if reasoning.text == "Thinking.")
+        );
+        assert_eq!(
+            steering,
+            &Message::user("First direction.\nSecond direction.")
+        );
+        assert_eq!(model.requests().len(), 2);
+        assert_replayed_history(prompt, &events, &history);
+    }
+
+    #[tokio::test]
+    async fn steering_waits_for_finalized_calls_before_delivery() {
+        let model = MockCompletionModel::from_stream_turns([
+            vec![
+                MockStreamEvent::tool_call(
+                    "c",
+                    "calculate",
+                    serde_json::json!({"operation":"add", "a":1, "b":2}),
+                ),
+                MockStreamEvent::Text("Old continuation.".into()),
+                MockStreamEvent::FinalResponse(mock_final_with_total_tokens(10)),
+            ],
+            vec![
+                MockStreamEvent::Text("Steered answer.".into()),
+                MockStreamEvent::FinalResponse(mock_final_with_total_tokens(20)),
+            ],
+        ]);
+        let hook = Arc::new(PendingSteering::default());
+        let mut tools = ToolSet::default();
+        tools.add_tool(tools::Calculate);
+        let mut events = Vec::new();
+        let mut history = Vec::new();
+        let prompt = Message::user("Calculate.");
+        Agent::new(model.erase(), tools)
+            .steering_hook(hook.clone())
+            .run(prompt.clone(), &mut history, |event| {
+                if matches!(&event, AgentEvent::Model(StreamEvent::Arguments { .. })) {
+                    hook.0.lock().unwrap().push("First.".into());
+                }
+                if matches!(&event, AgentEvent::ToolResult { .. }) {
+                    hook.0.lock().unwrap().push("While tool ran.".into());
+                }
+                events.push(event);
+            })
+            .await
+            .unwrap();
+        let [
+            _,
+            Message::Assistant(reply),
+            Message::User { content: results },
+            steering,
+            _,
+        ] = history.as_slice()
+        else {
+            panic!("unexpected history: {history:?}");
+        };
+        assert!(matches!(
+            reply.content.as_slice(),
+            [AssistantContent::ToolCall(_)]
+        ));
+        assert!(
+            matches!(results.as_slice(), [UserContent::ToolResult(result)] if !result.is_error)
+        );
+        assert_eq!(steering, &Message::user("First.\nWhile tool ran."));
+        assert_replayed_history(prompt, &events, &history);
+    }
+
+    #[tokio::test]
+    async fn cancellation_during_tool_execution_does_not_deliver_steering() {
+        let hook = Arc::new(PendingSteering::default());
+        let mut tools = ToolSet::default();
+        tools.add_tool(tools::Calculate);
+        let mut history = Vec::new();
+        let mut events = Vec::new();
+        Agent::new(calculation_turns().erase(), tools)
+            .steering_hook(hook.clone())
+            .run(Message::user("Calculate."), &mut history, |event| {
+                if matches!(&event, AgentEvent::Model(StreamEvent::Arguments { .. })) {
+                    hook.0.lock().unwrap().push("Cancel me.".into());
+                }
+                if matches!(&event, AgentEvent::ToolResult { .. }) {
+                    hook.0.lock().unwrap().clear();
+                }
+                events.push(event);
+            })
+            .await
+            .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Steered { .. }))
+        );
+        assert_eq!(history.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn interruption_discards_open_parts_and_answers_completed_calls() {
+        let model = MockCompletionModel::from_stream_turns([
+            vec![
+                MockStreamEvent::ReasoningDelta {
+                    id: "r".into(),
+                    reasoning: "An unfinished preview.".into(),
+                },
+                MockStreamEvent::tool_call(
+                    "c",
+                    "calculate",
+                    serde_json::json!({"operation":"add", "a":1, "b":2}),
+                ),
+                MockStreamEvent::Text("Never reaches history.".into()),
+                MockStreamEvent::FinalResponse(mock_final_with_total_tokens(10)),
+            ],
+            vec![
+                MockStreamEvent::Text("New answer.".into()),
+                MockStreamEvent::FinalResponse(mock_final_with_total_tokens(20)),
+            ],
+        ]);
+        let hook = Arc::new(PendingSteering::default());
+        let mut tools = ToolSet::default();
+        tools.add_tool(tools::Calculate);
+        let mut history = Vec::new();
+        let mut events = Vec::new();
+        let prompt = Message::user("Calculate.");
+        let mut submitted = false;
+        Agent::new(model.erase(), tools)
+            .steering_hook(hook.clone())
+            .run(prompt.clone(), &mut history, |event| {
+                if !submitted && matches!(&event, AgentEvent::Model(StreamEvent::Reasoning { .. }))
+                {
+                    hook.0.lock().unwrap().push("New direction.".into());
+                    submitted = true;
+                }
+                events.push(event);
+            })
+            .await
+            .unwrap();
+        let Message::Assistant(reply) = &history[1] else {
+            panic!("expected assistant reply");
+        };
+        assert!(
+            matches!(reply.content.as_slice(), [AssistantContent::ToolCall(_)]),
+            "{:?}",
+            reply.content
+        );
+        assert_replayed_history(prompt, &events, &history);
+    }
+
+    #[test]
+    fn steering_cannot_precede_pending_tool_results() {
+        let mut fold = TurnFold::default();
+        fold_all(&mut fold, &thinking_turn());
+        assert!(
+            fold.apply(&AgentEvent::Steered {
+                prompt: Message::user("Too soon.")
+            })
+            .is_err()
+        );
+    }
 
     /// A model event read from its JSON form, as one arrives from elsewhere.
     fn event(value: serde_json::Value) -> AgentEvent {

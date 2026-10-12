@@ -374,12 +374,19 @@ impl Thread {
                 _ => None,
             })
             .unwrap_or_else(Vec::new);
-        let Some(comment_id) = TurnComments::new(comments.len())
+        let initial_comment_id = TurnComments::new(comments.len())
             .comment_ids()
             .iter()
             .position(|alias| alias.as_str() == args.comment_id)
-            .and_then(|index| comments.get(index).copied())
-        else {
+            .and_then(|index| comments.get(index).copied());
+        let Some(comment_id) = initial_comment_id.or_else(|| {
+            self.steered_comments.get(&message_id).and_then(|aliases| {
+                aliases
+                    .iter()
+                    .find(|(alias, _)| alias == &args.comment_id)
+                    .map(|(_, id)| *id)
+            })
+        }) else {
             return;
         };
         let Some(message) = self.agent_message_mut(message_id.into_bytes()) else {

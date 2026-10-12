@@ -98,6 +98,10 @@ impl ApprovalRights {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum RunUpdate {
     Event(AgentEvent),
+    SteeringConsumed {
+        group: crate::timeline::UserMessageGroup,
+        aliases: Vec<String>,
+    },
     /// A call of the last reply waits for a decision, given through `decide`.
     Approval {
         call: CallId,

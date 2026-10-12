@@ -18,6 +18,7 @@ gpui_kit_assets::icon_assets!(
         PanelLeftOpen,
         Search,
         SendHorizontal,
+        CornerDownLeft,
         Square,
         SquarePen,
         UsersRound,
@@ -83,6 +84,21 @@ mod tests {
     use gpui_kit_assets::IconName;
 
     use super::*;
+
+    #[test]
+    fn composer_action_icons_are_bundled() {
+        for icon in [
+            IconName::SendHorizontal,
+            IconName::CornerDownLeft,
+            IconName::Square,
+            IconName::X,
+        ] {
+            assert!(
+                Assets.load(&icon.path()).unwrap().is_some(),
+                "missing composer icon: {icon:?}"
+            );
+        }
+    }
 
     #[test]
     fn sharing_and_permission_icons_are_bundled() {

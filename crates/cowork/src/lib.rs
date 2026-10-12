@@ -59,6 +59,7 @@ mod model_picker;
 mod models;
 mod participant;
 mod peer_access;
+mod pending_view;
 mod profile;
 mod profile_page;
 mod project_folders;
@@ -90,7 +91,16 @@ mod welcome;
 
 static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
-actions!(cowork, [Quit, SubmitComposer, OpenSearchPalette]);
+actions!(
+    cowork,
+    [
+        Quit,
+        SubmitComposer,
+        QueueComposer,
+        StopGeneration,
+        OpenSearchPalette
+    ]
+);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MainStage {
@@ -425,6 +435,9 @@ impl Cowork {
 
         let can_write = composer.is_some();
         let composer = composer.map(|composer| self.render_composer(composer, cx));
+        let pending_rows = active_thread_id
+            .map(|thread_id| self.render_pending_messages(thread_id, messages.len(), cx))
+            .unwrap_or_default();
 
         div()
             .id("main-editor")
@@ -489,6 +502,7 @@ impl Cowork {
                                     div().when(index != 0, |this| this.mt_6()).child(message)
                                 },
                             ))
+                            .children(pending_rows)
                             .children(composer.map(|composer| {
                                 composer.when(!messages.is_empty(), |this| this.mt_6())
                             }))
@@ -549,6 +563,8 @@ impl Render for Cowork {
             .bg(cx.theme().sidebar)
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(Self::submit_composer_action))
+            .on_action(cx.listener(Self::queue_composer_action))
+            .on_action(cx.listener(|this, _: &StopGeneration, _, cx| this.stop_generation(cx)))
             .on_action(cx.listener(|this, _: &OpenSearchPalette, window, cx| {
                 this.open_search_palette(window, cx);
             }))
@@ -628,9 +644,26 @@ impl Render for Cowork {
 }
 
 fn bind_app_keys(cx: &mut App) {
+    // Keep both existing submit bindings, registering the native one last so
+    // shortcut tooltips show Command on macOS and Control elsewhere.
+    let (alternate, native) = if cfg!(target_os = "macos") {
+        ("ctrl", "cmd")
+    } else {
+        ("cmd", "ctrl")
+    };
     cx.bind_keys([
-        KeyBinding::new("ctrl-enter", SubmitComposer, None),
-        KeyBinding::new("cmd-enter", SubmitComposer, None),
+        KeyBinding::new(&format!("{alternate}-enter"), SubmitComposer, None),
+        KeyBinding::new(&format!("{native}-enter"), SubmitComposer, None),
+        KeyBinding::new(&format!("{alternate}-shift-enter"), QueueComposer, None),
+        KeyBinding::new(&format!("{native}-shift-enter"), QueueComposer, None),
+        KeyBinding::new(
+            cfg_select! {
+                target_os = "macos" => "cmd-.",
+                _ => "ctrl-.",
+            },
+            StopGeneration,
+            None,
+        ),
         KeyBinding::new(
             cfg_select! {
                 target_os = "macos" => "cmd-k",

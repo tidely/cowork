@@ -76,7 +76,7 @@ mod tests {
             Theme::change(ThemeMode::Dark, None, cx);
             assert!(cx.theme().is_dark());
             assert_eq!(cx.theme().background, rgb(0x18181b).into());
-            assert_eq!(cx.theme().primary, rgb(0x8b8bf0).into());
+            assert_eq!(cx.theme().primary, rgb(0x60a5fa).into());
         });
     }
 }

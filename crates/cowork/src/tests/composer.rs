@@ -479,3 +479,78 @@ fn submitting_keeps_focus_on_an_item_that_stays(cx: &mut gpui::TestAppContext) {
         assert_eq!(thread.summary.title, "question");
     });
 }
+
+#[gpui::test]
+fn generation_button_switches_between_stop_and_steer_for_the_whole_draft(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    cowork.update_in(cx, |cowork, window, cx| {
+        let draft = std::mem::replace(
+            &mut cowork.new_thread_draft,
+            ThreadDraft::new(cowork.local_participant_id),
+        );
+        let thread = Cowork::new_empty_local_thread(
+            draft,
+            cowork.local_participant_id,
+            cowork.models.clone(),
+            cowork.new_thread_model.clone(),
+            cx,
+        );
+        let id = thread.read(cx).instance_id;
+        thread.update(cx, |thread, _| thread.generating = true);
+        cowork
+            .thread_store
+            .update(cx, |store, _| store.threads.push_front(thread));
+        cowork.active_thread_id = Some(id);
+        cowork.focus_composer(window, cx);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("stop-generation").is_some());
+    assert!(cx.debug_bounds("steer-message").is_none());
+
+    cx.simulate_input("hello");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("steer-message").is_some());
+    assert!(cx.debug_bounds("stop-generation").is_none());
+
+    cx.simulate_keystrokes("backspace backspace backspace backspace backspace");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("stop-generation").is_some());
+    assert!(cx.debug_bounds("steer-message").is_none());
+}
+
+#[gpui::test]
+fn comments_and_attachment_only_blocks_make_the_draft_sendable(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    cowork.update(cx, |cowork, cx| {
+        assert!(!cowork.composer_has_content(cx));
+        let draft = &mut cowork.new_thread_draft;
+        let comment = draft.create_comment(
+            draft.author.as_uuid(),
+            CommentTarget {
+                message_id: Uuid::new_v4(),
+                range: 0..5,
+                quote: "quote".into(),
+            },
+            "comment without a prompt block",
+        );
+        assert!(cowork.composer_has_content(cx));
+        cowork.new_thread_draft.remove_items(&[comment]);
+        assert!(!cowork.composer_has_content(cx));
+        let draft = &mut cowork.new_thread_draft;
+        let block = draft.create_prompt(draft.author.as_uuid(), "");
+        draft.add_attachment(
+            block,
+            AttachmentRecord {
+                id: AttachmentId::new(),
+                creator: draft.author.as_uuid(),
+                name: "note.txt".into(),
+                kind: AttachmentKind::Text,
+                size: 0,
+            },
+        );
+        assert!(cowork.composer_has_content(cx));
+    });
+}

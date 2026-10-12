@@ -14,6 +14,7 @@ use gpui_component::{
     attachment::Attachment,
     button::{Button, ButtonVariants as _},
     combobox::Combobox,
+    kbd::Kbd,
     searchable_list::SearchableListItem,
     tooltip::Tooltip,
 };
@@ -21,7 +22,7 @@ use gpui_kit_assets::IconName as AssetIconName;
 use uuid::Uuid;
 
 use crate::{
-    Cowork,
+    Cowork, QueueComposer, StopGeneration, SubmitComposer,
     composer_attachments::{AttachmentCard, PendingAttachment},
     model_picker::{LanguageModel, UNAVAILABLE_MODEL_TOOLTIP},
     participant::ParticipantId,
@@ -58,6 +59,139 @@ pub(crate) struct ComposerBlock {
 }
 
 impl Cowork {
+    /// Check the entire collaborative draft, including comments and attachment
+    /// only blocks; the focused editor is not necessarily the submission.
+    pub(crate) fn composer_has_content(&self, cx: &App) -> bool {
+        self.readable_draft_id(cx)
+            .and_then(|draft_id| {
+                self.read_draft(draft_id, cx, |draft| {
+                    draft.items().iter().any(|item| !item.is_empty())
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn render_composer_action(
+        &self,
+        generating: bool,
+        has_content: bool,
+        resume_pending: bool,
+        disabled_reason: Option<&'static str>,
+        cx: &Context<Self>,
+    ) -> gpui::AnyElement {
+        if generating && !has_content {
+            return div()
+                .id("stop-generation-tooltip")
+                .tooltip(|window, cx| {
+                    Tooltip::new("Stop generating")
+                        .action(&StopGeneration, None)
+                        .build(window, cx)
+                })
+                .child(
+                    Button::new("stop-generation")
+                        .debug_selector(|| "stop-generation".to_owned())
+                        .icon(Icon::new(AssetIconName::Square))
+                        .danger()
+                        .small()
+                        .accessibility_label("Stop generating")
+                        .on_click(cx.listener(Self::composer_button_clicked)),
+                )
+                .into_any_element();
+        }
+        let ready = disabled_reason.is_none();
+        div()
+            .id("send-message-tooltip")
+            .tooltip(move |window, cx| {
+                if let Some(reason) = disabled_reason {
+                    return Tooltip::new(reason).build(window, cx);
+                }
+                Tooltip::element(move |window, cx| {
+                    let mut content = div().py_1().flex().flex_col().gap_2().child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap_6()
+                            .child(if generating {
+                                "Steer"
+                            } else if resume_pending {
+                                "Resume pending messages"
+                            } else {
+                                "Send message"
+                            })
+                            .children(Kbd::binding_for_action(&SubmitComposer, None, window)),
+                    );
+                    if generating {
+                        content = content
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_6()
+                                    .child("Queue")
+                                    .children(Kbd::binding_for_action(
+                                        &QueueComposer,
+                                        None,
+                                        window,
+                                    )),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child("Click to steer · Shift-click to queue"),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_6()
+                                    .child("Stop generating")
+                                    .children(Kbd::binding_for_action(
+                                        &StopGeneration,
+                                        None,
+                                        window,
+                                    )),
+                            );
+                    }
+                    content
+                })
+                .build(window, cx)
+            })
+            .child(
+                Button::new("send-message")
+                    .debug_selector(move || {
+                        if generating {
+                            "steer-message"
+                        } else {
+                            "send-message"
+                        }
+                        .to_owned()
+                    })
+                    .icon(Icon::new(if generating {
+                        AssetIconName::CornerDownLeft
+                    } else {
+                        AssetIconName::SendHorizontal
+                    }))
+                    .small()
+                    .disabled(!ready)
+                    .when(ready, |button| {
+                        button.bg(cx.theme().accent).text_color(cx.theme().primary)
+                    })
+                    .accessibility_label(if generating {
+                        "Steer message; Shift-click to queue"
+                    } else if resume_pending {
+                        "Resume pending messages"
+                    } else {
+                        "Send message"
+                    })
+                    .on_click(cx.listener(Self::composer_button_clicked)),
+            )
+            .into_any_element()
+    }
+
     pub(crate) fn render_composer_comment(
         &self,
         comment: &UserComment,
@@ -274,47 +408,32 @@ impl Cowork {
                             )
                     }),
             );
-        let button = if generating && can_control {
-            Some(
-                Button::new("stop-generation")
-                    .icon(Icon::new(AssetIconName::Square))
-                    .danger()
-                    .small()
-                    .accessibility_label("Stop generating")
-                    .tooltip("Stop generating")
-                    .on_click(cx.listener(Self::composer_button_clicked)),
-            )
-        } else if !generating && can_control {
-            Some(
-                Button::new("send-message")
-                    .icon(Icon::new(AssetIconName::SendHorizontal))
-                    .small()
-                    .accessibility_label(if model_unavailable {
-                        "Send message (the selected model is unavailable)"
-                    } else if !has_model {
-                        "Send message (select a model first)"
-                    } else if loading_attachments {
-                        "Send message (waiting for attachments)"
-                    } else {
-                        "Send message"
-                    })
-                    .tooltip(if model_unavailable {
-                        "The selected model is unavailable"
-                    } else if !has_model {
-                        "Select a model to send"
-                    } else if loading_attachments {
-                        "Waiting for attachments"
-                    } else if cfg!(target_os = "macos") {
-                        "Send message (Cmd-Enter)"
-                    } else {
-                        "Send message (Ctrl-Enter)"
-                    })
-                    .disabled(loading_attachments || !has_model)
-                    .on_click(cx.listener(Self::composer_button_clicked)),
-            )
+        let has_content = self.composer_has_content(cx);
+        let resume_pending = !generating
+            && !has_content
+            && active_thread
+                .as_ref()
+                .is_some_and(|thread| !thread.read(cx).pending_submissions().is_empty());
+        let disabled_reason = if model_unavailable {
+            Some("The selected model is unavailable")
+        } else if !has_model {
+            Some("Select a model to send")
+        } else if loading_attachments {
+            Some("Waiting for attachments")
+        } else if !has_content && !resume_pending {
+            Some("Write a message to send")
         } else {
             None
         };
+        let button = can_control.then(|| {
+            self.render_composer_action(
+                generating,
+                has_content,
+                resume_pending,
+                disabled_reason,
+                cx,
+            )
+        });
 
         div()
             .id("bottom-bar")

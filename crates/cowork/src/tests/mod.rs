@@ -70,6 +70,7 @@ mod file_transfer;
 mod generation_profile;
 mod layout;
 mod model_picker;
+mod pending_submissions;
 mod permissions;
 mod project_folders;
 mod project_mode;

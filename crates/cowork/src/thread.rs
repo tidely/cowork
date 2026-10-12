@@ -128,6 +128,9 @@ impl ThreadOwnership {
 }
 
 pub(crate) struct Thread {
+    pub(crate) pending: Vec<submission::PendingSubmission>,
+    pub(crate) submission_sequence: u64,
+    pub(crate) steered_comments: HashMap<Uuid, Vec<(String, Uuid)>>,
     /// Identifies this local view. Multiple views may mirror the same shared
     /// thread, so this must remain distinct from `summary.id`.
     pub(crate) instance_id: Uuid,
@@ -229,6 +232,12 @@ impl Thread {
             models,
             context_tokens: None,
             streamed_bytes: 0,
+            submission_sequence: timeline
+                .iter()
+                .filter(|item| matches!(item, TimelineMessage::User(_)))
+                .count() as u64,
+            pending: Vec::new(),
+            steered_comments: HashMap::new(),
             timeline,
             draft,
             peer_permissions: PeerPermissions::default(),
@@ -506,6 +515,9 @@ impl Thread {
             models: Arc::default(),
             context_tokens: None,
             streamed_bytes: 0,
+            pending: Vec::new(),
+            submission_sequence: 0,
+            steered_comments: HashMap::new(),
             timeline: Vec::new(),
             draft,
             peer_permissions: PeerPermissions::default(),
@@ -534,6 +546,28 @@ impl Thread {
             .apply_update(&welcome.draft)
             .context("invalid host draft snapshot")?;
         snapshot.validate().context("invalid host draft snapshot")?;
+        let mut pending_ids = std::collections::HashSet::new();
+        for pending in &welcome.thread.pending {
+            anyhow::ensure!(
+                pending.id == pending.group.id && pending_ids.insert(pending.id),
+                "invalid pending submission identity"
+            );
+            anyhow::ensure!(
+                !pending.group.blocks.is_empty() || !pending.group.comments.is_empty(),
+                "empty pending submission"
+            );
+            let bytes: u64 = pending
+                .group
+                .blocks
+                .iter()
+                .flat_map(|block| &block.attachments)
+                .map(|attachment| attachment.size)
+                .fold(0_u64, u64::saturating_add);
+            anyhow::ensure!(
+                bytes <= crate::attachments::MAX_MESSAGE_ATTACHMENT_BYTES,
+                "oversized pending submission"
+            );
+        }
         let transcript = parse_transcript(&welcome.thread.transcript)?;
         let agent_messages = welcome
             .thread
@@ -625,6 +659,23 @@ impl Thread {
             .collect();
         self.project_folders = ProjectFolder::mirrored(std::mem::take(&mut thread.project_folders));
         self.project_mode = thread.project_mode;
+        self.submission_sequence = thread.submission_sequence;
+        self.pending = std::mem::take(&mut thread.pending)
+            .into_iter()
+            .map(submission::PendingSubmission::from_protocol)
+            .collect();
+        self.steered_comments = std::mem::take(&mut thread.steered_comments)
+            .into_iter()
+            .map(|(id, aliases)| {
+                (
+                    Uuid::from_bytes(id),
+                    aliases
+                        .into_iter()
+                        .map(|(alias, id)| (alias, Uuid::from_bytes(id)))
+                        .collect(),
+                )
+            })
+            .collect();
         let (summary, timeline) = thread.into_native(cx);
         self.summary = summary;
         self.set_timeline(timeline);
@@ -650,6 +701,26 @@ impl Thread {
 
     pub(crate) fn to_protocol(&self) -> protocol::ThreadSnapshot {
         protocol::ThreadSnapshot {
+            submission_sequence: self.submission_sequence,
+            pending: self
+                .pending
+                .iter()
+                .map(submission::PendingSubmission::to_protocol)
+                .collect(),
+            steered_comments: self
+                .steered_comments
+                .iter()
+                .map(|(id, comments)| {
+                    (
+                        id.into_bytes(),
+                        comments
+                            .iter()
+                            .map(|(alias, id)| (alias.clone(), id.into_bytes()))
+                            .collect(),
+                    )
+                })
+                .sorted_by_key(|(id, _)| *id)
+                .collect(),
             id: self.summary.id.into_bytes(),
             title: self.summary.title.clone(),
             participants: self
@@ -985,7 +1056,14 @@ impl Thread {
             .into_iter()
             .filter(eligible)
             .map(|record| record.id);
-        timeline.chain(draft).collect()
+        let pending = self
+            .pending
+            .iter()
+            .flat_map(|pending| &pending.group.blocks)
+            .flat_map(|block| &block.attachments)
+            .filter(|record| eligible(record))
+            .map(|record| record.id);
+        timeline.chain(pending).chain(draft).collect()
     }
 
     /// Marks a file as held by the host and tells everyone.
@@ -1124,10 +1202,7 @@ impl Thread {
 
     /// How many submissions this thread has accepted.
     pub(crate) fn submission_count(&self) -> u64 {
-        self.timeline
-            .iter()
-            .filter(|message| matches!(message, TimelineMessage::User(_)))
-            .count() as u64
+        self.submission_sequence
     }
 
     /// Sends a request to the host of a mirrored thread. Returns `false` when
@@ -1141,6 +1216,8 @@ impl Thread {
                 Some(PermissionOperation::EditDraft)
             }
             protocol::CollaboratorMessage::Submit { .. }
+            | protocol::CollaboratorMessage::SubmitPending { .. }
+            | protocol::CollaboratorMessage::CancelPending { .. }
             | protocol::CollaboratorMessage::Stop { .. } => {
                 Some(PermissionOperation::ControlGeneration)
             }
@@ -1422,9 +1499,44 @@ impl Thread {
                 }
             }
             protocol::HostMessage::ThreadTitled(title) => self.summary.title = title,
-            protocol::HostMessage::UserMessage(message) => self
-                .timeline
-                .push(TimelineMessage::User(message.into_native())),
+            protocol::HostMessage::UserMessage(message) => {
+                self.submission_sequence += 1;
+                self.timeline
+                    .push(TimelineMessage::User(message.into_native()));
+            }
+            protocol::HostMessage::PendingSubmissions { sequence, pending } => {
+                self.submission_sequence = sequence;
+                self.pending = pending
+                    .into_iter()
+                    .map(submission::PendingSubmission::from_protocol)
+                    .collect();
+            }
+            protocol::HostMessage::PendingDelivered {
+                id,
+                group,
+                agent_id,
+                aliases,
+            } => {
+                self.pending
+                    .retain(|pending| pending.id != Uuid::from_bytes(id));
+                let group = group.into_native();
+                if let Some(agent_id) = agent_id {
+                    self.steered_comments
+                        .entry(Uuid::from_bytes(agent_id))
+                        .or_default()
+                        .extend(
+                            aliases
+                                .into_iter()
+                                .zip(group.comments.iter().map(|comment| comment.id)),
+                        );
+                }
+                let before_agent = agent_id.and_then(|id| self.timeline.iter().position(|entry| matches!(entry, TimelineMessage::Agent(message) if message.id == Uuid::from_bytes(id))));
+                if let Some(index) = before_agent {
+                    self.timeline.insert(index, TimelineMessage::User(group));
+                } else {
+                    self.timeline.push(TimelineMessage::User(group));
+                }
+            }
             protocol::HostMessage::AgentStarted {
                 id,
                 comment_group_id,

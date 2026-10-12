@@ -36,7 +36,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 25;
+pub(crate) const PROTOCOL_VERSION: u32 = 26;
 
 /// A request from a collaborator to the host.
 ///
@@ -48,7 +48,9 @@ pub(crate) enum CollaboratorMessage {
     /// Always the first frame a collaborator sends. The host replies with
     /// [`HostMessage::Welcome`], or [`HostMessage::Rejected`] when it cannot
     /// serve this collaborator. Must remain the first variant.
-    Join { protocol_version: u32 },
+    Join {
+        protocol_version: u32,
+    },
     /// The collaborator's profile. Always the second frame, which the host
     /// waits for before admitting the collaborator, and sent again whenever
     /// the collaborator changes it.
@@ -58,15 +60,29 @@ pub(crate) enum CollaboratorMessage {
     SelectModel(ModelRef),
     /// Stops the agent run producing message `message_id`, if it is still
     /// running.
-    Stop { message_id: uuid::Bytes },
+    Stop {
+        message_id: uuid::Bytes,
+    },
     /// A Yrs update from this peer's current draft replica. Generation is
     /// assigned by the host; queued bytes from a rejected replica stay fenced
     /// out even if the peer regains Write before they reach the host.
-    DraftUpdate { generation: u64, update: Vec<u8> },
-    /// Submits the draft. `sequence` is the number of user messages the
-    /// collaborator has seen, so a submission that raced another one is
+    DraftUpdate {
+        generation: u64,
+        update: Vec<u8>,
+    },
+    /// Submits the draft. `sequence` is the number of accepted submissions the
+    /// collaborator has seen, including pending drafts, so a submission that raced another one is
     /// ignored instead of submitting whatever was typed in between.
-    Submit { sequence: u64 },
+    Submit {
+        sequence: u64,
+    },
+    SubmitPending {
+        sequence: u64,
+        mode: SubmissionMode,
+    },
+    CancelPending {
+        id: uuid::Bytes,
+    },
     /// Replaces the collaborator's presence.
     Presence(Presence),
     /// The collaborator stopped uploading a file whose record is gone, so
@@ -222,6 +238,16 @@ pub(crate) enum HostMessage {
     ThreadTitled(String),
     /// A user message was appended to the timeline.
     UserMessage(UserMessage),
+    PendingSubmissions {
+        sequence: u64,
+        pending: Vec<PendingSubmission>,
+    },
+    PendingDelivered {
+        id: uuid::Bytes,
+        group: UserMessage,
+        agent_id: Option<uuid::Bytes>,
+        aliases: Vec<String>,
+    },
     /// The agent started responding to `prompt`, which joins the transcript;
     /// an empty message is appended and the thread is marked as generating.
     /// `comment_group_id` identifies the submitted user comments rendered at
@@ -355,8 +381,25 @@ pub(crate) struct Welcome {
     pub(crate) stored_attachments: Vec<uuid::Bytes>,
 }
 
+/// Steering joins the current run; queued submissions begin later runs in FIFO order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum SubmissionMode {
+    Steering,
+    Queue,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct PendingSubmission {
+    pub(crate) id: uuid::Bytes,
+    pub(crate) mode: SubmissionMode,
+    pub(crate) group: UserMessage,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ThreadSnapshot {
+    pub(crate) submission_sequence: u64,
+    pub(crate) pending: Vec<PendingSubmission>,
+    pub(crate) steered_comments: Vec<(uuid::Bytes, Vec<(String, uuid::Bytes)>)>,
     pub(crate) id: uuid::Bytes,
     pub(crate) title: String,
     /// Connected participants in join order, starting with the host.
@@ -817,6 +860,9 @@ mod tests {
     #[test]
     fn snapshot_round_trips_through_postcard() {
         let snapshot = ThreadSnapshot {
+            submission_sequence: 0,
+            pending: Vec::new(),
+            steered_comments: Vec::new(),
             id: [1; 16],
             title: "Shared thread".into(),
             participants: vec![[11; 16], [12; 16]],
@@ -972,6 +1018,15 @@ mod tests {
                 update: vec![7, 8],
             },
             CollaboratorMessage::Submit { sequence: 3 },
+            CollaboratorMessage::SubmitPending {
+                sequence: 4,
+                mode: SubmissionMode::Steering,
+            },
+            CollaboratorMessage::SubmitPending {
+                sequence: 5,
+                mode: SubmissionMode::Queue,
+            },
+            CollaboratorMessage::CancelPending { id: [4; 16] },
             CollaboratorMessage::Presence(sample_presence()),
             CollaboratorMessage::AttachmentData(sample_chunk()),
             CollaboratorMessage::DecideToolCall {
@@ -990,6 +1045,34 @@ mod tests {
             let decoded: CollaboratorMessage =
                 postcard::from_bytes(&encoded).expect("decode protocol message");
             assert_eq!(decoded, message);
+        }
+    }
+
+    #[test]
+    fn pending_messages_round_trip() {
+        let group = UserMessage {
+            id: [9; 16],
+            comments: Vec::new(),
+            blocks: Vec::new(),
+        };
+        let pending = PendingSubmission {
+            id: [9; 16],
+            mode: SubmissionMode::Queue,
+            group: group.clone(),
+        };
+        for message in [
+            HostMessage::PendingSubmissions {
+                sequence: 42,
+                pending: vec![pending],
+            },
+            HostMessage::PendingDelivered {
+                id: [9; 16],
+                group,
+                agent_id: Some([2; 16]),
+                aliases: vec!["comment_4".into()],
+            },
+        ] {
+            assert_eq!(round_trip(&message), message);
         }
     }
 

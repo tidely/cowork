@@ -41,6 +41,7 @@ pub struct CommentResponse {
 
 #[derive(Default)]
 struct TurnCommentsState {
+    added_ids: Vec<CommentId>,
     responses: Vec<CommentResponse>,
     responded_to: HashSet<CommentId>,
 }
@@ -65,9 +66,24 @@ impl TurnComments {
         }
     }
 
-    /// Returns aliases in the same order as the comments supplied by the app.
+    /// Returns the initial aliases in the order supplied by the app.
     pub fn comment_ids(&self) -> &[CommentId] {
         &self.comment_ids
+    }
+
+    /// Allocates aliases for comments delivered by steering in the same
+    /// run. Existing aliases keep their identity, including answered ones.
+    pub fn extend(&self, count: usize) -> Result<Vec<CommentId>, CommentToolError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CommentToolError::StoreUnavailable)?;
+        let start = self.comment_ids.len() + state.added_ids.len();
+        let ids = (start..start + count)
+            .map(CommentId::for_index)
+            .collect::<Vec<_>>();
+        state.added_ids.extend(ids.clone());
+        Ok(ids)
     }
 
     /// Returns a snapshot of responses in tool-call order.
@@ -89,6 +105,7 @@ impl TurnComments {
         Ok(self
             .comment_ids
             .iter()
+            .chain(state.added_ids.iter())
             .filter(|comment_id| !state.responded_to.contains(*comment_id))
             .cloned()
             .collect())
@@ -97,6 +114,14 @@ impl TurnComments {
     /// Whether every comment in this turn has received a response.
     pub fn is_complete(&self) -> Result<bool, CommentToolError> {
         Ok(self.unanswered_comment_ids()?.is_empty())
+    }
+
+    fn has_comments(&self) -> Result<bool, CommentToolError> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| CommentToolError::StoreUnavailable)?;
+        Ok(!self.comment_ids.is_empty() || !state.added_ids.is_empty())
     }
 
     fn record_response(
@@ -108,16 +133,17 @@ impl TurnComments {
             return Err(CommentToolError::EmptyResponse);
         }
 
-        let comment_id = self
-            .comment_ids
-            .iter()
-            .find(|candidate| candidate.as_str() == comment_id)
-            .cloned()
-            .ok_or_else(|| CommentToolError::UnknownComment(comment_id.to_owned()))?;
         let mut state = self
             .state
             .lock()
             .map_err(|_| CommentToolError::StoreUnavailable)?;
+        let comment_id = self
+            .comment_ids
+            .iter()
+            .chain(state.added_ids.iter())
+            .find(|candidate| candidate.as_str() == comment_id)
+            .cloned()
+            .ok_or_else(|| CommentToolError::UnknownComment(comment_id.to_owned()))?;
 
         if !state.responded_to.insert(comment_id.clone()) {
             return Err(CommentToolError::AlreadyResponded(comment_id));
@@ -224,7 +250,7 @@ impl Tool for RespondToComment {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        if self.comments.comment_ids().is_empty() {
+        if !self.comments.has_comments()? {
             return Ok(CommentResponseRecorded {
                 comment_id: args.comment_id,
                 recorded: false,
@@ -308,6 +334,47 @@ mod tests {
                 .map(CommentId::as_str)
                 .collect::<Vec<_>>(),
             ["comment_1", "comment_2", "comment_3"]
+        );
+    }
+
+    #[test]
+    fn steering_adds_aliases_without_reusing_answered_comment_ids() {
+        let comments = TurnComments::new(1);
+        comments
+            .record_response("comment_1", "Original reply".into())
+            .unwrap();
+        assert_eq!(
+            comments.extend(2).unwrap(),
+            vec![CommentId::for_index(1), CommentId::for_index(2)]
+        );
+        assert_eq!(comments.extend(1).unwrap(), vec![CommentId::for_index(3)]);
+        comments
+            .record_response("comment_3", "Steering reply".into())
+            .unwrap();
+        assert_eq!(
+            comments.unanswered_comment_ids().unwrap(),
+            vec![CommentId::for_index(1), CommentId::for_index(3)]
+        );
+        assert_eq!(comments.responses().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn steering_comments_work_when_the_initial_prompt_had_none() {
+        let comments = Arc::new(TurnComments::new(0));
+        let tool = RespondToComment::new(comments.clone());
+        comments.extend(1).unwrap();
+        let args = || RespondToCommentArgs {
+            comment_id: "comment_1".into(),
+            response: "Reply".into(),
+        };
+        assert!(
+            futures::executor::block_on(tool.call(&mut ToolContext::new(), args()))
+                .unwrap()
+                .recorded
+        );
+        assert_eq!(
+            futures::executor::block_on(tool.call(&mut ToolContext::new(), args())).unwrap_err(),
+            CommentToolError::AlreadyResponded(CommentId::for_index(0))
         );
     }
 

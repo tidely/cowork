@@ -4,7 +4,7 @@
 use std::{
     collections::{HashMap, hash_map::Entry},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant, SystemTime},
@@ -102,6 +102,36 @@ pub(crate) struct ActiveGeneration {
     /// How to answer each call the run is waiting on a decision for.
     /// Dropping one, as when the run ends, denies its call.
     approvals: HashMap<CallId, PendingApproval>,
+    pub(super) steering: Arc<Mutex<Option<SteeringPayload>>>,
+    pub(super) turn_comments: Arc<tools::TurnComments>,
+}
+
+pub(super) struct SteeringPayload {
+    pub(super) group: crate::timeline::UserMessageGroup,
+    pub(super) aliases: Vec<tools::CommentId>,
+    pub(super) prompt: rig::completion::Message,
+}
+
+struct GenerationSteering {
+    pending: Arc<Mutex<Option<SteeringPayload>>>,
+    updates: mpsc::UnboundedSender<RunUpdate>,
+}
+impl agent::SteeringHook for GenerationSteering {
+    fn has_pending(&self) -> bool {
+        self.pending.lock().unwrap().is_some()
+    }
+    fn take_pending(&self) -> Option<rig::completion::Message> {
+        let payload = self.pending.lock().unwrap().take()?;
+        _ = self.updates.send(RunUpdate::SteeringConsumed {
+            group: payload.group,
+            aliases: payload
+                .aliases
+                .iter()
+                .map(|alias| alias.as_str().to_owned())
+                .collect(),
+        });
+        Some(payload.prompt)
+    }
 }
 
 struct PendingApproval {
@@ -143,6 +173,30 @@ impl ActiveGeneration {
 
 #[cfg(test)]
 impl ActiveGeneration {
+    pub(crate) fn take_steering_for_test(
+        &self,
+    ) -> (
+        crate::timeline::UserMessageGroup,
+        Vec<String>,
+        rig::completion::Message,
+    ) {
+        let payload = self
+            .steering
+            .lock()
+            .unwrap()
+            .take()
+            .expect("pending steering");
+        (
+            payload.group,
+            payload
+                .aliases
+                .iter()
+                .map(|alias| alias.as_str().to_owned())
+                .collect(),
+            payload.prompt,
+        )
+    }
+
     pub(crate) fn for_test(
         message_id: Uuid,
         abort_handle: tokio::task::AbortHandle,
@@ -154,6 +208,8 @@ impl ActiveGeneration {
             cancelled,
             gate: None,
             approvals: HashMap::new(),
+            steering: Arc::new(Mutex::new(None)),
+            turn_comments: Arc::new(tools::TurnComments::new(0)),
         }
     }
 }
@@ -207,7 +263,45 @@ impl Cowork {
             );
         });
         let (sender, mut receiver) = mpsc::unbounded_channel();
-        let tools = tool_set(&self.sandboxes, &thread_id.to_string(), turn_comments);
+        let tools = tool_set(
+            &self.sandboxes,
+            &thread_id.to_string(),
+            turn_comments.clone(),
+        );
+        let resumed_steering = {
+            let state = thread.read(cx);
+            state
+                .pending
+                .iter()
+                .find(|pending| pending.mode == protocol::SubmissionMode::Steering)
+                .map(|pending| {
+                    let aliases = turn_comments
+                        .extend(pending.group.comments.len())
+                        .expect("comment state is available");
+                    let preface = Cowork::comments_preface(
+                        &pending.group.comments,
+                        &aliases,
+                        &state.timeline,
+                        &state.prompt_names,
+                    );
+                    let prompt = prompt::agent_message(
+                        preface.as_deref(),
+                        &pending.group.blocks,
+                        &state.draft().files,
+                        &state.prompt_names,
+                    );
+                    SteeringPayload {
+                        group: pending.group.clone(),
+                        aliases,
+                        prompt,
+                    }
+                })
+        };
+        let pending_steering = Arc::new(Mutex::new(resumed_steering));
+        let steering = Arc::new(GenerationSteering {
+            pending: pending_steering.clone(),
+            updates: sender.clone(),
+        });
         let gate = ApprovalGate::new(
             sender.clone(),
             self.sandboxes.clone(),
@@ -226,6 +320,7 @@ impl Cowork {
             };
             StreamingAgent::new(model.erase(), tools)
                 .tool_hook(gate)
+                .steering_hook(steering)
                 .preamble(system_prompt())
                 .additional_params(json!({
                     "num_ctx": max_tokens,
@@ -245,6 +340,8 @@ impl Cowork {
                 cancelled: cancelled.clone(),
                 gate: Some(active_gate),
                 approvals: HashMap::new(),
+                steering: pending_steering,
+                turn_comments,
             },
         );
 
@@ -254,6 +351,20 @@ impl Cowork {
             while let Some(update) = receiver.recv().await {
                 let event = match update {
                     RunUpdate::Event(event) => event,
+                    RunUpdate::SteeringConsumed { group, aliases } => {
+                        thread.update(cx, |thread, cx| {
+                            thread.emit(
+                                protocol::HostMessage::PendingDelivered {
+                                    id: group.id.into_bytes(),
+                                    group: group.to_protocol(),
+                                    agent_id: Some(message_id.into_bytes()),
+                                    aliases,
+                                },
+                                cx,
+                            )
+                        });
+                        continue;
+                    }
                     RunUpdate::Approval { call, tool, decide } => {
                         if this
                             .update(cx, |this, cx| {
@@ -355,6 +466,14 @@ impl Cowork {
             usage,
         } = totals;
         let thread_id = thread.read(cx).instance_id;
+        if self
+            .active_generations
+            .get(&thread_id)
+            .is_some_and(|active| active.message_id != message_id)
+            || thread.read(cx).running_agent_message_id() != Some(message_id)
+        {
+            return;
+        }
         thread.update(cx, |thread, cx| {
             thread.emit(
                 protocol::HostMessage::AgentEnded {
@@ -378,6 +497,9 @@ impl Cowork {
         }
         self.save_statistics(cx);
         self.thread_updated(thread_id, cx);
+        if matches!(outcome, protocol::RunOutcome::Completed) {
+            self.start_next_pending(thread, cx);
+        }
         self.scheduled_generation_ended(thread_id, message_id, &outcome, cx);
     }
 
@@ -549,6 +671,8 @@ mod tests {
             cancelled: Arc::new(AtomicBool::new(false)),
             gate: Some(Arc::downgrade(&gate)),
             approvals: HashMap::new(),
+            steering: Arc::new(Mutex::new(None)),
+            turn_comments: Arc::new(tools::TurnComments::new(0)),
         };
         assert!(generation.granted().is_some());
         drop(gate);

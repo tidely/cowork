@@ -452,6 +452,10 @@ impl Cowork {
         request: protocol::CollaboratorMessage,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
+        let submission_mode = match &request {
+            protocol::CollaboratorMessage::SubmitPending { mode, .. } => *mode,
+            _ => protocol::SubmissionMode::Steering,
+        };
         match request {
             // Only valid as the first message, which `serve_peer` consumes.
             protocol::CollaboratorMessage::Join { .. } => {}
@@ -477,7 +481,9 @@ impl Cowork {
                     .with_context(|| format!("Invalid draft update from {participant:?}."))?;
                 cx.notify();
             }
-            protocol::CollaboratorMessage::Submit { sequence } => {
+            protocol::CollaboratorMessage::Submit { sequence }
+            | protocol::CollaboratorMessage::SubmitPending { sequence, .. } => {
+                let mode = submission_mode;
                 thread.update(cx, |thread, _| {
                     thread.with_authorized::<ControlGeneration, _>(participant, |_| ())
                 })?;
@@ -485,19 +491,32 @@ impl Cowork {
                     let thread = thread.read(cx);
                     (
                         thread.draft().id,
-                        thread.runnable_model().is_none()
-                            || thread.generating
-                            || thread.submission_count() != sequence,
+                        thread.runnable_model().is_none() || thread.submission_count() != sequence,
                     )
                 };
                 // A stale sequence means another submission won the race;
                 // everyone sees that one.
                 // TODO: tell the submitter why a submission was not accepted.
                 if !stale && !self.draft_is_loading_attachments(draft_id, cx) {
-                    self.accept_submission(draft_id, Some(thread.clone()), participant, false, cx);
+                    self.accept_submission_mode(
+                        draft_id,
+                        Some(thread.clone()),
+                        crate::thread::submission::SubmissionRequest {
+                            actor: participant,
+                            submitted_locally: false,
+                            mode,
+                        },
+                        cx,
+                    );
                     let thread_id = thread.read(cx).instance_id;
                     self.thread_updated(thread_id, cx);
                 }
+            }
+            protocol::CollaboratorMessage::CancelPending { id } => {
+                thread.update(cx, |thread, _| {
+                    thread.with_authorized::<ControlGeneration, _>(participant, |_| ())
+                })?;
+                self.cancel_pending_for(thread, participant, Uuid::from_bytes(id), cx);
             }
             protocol::CollaboratorMessage::AttachmentCancelled(id) => {
                 let id = AttachmentId::from_uuid(Uuid::from_bytes(id));

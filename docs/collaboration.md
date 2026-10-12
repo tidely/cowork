@@ -12,7 +12,9 @@ from the host's catalog (grouped by provider), shared stopping,
 Yrs drafts with prompt blocks, comments as items, per-block attachments,
 navigation, and empty-item removal, the draft
 synced through the host with host-coordinated submission, presence, and
-attachment transfer. Peer permissions are also implemented: `ReadOnly`, `Write`,
+attachment transfer. Multiple queued submissions and a cancellable steering batch are host-owned,
+mirrored in snapshots and delivered at safe agent boundaries; queued runs continue
+one at a time after normal completion. Peer permissions are also implemented: `ReadOnly`, `Write`,
 and `Admin`, defaulting to `Write`.
 The right-aligned titlebar gateway opens a nonmodal sharing popover with sharing
 and link actions; the host also manages live defaults before sharing and per-connection
@@ -40,7 +42,7 @@ the agent learns their paths from an environment note in its prompt; see
 
 Not yet implemented:
 
-- explaining non-permission submission refusals to collaborators (generating,
+- explaining non-permission submission refusals to collaborators (
   empty draft, unavailable model, attachments loading, size limit); these
   requests are still dropped silently;
 - showing names when hovering a remote caret or an avatar (names show only
@@ -113,8 +115,9 @@ Implementation notes on attachment transfer:
 - **Editor**: a participant whose focus is currently inside an item.
 - **Draft position**: the empty spot below the last prompt block. Typing
   there creates a new prompt block.
-- **Submission**: an ordered snapshot of the draft's non-empty items, published
-  as one immutable user message and sent to the agent as one request.
+- **Submission**: an ordered immutable snapshot of the draft's non-empty items.
+  It is delivered immediately, queued for a later run, or merged into the
+  steering batch for the ongoing run.
 
 ## Participants and identity
 
@@ -403,14 +406,14 @@ local viewer's mode.
 
 Send is available only to the host and `Admin` peers, and requires:
 
-- the agent is not generating;
-- the draft contains at least one non-empty item;
+- the draft contains at least one non-empty item, or the idle thread has
+  accepted pending messages to resume;
 - no participant has a pending attachment read; and
 - the host has stored every attachment in non-empty blocks.
 
 The host accepts a submission as follows:
 
-1. The submitter sends `Submit` with the submission sequence it has seen. It
+1. The submitter sends `SubmitPending` with its delivery mode and the submission sequence it has seen. It
    sends all its pending draft updates first, on the same ordered stream, so
    its own accepted edits are included. The host checks `ControlGeneration`
    before considering the submission.
@@ -422,16 +425,53 @@ The host accepts a submission as follows:
 4. In one transaction, the host removes exactly the snapshotted items from
    the draft. Empty items stay, for example a comment someone has not started
    typing yet.
-5. The host broadcasts that draft update and the published user message with
-   the next sequence number, then starts the agent run.
+5. The host broadcasts that draft update and advances the explicit submission
+   sequence. While idle it publishes the user message and starts the agent.
+   While generating it accepts a pending submission without adding it to the
+   transcript yet. Steering is the default; Shift-Ctrl-Enter (Shift-Cmd-Enter
+   on macOS), or Shift-click on the send control, queues instead.
 6. Edits that arrive for removed items are discarded. Participants whose
    focused item was submitted move to the draft position.
 
 A permission rejection is reported only to the submitter as
 `PermissionDenied`. Feedback uses the originating local `thread_id` and its
 draft, not the currently active thread, including after switching threads.
-Other refusals (generating, empty, unavailable model, attachments not stored,
+Other refusals (empty, unavailable model, attachments not stored,
 size limit) still lack collaborator feedback, as noted in Status.
+
+**Pending delivery**: each accepted draft is immutable and receives an ID.
+Queued drafts remain separate and start one run each in FIFO order, using the
+selected model and project settings when each run starts. Accepted user queues
+take precedence over the scheduler trying to reuse that thread. Steering
+submissions merge into one pending batch and are consumed together after the
+current finalized model part and its tool calls finish. A tool's result always
+precedes the injected user prompt. Partial provider fragments never enter the
+transcript. The agent emits `Steered` with the injected Rig user prompt so the
+host and collaborators fold exactly the same history.
+
+Cancellation requires current `ControlGeneration` permission. The batch ID
+fences cancellation: once consumed, an old cancel cannot remove newer steering.
+The whole steering batch is cancelled together; each queued draft is cancelled
+individually. Consumption and cancellation synchronize with the run's hook.
+`PendingDelivered` removes the accepted batch and publishes its user group.
+For steering the group appears immediately before the ongoing agent response;
+the transcript preserves the actual injection order. Pending comments get unique
+run-local aliases, mirrored with their original comment UUIDs, so tool replies
+keep targeting the right comment. Pending attachment bytes stay stored and are
+included in late-join transfers. The 32 MB message attachment limit also applies
+to the combined steering batch.
+
+Normally completed runs automatically start one pending run. Stopping or failure
+keeps pending submissions visible and cancellable; clicking idle Send with an
+empty draft resumes the pending messages, without creating a new submission.
+Sending a new draft resumes the agent and any pending steering. Archived threads do not start queued
+runs. Queues are session state, like threads, and are not saved across app restarts.
+
+The composer shows the red Stop control while generating with an empty draft.
+With any non-empty block, comment, or attachment it shows the blue steering
+control. Idle Send uses the same blue enabled accent. Pending blocks have muted
+centered Steering or Queued labels in dashed dividers, cancellation at the right,
+and a solid Draft divider before the editable draft.
 
 **Published user message**: one timeline entry, rendered like today:
 
@@ -784,7 +824,7 @@ can still be reported. Runtime permission denials use the separate
 | `Presence`            | Replaces this participant's presence; host sanitizes readers to empty                                  |
 | `AttachmentData`      | Upload chunks; requires draft-write access or an already accepted record                               |
 | `AttachmentCancelled` | Cancels this peer's upload, including after revocation                                                 |
-| `Submit`              | Requests a submission at the given sequence; requires `Admin`                                          |
+| `Submit` / `SubmitPending` | Requests a submission at the given sequence, with one-shot steering or queue mode; requires `Admin`                                          |
 | `Stop`                | Stops the named agent run; same permission as `Submit`                                                 |
 | `SelectModel`         | Selects a model by provider and model ID; requires `Admin`                                             |
 | `DecideToolCall`      | Allows or denies the named run's waiting tool call; requires `Admin`; ignored once decided             |
@@ -793,7 +833,7 @@ can still be reported. Runtime permission denials use the separate
 
 | Message                                      | Purpose                                                                                                                                                                                                                                                                                                    |
 | -------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `Welcome`                                    | Participant UUID, timeline and transcript snapshot (models, run state, prompt names, project folder names and mode), draft and receiving peer's `draft_generation`, participants, profiles, presence, stored attachment IDs, and peer permissions; submission count comes from the timeline; peer-specific |
+| `Welcome`                                    | Participant UUID, timeline and transcript snapshot (models, run state, prompt names, project folder names and mode), draft and receiving peer's `draft_generation`, participants, profiles, presence, stored attachment IDs, and peer permissions; explicit submission sequence and pending groups are included; peer-specific |
 | `Rejected`                                   | Join refused (e.g. protocol version); stable handshake encoding, then disconnect; peer-specific                                                                                                                                                                                                            |
 | `PermissionDenied`                           | Runtime denial with participant UUID, operation, and reason (`NotParticipant`, `InsufficientMode`, `HostOnly`, or `StaleDraftGeneration`); peer-specific, connection stays open                                                                                                                            |
 | `DraftReset`                                 | `{ generation, state }`: peer-specific authoritative draft; matching epoch merges, newer epoch replaces, older epoch is ignored                                                                                                                                                                            |
@@ -809,7 +849,9 @@ can still be reported. Runtime permission denials use the separate
 | `ModelCatalogChanged`                        | Replaces the thread's model catalog (including with an empty one)                                                                                                                                                                                                                                          |
 | `ProjectFoldersChanged`                      | Replaces the names of the project's folders, in order; paths are never sent                                                                                                                                                                                                                                |
 | `ProjectModeChanged`                         | The project's mode is now `Read`, `Write`, or `Write + Network`                                                                                                                                                                                                                                            |
-| `UserMessage`                                | An accepted submission with creators and attachment references instead of bytes; advances the submission count                                                                                                                                                                                             |
+| `PendingSubmissions` | Full accepted pending groups and current submission sequence; IDs fence cancellation |
+| `PendingDelivered` | Removes a pending ID, publishes its user group, and maps steering comment aliases to the ongoing agent run |
+| `UserMessage`                                | A delivered immediate submission with creators and attachment references instead of bytes; advances the submission sequence                                                                                                                                                                                             |
 | `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and whether it completed, was stopped, or failed (with a message)                                                                                                                                                                |
 | `AgentEvent`                                 | What the host's agent loop reported during a run, which everyone folds into the agent message and transcript                                                                                                                                                                                               |
 | `PromptNamed`                                | A participant's prompt name, fixed on their first submitted item                                                                                                                                                                                                                                           |
@@ -941,10 +983,6 @@ document needs no schema version or compatibility with older clients.
 
 These fit the design without changing the document layout:
 
-- **Queued messages**: accepting a submission (snapshot and remove) is
-  already separate from starting a run. Queueing means accepting while
-  generating, showing the accepted message as pending, and running it after
-  the current run.
 - **Authentication**: the host maps authenticated identities to participant
   UUIDs and enforces `creator`.
 - **Contributor history**: the host can derive which items each participant's

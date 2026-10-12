@@ -17,7 +17,7 @@ use tools::TurnComments;
 use uuid::Uuid;
 
 use crate::{
-    Cowork, SubmitComposer,
+    Cowork, QueueComposer, SubmitComposer,
     attachments::{MAX_MESSAGE_ATTACHMENT_BYTES, format_bytes},
     composer_attachments::AttachmentError,
     models::ModelRef,
@@ -32,6 +32,70 @@ use crate::{
         UserMessageGroup,
     },
 };
+
+pub(crate) use crate::protocol::SubmissionMode;
+
+/// The requester's authority and one-shot delivery choice are checked together.
+pub(crate) struct SubmissionRequest {
+    pub(crate) actor: ParticipantId,
+    pub(crate) submitted_locally: bool,
+    pub(crate) mode: SubmissionMode,
+}
+
+#[derive(Clone)]
+pub(crate) struct PendingSubmission {
+    pub(crate) id: Uuid,
+    pub(crate) mode: SubmissionMode,
+    pub(crate) group: UserMessageGroup,
+}
+
+impl PendingSubmission {
+    pub(crate) fn to_protocol(&self) -> protocol::PendingSubmission {
+        protocol::PendingSubmission {
+            id: self.id.into_bytes(),
+            mode: self.mode,
+            group: self.group.to_protocol(),
+        }
+    }
+    pub(crate) fn from_protocol(pending: protocol::PendingSubmission) -> Self {
+        Self {
+            id: Uuid::from_bytes(pending.id),
+            mode: pending.mode,
+            group: pending.group.into_native(),
+        }
+    }
+}
+
+impl Thread {
+    pub(crate) fn pending_submissions(&self) -> &[PendingSubmission] {
+        &self.pending
+    }
+    pub(crate) fn toggle_pending_comments(&mut self, id: Uuid) -> bool {
+        if let Some(pending) = self
+            .pending
+            .iter_mut()
+            .find(|pending| pending.group.id == id)
+        {
+            pending.group.comments_folded = !pending.group.comments_folded;
+            true
+        } else {
+            false
+        }
+    }
+    pub(crate) fn publish_pending(&mut self, cx: &mut impl gpui::AppContext) {
+        self.emit(
+            protocol::HostMessage::PendingSubmissions {
+                sequence: self.submission_sequence,
+                pending: self
+                    .pending
+                    .iter()
+                    .map(PendingSubmission::to_protocol)
+                    .collect(),
+            },
+            cx,
+        );
+    }
+}
 
 /// The owned run payload of an accepted submission, consumed synchronously
 /// before spawning any work. This is not a reusable authorization token.
@@ -49,7 +113,7 @@ struct GenerationPlan {
 impl Cowork {
     pub(crate) fn composer_button_clicked(
         &mut self,
-        _: &gpui::ClickEvent,
+        event: &gpui::ClickEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -57,8 +121,18 @@ impl Cowork {
             .active_thread_id
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
             .is_some_and(|thread| thread.read(cx).generating);
-        if generating {
+        let empty = self.active_thread(cx).is_none_or(|thread| {
+            thread
+                .read(cx)
+                .draft()
+                .items()
+                .iter()
+                .all(DraftItem::is_empty)
+        });
+        if generating && empty {
             self.stop_generation(cx);
+        } else if event.modifiers().shift {
+            self.queue_composer(window, cx);
         } else {
             self.submit_composer(window, cx);
         }
@@ -73,7 +147,26 @@ impl Cowork {
         self.submit_composer(window, cx);
     }
 
+    pub(crate) fn queue_composer_action(
+        &mut self,
+        _: &QueueComposer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.queue_composer(window, cx);
+    }
+    pub(crate) fn queue_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_composer_mode(SubmissionMode::Queue, window, cx);
+    }
     pub(crate) fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_composer_mode(SubmissionMode::Steering, window, cx);
+    }
+    fn submit_composer_mode(
+        &mut self,
+        mode: SubmissionMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let active_thread = self.active_thread(cx);
         if active_thread
             .as_ref()
@@ -82,12 +175,6 @@ impl Cowork {
             return;
         }
         if !self.active_model_is_runnable(cx) {
-            return;
-        }
-        if active_thread
-            .as_ref()
-            .is_some_and(|thread| thread.read(cx).generating)
-        {
             return;
         }
         let Some(draft_id) = self.writable_draft_id(cx) else {
@@ -104,12 +191,14 @@ impl Cowork {
             .filter(|thread| matches!(thread.read(cx).sharing, ThreadSharing::Connected { .. }))
         {
             let requested = thread.update(cx, |thread, _| {
-                if thread.draft().items().iter().all(DraftItem::is_empty) {
+                if thread.draft().items().iter().all(DraftItem::is_empty)
+                    && (thread.generating || thread.pending.is_empty())
+                {
                     return false;
                 }
                 thread
                     .with_authorized::<ControlGeneration, _>(thread.participant_id(), |auth| {
-                        auth.request_submit()
+                        auth.request_submit_mode(mode)
                     })
                     .unwrap_or(false)
             });
@@ -125,7 +214,16 @@ impl Cowork {
             .map_or(self.local_participant_id, |thread| {
                 thread.read(cx).participant_id()
             });
-        if self.accept_submission(draft_id, active_thread, actor, true, cx) {
+        if self.accept_submission_mode(
+            draft_id,
+            active_thread,
+            SubmissionRequest {
+                actor,
+                submitted_locally: true,
+                mode,
+            },
+            cx,
+        ) {
             self.selection_message_id = None;
             self.follow_generation = true;
             self.timeline_scroll_handle.scroll_to_bottom();
@@ -141,6 +239,7 @@ impl Cowork {
     /// items as one user message and starts the agent on it. Without a
     /// thread, the draft starts a new one. Returns whether anything was
     /// submitted. Rejections are shown when the local user submitted.
+    #[cfg(test)]
     pub(crate) fn accept_submission(
         &mut self,
         draft_id: Uuid,
@@ -149,11 +248,35 @@ impl Cowork {
         submitted_locally: bool,
         cx: &mut Context<Self>,
     ) -> bool {
+        self.accept_submission_mode(
+            draft_id,
+            active_thread,
+            SubmissionRequest {
+                actor,
+                submitted_locally,
+                mode: SubmissionMode::Steering,
+            },
+            cx,
+        )
+    }
+
+    pub(crate) fn accept_submission_mode(
+        &mut self,
+        draft_id: Uuid,
+        active_thread: Option<Entity<Thread>>,
+        request: SubmissionRequest,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let SubmissionRequest {
+            actor,
+            submitted_locally,
+            mode,
+        } = request;
         // An actor is the requester, not the host's local viewer. In particular,
         // Write may edit the draft but cannot consume it on someone else's behalf.
         if active_thread.as_ref().is_some_and(|thread| {
             let thread = thread.read(cx);
-            !thread.is_host() || thread.draft().id != draft_id || thread.generating
+            !thread.is_host() || thread.draft().id != draft_id
         }) || (active_thread.is_none()
             && (actor != self.local_participant_id || draft_id != self.new_thread_draft.id))
         {
@@ -174,7 +297,26 @@ impl Cowork {
                     .sum::<u64>()
             })
             .unwrap_or(0);
-        if attached > MAX_MESSAGE_ATTACHMENT_BYTES {
+        let pending_bytes = if mode == SubmissionMode::Steering {
+            active_thread
+                .as_ref()
+                .and_then(|thread| self.active_generations.get(&thread.read(cx).instance_id))
+                .and_then(|generation| {
+                    generation.steering.lock().unwrap().as_ref().map(|payload| {
+                        payload
+                            .group
+                            .blocks
+                            .iter()
+                            .flat_map(|block| &block.attachments)
+                            .map(|record| record.size)
+                            .sum::<u64>()
+                    })
+                })
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        if attached.saturating_add(pending_bytes) > MAX_MESSAGE_ATTACHMENT_BYTES {
             // TODO: tell a collaborator who submitted, too.
             if !submitted_locally {
                 return false;
@@ -192,19 +334,29 @@ impl Cowork {
             return false;
         }
         let submission = if let Some(thread) = &active_thread {
-            thread.update(cx, |thread, _| {
+            match thread.update(cx, |thread, _| {
                 thread
                     .with_authorized::<ControlGeneration, _>(actor, |auth| {
                         auth.take_submission(Self::take_submission)
                     })
                     .and_then(|result| result)
-                    .ok()
-                    .flatten()
-            })
+            }) {
+                Ok(submission) => submission,
+                Err(_) => return false,
+            }
         } else {
             Self::take_submission(&mut self.new_thread_draft)
         };
         let Some((comments, blocks, comments_folded)) = submission else {
+            if let Some(thread) = active_thread
+                .as_ref()
+                .filter(|thread| !thread.read(cx).generating && !thread.read(cx).pending.is_empty())
+            {
+                // Taking the (empty) draft above checked current permission;
+                // resume consumes an accepted submission, never a new sequence.
+                self.start_next_pending(thread, cx);
+                return thread.read(cx).generating;
+            }
             return false;
         };
         self.attachment_errors
@@ -237,6 +389,19 @@ impl Cowork {
                 .entry(author)
                 .or_insert_with(|| participant_name(author, profiles.get(&author)));
         }
+        if let Some(thread) = active_thread
+            .as_ref()
+            .filter(|thread| thread.read(cx).generating)
+        {
+            let group = UserMessageGroup {
+                id: Uuid::new_v4(),
+                comments,
+                blocks,
+                comments_folded,
+            };
+            self.defer_submission(thread, mode, group, prompt_names, cx);
+            return true;
+        }
         let turn_comments = Arc::new(TurnComments::new(comments.len()));
         let preface = Self::comments_preface(
             &comments,
@@ -261,6 +426,7 @@ impl Cowork {
                 if let Some(title) = Self::title_for_first_message(&thread.timeline, &title) {
                     thread.emit(protocol::HostMessage::ThreadTitled(title), cx);
                 }
+                thread.submission_sequence += 1;
                 thread.publish(protocol::HostMessage::UserMessage(
                     submitted_group.to_protocol(),
                 ));
@@ -307,6 +473,186 @@ impl Cowork {
             cx,
         );
         true
+    }
+
+    fn defer_submission(
+        &mut self,
+        thread: &Entity<Thread>,
+        mode: SubmissionMode,
+        mut group: UserMessageGroup,
+        names: HashMap<ParticipantId, SharedString>,
+        cx: &mut Context<Self>,
+    ) {
+        let thread_id = thread.read(cx).instance_id;
+        if mode == SubmissionMode::Steering {
+            let generation = self
+                .active_generations
+                .get_mut(&thread_id)
+                .expect("a generating host has a run");
+            let mut slot = generation.steering.lock().unwrap();
+            let aliases = generation
+                .turn_comments
+                .extend(group.comments.len())
+                .expect("comment state is available");
+            if let Some(payload) = slot.as_mut() {
+                payload.group.comments.extend(group.comments);
+                payload.group.blocks.extend(group.blocks);
+                payload.aliases.extend(aliases);
+                group = payload.group.clone();
+            } else {
+                *slot = Some(generation::SteeringPayload {
+                    group: group.clone(),
+                    aliases,
+                    prompt: RigMessage::user(""),
+                });
+            }
+            let state = thread.read(cx);
+            let payload = slot.as_mut().unwrap();
+            let preface =
+                Self::comments_preface(&group.comments, &payload.aliases, &state.timeline, &names);
+            payload.prompt = agent_message(
+                preface.as_deref(),
+                &group.blocks,
+                &state.draft().files,
+                &names,
+            );
+        }
+        thread.update(cx, |thread, cx| {
+            if let Some(pending) = thread
+                .pending
+                .iter_mut()
+                .find(|pending| pending.id == group.id)
+            {
+                pending.group = group;
+            } else {
+                thread.pending.push(PendingSubmission {
+                    id: group.id,
+                    mode,
+                    group,
+                });
+            }
+            thread.submission_sequence += 1;
+            thread.name_in_prompts(names, cx);
+            thread.publish_pending(cx);
+        });
+        self.thread_updated(thread_id, cx);
+    }
+
+    pub(crate) fn cancel_pending_submission(
+        &mut self,
+        thread_id: Uuid,
+        id: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+            return;
+        };
+        let actor = thread.read(cx).participant_id();
+        if !thread.read(cx).is_host() {
+            _ = thread.update(cx, |thread, _| {
+                thread.with_authorized::<ControlGeneration, _>(actor, |auth| {
+                    auth.request_cancel_pending(id)
+                })
+            });
+        } else {
+            self.cancel_pending_for(&thread, actor, id, cx);
+        }
+    }
+
+    pub(crate) fn cancel_pending_for(
+        &mut self,
+        thread: &Entity<Thread>,
+        actor: ParticipantId,
+        id: Uuid,
+        cx: &mut Context<Self>,
+    ) {
+        let thread_id = thread.read(cx).instance_id;
+        let allowed = thread
+            .update(cx, |thread, _| {
+                thread.with_authorized::<ControlGeneration, _>(actor, |_| ())
+            })
+            .is_ok();
+        if !allowed || !thread.read(cx).is_host() {
+            return;
+        }
+        if let Some(generation) = self.active_generations.get(&thread_id) {
+            let mut slot = generation.steering.lock().unwrap();
+            if thread
+                .read(cx)
+                .pending
+                .iter()
+                .any(|pending| pending.id == id && pending.mode == SubmissionMode::Steering)
+            {
+                if !slot.as_ref().is_some_and(|payload| payload.group.id == id) {
+                    return;
+                }
+                *slot = None;
+            }
+        }
+        thread.update(cx, |thread, cx| {
+            thread.pending.retain(|pending| pending.id != id);
+            thread.publish_pending(cx);
+        });
+        self.thread_updated(thread_id, cx);
+    }
+
+    /// Only normally completed runs continue the FIFO. Stopping or failure
+    /// leaves accepted drafts visible and cancellable until the user resumes.
+    pub(super) fn start_next_pending(&mut self, thread: &Entity<Thread>, cx: &mut Context<Self>) {
+        let state = thread.read(cx);
+        if state.generating
+            || state.runnable_model().is_none()
+            || self
+                .thread_store
+                .read(cx)
+                .thread(state.instance_id, cx)
+                .is_none()
+        {
+            return;
+        }
+        let Some(pending) = state
+            .pending
+            .iter()
+            .find(|pending| pending.mode == SubmissionMode::Steering)
+            .or_else(|| state.pending.first())
+            .cloned()
+        else {
+            return;
+        };
+        let group = pending.group;
+        let turn_comments = Arc::new(TurnComments::new(group.comments.len()));
+        let preface = Self::comments_preface(
+            &group.comments,
+            turn_comments.comment_ids(),
+            &state.timeline,
+            &state.prompt_names,
+        );
+        let prompt = agent_message(
+            preface.as_deref(),
+            &group.blocks,
+            &state.draft().files,
+            &state.prompt_names,
+        );
+        let plan = GenerationPlan {
+            thread_id: state.instance_id,
+            prompt,
+            history: state.transcript.clone(),
+            comment_group_id: (!group.comments.is_empty()).then_some(group.id),
+            turn_comments,
+            scheduled: false,
+        };
+        thread.update(cx, |thread, cx| {
+            thread.emit(
+                protocol::HostMessage::PendingDelivered {
+                    id: pending.id.into_bytes(),
+                    group: group.to_protocol(),
+                    agent_id: None,
+                    aliases: Vec::new(),
+                },
+                cx,
+            )
+        });
+        self.start_generation(plan, cx);
     }
 
     /// Submits a scheduled task's prompt to one of the user's own threads as
@@ -365,6 +711,7 @@ impl Cowork {
                     cx,
                 );
             }
+            thread.submission_sequence += 1;
             thread.publish(protocol::HostMessage::UserMessage(group.to_protocol()));
             thread.timeline.push(TimelineMessage::User(group));
             thread.name_in_prompts(prompt_names, cx);
