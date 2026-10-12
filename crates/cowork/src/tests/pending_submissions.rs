@@ -274,10 +274,20 @@ fn consumed_steering_cannot_be_cancelled_and_mirrors_keep_the_prompt_out_of_outp
         });
         assert!(thread.read(cx).pending_submissions().is_empty());
         let state = thread.read(cx);
-        assert!(matches!(state.timeline[0], TimelineMessage::User(_)));
-        let TimelineMessage::Agent(agent) = &state.timeline[1] else {
-            panic!("reply follows steered input");
+        // Steering joins the timeline when it was delivered, after the
+        // message it steers, which shows it where it joined the run.
+        let TimelineMessage::Agent(agent) = &state.timeline[0] else {
+            panic!("the steered reply comes first");
         };
+        let TimelineMessage::User(steering) = &state.timeline[1] else {
+            panic!("steering follows the message it was delivered into");
+        };
+        assert_eq!(steering.id, id);
+        assert_eq!(agent.steering, vec![id]);
+        assert!(matches!(
+            &agent.output.steps[..],
+            [AgentStep::Steering, AgentStep::Text(text)] if text == "updated answer"
+        ));
         assert_eq!(agent.output.text, "updated answer");
         assert_eq!(state.transcript.len(), 3);
     });
@@ -294,6 +304,14 @@ fn consumed_steering_cannot_be_cancelled_and_mirrors_keep_the_prompt_out_of_outp
         thread.read_with(session.cx, |thread, _| thread.conversation()),
         mirror.read_with(session.cx, |thread, _| thread.conversation())
     );
+    mirror.read_with(session.cx, |thread, _| {
+        let TimelineMessage::Agent(agent) = &thread.timeline[0] else {
+            panic!("the mirror orders the timeline alike");
+        };
+        assert_eq!(agent.steering.len(), 1);
+        assert!(matches!(thread.timeline[1], TimelineMessage::User(_)));
+        assert!(matches!(agent.output.steps[0], AgentStep::Steering));
+    });
     task.abort();
 }
 

@@ -4,7 +4,7 @@
 
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     rc::Rc,
     sync::{Arc, OnceLock},
 };
@@ -323,7 +323,28 @@ impl Cowork {
         let comments = Rc::new(comments);
         let mut timeline_messages = Vec::new();
         if let Some(thread_id) = active_thread_id {
+            // Shown by the agent messages they steer.
+            let steering = messages
+                .iter()
+                .filter_map(|message| match message {
+                    TimelineMessage::Agent(message) => Some(message.steering.iter().copied()),
+                    TimelineMessage::User(_) => None,
+                })
+                .flatten()
+                .collect::<HashSet<_>>();
+            let user_stable = |group: &timeline::UserMessageGroup| {
+                group.comments.is_empty()
+                    && group
+                        .blocks
+                        .iter()
+                        .all(|block| block.attachments.is_empty())
+            };
             for (index, message) in messages.iter().enumerate() {
+                if let TimelineMessage::User(group) = message
+                    && steering.contains(&group.id)
+                {
+                    continue;
+                }
                 let submitted_comments = match message {
                     TimelineMessage::Agent(message) => message
                         .comment_group_id
@@ -339,15 +360,17 @@ impl Cowork {
                     TimelineMessage::User(_) => &[],
                 };
                 let stable = match message {
-                    TimelineMessage::User(group) => {
-                        group.comments.is_empty()
-                            && group
-                                .blocks
-                                .iter()
-                                .all(|block| block.attachments.is_empty())
-                    }
+                    TimelineMessage::User(group) => user_stable(group),
                     TimelineMessage::Agent(message) => {
                         !message.is_generating()
+                            && messages.iter().all(|entry| match entry {
+                                TimelineMessage::User(group)
+                                    if message.steering.contains(&group.id) =>
+                                {
+                                    user_stable(group)
+                                }
+                                _ => true,
+                            })
                             && !message.work_expanded
                             && message.awaiting_approval.is_none()
                             && message.comment_group_id.is_none()
@@ -385,7 +408,7 @@ impl Cowork {
                                         this.render_timeline_message(
                                             thread_id,
                                             index,
-                                            &messages[index],
+                                            &messages,
                                             &comments,
                                             &[],
                                             wrap_width,
@@ -406,7 +429,7 @@ impl Cowork {
                     let row = self.render_timeline_message(
                         thread_id,
                         index,
-                        message,
+                        &messages,
                         &comments,
                         submitted_comments,
                         wrap_width,

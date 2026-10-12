@@ -437,6 +437,14 @@ impl AgentOutput {
                         self.record_tool_result(&result.call, &result.content);
                     }
                 }
+                // A run's own user messages carry tool results only; any
+                // other content is a steering prompt delivered into it.
+                if content
+                    .iter()
+                    .any(|item| !matches!(item, UserContent::ToolResult(_)))
+                {
+                    self.steps.push(AgentStep::Steering);
+                }
             }
             RigMessage::System { .. } => {}
         }
@@ -470,7 +478,7 @@ impl AgentOutput {
     fn tool_calls_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut AgentToolCall> {
         self.steps.iter_mut().filter_map(|step| match step {
             AgentStep::ToolCall(call) => Some(call),
-            AgentStep::Thinking(_) | AgentStep::Text(_) => None,
+            AgentStep::Thinking(_) | AgentStep::Text(_) | AgentStep::Steering => None,
         })
     }
 
@@ -555,7 +563,7 @@ impl AgentMessage {
             .iter()
             .map(|step| match step {
                 AgentStep::Thinking(text) | AgentStep::Text(text) => Some(text.clone()),
-                AgentStep::ToolCall(_) => None,
+                AgentStep::ToolCall(_) | AgentStep::Steering => None,
             })
             .collect::<Vec<_>>();
         self.output.rewind(from);
@@ -585,7 +593,8 @@ impl AgentMessage {
                         _ => view.update(cx, |view, cx| view.set_text(text, cx)),
                     }
                 }
-                (Some(StepView::ToolCall { .. }), AgentStep::ToolCall(_)) => {}
+                (Some(StepView::ToolCall { .. }), AgentStep::ToolCall(_))
+                | (Some(StepView::Steering), AgentStep::Steering) => {}
                 (Some(shown), step) => *shown = StepView::new(step, cx),
                 (None, step) => self.step_views.push(StepView::new(step, cx)),
             }

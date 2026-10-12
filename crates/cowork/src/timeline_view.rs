@@ -75,6 +75,13 @@ pub(crate) struct ShownSegments {
 /// anyway.
 const SEGMENT_PARSE_TIMEOUT: Duration = Duration::from_secs(1);
 
+/// A piece of an agent message's work, as [`Cowork::render_work`] lays it
+/// out: something the agent did, or where a steering message joined.
+enum WorkPiece {
+    Shown(gpui::AnyElement),
+    Steering,
+}
+
 impl Cowork {
     fn selected_message_source_range(
         &self,
@@ -936,29 +943,29 @@ impl Cowork {
         div().w_full().my_1().child(card).into_any_element()
     }
 
-    /// An agent message's work in order: its steps except the response.
-    /// Consecutive tool calls sit back to back; everything else gets the
-    /// timeline's usual spacing.
+    /// An agent message's work in order: its steps except the response,
+    /// with where each steering message joined. Consecutive tool calls sit
+    /// back to back; everything else gets the timeline's usual spacing.
     fn render_work(
         &self,
         thread_id: Uuid,
         message: &AgentMessage,
         rights: ApprovalRights,
         cx: &Context<Self>,
-    ) -> Vec<gpui::AnyElement> {
+    ) -> Vec<WorkPiece> {
         let awaiting_step = message.awaiting_approval_step();
         let mut rendered = Vec::new();
         let mut calls = Vec::new();
-        let flush = |calls: &mut Vec<gpui::AnyElement>, rendered: &mut Vec<gpui::AnyElement>| {
+        let flush = |calls: &mut Vec<gpui::AnyElement>, rendered: &mut Vec<WorkPiece>| {
             if !calls.is_empty() {
-                rendered.push(
+                rendered.push(WorkPiece::Shown(
                     div()
                         .w_full()
                         .flex()
                         .flex_col()
                         .children(calls.drain(..))
                         .into_any_element(),
-                );
+                ));
             }
         };
         for step_index in message.output.work() {
@@ -986,19 +993,23 @@ impl Cowork {
                 )),
                 (AgentStep::Thinking(_), StepView::Thinking { view, .. }) => {
                     flush(&mut calls, &mut rendered);
-                    rendered.push(Self::render_thinking(
+                    rendered.push(WorkPiece::Shown(Self::render_thinking(
                         thread_id, message, step_index, view, cx,
-                    ));
+                    )));
                 }
                 (AgentStep::Text(_), StepView::Text { view }) => {
                     flush(&mut calls, &mut rendered);
-                    rendered.push(
+                    rendered.push(WorkPiece::Shown(
                         TextView::new(view)
                             .selection_format(SelectionFormat::Plain)
                             .style(Self::markdown_style(cx))
                             .w_full()
                             .into_any_element(),
-                    );
+                    ));
+                }
+                (AgentStep::Steering, _) => {
+                    flush(&mut calls, &mut rendered);
+                    rendered.push(WorkPiece::Steering);
                 }
                 // The views are kept in step with the output.
                 _ => {}
@@ -1260,11 +1271,17 @@ impl Cowork {
         }
     }
 
+    /// An agent message, with the user messages steering it: each where it
+    /// joined the work while the work is open, and all between the summary
+    /// and the response while it is closed. The agent's parts around them
+    /// are rows of their own.
+    #[allow(clippy::too_many_arguments)]
     fn render_agent_message(
         &mut self,
         thread_id: Uuid,
         index: usize,
         message: &AgentMessage,
+        timeline: &[TimelineMessage],
         comments: &[UserComment],
         submitted_comments: &[UserComment],
         wrap_width: gpui::Pixels,
@@ -1356,94 +1373,165 @@ impl Cowork {
                 .thread(thread_id, cx)
                 .map(|thread| ApprovalRights::of(thread.read(cx)))
                 .unwrap_or_default();
-            self.render_work(thread_id, message, rights, cx)
+            Some(self.render_work(thread_id, message, rights, cx))
         } else {
-            Vec::new()
+            None
         };
+        let steering = message
+            .steering
+            .iter()
+            .filter_map(|id| {
+                timeline
+                    .iter()
+                    .enumerate()
+                    .find_map(|(group_index, entry)| match entry {
+                        TimelineMessage::User(group) if group.id == *id => {
+                            Some((group_index, group))
+                        }
+                        _ => None,
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        let failed = message.run.failure().is_some();
+        let agent_row = |this: &Self, content: Vec<gpui::AnyElement>, cx: &Context<Self>| {
+            div()
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _, _, _| {
+                        this.selection_message_id = Some(message_id);
+                    }),
+                )
+                .w_full()
+                .flex()
+                .items_start()
+                .child(
+                    div()
+                        .w(px(40.))
+                        .flex_none()
+                        .flex()
+                        .justify_center()
+                        .child(this.render_avatar(MessageAuthor::Agent)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .when(failed, |this| this.text_color(cx.theme().danger))
+                        .children(content),
+                )
+                .child(div().w(px(40.)).flex_none())
+                .into_any_element()
+        };
+
+        let mut rows = Vec::new();
+        let mut content = submitted_comment_content;
+        content.extend(summary);
+        if waiting {
+            content.push(
+                ShimmerText::new("Thinking\u{2026}")
+                    .id(("agent-waiting", index))
+                    .text_color(cx.theme().muted_foreground)
+                    .into_any_element(),
+            );
+        }
+        let mut steering = steering.into_iter();
+        let show_steering = |this: &mut Self,
+                             group: Option<(usize, &UserMessageGroup)>,
+                             content: &mut Vec<gpui::AnyElement>,
+                             rows: &mut Vec<gpui::AnyElement>,
+                             cx: &mut Context<Self>| {
+            let Some((group_index, group)) = group else {
+                return;
+            };
+            if !content.is_empty() {
+                rows.push(agent_row(this, std::mem::take(content), cx));
+            }
+            let cards = this.user_group_cards(thread_id, group, cx);
+            rows.push(this.render_user_message_group(group_index, group, cards, cx));
+        };
+        for piece in work.into_iter().flatten() {
+            match piece {
+                WorkPiece::Shown(element) => content.push(element),
+                WorkPiece::Steering => {
+                    show_steering(self, steering.next(), &mut content, &mut rows, cx)
+                }
+            }
+        }
+        // Collapsed work leaves every steering message here, as does a run
+        // that has taken one its transcript has yet to show.
+        for group in steering {
+            show_steering(self, Some(group), &mut content, &mut rows, cx);
+        }
+        content.extend(message_content);
+        content.extend(failure.map(IntoElement::into_any_element));
+        if !content.is_empty() || rows.is_empty() {
+            rows.push(agent_row(self, content, cx));
+        }
         div()
             .id(("timeline-message", index))
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(move |this, _, _, _| {
-                    this.selection_message_id = Some(message_id);
-                }),
-            )
             .w_full()
             .flex()
-            .items_start()
-            .child(
-                div()
-                    .w(px(40.))
-                    .flex_none()
-                    .flex()
-                    .justify_center()
-                    .child(self.render_avatar(MessageAuthor::Agent)),
-            )
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .when(message.run.failure().is_some(), |this| {
-                        this.text_color(cx.theme().danger)
-                    })
-                    .children(submitted_comment_content)
-                    .children(summary)
-                    .when(waiting, |this| {
-                        this.child(
-                            ShimmerText::new("Thinking\u{2026}")
-                                .id(("agent-waiting", index))
-                                .text_color(cx.theme().muted_foreground),
-                        )
-                    })
-                    .children(work)
-                    .children(message_content)
-                    .children(failure),
-            )
-            .child(div().w(px(40.)).flex_none())
+            .flex_col()
+            .gap_6()
+            .children(rows)
             .into_any_element()
     }
 
+    /// The attachment cards of each of `group`'s blocks.
+    fn user_group_cards(
+        &self,
+        thread_id: Uuid,
+        group: &UserMessageGroup,
+        cx: &App,
+    ) -> Vec<Vec<AttachmentCard>> {
+        self.thread_store
+            .read(cx)
+            .thread(thread_id, cx)
+            .map(|thread| {
+                let draft = thread.read(cx).draft();
+                group
+                    .blocks
+                    .iter()
+                    .map(|block| {
+                        block
+                            .attachments
+                            .iter()
+                            .map(|record| AttachmentCard::new(draft, record))
+                            .collect()
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Timeline entry `index`. Steering messages are entries of their own,
+    /// but are shown by the agent message they steer.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_timeline_message(
         &mut self,
         thread_id: Uuid,
         index: usize,
-        message: &TimelineMessage,
+        timeline: &[TimelineMessage],
         comments: &[UserComment],
         submitted_comments: &[UserComment],
         wrap_width: gpui::Pixels,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        match message {
+        match &timeline[index] {
             TimelineMessage::User(group) => {
-                let cards = self
-                    .thread_store
-                    .read(cx)
-                    .thread(thread_id, cx)
-                    .map(|thread| {
-                        let draft = thread.read(cx).draft();
-                        group
-                            .blocks
-                            .iter()
-                            .map(|block| {
-                                block
-                                    .attachments
-                                    .iter()
-                                    .map(|record| AttachmentCard::new(draft, record))
-                                    .collect()
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
+                let cards = self.user_group_cards(thread_id, group, cx);
                 self.render_user_message_group(index, group, cards, cx)
             }
             TimelineMessage::Agent(message) => self.render_agent_message(
                 thread_id,
                 index,
                 message,
+                timeline,
                 comments,
                 submitted_comments,
                 wrap_width,

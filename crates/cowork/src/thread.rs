@@ -1530,12 +1530,12 @@ impl Thread {
                                 .zip(group.comments.iter().map(|comment| comment.id)),
                         );
                 }
-                let before_agent = agent_id.and_then(|id| self.timeline.iter().position(|entry| matches!(entry, TimelineMessage::Agent(message) if message.id == Uuid::from_bytes(id))));
-                if let Some(index) = before_agent {
-                    self.timeline.insert(index, TimelineMessage::User(group));
-                } else {
-                    self.timeline.push(TimelineMessage::User(group));
+                // Steering joins the timeline when it joins the run, after
+                // the agent message, which shows it where its prompt landed.
+                if let Some(message) = agent_id.and_then(|id| self.agent_message_mut(id)) {
+                    message.steering.push(group.id);
                 }
+                self.timeline.push(TimelineMessage::User(group));
             }
             protocol::HostMessage::AgentStarted {
                 id,

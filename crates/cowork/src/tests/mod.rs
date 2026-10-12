@@ -564,6 +564,7 @@ impl<'a> Collaboration<'a> {
                     committed: Default::default(),
                     comment_calls_checked: 0,
                     awaiting_approval: None,
+                    steering: Vec::new(),
                     step_views: Vec::new(),
                     work_expanded: false,
                     text_view: cx.new(|cx| TextViewState::markdown(&text, cx)),

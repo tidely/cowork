@@ -317,6 +317,108 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
     assert_eq!(expanded(cx), vec![1]);
 }
 
+/// A steering message shows below the summary of the work it joined, and,
+/// with the work open, between the steps before and after it joined.
+#[gpui::test]
+fn steering_shows_where_it_joined_the_work(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let thread_id = Uuid::new_v4();
+    let message_id = Uuid::new_v4();
+    let steering_id = Uuid::new_v4();
+    let block_id = Uuid::new_v4();
+    let (_root, cx) = cx.add_window_view(|window, cx| {
+        let mut message = AgentMessage::new(
+            message_id,
+            None,
+            SystemTime::UNIX_EPOCH,
+            0,
+            crate::protocol::AgentRun::Ended {
+                outcome: crate::protocol::RunOutcome::Completed,
+                duration: Duration::from_secs(1),
+            },
+            Vec::new(),
+            cx,
+        );
+        message.steering = vec![steering_id];
+        message.show_output(
+            crate::timeline::AgentOutput {
+                steps: vec![
+                    AgentStep::Thinking("Before.".into()),
+                    AgentStep::Steering,
+                    AgentStep::Thinking("After.".into()),
+                    AgentStep::Text("Done.".into()),
+                ],
+                thinking_complete: true,
+                text: "Done.".into(),
+            },
+            cx,
+        );
+        let steering = UserMessageGroup {
+            id: steering_id,
+            comments: Vec::new(),
+            blocks: vec![PromptBlock {
+                id: block_id,
+                author: ParticipantId::new(),
+                text: "Also check the tests.".into(),
+                attachments: Vec::new(),
+            }],
+            comments_folded: false,
+        };
+        let thread = cx.new(|_| {
+            test_thread(
+                thread_id,
+                vec![
+                    TimelineMessage::Agent(message),
+                    TimelineMessage::User(steering),
+                ],
+                ThreadDraft::new(ParticipantId::new()),
+            )
+        });
+        let thread_store = cx.new(|_| ThreadStore {
+            threads: VecDeque::from([thread]),
+            ..Default::default()
+        });
+        Root::new(
+            cx.new(|cx| {
+                test_cowork(
+                    thread_store,
+                    Some(thread_id),
+                    runtime.handle().clone(),
+                    window,
+                    cx,
+                )
+            }),
+            window,
+            cx,
+        )
+    });
+    let leak = |id: String| -> &'static str { Box::leak(id.into_boxed_str()) };
+    let work_summary = leak(format!("toggle-work-{message_id}"));
+    let steering_text = leak(format!("timeline-user-text-{block_id}"));
+    let before = leak(format!("toggle-thinking-{message_id}-0"));
+    let after = leak(format!("toggle-thinking-{message_id}-2"));
+    cx.run_until_parked();
+
+    let summary = cx.debug_bounds(work_summary).expect("the work summary");
+    let steering = cx
+        .debug_bounds(steering_text)
+        .expect("the steering message");
+    assert!(summary.bottom() <= steering.top());
+    cx.simulate_click(summary.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+
+    let before = cx.debug_bounds(before).expect("the thinking before");
+    let steering = cx
+        .debug_bounds(steering_text)
+        .expect("the steering message");
+    let after = cx.debug_bounds(after).expect("the thinking after");
+    assert!(before.bottom() <= steering.top());
+    assert!(steering.bottom() <= after.top());
+}
+
 /// Text selected in a submitted user message copies while the composer
 /// still has focus, as agent text does.
 #[gpui::test]

@@ -36,7 +36,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 26;
+pub(crate) const PROTOCOL_VERSION: u32 = 27;
 
 /// A request from a collaborator to the host.
 ///
@@ -242,6 +242,10 @@ pub(crate) enum HostMessage {
         sequence: u64,
         pending: Vec<PendingSubmission>,
     },
+    /// An accepted pending submission was delivered, and `group` is
+    /// appended to the timeline. With `agent_id`, it steers that running
+    /// agent message, joining its [`AgentMessage::steering`]; the run's
+    /// `Steered` event follows.
     PendingDelivered {
         id: uuid::Bytes,
         group: UserMessage,
@@ -501,6 +505,11 @@ pub(crate) struct AgentMessage {
     /// The tool call the run is waiting for approval of; see
     /// [`HostMessage::ToolApprovalRequested`].
     pub(crate) awaiting_approval: Option<Json<rig::message::CallId>>,
+    /// The user messages steering this run, in the order they joined it;
+    /// see [`HostMessage::PendingDelivered`]. They follow this message in
+    /// the timeline, as they were added after it, but are shown inside it,
+    /// each where its prompt joined the run's transcript.
+    pub(crate) steering: Vec<uuid::Bytes>,
 }
 
 /// Whether an agent message's run is still going.
@@ -911,6 +920,7 @@ mod tests {
                     awaiting_approval: Some(Json::call_id(&rig::message::CallId::from_wire(
                         "call_1",
                     ))),
+                    steering: vec![[5; 16]],
                 }),
             ],
             transcript: vec![json(r#"{"role":"user"}"#), json(r#"{"role":"assistant"}"#)],

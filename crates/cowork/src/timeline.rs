@@ -68,6 +68,8 @@ pub(crate) struct AgentMessage {
     /// beside `output` rather than in it, since the output is refolded on
     /// every event. One at most, as the agent runs calls one at a time.
     pub(crate) awaiting_approval: Option<CallId>,
+    /// See [`protocol::AgentMessage::steering`].
+    pub(crate) steering: Vec<Uuid>,
 
     // Local view state.
     /// Whether the agent's work (everything but its response) is shown. Open
@@ -105,6 +107,10 @@ pub(crate) enum AgentStep {
     /// A stretch of text, continued the same way.
     Text(String),
     ToolCall(AgentToolCall),
+    /// Where a steering prompt joined the run. The `n`th shows the user
+    /// message [`AgentMessage::steering`]`[n]`; the prompt itself is in the
+    /// transcript.
+    Steering,
 }
 
 /// How an [`AgentStep`] is shown: local state, never sent.
@@ -120,6 +126,8 @@ pub(crate) enum StepView {
     Text { view: Entity<TextViewState> },
     /// Whether the call's input and output are shown.
     ToolCall { expanded: bool },
+    /// Shown by the user message it stands for.
+    Steering,
 }
 
 /// Where an [`AgentOutput`]'s committed part ends: how many steps it has,
@@ -180,7 +188,7 @@ impl AgentOutput {
     pub(crate) fn tool_calls(&self) -> impl DoubleEndedIterator<Item = &AgentToolCall> {
         self.steps.iter().filter_map(|step| match step {
             AgentStep::ToolCall(call) => Some(call),
-            AgentStep::Thinking(_) | AgentStep::Text(_) => None,
+            AgentStep::Thinking(_) | AgentStep::Text(_) | AgentStep::Steering => None,
         })
     }
 
@@ -188,21 +196,22 @@ impl AgentOutput {
     pub(crate) fn thinking(&self) -> impl Iterator<Item = &str> {
         self.steps.iter().filter_map(|step| match step {
             AgentStep::Thinking(text) => Some(text.as_str()),
-            AgentStep::Text(_) | AgentStep::ToolCall(_) => None,
+            AgentStep::Text(_) | AgentStep::ToolCall(_) | AgentStep::Steering => None,
         })
     }
 
     /// Where the steps that can hold the response start: after the last
-    /// tool call.
+    /// tool call or steering prompt. Text before a steering prompt answered
+    /// something the user has since added to, so it is work too.
     pub(crate) fn response_start(&self) -> usize {
         self.steps
             .iter()
-            .rposition(|step| matches!(step, AgentStep::ToolCall(_)))
+            .rposition(|step| matches!(step, AgentStep::ToolCall(_) | AgentStep::Steering))
             .map_or(0, |index| index + 1)
     }
 
     /// The positions of the steps that are the agent's work rather than its
-    /// response: all but the text after the last tool call.
+    /// response: all but the text after the last tool call or steering.
     pub(crate) fn work(&self) -> impl Iterator<Item = usize> + '_ {
         let response_start = self.response_start();
         self.steps
@@ -220,7 +229,7 @@ impl AgentOutput {
             .iter()
             .filter_map(|step| match step {
                 AgentStep::Text(text) => Some(text.as_str()),
-                AgentStep::Thinking(_) | AgentStep::ToolCall(_) => None,
+                AgentStep::Thinking(_) | AgentStep::ToolCall(_) | AgentStep::Steering => None,
             })
             .collect()
     }
@@ -244,21 +253,22 @@ impl StepView {
                 view: cx.new(|cx| TextViewState::markdown(text, cx)),
             },
             AgentStep::ToolCall(_) => Self::ToolCall { expanded: false },
+            AgentStep::Steering => Self::Steering,
         }
     }
 
-    /// Whether the step is opened up. Text has nothing to open.
+    /// Whether the step is opened up. Text and steering have nothing to open.
     pub(crate) fn expanded(&self) -> bool {
         match self {
             Self::Thinking { expanded, .. } | Self::ToolCall { expanded } => *expanded,
-            Self::Text { .. } => false,
+            Self::Text { .. } | Self::Steering => false,
         }
     }
 
     pub(crate) fn set_expanded(&mut self, value: bool) {
         match self {
             Self::Thinking { expanded, .. } | Self::ToolCall { expanded } => *expanded = value,
-            Self::Text { .. } => {}
+            Self::Text { .. } | Self::Steering => {}
         }
     }
 }
@@ -452,6 +462,7 @@ impl AgentMessage {
             committed: OutputMark::default(),
             comment_calls_checked: 0,
             awaiting_approval: None,
+            steering: Vec::new(),
             step_views: Vec::new(),
             text_view: cx.new(|cx| TextViewState::markdown("", cx)),
             comment_responses: Vec::new(),
@@ -494,6 +505,7 @@ impl AgentMessage {
             pending_events: self.pending_events.clone(),
             run: self.run.clone(),
             awaiting_approval: self.awaiting_approval.as_ref().map(protocol::Json::call_id),
+            steering: self.steering.iter().map(|id| id.into_bytes()).collect(),
         }
     }
 }
@@ -515,6 +527,7 @@ impl protocol::AgentMessage {
         message.awaiting_approval = self
             .awaiting_approval
             .map(|call| call.to_call_id().expect("validated with the snapshot"));
+        message.steering = self.steering.into_iter().map(Uuid::from_bytes).collect();
         message
     }
 }
