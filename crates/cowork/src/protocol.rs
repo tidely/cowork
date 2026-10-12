@@ -7,7 +7,10 @@ use anyhow::Context as _;
 use futures::{SinkExt as _, StreamExt as _};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio_util::codec::{FramedRead, FramedWrite, LengthDelimitedCodec};
+use tokio_util::{
+    bytes::Bytes,
+    codec::{FramedRead, FramedWrite, LengthDelimitedCodec},
+};
 
 use crate::models::{ModelCatalog, ModelRef};
 pub(crate) use crate::project_mode::ProjectMode;
@@ -651,7 +654,7 @@ where
             let bytes =
                 postcard::to_stdvec(&message).context("Failed to encode protocol message.")?;
             writer
-                .send(bytes.into())
+                .send(Bytes::from(bytes))
                 .await
                 .context("Failed to send protocol message.")?;
         }
