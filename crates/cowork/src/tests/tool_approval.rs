@@ -4,7 +4,7 @@ use tokio::sync::oneshot;
 
 use super::*;
 
-/// A run of the host's thread waiting for approval of a `calculate` call.
+/// A run of the host's thread waiting for approval of a non-allowlisted call.
 struct WaitingCall {
     message_id: Uuid,
     call: CallId,
@@ -12,12 +12,12 @@ struct WaitingCall {
     task: tokio::task::JoinHandle<()>,
 }
 
-/// Starts a run on the host whose reply calls `calculate`, and has it wait
+/// Starts a run on the host whose reply calls a non-allowlisted tool, and has it wait
 /// for approval as the agent's hook would, until everyone sees it waiting.
 fn wait_for_approval(session: &mut Collaboration<'_>) -> WaitingCall {
     wait_for_approval_of(
         session,
-        "calculate",
+        "approval_test_tool",
         serde_json::json!({"operation": "add", "a": 1, "b": 2}),
     )
 }

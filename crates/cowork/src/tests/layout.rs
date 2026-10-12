@@ -207,11 +207,11 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
             Vec::new(),
             cx,
         );
-        let call = |id: &str, arguments: serde_json::Value| {
+        let call = |id: &str, name: &str, arguments: serde_json::Value| {
             rig::message::ToolCall::from_wire(
                 id,
                 rig::message::ToolFunction::new(
-                    rig::message::ToolName::new("calculate").expect("a valid name"),
+                    rig::message::ToolName::new(name).expect("a valid name"),
                     arguments,
                 ),
             )
@@ -221,13 +221,15 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
             AgentStep::ToolCall(crate::timeline::AgentToolCall {
                 call: call(
                     "first",
-                    serde_json::json!({"a": 1, "b": 2, "operation": "add"}),
+                    "run_command",
+                    serde_json::json!({"command": "echo \"café\"; ".repeat(100)}),
                 ),
                 result: Some(vec![rig::completion::message::ToolResultContent::text("3")]),
             }),
             AgentStep::ToolCall(crate::timeline::AgentToolCall {
                 call: call(
                     "second",
+                    "calculate",
                     serde_json::json!({"a": 3, "b": 2, "operation": "multiply"}),
                 ),
                 result: None,
@@ -309,6 +311,11 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
     let first = cx.debug_bounds(first_row).expect("first tool call row");
     let second = cx.debug_bounds(second_row).expect("second tool call row");
     assert_eq!(first.bottom(), second.top());
+    assert_eq!(
+        first.size.height,
+        px(20.),
+        "a long command stays on one row"
+    );
     assert!(cx.debug_bounds(first_details).is_none());
     assert!(cx.debug_bounds(second_details).is_none());
 

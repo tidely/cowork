@@ -162,9 +162,55 @@ impl AgentToolCall {
         pretty_json(&self.call.function.arguments_value())
     }
 
-    /// The arguments on one line, for the call's collapsed row.
-    pub(crate) fn arguments_summary(&self) -> String {
-        self.call.function.arguments_value().to_string()
+    /// A quiet description for the collapsed row; raw arguments stay in the details.
+    pub(crate) fn description(&self) -> String {
+        match self.call.function.name.as_str() {
+            "calculate" => {
+                let arguments = self.call.function.arguments_value();
+                let calculation = (|| {
+                    let a = arguments.get("a")?.as_f64()?;
+                    let b = arguments.get("b")?.as_f64()?;
+                    let operator = match arguments.get("operation")?.as_str()? {
+                        "add" => "+",
+                        "subtract" => "-",
+                        "multiply" => "*",
+                        "divide" => "/",
+                        _ => return None,
+                    };
+                    Some(format!("Calculated {a}{operator}{b}"))
+                })();
+                calculation.unwrap_or_else(|| "Calculated".into())
+            }
+            "run_command" => self
+                .command_preview()
+                .map(|command| format!("Ran {command}"))
+                .unwrap_or_else(|| "Ran command".into()),
+            "respond_to_comment" => "Replied to comment".into(),
+            "read_file" => "Read file".into(),
+            "write_file" => "Wrote to file".into(),
+            "list_directory" => "Listed directories".into(),
+            "request_permissions" => "Requested permissions".into(),
+            name => format!("Ran {}", name),
+        }
+    }
+
+    /// Preview only the first nonempty shell line, never flattening a script
+    /// into something that looks like a different command.
+    pub(crate) fn command_preview(&self) -> Option<String> {
+        if self.call.function.name.as_str() != "run_command" {
+            return None;
+        }
+        let arguments = self.call.function.arguments_value();
+        let command = arguments.get("command")?.as_str()?;
+        let mut lines = command
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty());
+        let mut preview = lines.next()?.to_owned();
+        if lines.next().is_some() {
+            preview.push_str(" …");
+        }
+        Some(preview)
     }
 
     /// The result's content as text, one item per line.
@@ -181,6 +227,104 @@ impl AgentToolCall {
                 .collect::<Vec<_>>()
                 .join("\n"),
         )
+    }
+}
+
+#[cfg(test)]
+mod tool_call_tests {
+    use super::AgentToolCall;
+    use rig::message::{ToolCall, ToolFunction, ToolName};
+    use serde_json::{Value, json};
+
+    fn tool_call(name: &str, arguments: Value) -> AgentToolCall {
+        AgentToolCall {
+            call: ToolCall::from_wire(
+                "test",
+                ToolFunction::new(ToolName::new(name).unwrap(), arguments),
+            ),
+            result: Some(Vec::new()),
+        }
+    }
+
+    fn description(name: &str, arguments: Value) -> String {
+        tool_call(name, arguments).description()
+    }
+
+    #[test]
+    fn command_previews_keep_shell_lines_separate() {
+        for (command, expected) in [
+            ("cargo test -p cowork", Some("cargo test -p cowork")),
+            ("\n  echo café\n\n cargo test\n", Some("echo café …")),
+            ("echo done\n", Some("echo done")),
+            (" \n\t", None),
+        ] {
+            let call = tool_call("run_command", json!({"command": command}));
+            assert_eq!(call.command_preview().as_deref(), expected);
+            assert_eq!(
+                call.description(),
+                expected
+                    .map(|command| format!("Ran {command}"))
+                    .unwrap_or_else(|| "Ran command".into()),
+            );
+            assert_eq!(call.call.function.arguments_value()["command"], command);
+        }
+        for arguments in [json!({}), json!({"command": 42})] {
+            assert!(
+                tool_call("run_command", arguments)
+                    .command_preview()
+                    .is_none()
+            );
+        }
+        assert!(
+            tool_call("other_tool", json!({"command": "cargo test"}))
+                .command_preview()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn known_tools_have_readable_descriptions() {
+        for (name, expected) in [
+            ("run_command", "Ran command"),
+            ("respond_to_comment", "Replied to comment"),
+            ("read_file", "Read file"),
+            ("write_file", "Wrote to file"),
+            ("list_directory", "Listed directories"),
+            ("request_permissions", "Requested permissions"),
+            ("other_tool", "Ran other_tool"),
+        ] {
+            assert_eq!(description(name, json!({})), expected);
+        }
+    }
+
+    #[test]
+    fn calculations_show_the_expression_instead_of_json() {
+        for (operation, expected) in [
+            ("add", "Calculated 3+4"),
+            ("subtract", "Calculated 3-4"),
+            ("multiply", "Calculated 3*4"),
+            ("divide", "Calculated 3/4"),
+        ] {
+            assert_eq!(
+                description("calculate", json!({"a": 3, "b": 4, "operation": operation})),
+                expected,
+            );
+        }
+        assert_eq!(
+            description("calculate", json!({"a": -1.5, "b": 2, "operation": "add"})),
+            "Calculated -1.5+2",
+        );
+    }
+
+    #[test]
+    fn malformed_calculations_keep_a_readable_fallback() {
+        for arguments in [
+            json!({}),
+            json!({"a": "three", "b": 4, "operation": "multiply"}),
+            json!({"a": 3, "b": 4, "operation": "unknown"}),
+        ] {
+            assert_eq!(description("calculate", arguments), "Calculated");
+        }
     }
 }
 

@@ -4,7 +4,9 @@
 //! on macOS, Bubblewrap on Linux, or a Windows process container via mxc-sdk.
 //! Each command gets its own sandbox with these permissions:
 //! - Read the host filesystem, subject to OS permissions and `DENIED_PATHS`.
-//!   Unix grants `/`; Windows grants each drive and its entries.
+//!   macOS grants `/`; Windows grants each drive and its entries. Linux grants
+//!   the root's entries except `/dev` and `/proc`, keeping Bubblewrap's private
+//!   devices and process filesystem instead of shadowing them with host mounts.
 //! - Write the project with Write/Network scope, plus explicitly granted
 //!   writable folders. The thread's scratch folder is always writable.
 //!   Unix also permits writes to `/dev/null` for normal output redirection.
@@ -25,10 +27,17 @@
 /// instance that did not quit cleanly are removed by the next instance.
 pub const SCRATCH_DIR: &str = "scratch";
 
-/// Broad read-only root grants otherwise override the backend's standard
-/// null-device write permission, breaking ordinary shell redirection.
-#[cfg(unix)]
+/// Linux's synthetic devices must not be shadowed by policy binds: ordinary
+/// Bubblewrap binds are nodev, even for a read-write `/dev/null` grant.
+#[cfg(target_os = "linux")]
+pub const PRIVATE_FILESYSTEMS: &[&str] = &["/dev", "/proc"];
+
+/// macOS's broad read-only root grant needs an explicit null-device exception.
+/// Linux already has a writable null device in Bubblewrap's private `/dev`.
+#[cfg(all(unix, not(target_os = "linux")))]
 pub const WRITABLE_DEVICES: &[&str] = &["/dev/null"];
+#[cfg(target_os = "linux")]
+pub const WRITABLE_DEVICES: &[&str] = &[];
 
 /// Credentials commands may not read even where a granted folder holds
 /// them, relative to the user's home. Only paths that exist are passed on, as

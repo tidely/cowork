@@ -339,6 +339,33 @@ pub(super) struct BenchRoot {
     draws: usize,
 }
 
+impl BenchRoot {
+    pub(super) fn stage(cowork: Entity<Cowork>) -> Self {
+        Self {
+            cowork,
+            reply_views: Vec::new(),
+            count: 0,
+            mode: Mode::Stage,
+            construction: None,
+            phases: Rc::new(Cell::new(EditorPhases::default())),
+            profile_totals: Some(Rc::new(Cell::new(EditorPhases::default()))),
+            draws: 0,
+        }
+    }
+
+    pub(super) fn draws(&self) -> usize {
+        self.draws
+    }
+
+    /// Cumulative timings survive the per-render phase counter reset.
+    pub(super) fn profile_phases(&self) -> EditorPhases {
+        self.profile_totals
+            .as_ref()
+            .expect("stage profiling is enabled")
+            .get()
+    }
+}
+
 impl Render for BenchRoot {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.draws += 1;

@@ -256,7 +256,7 @@ impl Sandboxes {
             }
             None => Folders::default(),
         };
-        let request = request(command, &project, &folders, &scratch, &environment);
+        let request = request(command, &project, &folders, &scratch, &environment)?;
         let stop = StopOnDrop(Arc::new(AtomicBool::new(false)));
         let stopped = stop.0.clone();
         let result = tokio::task::spawn_blocking(move || execute(request, &stopped)).await;
@@ -431,7 +431,7 @@ fn request(
     folders: &Folders,
     scratch: &Path,
     environment: &HashMap<String, String>,
-) -> ContainerRequest {
+) -> Result<ContainerRequest, SandboxError> {
     let home = std::env::home_dir();
     let scratch = resolved(scratch).unwrap_or_else(|| scratch.to_owned());
     let mut environment = environment.clone();
@@ -461,7 +461,10 @@ fn request(
     }
     readwrite.extend(granted.write.iter().cloned());
     readonly.extend(granted.read.iter().cloned());
-    readonly.extend(system_read_paths());
+    readonly.extend(system_read_paths()?);
+    // A redundant explicit root read grant must not hide Linux's private devices.
+    #[cfg(target_os = "linux")]
+    readonly.retain(|path| path != Path::new("/"));
     readonly.sort();
     readonly.dedup();
     // The sandbox lets read-only win over read-write for the same path, so a
@@ -479,7 +482,7 @@ fn request(
             .map(|path| path.to_string_lossy().into_owned())
             .collect::<Vec<_>>()
     };
-    ContainerRequest {
+    Ok(ContainerRequest {
         filesystem: Some(FilesystemPolicy {
             readwrite_paths: text(readwrite),
             readonly_paths: text(readonly),
@@ -514,12 +517,12 @@ fn request(
             ..Default::default()
         }),
         ..ContainerRequest::new(command)
-    }
+    })
 }
 
-/// Read the host filesystem, as Codex does; see [`settings`]. Windows
-/// needs each drive and its entries, while Unix has one filesystem root.
-fn system_read_paths() -> Vec<PathBuf> {
+/// Read the host filesystem; see [`settings`]. Linux mounts the root's
+/// entries rather than `/` to preserve Bubblewrap's private `/dev` and `/proc`.
+fn system_read_paths() -> Result<Vec<PathBuf>, SandboxError> {
     #[cfg(windows)]
     {
         // SAFETY: takes no arguments and only returns a bit mask.
@@ -533,10 +536,42 @@ fn system_read_paths() -> Vec<PathBuf> {
             paths.extend(entries.flatten().map(|entry| entry.path()));
             paths.push(root);
         }
-        paths
+        Ok(paths)
     }
-    #[cfg(not(windows))]
-    vec![PathBuf::from("/")]
+    #[cfg(target_os = "linux")]
+    {
+        let paths = std::fs::read_dir("/")
+            .and_then(|entries| {
+                entries
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<std::io::Result<Vec<_>>>()
+            })
+            .map_err(|error| {
+                SandboxError::Setup(format!("could not list the host filesystem root: {error}"))
+            })?;
+        Ok(paths
+            .into_iter()
+            .filter(|path| {
+                if settings::PRIVATE_FILESYSTEMS
+                    .iter()
+                    .any(|private| path == Path::new(private))
+                {
+                    return false;
+                }
+                // The SDK rejects explicit grants the host user cannot read
+                // (e.g. /lost+found). Such entries were inaccessible under `/`
+                // too; omit them rather than failing every command.
+                let Ok(path) = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()) else {
+                    return false;
+                };
+                // SAFETY: `path` is a live NUL-terminated string; access only
+                // checks the invoking user's permissions and retains no pointer.
+                unsafe { libc::access(path.as_ptr(), libc::R_OK) == 0 }
+            })
+            .collect())
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    Ok(vec![PathBuf::from("/")])
 }
 
 /// Runs `request` to its end, or until `stopped`.
@@ -785,7 +820,8 @@ mod tests {
             &Folders::default(),
             &scratch,
             &HashMap::new(),
-        );
+        )
+        .unwrap();
         let filesystem = request.filesystem.unwrap();
         let system = std::env::var("SystemDrive").unwrap_or_else(|_| "C:".into());
         for path in [format!("{system}\\"), format!("{system}\\Users")] {
@@ -850,6 +886,43 @@ mod tests {
         sandboxes.shutdown();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_requests_preserve_private_filesystems() {
+        let root = TestRoot::new();
+        let scratch = root.0.join("scratch");
+        std::fs::create_dir_all(&scratch).unwrap();
+        let folders = Folders {
+            read: vec![PathBuf::from("/")],
+            ..Default::default()
+        };
+        let request = request(
+            "true",
+            &Project::default(),
+            &folders,
+            &scratch,
+            &HashMap::new(),
+        )
+        .unwrap();
+        let filesystem = request.filesystem.unwrap();
+        for path in ["/", "/dev", "/proc", "/dev/null"] {
+            assert!(!filesystem.readonly_paths.iter().any(|grant| grant == path));
+            assert!(!filesystem.readwrite_paths.iter().any(|grant| grant == path));
+        }
+        assert!(filesystem.readonly_paths.iter().any(|path| path == "/home"));
+        if let Some(home) = std::env::home_dir() {
+            for credential in settings::DENIED_PATHS {
+                if let Some(path) = resolved(&home.join(credential)) {
+                    assert!(
+                        filesystem
+                            .denied_paths
+                            .contains(&path.to_string_lossy().into_owned())
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn requests_grant_the_project_and_the_network_by_mode() {
         let root = TestRoot::new();
@@ -868,7 +941,8 @@ mod tests {
         let scratch_path = resolved(&scratch).unwrap().to_string_lossy().into_owned();
 
         let none = Folders::default();
-        let read_only = request("ls", &project(Access::Read), &none, &scratch, &environment);
+        let read_only =
+            request("ls", &project(Access::Read), &none, &scratch, &environment).unwrap();
         let filesystem = read_only.filesystem.clone().unwrap();
         assert!(filesystem.readonly_paths.contains(&zed_path));
         let mut writable_paths = vec![scratch_path.clone()];
@@ -879,7 +953,7 @@ mod tests {
                 .map(|path| (*path).to_owned()),
         );
         assert_eq!(filesystem.readwrite_paths, writable_paths);
-        for path in system_read_paths() {
+        for path in system_read_paths().unwrap() {
             assert!(
                 filesystem
                     .readonly_paths
@@ -913,7 +987,8 @@ mod tests {
         assert_eq!(network.egress.unwrap().default, Some(NetworkAction::Deny));
         assert_eq!(network.ingress.unwrap().default, Some(NetworkAction::Deny));
 
-        let writable = request("ls", &project(Access::Write), &none, &scratch, &environment);
+        let writable =
+            request("ls", &project(Access::Write), &none, &scratch, &environment).unwrap();
         let network = writable.network.clone().unwrap();
         assert_eq!(network.egress.unwrap().default, Some(NetworkAction::Deny));
         let filesystem = writable.filesystem.unwrap();
@@ -925,7 +1000,8 @@ mod tests {
             &none,
             &scratch,
             &environment,
-        );
+        )
+        .unwrap();
         let network = networked.network.unwrap();
         assert_eq!(network.egress.unwrap().default, Some(NetworkAction::Allow));
         let ingress = network.ingress.unwrap();
@@ -955,7 +1031,7 @@ mod tests {
             read: vec![resolved(&docs.path).unwrap()],
             write: vec![resolved(&cache.path).unwrap()],
         };
-        let request = request("ls", &project, &folders, &scratch, &HashMap::new());
+        let request = request("ls", &project, &folders, &scratch, &HashMap::new()).unwrap();
         let filesystem = request.filesystem.unwrap();
         assert!(filesystem.readwrite_paths.contains(&text(&cache.path)));
         assert!(!filesystem.readonly_paths.contains(&text(&cache.path)));

@@ -10,12 +10,14 @@ use std::{
 use draft::CommentTarget;
 use gpui::{
     App, AppContext, Bounds, Context, Entity, HighlightStyle, IntoElement, KeyDownEvent,
-    LineFragment, MouseButton, ScrollWheelEvent, Window, canvas, div, prelude::*, px, rems, rgb,
-    rgba, size,
+    LineFragment, MouseButton, ScrollWheelEvent, StyledText, Window, canvas, div, prelude::*, px,
+    rems, rgb, rgba, size,
 };
 use gpui_base::{
     RangeHighlight, RenderedText, SelectableText, TextSelection, TextView, TextViewState,
-    TextViewStyle, Textarea, input::TextareaState, text::SelectionFormat,
+    TextViewStyle, Textarea,
+    input::TextareaState,
+    text::{CodeBlock, SelectionFormat},
 };
 use gpui_component::{ActiveTheme, Icon, shimmer::ShimmerText};
 use gpui_kit_assets::IconName as AssetIconName;
@@ -26,6 +28,7 @@ use crate::{
     Cowork,
     caret::{paint_caret_label, selection_rects},
     composer_attachments::AttachmentCard,
+    highlight::highlight_code_block_in_mode,
     participant::ParticipantId,
     protocol::RunOutcome,
     thread_draft::{CARET_LABEL_DURATION, EditorSlot, RemoteCaret},
@@ -806,6 +809,36 @@ impl Cowork {
     ) -> gpui::AnyElement {
         let message_id = message.id;
         let running = call.result.is_none() && message.is_generating();
+        let summary = if let Some(command) = call.command_preview().filter(|_| !running) {
+            let block = CodeBlock::from_code(command.as_str(), Some("sh"));
+            let highlights = highlight_code_block_in_mode(&block, cx.theme().is_dark());
+            div()
+                .min_w_0()
+                .flex_1()
+                .flex()
+                .items_center()
+                .gap_1()
+                .child(div().flex_none().child("Ran"))
+                .child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_family(cx.theme().mono_font_family.clone())
+                        .opacity(0.8)
+                        .child(StyledText::new(command).with_highlights(highlights)),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .min_w_0()
+                .truncate()
+                .child(if running {
+                    format!("Running {}", call.call.function.name)
+                } else {
+                    call.description()
+                })
+                .into_any_element()
+        };
         let label = |text: &'static str| {
             div()
                 .text_xs()
@@ -842,18 +875,7 @@ impl Cowork {
                         .size_3()
                         .flex_none(),
                     )
-                    .child(div().flex_none().child(call.call.function.name.to_string()))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .opacity(0.7)
-                            .child(call.arguments_summary()),
-                    )
-                    .when(running, |this| {
-                        this.child(div().flex_none().child("Running…"))
-                    }),
+                    .child(summary),
             )
             .when(expanded, |this| {
                 this.child(

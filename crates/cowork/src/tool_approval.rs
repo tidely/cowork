@@ -22,7 +22,7 @@ use sandbox::{
     WriteFile,
 };
 use tokio::sync::{mpsc, oneshot};
-use tools::RespondToComment;
+use tools::{Calculate, RespondToComment};
 use uuid::Uuid;
 
 use crate::{
@@ -32,12 +32,16 @@ use crate::{
     thread::{ApproveTools, Thread, ThreadSharing},
 };
 
-/// Tools whose calls always run, as they only act within the thread or
-/// read what the host shared with it. Every other tool's calls wait for
+/// Tools whose calls always run, as they only compute, act within the thread,
+/// or read what the host shared with it. Every other tool's calls wait for
 /// approval, so a tool added without a thought about it is asked about
 /// rather than trusted.
-pub(crate) const ALWAYS_ALLOWED: &[&str] =
-    &[RespondToComment::NAME, ListDirectory::NAME, ReadFile::NAME];
+pub(crate) const ALWAYS_ALLOWED: &[&str] = &[
+    Calculate::NAME,
+    RespondToComment::NAME,
+    ListDirectory::NAME,
+    ReadFile::NAME,
+];
 
 /// What the model is told about a call someone denied.
 const DENIED: &str = "The user denied this tool call.";
@@ -437,7 +441,7 @@ mod tests {
         assert!(!needs_approval(ListDirectory::NAME));
         assert!(!needs_approval(ReadFile::NAME));
         assert!(needs_approval(WriteFile::NAME));
-        assert!(needs_approval(tools::Calculate::NAME));
+        assert!(!needs_approval(Calculate::NAME));
         assert!(needs_approval(RunCommand::NAME));
         assert!(needs_approval(RequestPermissions::NAME));
         assert!(needs_approval("a_tool_nobody_listed"));
@@ -934,10 +938,7 @@ mod tests {
     #[tokio::test]
     async fn a_scheduled_run_asks_only_when_a_call_is_repeated() {
         let (gate, mut asked) = gate(true);
-        let first = call_with(
-            tools::Calculate::NAME,
-            serde_json::json!({ "a": 1, "b": 2 }),
-        );
+        let first = call_with("approval_test_tool", serde_json::json!({ "a": 1, "b": 2 }));
         assert_eq!(
             gate.before_tool_call(&first).await,
             ToolDecision::Deny {
@@ -947,7 +948,7 @@ mod tests {
         assert!(asked.try_recv().is_err(), "nobody was asked");
 
         // Other arguments are another call, refused once too.
-        let other = call_with(tools::Calculate::NAME, serde_json::json!({ "a": 3 }));
+        let other = call_with("approval_test_tool", serde_json::json!({ "a": 3 }));
         assert!(matches!(
             gate.before_tool_call(&other).await,
             ToolDecision::Deny { .. }
@@ -955,10 +956,7 @@ mod tests {
         assert!(asked.try_recv().is_err());
 
         // The same arguments, in any order, ask the user and wait.
-        let repeat = call_with(
-            tools::Calculate::NAME,
-            serde_json::json!({ "b": 2, "a": 1 }),
-        );
+        let repeat = call_with("approval_test_tool", serde_json::json!({ "b": 2, "a": 1 }));
         let decision = gate.before_tool_call(&repeat);
         let answer = async {
             let Some(RunUpdate::Approval { decide, .. }) = asked.recv().await else {
@@ -973,6 +971,12 @@ mod tests {
         // beyond the project level is refused the first time.
         let comment = call(RespondToComment::NAME);
         assert_eq!(gate.before_tool_call(&comment).await, ToolDecision::Allow);
+        let calculation = call(Calculate::NAME);
+        assert_eq!(
+            gate.before_tool_call(&calculation).await,
+            ToolDecision::Allow
+        );
+        assert!(asked.try_recv().is_err());
         assert!(matches!(
             gate.before_tool_call(&command(Some("network"))).await,
             ToolDecision::Deny { .. }
@@ -1007,14 +1011,24 @@ mod tests {
         assert_eq!(gate.before_tool_call(&comment).await, ToolDecision::Allow);
         assert!(asked.try_recv().is_err(), "comments are never asked about");
 
-        let calculation = call(tools::Calculate::NAME);
-        let decision = gate.before_tool_call(&calculation);
+        let calculation = call(Calculate::NAME);
+        assert_eq!(
+            gate.before_tool_call(&calculation).await,
+            ToolDecision::Allow
+        );
+        assert!(
+            asked.try_recv().is_err(),
+            "calculations are never asked about"
+        );
+
+        let unknown = call("approval_test_tool");
+        let decision = gate.before_tool_call(&unknown);
         let answer = async {
             let Some(RunUpdate::Approval { call, tool, decide }) = asked.recv().await else {
                 panic!("expected an approval request");
             };
             assert_eq!(call, CallId::from_wire("call_1"));
-            assert_eq!(tool, tools::Calculate::NAME);
+            assert_eq!(tool, "approval_test_tool");
             decide.send(ToolDecision::Allow).expect("the gate waits");
         };
         let (decision, ()) = tokio::join!(decision, answer);
@@ -1027,6 +1041,31 @@ mod tests {
     /// Ollama may, since Rig gives each call its own.
     #[tokio::test]
     async fn each_call_of_a_reply_is_asked_about_on_its_own() {
+        // Keep exercising per-call approvals with a tool outside the allowlist.
+        struct ApprovalTestCalculate;
+        impl rig::tool::Tool for ApprovalTestCalculate {
+            const NAME: &'static str = "approval_test_calculate";
+            type Error = <Calculate as rig::tool::Tool>::Error;
+            type Args = <Calculate as rig::tool::Tool>::Args;
+            type Output = <Calculate as rig::tool::Tool>::Output;
+
+            fn description(&self) -> String {
+                Calculate.description()
+            }
+
+            fn parameters(&self) -> serde_json::Value {
+                Calculate.parameters()
+            }
+
+            async fn call(
+                &self,
+                context: &mut rig::tool::ToolContext,
+                args: Self::Args,
+            ) -> Result<Self::Output, Self::Error> {
+                Calculate.call(context, args).await
+            }
+        }
+
         for ids in [["c1", "c2", "c3", "c4"], ["", "", "", ""]] {
             use rig::test_utils::{
                 MockCompletionModel, MockStreamEvent, mock_final_with_total_tokens,
@@ -1037,7 +1076,7 @@ mod tests {
                 .map(|(index, id)| {
                     MockStreamEvent::tool_call(
                         *id,
-                        tools::Calculate::NAME,
+                        ApprovalTestCalculate::NAME,
                         serde_json::json!({"operation": "add", "a": index, "b": 1}),
                     )
                 })
@@ -1053,7 +1092,7 @@ mod tests {
                 ],
             ]);
             let mut tool_set = rig::tool::ToolSet::default();
-            tool_set.add_tool(tools::Calculate);
+            tool_set.add_tool(ApprovalTestCalculate);
             let (gate, mut asked) = gate(false);
             let run = tokio::spawn(async move {
                 let mut history = Vec::new();
@@ -1110,8 +1149,8 @@ mod tests {
     #[tokio::test]
     async fn an_abandoned_request_denies_the_call() {
         let (gate, mut asked) = gate(false);
-        let calculation = call(tools::Calculate::NAME);
-        let decision = gate.before_tool_call(&calculation);
+        let unknown = call("approval_test_tool");
+        let decision = gate.before_tool_call(&unknown);
         let abandon = async {
             drop(asked.recv().await);
         };

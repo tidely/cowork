@@ -82,6 +82,47 @@ async fn run(sandboxes: &Sandboxes, command: &str) -> CommandOutput {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn null_device_redirection_runs_the_command() {
+    if !supported() {
+        return;
+    }
+    let root = Root::new("null-device");
+    let sandboxes = sandboxes(&root);
+    let output = run(
+        &sandboxes,
+        "{ echo ran > \"$TMPDIR/redirected\"; echo discarded; echo discarded >&2; } \
+         >/dev/null 2>/dev/null && cat \"$TMPDIR/redirected\" && \
+         cat </dev/null && echo read-null",
+    )
+    .await;
+    assert_eq!(output.exit_code, 0, "redirection succeeds: {output:?}");
+    assert_eq!(
+        output.stdout, "ran\nread-null\n",
+        "the body ran: {output:?}"
+    );
+    assert_eq!(
+        output.stderr, "",
+        "both streams were redirected: {output:?}"
+    );
+
+    #[cfg(target_os = "linux")]
+    {
+        let devices = run(
+            &sandboxes,
+            "test -c /dev/null && test ! -e /dev/disk && \
+             { touch /dev/cowork-test && echo private; } && rm /dev/cowork-test",
+        )
+        .await;
+        assert_eq!(devices.exit_code, 0, "private devices: {devices:?}");
+        assert_eq!(devices.stdout, "private\n", "{devices:?}");
+        assert!(
+            !Path::new("/dev/cowork-test").exists(),
+            "host /dev is untouched"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn commands_are_confined() {
     if !supported() {
         return;
@@ -114,11 +155,7 @@ async fn commands_are_confined() {
     let kept = run(&sandboxes, "cat \"$TMPDIR/kept\"").await;
     assert_eq!(kept.stdout, "kept\n", "scratch files persist: {kept:?}");
     let marker = format!(".cowork-sandbox-test-{}", std::process::id());
-    let home_write = run(
-        &sandboxes,
-        &format!("touch ~/{marker} 2>/dev/null || echo denied"),
-    )
-    .await;
+    let home_write = run(&sandboxes, &format!("touch ~/{marker} || echo denied")).await;
     assert!(
         home_write.stdout.ends_with("denied\n") && !home.join(&marker).exists(),
         "the real home stays read-only without a write grant: {home_write:?}"
@@ -133,24 +170,25 @@ async fn commands_are_confined() {
     assert!(!outside.exists());
 
     let home = std::env::home_dir().unwrap();
-    let readable = run(
-        &sandboxes,
-        &format!("ls '{}' >/dev/null 2>&1 || echo denied", home.display()),
-    )
-    .await;
+    let readable = run(&sandboxes, &format!("ls '{}'", home.display())).await;
     assert_eq!(
-        readable.stdout, "",
+        readable.exit_code, 0,
         "the real home can be listed: {readable:?}"
     );
     for credential in [".ssh", ".aws", ".gnupg"] {
         let path = home.join(credential);
         if path.exists() {
-            let denied = run(
-                &sandboxes,
-                &format!("ls '{}' >/dev/null 2>&1 || echo denied", path.display()),
-            )
-            .await;
-            assert_eq!(denied.stdout, "denied\n", "credentials stay denied");
+            // Bubblewrap masks denied directories with an empty filesystem;
+            // Seatbelt refuses the listing. Neither may expose host entries.
+            let denied = run(&sandboxes, &format!("ls -A '{}'", path.display())).await;
+            assert_eq!(denied.stdout, "", "credentials stay hidden: {denied:?}");
+            if let Ok(mut entries) = std::fs::read_dir(&path)
+                && let Some(Ok(entry)) = entries.next()
+            {
+                let path = entry.path().to_string_lossy().replace('\'', "'\\''");
+                let hidden = run(&sandboxes, &format!("test ! -e '{path}'")).await;
+                assert_eq!(hidden.exit_code, 0, "the host entry is hidden: {hidden:?}");
+            }
         }
     }
 
@@ -238,7 +276,7 @@ async fn project_folders_follow_the_mode() {
     let removed = run(
         &sandboxes,
         &format!(
-            "cat '{}/notes.txt'; touch '{}/new' 2>/dev/null || echo denied",
+            "cat '{}/notes.txt'; touch '{}/new' || echo denied",
             zed.display(),
             zed.display()
         ),

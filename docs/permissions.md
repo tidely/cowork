@@ -36,7 +36,8 @@ apply.
 one run. Lowering auto-approve affects future calls but does not revoke
 those grants or a call already approved. Only the host can approve commands,
 file writes, and permission grants; Admin peers can approve other tools.
-Other tools ask unless explicitly allowlisted.
+`calculate` and `respond_to_comment` always run without approval, including
+in scheduled runs. Other tools ask unless explicitly allowlisted.
 
 Cards show what approval adds: Network in Write, or Write + Network when
 new writable folders are also needed. Scheduled calls needing approval fail
