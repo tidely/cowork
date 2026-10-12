@@ -11,7 +11,7 @@
 
 use gpui::{Anchor, App, Context, IntoElement, SharedString, WeakEntity, div, prelude::*, px};
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Icon, Side, Sizable as _,
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     menu::{DropdownMenu as _, PopupMenuItem},
@@ -109,7 +109,7 @@ impl Cowork {
         let (mode, editable) = self.active_project_mode(cx);
         let trigger = Button::new("project-mode")
             .debug_selector(|| "project-mode".to_owned())
-            .label(format!("Auto-approve: {}", mode.label()))
+            .label(mode.label())
             .dropdown_caret(true)
             .ghost()
             .small()
@@ -126,28 +126,49 @@ impl Cowork {
         let target = self.active_thread(cx).map(|thread| thread.downgrade());
         let cowork = cx.entity().downgrade();
         trigger
-            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
-                ProjectMode::ALL
-                    .into_iter()
-                    .fold(menu.check_side(Side::Right), |menu, option| {
+            .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, cx| {
+                ProjectMode::ALL.into_iter().fold(
+                    menu.item(
+                        PopupMenuItem::element(|_, _| {
+                            // PopupMenu reserves a 3-unit icon and a 1-unit gap
+                            // on every row when any option has an icon.
+                            div()
+                                .ml_neg_4()
+                                .debug_selector(|| "project-mode-heading".to_owned())
+                                .child("Auto-approve")
+                        })
+                        .disabled(true),
+                    )
+                    .separator(),
+                    |menu, option| {
                         let cowork = cowork.clone();
                         let target = target.clone();
+                        let selected = option == mode;
                         let item = match option.warning() {
                             Some(warning) => PopupMenuItem::element(move |_, cx| {
-                                Self::render_warned_option(option, warning, cx)
+                                Self::render_warned_option(option, warning, selected, cx)
                             }),
-                            None => PopupMenuItem::new(SharedString::from(option.label())),
+                            None => PopupMenuItem::element(move |_, cx| {
+                                div()
+                                    .debug_selector(|| "project-mode-read".to_owned())
+                                    .flex_1()
+                                    .when(selected, |this| this.text_color(cx.theme().primary))
+                                    .child(option.label())
+                            }),
                         };
                         menu.item(
-                            item.icon(Icon::new(option.icon()))
-                                .checked(option == mode)
-                                .on_click(move |_, _, cx| {
-                                    _ = cowork.update(cx, |cowork, cx| {
-                                        cowork.set_project_mode(target.clone(), option, cx);
-                                    });
-                                }),
+                            item.icon(
+                                Icon::new(option.icon())
+                                    .when(selected, |icon| icon.text_color(cx.theme().primary)),
+                            )
+                            .on_click(move |_, _, cx| {
+                                _ = cowork.update(cx, |cowork, cx| {
+                                    cowork.set_project_mode(target.clone(), option, cx);
+                                });
+                            }),
                         )
-                    })
+                    },
+                )
             })
             .into_any_element()
     }
@@ -156,6 +177,7 @@ impl Cowork {
     fn render_warned_option(
         option: ProjectMode,
         text: &'static str,
+        selected: bool,
         cx: &App,
     ) -> impl IntoElement + use<> {
         let warning = cx.theme().warning;
@@ -167,6 +189,7 @@ impl Cowork {
             .flex_1()
             .gap_2()
             .justify_between()
+            .when(selected, |this| this.text_color(cx.theme().primary))
             .child(option.label())
             .child(
                 Icon::new(IconName::TriangleAlert)

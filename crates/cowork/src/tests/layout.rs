@@ -57,6 +57,37 @@ fn continue_buttons_have_room_for_their_labels(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+fn empty_model_picker_sizes_to_its_label_and_only_hovers_on_its_trigger(
+    cx: &mut gpui::TestAppContext,
+) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    cx.run_until_parked();
+    let picker = cx.debug_bounds("model-picker").expect("model picker");
+    let trigger = cx
+        .debug_bounds("model-picker-trigger")
+        .expect("model picker trigger");
+    let label = cx.debug_bounds("model-picker-label").expect("model label");
+    let project_mode = cx.debug_bounds("project-mode").expect("project mode");
+
+    assert!(label.size.width > px(0.));
+    assert!(label.left() >= trigger.left() && label.right() <= trigger.right());
+    assert!(trigger.left() >= picker.left() && trigger.right() <= picker.right());
+    assert!(picker.size.width - trigger.size.width <= px(6.));
+
+    cx.update(|window, cx| window.simulate_mouse_move(trigger.center(), cx));
+    cx.run_until_parked();
+    assert!(cowork.read_with(cx, |cowork, _| cowork.model_picker_hovered));
+
+    let gap = gpui::point(
+        (project_mode.right() + trigger.left()) / 2.,
+        trigger.center().y,
+    );
+    cx.update(|window, cx| window.simulate_mouse_move(gap, cx));
+    cx.run_until_parked();
+    assert!(!cowork.read_with(cx, |cowork, _| cowork.model_picker_hovered));
+}
+
+#[gpui::test]
 fn title_bar_preserves_layout_and_the_sidebar_toggle(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     let content = cx

@@ -5,8 +5,8 @@ use std::{cell::Cell, rc::Rc};
 
 use draft::{DraftItemKind, ItemId};
 use gpui::{
-    App, Bounds, Context, Entity, ExternalPaths, Focusable, IntoElement, MouseButton, TextRun,
-    Window, canvas, div, img, prelude::*, px, rems, rgb,
+    App, Bounds, Context, Entity, ExternalPaths, Focusable, IntoElement, MouseButton, Window,
+    canvas, div, img, prelude::*, px, rems, rgb,
 };
 use gpui_base::{GlobalState, Textarea, input::TextareaState};
 use gpui_component::{
@@ -268,7 +268,7 @@ impl Cowork {
         &self,
         composer: Option<Entity<TextareaState>>,
         read_only_line_bounds: Rc<Cell<Option<Bounds<gpui::Pixels>>>>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let timeline_scroll_handle = self.timeline_scroll_handle.clone();
@@ -293,32 +293,13 @@ impl Cowork {
         let has_model = active_model.is_some() && !model_unavailable;
         let context_indicator =
             has_model.then(|| self.render_context_indicator(active_thread.as_ref(), cx));
-        let selected_model_title = self
-            .model_picker
-            .read(cx)
-            .selection()
-            .first()
-            .map(|(_, model)| model.title())
-            .unwrap_or_else(|| "Select a model...".into());
-        let title_run = TextRun {
-            len: selected_model_title.len(),
-            font: window.text_style().font(),
-            color: cx.theme().foreground,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let title_width = window
-            .text_system()
-            .shape_line(selected_model_title, px(14.), &[title_run], None)
-            .width();
-        // Icon + chevron + two gaps + button padding + Combobox's custom-trigger slot gap.
-        let model_picker_width = title_width + px(62.);
+
         let model_picker_hovered = self.model_picker_hovered;
+        let model_picker_owner = cx.entity().downgrade();
         let model_picker = div()
             .id("model-picker-container")
             .debug_selector(|| "model-picker".to_owned())
-            .w(model_picker_width)
+            .w_auto()
             .min_w_0()
             .h(px(28.))
             .mt(px(3.))
@@ -328,12 +309,6 @@ impl Cowork {
             .on_mouse_down(MouseButton::Left, |_, _, cx| {
                 GlobalState::suppress_text_selection(cx);
             })
-            .on_hover(cx.listener(|this, hovered: &bool, _, cx| {
-                if this.model_picker_hovered != *hovered {
-                    this.model_picker_hovered = *hovered;
-                    cx.notify();
-                }
-            }))
             .child(
                 Combobox::new(&self.model_picker)
                     .disabled(!can_change_model)
@@ -350,62 +325,68 @@ impl Cowork {
                             .unwrap_or_else(|| "Select a model...".into());
                         let provider = selected_model.map(|model| model.model.provider);
                         let unavailable = selected_model.is_some_and(|model| !model.available);
+                        let model_picker_owner = model_picker_owner.clone();
 
-                        div()
-                            .h_full()
-                            .w_full()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .justify_end()
-                            .child(
-                                div()
-                                    .id("model-picker-trigger")
-                                    .h_full()
-                                    .max_w_full()
-                                    .min_w_0()
-                                    .px_2()
-                                    .flex()
-                                    .items_center()
-                                    .gap_1()
-                                    .rounded_md()
-                                    .when(can_change_model, |this| this.cursor_pointer())
-                                    .when(model_picker_hovered && can_change_model, |this| {
-                                        this.bg(cx.theme().secondary_hover)
+                        div().h_full().flex().items_center().child(
+                            div()
+                                .id("model-picker-trigger")
+                                .debug_selector(|| "model-picker-trigger".to_owned())
+                                .h_full()
+                                .flex_none()
+                                .whitespace_nowrap()
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .rounded_md()
+                                .on_hover(move |hovered, _, cx| {
+                                    let _ = model_picker_owner.update(cx, |this, cx| {
+                                        if this.model_picker_hovered != *hovered {
+                                            this.model_picker_hovered = *hovered;
+                                            cx.notify();
+                                        }
+                                    });
+                                })
+                                .when(can_change_model, |this| this.cursor_pointer())
+                                .when(model_picker_hovered && can_change_model, |this| {
+                                    this.bg(cx.theme().secondary_hover)
+                                })
+                                .text_sm()
+                                .text_color(if unavailable {
+                                    cx.theme().muted_foreground.opacity(0.7)
+                                } else {
+                                    cx.theme().foreground
+                                })
+                                .when(unavailable, |this| {
+                                    this.tooltip(|window, cx| {
+                                        Tooltip::new(UNAVAILABLE_MODEL_TOOLTIP).build(window, cx)
                                     })
-                                    .text_sm()
-                                    .text_color(if unavailable {
-                                        cx.theme().muted_foreground.opacity(0.7)
+                                })
+                                .when_some(provider, |this, provider| {
+                                    this.child(
+                                        img(provider.icon_path())
+                                            .size(px(18.))
+                                            .flex_none()
+                                            .rounded(px(4.))
+                                            .when(unavailable, |this| this.opacity(0.5)),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .debug_selector(|| "model-picker-label".to_owned())
+                                        .child(title),
+                                )
+                                .child(
+                                    Icon::new(if trigger.is_open() {
+                                        AssetIconName::ChevronUp
                                     } else {
-                                        cx.theme().foreground
+                                        AssetIconName::ChevronDown
                                     })
-                                    .when(unavailable, |this| {
-                                        this.tooltip(|window, cx| {
-                                            Tooltip::new(UNAVAILABLE_MODEL_TOOLTIP)
-                                                .build(window, cx)
-                                        })
-                                    })
-                                    .when_some(provider, |this, provider| {
-                                        this.child(
-                                            img(provider.icon_path())
-                                                .size(px(18.))
-                                                .flex_none()
-                                                .rounded(px(4.))
-                                                .when(unavailable, |this| this.opacity(0.5)),
-                                        )
-                                    })
-                                    .child(div().child(title))
-                                    .child(
-                                        Icon::new(if trigger.is_open() {
-                                            AssetIconName::ChevronUp
-                                        } else {
-                                            AssetIconName::ChevronDown
-                                        })
-                                        .size_4()
-                                        .flex_none()
-                                        .text_color(cx.theme().muted_foreground),
-                                    ),
-                            )
+                                    .size_4()
+                                    .flex_none()
+                                    .text_color(cx.theme().muted_foreground),
+                                ),
+                        )
                     }),
             );
         let has_content = self.composer_has_content(cx);
