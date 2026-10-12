@@ -21,9 +21,3 @@ owner's own feature notes.
 - **Cancel Command button.** A button on a running `run_command` card that
   ends just that command, without stopping the whole run. Today a command runs
   until it exits or the run is stopped, with no time limit.
-
-## Reading the project
-
-- **Read tools.** Tools for reading files, listing folders, and searching,
-  so the agent can explore the project without bare shell commands, and
-  without asking each time.
