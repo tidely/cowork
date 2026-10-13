@@ -8,9 +8,7 @@ use gpui::{
     div, img, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme,
     combobox::{ComboboxEvent, ComboboxState},
-    progress::ProgressCircle,
     searchable_list::{SearchableGroup, SearchableListItem, SearchableVec},
     tooltip::Tooltip,
 };
@@ -19,9 +17,10 @@ use rig::providers::ollama::Ollama;
 use crate::{
     Cowork,
     assets::OLLAMA_AVATAR_PATH,
+    compaction_settings::{context_details, context_ring},
     models::{ModelCatalog, ModelInfo, ModelProvider, ModelRef},
     thread::{Thread, ThreadOwnership},
-    usage::{ContextUsage, format_token_count},
+    usage::ContextUsage,
 };
 
 pub(crate) const OLLAMA_CONTEXT_TOKENS: u64 = 16 * 8_192;
@@ -344,7 +343,13 @@ impl Cowork {
             .and_then(|model| self.models.get(model))
             .map_or(0, |info| info.max_tokens);
         let usage = ContextUsage::of(thread.map(|thread| thread.read(cx)), new_thread_max_tokens);
+        let compacting = thread.is_some_and(|thread| thread.read(cx).compacting);
         let thread = thread.map(Entity::downgrade);
+        let settings = thread
+            .as_ref()
+            .and_then(WeakEntity::upgrade)
+            .is_none_or(|thread| thread.read(cx).is_host())
+            .then_some(self.compaction_settings);
         div()
             .id("context-indicator")
             .debug_selector(|| "context-indicator".to_owned())
@@ -353,13 +358,7 @@ impl Cowork {
             .flex()
             .items_center()
             .justify_center()
-            .child(
-                ProgressCircle::new("context-ring")
-                    .value(usage.percent())
-                    .color(usage.color(cx.theme()))
-                    .accessibility_label(format!("Context window {:.0}% full", usage.percent()))
-                    .size(px(16.)),
-            )
+            .child(context_ring(usage, compacting, cx))
             .tooltip(move |window, cx| {
                 let thread = thread.clone();
                 // Reads the thread on every render, so the numbers keep up
@@ -370,39 +369,14 @@ impl Cowork {
                         thread.as_ref().map(|thread| thread.read(cx)),
                         new_thread_max_tokens,
                     );
-                    Self::render_context_details(usage, cx)
+                    let compacting = thread
+                        .as_ref()
+                        .is_some_and(|thread| thread.read(cx).compacting);
+                    context_details(usage, settings, compacting, cx)
                 })
                 .py_2()
                 .px_3()
                 .build(window, cx)
             })
-    }
-
-    fn render_context_details(usage: ContextUsage, cx: &App) -> impl IntoElement + use<> {
-        let muted = cx.theme().muted_foreground.opacity(0.7);
-        div()
-            .flex()
-            .flex_col()
-            .gap_1()
-            .child(
-                div()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Context"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_1p5()
-                    .text_color(cx.theme().secondary_foreground)
-                    .child(format!("{:.0}%", usage.percent()))
-                    .child(div().text_color(muted).child("·"))
-                    .child(format_token_count(usage.tokens))
-                    .child(
-                        div()
-                            .text_color(muted)
-                            .child(format!("/ {}", format_token_count(usage.max_tokens))),
-                    ),
-            )
     }
 }

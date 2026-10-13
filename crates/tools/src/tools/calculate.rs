@@ -14,7 +14,7 @@ pub enum Operation {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct CalculateArgs {
     /// The arithmetic operation to perform
     pub operation: Operation,
@@ -102,6 +102,24 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn unknown_arguments_return_model_feedback() {
+        let mut tools = rig::tool::ToolSet::default();
+        tools.add_tool(Calculate);
+        let result = futures::executor::block_on(tools.execute(
+            Calculate::NAME,
+            json!({ "operation": "add", "a": 2, "b": 3, "timeout": "60000" }).to_string(),
+            &mut ToolContext::new(),
+        ));
+        assert_eq!(
+            result.error().unwrap().kind(),
+            rig::tool::ToolErrorKind::InvalidArgs
+        );
+        let feedback = result.output().as_text().unwrap();
+        assert!(feedback.contains("unknown field `timeout`"), "{feedback}");
+        assert!(feedback.contains("operation"), "{feedback}");
+    }
 
     fn calculate(operation: Operation, a: f64, b: f64) -> Result<f64, CalculateError> {
         futures::executor::block_on(

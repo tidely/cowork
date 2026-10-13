@@ -188,7 +188,7 @@ impl fmt::Display for CommentToolError {
 impl std::error::Error for CommentToolError {}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct RespondToCommentArgs {
     /// One of the comment_ids listed with the inline comments, for example comment_1. Never invent one.
     pub comment_id: String,
@@ -272,6 +272,27 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn unknown_arguments_return_model_feedback() {
+        let mut tools = rig::tool::ToolSet::default();
+        tools.add_tool(RespondToComment::new(Arc::new(TurnComments::new(1))));
+        let result = futures::executor::block_on(
+            tools.execute(
+                RespondToComment::NAME,
+                json!({ "comment_id": "comment_1", "response": "Reply", "timeout": "60000" })
+                    .to_string(),
+                &mut ToolContext::new(),
+            ),
+        );
+        assert_eq!(
+            result.error().unwrap().kind(),
+            rig::tool::ToolErrorKind::InvalidArgs
+        );
+        let feedback = result.output().as_text().unwrap();
+        assert!(feedback.contains("unknown field `timeout`"), "{feedback}");
+        assert!(feedback.contains("comment_id"), "{feedback}");
+    }
 
     #[test]
     fn schema_and_argument_names_match() {

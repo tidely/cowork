@@ -74,7 +74,7 @@ fn io_error(error: std::io::Error, location: &Location) -> FileError {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct ListDirectoryArgs {
     /// The folder to list, such as `myproject`, `myproject/src`, or
     /// `scratch://`. `.` lists the project folders themselves.
@@ -212,7 +212,7 @@ pub(crate) fn list_directory(places: &Places, path: &str) -> Result<String, File
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct ReadFileArgs {
     /// The file to read, such as `myproject/src/main.rs` or
     /// `scratch://notes.md`.
@@ -386,7 +386,7 @@ pub(crate) fn read_file(
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct WriteFileArgs {
     /// The file to create or replace, such as `myproject/src/main.rs` or
     /// `scratch://notes.md`.

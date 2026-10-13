@@ -533,3 +533,140 @@ fn policy_events_mirror_and_management_is_host_only(cx: &mut gpui::TestAppContex
     });
     assert!(mirror.draft().comments_folded);
 }
+
+#[test]
+fn compaction_replaces_request_prefix_but_keeps_complete_transcript() {
+    let mut thread = local_thread();
+    let first = rig::completion::Message::user("Original request");
+    let later = rig::completion::Message::user("Next request");
+    thread.transcript = vec![first.clone(), later.clone()];
+    thread.compacted_context = Some(protocol::CompactedContext {
+        through: 1,
+        summary: "First summary".into(),
+    });
+    assert_eq!(
+        thread.request_history(),
+        vec![
+            rig::completion::Message::user("Summary of the conversation so far:\nFirst summary"),
+            later.clone()
+        ]
+    );
+    thread.compacted_context = Some(protocol::CompactedContext {
+        through: 2,
+        summary: "Second summary".into(),
+    });
+    assert_eq!(
+        thread.request_history(),
+        vec![rig::completion::Message::user(
+            "Summary of the conversation so far:\nSecond summary"
+        )]
+    );
+    assert_eq!(thread.transcript, vec![first, later]);
+    let snapshot = thread.to_protocol();
+    let bytes = postcard::to_stdvec(&snapshot).unwrap();
+    let decoded: protocol::ThreadSnapshot = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(decoded.compacted_context, thread.compacted_context);
+    assert_eq!(decoded.transcript.len(), 2);
+}
+
+#[gpui::test]
+fn compaction_events_preserve_previous_context_on_failure_and_stop(cx: &mut gpui::TestAppContext) {
+    let mut thread = local_thread();
+    thread
+        .transcript
+        .push(rig::completion::Message::user("Earlier request"));
+    let previous = protocol::CompactedContext {
+        through: 1,
+        summary: "Earlier summary".into(),
+    };
+    thread.compacted_context = Some(previous.clone());
+    let id = Uuid::new_v4().into_bytes();
+    thread
+        .try_apply_for_test(
+            protocol::HostMessage::AgentStarted {
+                id,
+                comment_group_id: None,
+                started_at: std::time::SystemTime::now(),
+                prompt: protocol::Json::from_rig(&rig::completion::Message::user("Continue")),
+            },
+            cx,
+        )
+        .unwrap();
+    thread
+        .try_apply_for_test(protocol::HostMessage::CompactionStarted, cx)
+        .unwrap();
+    thread
+        .try_apply_for_test(
+            protocol::HostMessage::CompactionFinished { context: None },
+            cx,
+        )
+        .unwrap();
+    assert_eq!(thread.compacted_context, Some(previous.clone()));
+    assert!(!thread.compacting);
+    thread
+        .try_apply_for_test(protocol::HostMessage::CompactionStarted, cx)
+        .unwrap();
+    thread
+        .try_apply_for_test(
+            protocol::HostMessage::AgentEnded {
+                id,
+                outcome: protocol::RunOutcome::Stopped,
+                duration: std::time::Duration::ZERO,
+            },
+            cx,
+        )
+        .unwrap();
+    assert!(!thread.compacting);
+    assert_eq!(thread.compacted_context, Some(previous));
+    assert_eq!(thread.transcript.len(), 2);
+}
+
+#[gpui::test]
+fn compaction_snapshot_restores_summary_and_full_transcript(cx: &mut gpui::TestAppContext) {
+    let mut host = local_thread();
+    let peer = add_peer(&mut host);
+    host.transcript
+        .push(rig::completion::Message::user("Earlier request"));
+    let id = Uuid::new_v4().into_bytes();
+    host.try_apply_for_test(
+        protocol::HostMessage::AgentStarted {
+            id,
+            comment_group_id: None,
+            started_at: std::time::SystemTime::now(),
+            prompt: protocol::Json::from_rig(&rig::completion::Message::user("Continue")),
+        },
+        cx,
+    )
+    .unwrap();
+    host.try_apply_for_test(protocol::HostMessage::CompactionStarted, cx)
+        .unwrap();
+    host.try_apply_for_test(
+        protocol::HostMessage::CompactionFinished {
+            context: Some(protocol::CompactedContext {
+                // A loop boundary can summarize every recorded message.
+                through: 2,
+                summary: "Summary".into(),
+            }),
+        },
+        cx,
+    )
+    .unwrap();
+    let welcome = protocol::Welcome {
+        participant_id: peer.into_bytes(),
+        thread: host.to_protocol(),
+        draft: host.draft.encode_state(),
+        draft_generation: 0,
+        presence: Vec::new(),
+        stored_attachments: Vec::new(),
+    };
+    let prepared = Thread::prepare_welcome(welcome).unwrap();
+    let restored = Thread::from_prepared_welcome(
+        prepared,
+        ThreadDraft::new(peer),
+        ThreadSharing::NotShared,
+        cx,
+    );
+    assert_eq!(restored.request_history(), host.request_history());
+    assert_eq!(restored.transcript, host.transcript);
+    assert_eq!(restored.compacted_context, host.compacted_context);
+}

@@ -1,0 +1,1 @@
+Summarize this conversation so another agent can continue it. Preserve the user's goals, constraints, decisions, completed work, important files and findings, outstanding tasks, and necessary technical details. Return only the summary. Do not call tools.

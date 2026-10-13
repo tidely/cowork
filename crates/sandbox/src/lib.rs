@@ -38,7 +38,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use mxc_sdk::v1::{
@@ -80,6 +80,12 @@ pub enum SandboxError {
     Failed(String),
     /// The model's command was rejected before anything ran.
     InvalidCommand(String),
+    /// The command exceeded its requested runtime. Its sandbox was ended;
+    /// output from before termination is kept for the model to diagnose it.
+    Timeout {
+        timeout: Duration,
+        output: CommandOutput,
+    },
 }
 
 impl std::fmt::Display for SandboxError {
@@ -92,6 +98,13 @@ impl std::fmt::Display for SandboxError {
             Self::Setup(error) => write!(formatter, "the sandbox could not be set up: {error}"),
             Self::Failed(error) => write!(formatter, "the command failed to run: {error}"),
             Self::InvalidCommand(reason) => formatter.write_str(reason),
+            Self::Timeout { timeout, output } => write!(
+                formatter,
+                "the command timed out after {} ms\nstdout:\n{}\nstderr:\n{}",
+                timeout.as_millis(),
+                output.stdout,
+                output.stderr
+            ),
         }
     }
 }
@@ -219,18 +232,20 @@ impl Sandboxes {
     /// its scratch folder. Dropping the future kills the command and whatever
     /// it started.
     pub async fn run(&self, thread: &str, command: &str) -> Result<CommandOutput, SandboxError> {
-        self.run_with(thread, command, None).await
+        self.run_with(thread, command, None, None).await
     }
 
     /// Like [`Sandboxes::run`], with `grant` in place of the project's mode
     /// when given, whatever the mode is by the time the command starts: what
     /// someone allowed, or what a command needing no approval was let through
-    /// with.
+    /// with. `timeout` limits runtime from process launch, excluding approval,
+    /// environment loading, and sandbox setup. Omit it for no time limit.
     pub async fn run_with(
         &self,
         thread: &str,
         command: &str,
         grant: Option<Grant>,
+        timeout: Option<Duration>,
     ) -> Result<CommandOutput, SandboxError> {
         if command.trim().is_empty() {
             return Err(SandboxError::InvalidCommand("the command is empty".into()));
@@ -259,7 +274,7 @@ impl Sandboxes {
         let request = request(command, &project, &folders, &scratch, &environment)?;
         let stop = StopOnDrop(Arc::new(AtomicBool::new(false)));
         let stopped = stop.0.clone();
-        let result = tokio::task::spawn_blocking(move || execute(request, &stopped)).await;
+        let result = tokio::task::spawn_blocking(move || execute(request, &stopped, timeout)).await;
         drop(stop);
         result.unwrap_or_else(|error| Err(SandboxError::Failed(error.to_string())))
     }
@@ -574,10 +589,15 @@ fn system_read_paths() -> Result<Vec<PathBuf>, SandboxError> {
     Ok(vec![PathBuf::from("/")])
 }
 
-/// Runs `request` to its end, or until `stopped`.
-fn execute(request: ContainerRequest, stopped: &AtomicBool) -> Result<CommandOutput, SandboxError> {
+/// Runs `request` to its end, until `stopped`, or until its runtime expires.
+fn execute(
+    request: ContainerRequest,
+    stopped: &AtomicBool,
+    timeout: Option<Duration>,
+) -> Result<CommandOutput, SandboxError> {
     let mut process = v1::spawn(request, Default::default())
         .map_err(|error| SandboxError::Failed(error.to_string()))?;
+    let started = Instant::now();
     let stdout = Output::read(&mut process, Stream::Stdout);
     let stderr = Output::read(&mut process, Stream::Stderr);
     let exit_code = loop {
@@ -586,23 +606,37 @@ fn execute(request: ContainerRequest, stopped: &AtomicBool) -> Result<CommandOut
             return Err(SandboxError::Failed("the command was stopped".into()));
         }
         match process.try_wait() {
-            Ok(Some(code)) => break code,
-            Ok(None) => std::thread::sleep(POLL_INTERVAL),
+            Ok(Some(code)) => break Ok(code),
+            Ok(None) => {
+                if let Some(timeout) = timeout {
+                    let remaining = timeout.saturating_sub(started.elapsed());
+                    if remaining.is_zero() {
+                        break Err(timeout);
+                    }
+                    std::thread::sleep(POLL_INTERVAL.min(remaining));
+                } else {
+                    std::thread::sleep(POLL_INTERVAL);
+                }
+            }
             Err(error) => {
                 _ = process.kill();
                 return Err(SandboxError::Failed(error.to_string()));
             }
         }
     };
-    // Ends what the command left running in the background, which may also
-    // hold its output open.
+    // Ends the command if it timed out, and anything left in the background
+    // in either case. Those processes may also hold its output open.
     _ = process.kill();
     drop(process);
-    Ok(CommandOutput::new(
-        exit_code,
+    let output = CommandOutput::new(
+        exit_code.as_ref().copied().unwrap_or(-1),
         &stdout.collect(),
         &stderr.collect(),
-    ))
+    );
+    match exit_code {
+        Ok(_) => Ok(output),
+        Err(timeout) => Err(SandboxError::Timeout { timeout, output }),
+    }
 }
 
 enum Stream {

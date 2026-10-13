@@ -264,6 +264,8 @@ fn rebasing_keeps_local_edits_the_host_has_not_seen(cx: &mut gpui::TestAppContex
             models: ModelCatalog::default(),
             model: None,
             context_tokens: None,
+            compacted_context: None,
+            compacting: false,
             streamed_bytes: 0,
             transcript: Vec::new(),
             prompt_names: Vec::new(),

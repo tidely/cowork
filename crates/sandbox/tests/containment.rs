@@ -306,6 +306,69 @@ async fn background_processes_end_with_their_command() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_timeout_returns_output_and_stops_child_processes() {
+    if !supported() {
+        return;
+    }
+    let root = Root::new("timeout");
+    let sandboxes = sandboxes(&root);
+    let mut tools = rig::tool::ToolSet::default();
+    tools.add_tool(sandbox::RunCommand::new(sandboxes, "thread"));
+    let started = Instant::now();
+    let result = tools
+        .execute(
+            "run_command",
+            serde_json::json!({
+                "command": "(while true; do echo tick >> \"$TMPDIR/ticks\"; sleep 0.05; done) & echo started; echo diagnostic >&2; wait",
+                "timeout_ms": 300,
+            })
+            .to_string(),
+            &mut rig::tool::ToolContext::new(),
+        )
+        .await;
+    assert_eq!(
+        result.error().unwrap().kind(),
+        rig::tool::ToolErrorKind::Timeout
+    );
+    let feedback = result.output().as_text().unwrap();
+    assert!(feedback.contains("timed out after 300 ms"), "{feedback}");
+    assert!(feedback.contains("stdout:\nstarted\n"), "{feedback}");
+    assert!(feedback.contains("stderr:\ndiagnostic\n"), "{feedback}");
+    assert!(started.elapsed() < Duration::from_secs(5), "{feedback}");
+
+    let ticks = root.0.join("scratch/test/thread/ticks");
+    let after_timeout = std::fs::read_to_string(&ticks).unwrap();
+    assert!(!after_timeout.is_empty(), "the child ran before timeout");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        std::fs::read_to_string(ticks).unwrap(),
+        after_timeout,
+        "the child stopped with its command"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_command_finishing_before_timeout_returns_normally() {
+    if !supported() {
+        return;
+    }
+    let root = Root::new("before-timeout");
+    let sandboxes = sandboxes(&root);
+    let output = sandboxes
+        .run_with(
+            "thread",
+            "echo done; echo diagnostic >&2; exit 7",
+            None,
+            Some(Duration::from_secs(5)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(output.exit_code, 7);
+    assert_eq!(output.stdout, "done\n");
+    assert_eq!(output.stderr, "diagnostic\n");
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn stopping_a_run_kills_its_command() {
     if !supported() {
         return;

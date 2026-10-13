@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use crate::{Access, Folders, Grant, RunCommand, grant::named_folders};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct RequestPermissionsArgs {
     /// Why the permissions are needed, in one short sentence the user reads
     /// when deciding, such as "Download the project's dependencies."

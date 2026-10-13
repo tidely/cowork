@@ -115,7 +115,7 @@ impl Cowork {
                             .child(if generating {
                                 "Steer"
                             } else if resume_pending {
-                                "Resume pending messages"
+                                "Resume messages"
                             } else {
                                 "Send message"
                             })
@@ -165,6 +165,8 @@ impl Cowork {
                     .debug_selector(move || {
                         if generating {
                             "steer-message"
+                        } else if resume_pending {
+                            "resume-messages"
                         } else {
                             "send-message"
                         }
@@ -172,9 +174,12 @@ impl Cowork {
                     })
                     .icon(Icon::new(if generating {
                         AssetIconName::CornerDownLeft
+                    } else if resume_pending {
+                        AssetIconName::Play
                     } else {
                         AssetIconName::SendHorizontal
                     }))
+                    .when(resume_pending, |button| button.label("Resume messages"))
                     .small()
                     .disabled(!ready)
                     .when(ready, |button| {
@@ -183,7 +188,7 @@ impl Cowork {
                     .accessibility_label(if generating {
                         "Steer message; Shift-click to queue"
                     } else if resume_pending {
-                        "Resume pending messages"
+                        "Resume messages"
                     } else {
                         "Send message"
                     })

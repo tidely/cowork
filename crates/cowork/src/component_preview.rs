@@ -292,3 +292,75 @@ fn tool_call(name: &str, arguments: serde_json::Value) -> ToolCall {
         ToolFunction::new(ToolName::new(name).expect("a valid name"), arguments),
     )
 }
+
+/// Opens a focused, interactive example of compaction settings and the
+/// composer's context ring. No provider or running agent is needed.
+pub fn run_compaction() -> anyhow::Result<()> {
+    gpui_platform::application()
+        .with_assets(crate::assets::Assets)
+        .run(|cx: &mut App| {
+            crate::init_app(cx);
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(gpui::Bounds::centered(
+                    None,
+                    size(px(820.), px(680.)),
+                    cx,
+                ))),
+                titlebar: Some(gpui::TitlebarOptions {
+                    title: Some("Cowork compaction preview".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            if let Err(error) = cx.open_window(options, |window, cx| {
+                let preview = cx.new(|_| CompactionPreview {
+                    settings: Default::default(),
+                });
+                cx.new(|cx| Root::new(preview, window, cx))
+            }) {
+                eprintln!("failed to open compaction preview: {error}");
+                cx.quit();
+            }
+            cx.set_quit_mode(QuitMode::LastWindowClosed);
+            cx.activate(true);
+        });
+    Ok(())
+}
+
+struct CompactionPreview {
+    settings: crate::compaction_settings::CompactionSettings,
+}
+
+impl Render for CompactionPreview {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        use crate::{
+            compaction_settings::{context_details, context_ring, controls},
+            usage::ContextUsage,
+        };
+        let settings = self.settings;
+        div().size_full().bg(cx.theme().background).text_color(cx.theme().foreground)
+            .id("compaction-preview").overflow_y_scroll()
+            .child(div().p_8().flex().flex_col().gap_4()
+                .child(div().text_lg().child("Compaction"))
+                .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                    .child("Adjust the settings to see the trigger move. The minimum can delay compaction beyond the chosen percentage."))
+                .child(controls(settings, cx, |this, settings, cx| { this.settings = settings; cx.notify(); }))
+                .children([
+                    ("Room to keep working", 52_429, 131_072, false),
+                    ("Near the compaction trigger", 100_925, 131_072, false),
+                    ("Compacting conversation", 106_168, 131_072, true),
+                    ("A smaller context window", 24_576, 32_768, false),
+                ].map(|(label, tokens, max_tokens, compacting)| {
+                    let usage = ContextUsage { tokens, max_tokens };
+                    let hover = settings;
+                    div().flex().items_center().justify_between().gap_6().py_3()
+                        .child(div().flex_1().flex().flex_col().gap_2()
+                            .child(div().text_sm().child(label))
+                            .child(div().id(SharedString::from(format!("preview-ring-{max_tokens}-{tokens}")))
+                                .size(px(28.)).flex().items_center().justify_center()
+                                .child(context_ring(usage, compacting, cx))
+                                .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::element(move |_, cx| context_details(usage, Some(hover), compacting, cx)).py_2().px_3().build(window, cx))))
+                        .child(context_details(usage, Some(settings), compacting, cx))
+                })))
+    }
+}

@@ -932,6 +932,7 @@ pub(crate) mod tests {
                         stage_before_settings: MainStage::Thread,
                         selected_provider: None,
                         settings_provider_step: Default::default(),
+                        compaction_settings: Default::default(),
                         profile: Profile::local(actor),
                         shown_profiles: HashMap::new(),
                         profile_error: None,

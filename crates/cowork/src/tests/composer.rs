@@ -522,6 +522,52 @@ fn generation_button_switches_between_stop_and_steer_for_the_whole_draft(
 }
 
 #[gpui::test]
+fn idle_pending_messages_show_resume_until_a_new_draft_is_written(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    cowork.update_in(cx, |cowork, window, cx| {
+        let mut draft = std::mem::replace(
+            &mut cowork.new_thread_draft,
+            ThreadDraft::new(cowork.local_participant_id),
+        );
+        draft.create_prompt(cowork.local_participant_id.as_uuid(), "queued message");
+        let thread = Cowork::new_empty_local_thread(
+            draft,
+            cowork.local_participant_id,
+            cowork.models.clone(),
+            cowork.new_thread_model.clone(),
+            cx,
+        );
+        let id = thread.read(cx).instance_id;
+        thread.update(cx, |thread, _| thread.generating = true);
+        cowork
+            .thread_store
+            .update(cx, |store, _| store.threads.push_front(thread.clone()));
+        cowork.active_thread_id = Some(id);
+        assert!(cowork.accept_submission_mode(
+            thread.read(cx).draft().id,
+            Some(thread.clone()),
+            crate::thread::submission::SubmissionRequest {
+                actor: cowork.local_participant_id,
+                submitted_locally: true,
+                mode: crate::thread::submission::SubmissionMode::Queue,
+            },
+            cx,
+        ));
+        thread.update(cx, |thread, _| thread.generating = false);
+        cowork.focus_composer(window, cx);
+        cx.notify();
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("resume-messages").is_some());
+    assert!(cx.debug_bounds("send-message").is_none());
+
+    cx.simulate_input("new message");
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("resume-messages").is_none());
+    assert!(cx.debug_bounds("send-message").is_some());
+}
+
+#[gpui::test]
 fn comments_and_attachment_only_blocks_make_the_draft_sendable(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     cowork.update(cx, |cowork, cx| {

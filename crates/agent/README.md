@@ -34,6 +34,11 @@ stop reason and default usage: token usage is unavailable when the provider
 stream is cancelled before its final response. Without pending steering,
 normal replies and usage keep their provider values.
 
+A `ContextHook` can summarize at request boundaries after all tools return
+and before pending steering is delivered. It replaces only the next requests'
+context; the caller's complete history and event replay remain intact. Summary
+requests retain the same tools and system prompt and never execute tools.
+
 A run is fully described by its events. `TurnFold` folds them into the
 messages they add to the history, and the loop records its own history by
 folding them, so anyone folding the same events, in this process or after

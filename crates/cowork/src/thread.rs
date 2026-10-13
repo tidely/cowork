@@ -145,11 +145,13 @@ pub(crate) struct Thread {
     /// leave so their messages still name them. Includes the local user's,
     /// although [`Cowork::profile`] is what shows for them.
     pub(crate) profiles: HashMap<ParticipantId, Profile>,
-    /// Everything the agent has been sent and has replied, exactly as sent,
-    /// so each request extends the previous one and the provider's prompt
-    /// cache stays valid. The host records it and everyone mirrors it; see
+    /// Complete ordinary-run history, kept for rendering and replay even
+    /// after compaction. Requests use `request_history` to substitute a
+    /// summary for an earlier prefix. Everyone mirrors this full history; see
     /// `transcript.rs`.
     pub(crate) transcript: Vec<RigMessage>,
+    pub(crate) compacted_context: Option<protocol::CompactedContext>,
+    pub(crate) compacting: bool,
     /// Folds the running agent's events into the transcript's next message.
     /// The events it has folded so far are the running message's pending
     /// events.
@@ -225,6 +227,8 @@ impl Thread {
             participants: Vec::new(),
             profiles: HashMap::new(),
             transcript: Vec::new(),
+            compacted_context: None,
+            compacting: false,
             agent_turn: TurnFold::default(),
             prompt_names: HashMap::new(),
             tokens_used: 0,
@@ -508,6 +512,8 @@ impl Thread {
             participants: Vec::new(),
             profiles: HashMap::new(),
             transcript: Vec::new(),
+            compacted_context: None,
+            compacting: false,
             agent_turn: TurnFold::default(),
             prompt_names: HashMap::new(),
             tokens_used: 0,
@@ -569,6 +575,15 @@ impl Thread {
             );
         }
         let transcript = parse_transcript(&welcome.thread.transcript)?;
+        if let Some(context) = &welcome.thread.compacted_context {
+            anyhow::ensure!(
+                context.through > 0
+                    && context.through <= transcript.len() as u64
+                    && !context.summary.trim().is_empty(),
+                "invalid compacted context"
+            );
+        }
+        anyhow::ensure!(!welcome.thread.compacting || welcome.thread.messages.iter().any(|message| matches!(message, protocol::TimelineMessage::Agent(message) if matches!(message.run, protocol::AgentRun::Generating))), "compaction without an active run");
         let agent_messages = welcome
             .thread
             .messages
@@ -651,6 +666,8 @@ impl Thread {
         self.models = Arc::new(std::mem::take(&mut thread.models));
         self.model = thread.model.take();
         self.context_tokens = thread.context_tokens;
+        self.compacted_context = thread.compacted_context.take();
+        self.compacting = thread.compacting;
         self.streamed_bytes = thread.streamed_bytes;
         self.transcript = transcript;
         self.prompt_names = std::mem::take(&mut thread.prompt_names)
@@ -739,6 +756,8 @@ impl Thread {
             model: self.model.clone(),
             peer_permissions: self.peer_permissions.clone(),
             context_tokens: self.context_tokens,
+            compacted_context: self.compacted_context.clone(),
+            compacting: self.compacting,
             streamed_bytes: self.streamed_bytes,
             messages: self
                 .timeline
@@ -1537,6 +1556,36 @@ impl Thread {
                 }
                 self.timeline.push(TimelineMessage::User(group));
             }
+            protocol::HostMessage::CompactionStarted => {
+                anyhow::ensure!(
+                    self.generating && !self.compacting,
+                    "compaction requires an active run"
+                );
+                self.compacting = true;
+            }
+            protocol::HostMessage::CompactionFinished { context } => {
+                anyhow::ensure!(
+                    self.compacting && self.generating,
+                    "compaction is not running"
+                );
+                self.compacting = false;
+                if let Some(context) = context {
+                    anyhow::ensure!(
+                        context.through > 0
+                            && context.through <= self.transcript.len() as u64
+                            && self
+                                .compacted_context
+                                .as_ref()
+                                .is_none_or(|previous| context.through >= previous.through)
+                            && !context.summary.trim().is_empty(),
+                        "invalid compacted context"
+                    );
+                    self.context_tokens =
+                        Some((context.summary.len() as u64).div_ceil(BYTES_PER_TOKEN));
+                    self.streamed_bytes = 0;
+                    self.compacted_context = Some(context);
+                }
+            }
             protocol::HostMessage::AgentStarted {
                 id,
                 comment_group_id,
@@ -1567,7 +1616,10 @@ impl Thread {
                 id,
                 outcome,
                 duration,
-            } => self.end_agent_run(id, outcome, duration, cx),
+            } => {
+                self.compacting = false;
+                self.end_agent_run(id, outcome, duration, cx);
+            }
             protocol::HostMessage::ToolApprovalRequested { id, call } => {
                 self.await_tool_approval(Uuid::from_bytes(id), call.to_call_id()?)?;
             }
@@ -1641,6 +1693,20 @@ impl Thread {
                 TimelineMessage::User(_) => None,
             })
             .sum()
+    }
+
+    /// The complete transcript stays available to render and validate old
+    /// runs; only requests substitute a successful summary for its prefix.
+    pub(crate) fn request_history(&self) -> Vec<RigMessage> {
+        match &self.compacted_context {
+            Some(context) => std::iter::once(RigMessage::user(format!(
+                "Summary of the conversation so far:\n{}",
+                context.summary
+            )))
+            .chain(self.transcript[context.through as usize..].iter().cloned())
+            .collect(),
+            None => self.transcript.clone(),
+        }
     }
 
     /// How much of the context window the thread fills right now: the last

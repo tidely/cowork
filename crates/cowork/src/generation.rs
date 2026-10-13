@@ -36,6 +36,10 @@ use crate::{
 /// in its own file so it reads and diffs as prose.
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 
+/// Kept separate for prompt iteration; appended as a user message, never
+/// substituted for the stable system and tool prefix.
+const COMPACTION_PROMPT: &str = include_str!("../prompts/compaction.md");
+
 /// The system prompt with the platform the host's commands run on, which
 /// decides their shell and tools. The same for every run on this computer, so
 /// it keeps the prompt prefix cacheable.
@@ -84,6 +88,108 @@ fn tool_set(
     tools.add_tool(ReadFile::new(sandboxes.clone(), thread));
     tools.add_tool(WriteFile::new(sandboxes.clone(), thread));
     tools
+}
+
+/// Compare like-for-like encoded messages rather than provider token totals,
+/// which include fixed system and tool overhead that a summary cannot shrink.
+fn summary_reduces_history(
+    history: &[rig::completion::Message],
+    replacement: &[rig::completion::Message],
+) -> bool {
+    match (serde_json::to_vec(history), serde_json::to_vec(replacement)) {
+        (Ok(before), Ok(after)) => after.len() < before.len(),
+        _ => false,
+    }
+}
+
+/// Uses the same summary path before a run and at its tool boundaries.
+/// Transcript positions count ordinary messages, never the smaller context.
+struct GenerationCompaction {
+    threshold: Option<u64>,
+    transcript_base: u64,
+    latest_context_tokens: Mutex<u64>,
+    environment_note: String,
+    updates: mpsc::UnboundedSender<RunUpdate>,
+}
+
+impl GenerationCompaction {
+    async fn compact(
+        &self,
+        agent: &StreamingAgent,
+        history: &[rig::completion::Message],
+        through: u64,
+        retain_environment: bool,
+    ) -> Option<Vec<rig::completion::Message>> {
+        _ = self.updates.send(RunUpdate::CompactionStarted);
+        let result = agent
+            .summarize(rig::completion::Message::user(COMPACTION_PROMPT), history)
+            .await;
+        let (context, replacement, usage) = match result {
+            Ok((mut summary, usage)) => {
+                // Between requests there is no new user prompt to restore
+                // the environment note, so carry it with the summary.
+                if retain_environment {
+                    summary.push_str("\n\n");
+                    summary.push_str(&self.environment_note);
+                }
+                let replacement = vec![rig::completion::Message::user(format!(
+                    "Summary of the conversation so far:\n{summary}"
+                ))];
+                if summary_reduces_history(history, &replacement) {
+                    *self.latest_context_tokens.lock().unwrap() =
+                        (summary.len() as u64).div_ceil(4);
+                    (
+                        Some(protocol::CompactedContext { through, summary }),
+                        Some(replacement),
+                        usage,
+                    )
+                } else {
+                    eprintln!("compaction skipped: summary did not reduce request history");
+                    (None, None, usage)
+                }
+            }
+            Err(error) => {
+                eprintln!("compaction failed: {error:#}");
+                (None, None, Usage::default())
+            }
+        };
+        _ = self
+            .updates
+            .send(RunUpdate::CompactionFinished { context, usage });
+        replacement
+    }
+}
+
+impl agent::ContextHook for GenerationCompaction {
+    fn before_request<'a>(
+        &'a self,
+        agent: &'a StreamingAgent,
+        boundary: agent::RequestBoundary<'a>,
+    ) -> futures::future::BoxFuture<'a, Option<Vec<rig::completion::Message>>> {
+        Box::pin(async move {
+            let threshold = self.threshold?;
+            let context_tokens = if boundary.usage.is_reported() {
+                usage_tokens(boundary.usage).saturating_add(boundary.tool_result_tokens)
+            } else {
+                // Interrupted streams have no final usage. Keep the last
+                // count and estimate the completed messages instead.
+                let estimate = serde_json::to_vec(boundary.history)
+                    .map_or(0, |bytes| (bytes.len() as u64).div_ceil(4));
+                (*self.latest_context_tokens.lock().unwrap()).max(estimate)
+            };
+            *self.latest_context_tokens.lock().unwrap() = context_tokens;
+            if context_tokens < threshold {
+                return None;
+            }
+            self.compact(
+                agent,
+                boundary.history,
+                self.transcript_base + boundary.added_messages as u64,
+                true,
+            )
+            .await
+        })
+    }
 }
 
 /// What a finished run took, for the usage statistics.
@@ -231,6 +337,16 @@ impl Cowork {
             scheduled,
         } = plan;
         let thread = self.thread_store.read(cx).thread(thread_id, cx)?;
+        if thread.read(cx).compacted_context.is_some() {
+            history = thread.read(cx).request_history();
+        }
+        let compact_through = thread.read(cx).transcript.len() as u64;
+        let context_tokens = thread.read(cx).live_context_tokens().unwrap_or(0);
+        let threshold = self
+            .compaction_settings
+            .threshold(thread.read(cx).max_tokens());
+        let compact =
+            threshold.is_some_and(|threshold| context_tokens >= threshold) && !history.is_empty();
         let message_id = Uuid::new_v4();
         let started_at = SystemTime::now();
         // Monotonic, so the duration survives clock changes.
@@ -244,10 +360,11 @@ impl Cowork {
         // project changes reach it through `Cowork::sync_sandbox_project`,
         // and the model through the next run's note.
         self.sync_sandbox_project(&thread, cx);
+        let environment_note = self.sandboxes.environment_note(&thread_id.to_string());
         prompt = prompt::with_environment_note(
             prompt,
-            &history,
-            self.sandboxes.environment_note(&thread_id.to_string()),
+            if compact { &[] } else { &history },
+            environment_note.clone(),
         );
         thread.update(cx, |thread, cx| {
             // Recorded before the run starts, so a prompt stays in the
@@ -263,6 +380,13 @@ impl Cowork {
             );
         });
         let (sender, mut receiver) = mpsc::unbounded_channel();
+        let compaction = Arc::new(GenerationCompaction {
+            threshold,
+            transcript_base: compact_through,
+            latest_context_tokens: Mutex::new(context_tokens),
+            environment_note,
+            updates: sender.clone(),
+        });
         let tools = tool_set(
             &self.sandboxes,
             &thread_id.to_string(),
@@ -318,14 +442,23 @@ impl Cowork {
                 // accepts; the OpenAI-compatible route refuses the request.
                 ModelProvider::Ollama => Ollama::new().native_completion(selected_model.id),
             };
-            StreamingAgent::new(model.erase(), tools)
+            let agent = StreamingAgent::new(model.erase(), tools)
                 .tool_hook(gate)
                 .steering_hook(steering)
+                .context_hook(compaction.clone())
                 .preamble(system_prompt())
                 .additional_params(json!({
                     "num_ctx": max_tokens,
                     "think": "medium"
-                }))
+                }));
+            if compact
+                && let Some(replacement) = compaction
+                    .compact(&agent, &history, compact_through, false)
+                    .await
+            {
+                history = replacement;
+            }
+            agent
                 .run(prompt, &mut history, move |event| {
                     _ = sender.send(RunUpdate::Event(event));
                 })
@@ -351,6 +484,21 @@ impl Cowork {
             while let Some(update) = receiver.recv().await {
                 let event = match update {
                     RunUpdate::Event(event) => event,
+                    RunUpdate::CompactionStarted => {
+                        thread.update(cx, |thread, cx| {
+                            thread.emit(protocol::HostMessage::CompactionStarted, cx)
+                        });
+                        _ = this.update(cx, |this, cx| this.thread_updated(thread_id, cx));
+                        continue;
+                    }
+                    RunUpdate::CompactionFinished { context, usage } => {
+                        turn_usage += usage;
+                        thread.update(cx, |thread, cx| {
+                            thread.emit(protocol::HostMessage::CompactionFinished { context }, cx)
+                        });
+                        _ = this.update(cx, |this, cx| this.thread_updated(thread_id, cx));
+                        continue;
+                    }
                     RunUpdate::SteeringConsumed { group, aliases } => {
                         thread.update(cx, |thread, cx| {
                             thread.emit(
@@ -474,6 +622,17 @@ impl Cowork {
         {
             return;
         }
+        // Stop can arrive after the provider finished but before its outcome
+        // reaches the UI. The user's stop still pauses pending delivery.
+        let outcome = if self
+            .active_generations
+            .get(&thread_id)
+            .is_some_and(|active| active.cancelled.load(Ordering::Acquire))
+        {
+            protocol::RunOutcome::Stopped
+        } else {
+            outcome
+        };
         thread.update(cx, |thread, cx| {
             thread.emit(
                 protocol::HostMessage::AgentEnded {
@@ -648,10 +807,27 @@ impl Cowork {
 }
 
 #[cfg(test)]
+#[path = "generation_compaction_tests.rs"]
+mod compaction_tests;
+
+#[cfg(test)]
 mod tests {
     use rig::tool::Tool as _;
 
     use super::*;
+
+    #[test]
+    fn summary_must_reduce_encoded_history_including_wrapper() {
+        let history = vec![rig::completion::Message::user("A short conversation")];
+        let wrapped = vec![rig::completion::Message::user(
+            "Summary of the conversation so far:\nShort",
+        )];
+        assert!(!summary_reduces_history(&history, &wrapped));
+        let history = vec![rig::completion::Message::user(
+            "Long conversation ".repeat(100),
+        )];
+        assert!(summary_reduces_history(&history, &wrapped));
+    }
 
     /// Displaying grants must not keep the update channel alive after the
     /// agent finishes; the receiver closing is what completes the run.

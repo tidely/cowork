@@ -29,16 +29,23 @@ pub(crate) enum SettingsPage {
     /// The LLM providers and their models, to pick the model new chats start
     /// with and discover models again; see `provider_setup.rs`.
     Providers,
+    /// When long conversations are summarized into a fresh context.
+    Compaction,
 }
 
 impl SettingsPage {
     /// Every page, in the order the sidebar lists their tabs.
-    pub(crate) const ALL: [SettingsPage; 2] = [SettingsPage::Profile, SettingsPage::Providers];
+    pub(crate) const ALL: [SettingsPage; 3] = [
+        SettingsPage::Profile,
+        SettingsPage::Providers,
+        SettingsPage::Compaction,
+    ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             SettingsPage::Profile => "Profile",
             SettingsPage::Providers => "Providers",
+            SettingsPage::Compaction => "Compaction",
         }
     }
 
@@ -46,6 +53,7 @@ impl SettingsPage {
         match self {
             SettingsPage::Profile => AssetIconName::CircleUser,
             SettingsPage::Providers => AssetIconName::Bot,
+            SettingsPage::Compaction => AssetIconName::FileText,
         }
     }
 }
@@ -67,6 +75,7 @@ impl Cowork {
         match page {
             SettingsPage::Profile => self.profile_error = None,
             SettingsPage::Providers => self.settings_provider_step = ProviderStep::Providers,
+            SettingsPage::Compaction => {}
         }
         // The composer is hidden, so it must not keep taking keystrokes.
         window.blur(cx);
@@ -92,6 +101,7 @@ impl Cowork {
         match page {
             SettingsPage::Profile => self.render_profile_page(cx).into_any_element(),
             SettingsPage::Providers => self.render_providers_page(cx).into_any_element(),
+            SettingsPage::Compaction => self.render_compaction_page(cx).into_any_element(),
         }
     }
 

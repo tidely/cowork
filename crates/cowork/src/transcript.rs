@@ -1,9 +1,10 @@
 //! The transcript and the agent's events: on the wire, and folded into a
 //! thread.
 //!
-//! The transcript is everything the agent has been sent and has replied,
-//! exactly as sent, as Rig's own messages. Prompts carry their files' content
-//! like any other request does.
+//! The transcript records ordinary agent runs exactly as sent, as Rig's own
+//! messages. Prompts carry their files' content like any other request does.
+//! Compaction's separate summary request is kept as request-context metadata;
+//! it never rewrites the transcript used to render those runs.
 //!
 //! The host forwards what its agent loop reports ([`AgentEvent`]s) as it
 //! happens, and every participant, the host included, folds them with the
@@ -310,8 +311,8 @@ impl Thread {
             AgentEvent::Model(
                 StreamEvent::Text { text, .. } | StreamEvent::Reasoning { text, .. },
             ) => self.streamed_bytes += text.len() as u64,
-            // Each request sends the whole transcript, so its usage is how
-            // full the context is.
+            // Each request sends the current request context (possibly a
+            // summary plus newer messages), so its usage measures fullness.
             AgentEvent::TurnEnded { usage, .. } if usage.is_reported() => {
                 self.context_tokens = Some(usage_tokens(*usage));
                 self.streamed_bytes = 0;

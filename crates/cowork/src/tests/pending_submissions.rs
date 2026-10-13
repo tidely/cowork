@@ -238,6 +238,90 @@ fn completed_runs_start_one_queued_message_but_stopping_preserves_pending(
 }
 
 #[gpui::test]
+fn stop_wins_late_completion_and_resume_delivers_steering_before_the_queue(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut session = Collaboration::start(cx);
+    let (message_id, task) = generating(&mut session);
+    accept(&mut session, "queue one", SubmissionMode::Queue);
+    accept(&mut session, "queue two", SubmissionMode::Queue);
+    accept(&mut session, "steer first", SubmissionMode::Steering);
+    let thread = session.host_thread.clone();
+    session.host.update(session.cx, |cowork, cx| {
+        let actor = thread.read(cx).participant_id();
+        let thread_id = thread.read(cx).instance_id;
+        cowork.cancel_generation(thread_id, actor, Some(message_id), cx);
+        // Completion was already on its way when Stop was clicked.
+        cowork.finish_generation(
+            &thread,
+            message_id,
+            protocol::RunOutcome::Completed,
+            RunTotals {
+                started_at: SystemTime::now(),
+                duration: Duration::ZERO,
+                usage: rig::completion::Usage::default(),
+            },
+            cx,
+        );
+        assert!(!thread.read(cx).generating);
+        assert_eq!(thread.read(cx).pending_submissions().len(), 3);
+    });
+    let mirror = session.collaborator_thread().unwrap();
+    session.wait_until(
+        "stopped pending messages reach the collaborator",
+        |session| {
+            mirror.read_with(session.cx, |thread, _| {
+                !thread.generating && thread.pending_submissions().len() == 3
+            })
+        },
+    );
+    session.host.update(session.cx, |cowork, cx| {
+        let actor = thread.read(cx).participant_id();
+        let draft_id = thread.read(cx).draft().id;
+        assert!(cowork.accept_submission_mode(
+            draft_id,
+            Some(thread.clone()),
+            crate::thread::submission::SubmissionRequest {
+                actor,
+                submitted_locally: true,
+                mode: SubmissionMode::Steering,
+            },
+            cx,
+        ));
+        assert!(thread.read(cx).generating);
+        assert_eq!(thread.read(cx).pending_submissions().len(), 2);
+        assert_eq!(thread.read(cx).submission_count(), 3);
+        assert!(thread.read(cx).timeline.iter().any(|entry| matches!(
+            entry, TimelineMessage::User(group) if group.blocks[0].text == "steer first"
+        )));
+        for (expected, remaining) in [("queue one", 1), ("queue two", 0)] {
+            let id = thread.read(cx).running_agent_message_id().unwrap();
+            cowork.finish_generation(
+                &thread,
+                id,
+                protocol::RunOutcome::Completed,
+                RunTotals {
+                    started_at: SystemTime::now(),
+                    duration: Duration::ZERO,
+                    usage: rig::completion::Usage::default(),
+                },
+                cx,
+            );
+            let state = thread.read(cx);
+            assert!(state.generating);
+            assert_eq!(state.pending_submissions().len(), remaining);
+            let latest = state.timeline.iter().rev().find_map(|entry| match entry {
+                TimelineMessage::User(group) => Some(group.blocks[0].text.as_str()),
+                _ => None,
+            });
+            assert_eq!(latest, Some(expected));
+            assert_eq!(state.submission_count(), 3);
+        }
+    });
+    task.abort();
+}
+
+#[gpui::test]
 fn consumed_steering_cannot_be_cancelled_and_mirrors_keep_the_prompt_out_of_output(
     cx: &mut gpui::TestAppContext,
 ) {

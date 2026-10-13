@@ -39,7 +39,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 27;
+pub(crate) const PROTOCOL_VERSION: u32 = 29;
 
 /// A request from a collaborator to the host.
 ///
@@ -281,6 +281,13 @@ pub(crate) enum HostMessage {
         outcome: RunOutcome,
         duration: Duration,
     },
+    /// Summary generation belongs to the active run and shares its cancellation.
+    CompactionStarted,
+    /// Only a validated, smaller summary replaces request history. None
+    /// reports a failed attempt without changing the last successful summary.
+    CompactionFinished {
+        context: Option<CompactedContext>,
+    },
     /// `participant` is called `name` in prompts from now on. Sent when their
     /// first item is submitted; a name never changes afterwards.
     PromptNamed {
@@ -423,6 +430,8 @@ pub(crate) struct ThreadSnapshot {
     pub(crate) peer_permissions: PeerPermissions,
     /// The context window use the provider last measured, if any.
     pub(crate) context_tokens: Option<u64>,
+    pub(crate) compacted_context: Option<CompactedContext>,
+    pub(crate) compacting: bool,
     /// Bytes of agent output streamed since `context_tokens` was measured.
     pub(crate) streamed_bytes: u64,
     pub(crate) messages: Vec<TimelineMessage>,
@@ -434,6 +443,14 @@ pub(crate) struct ThreadSnapshot {
     /// [`HostMessage::ProjectFoldersChanged`].
     pub(crate) project_folders: Vec<String>,
     pub(crate) project_mode: ProjectMode,
+}
+
+/// A summary replaces only this prefix of the complete transcript when
+/// constructing model requests; rendered messages retain their original indices.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct CompactedContext {
+    pub(crate) through: u64,
+    pub(crate) summary: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -883,6 +900,8 @@ mod tests {
             model: Some(sample_model()),
             peer_permissions: PeerPermissions::default(),
             context_tokens: Some(4_096),
+            compacted_context: None,
+            compacting: false,
             streamed_bytes: 120,
             messages: vec![
                 TimelineMessage::User(UserMessage {

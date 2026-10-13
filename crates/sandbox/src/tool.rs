@@ -5,7 +5,7 @@
 //! project's folders and mode, reaches the model as an environment note in
 //! the conversation instead; see [`Sandboxes::environment_note`].
 
-use std::sync::Arc;
+use std::{num::NonZeroU64, sync::Arc, time::Duration};
 
 use rig::tool::{ContextValue, Tool, ToolContext, ToolExecutionError};
 use serde::{Deserialize, Serialize};
@@ -13,10 +13,16 @@ use serde::{Deserialize, Serialize};
 use crate::{Access, CommandOutput, Folders, Grant, SandboxError, Sandboxes};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
-#[schemars(deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
 pub struct RunCommandArgs {
     /// A command line for the platform's shell, for example `ls -la`.
     pub command: String,
+    /// Maximum command runtime in milliseconds, as a positive integer.
+    /// Starts when the command launches, after approval. Omit for no time
+    /// limit. On expiry the command and its children are stopped, and the
+    /// timeout error includes stdout and stderr captured so far.
+    #[serde(default)]
+    pub timeout_ms: Option<NonZeroU64>,
     /// The access this one command needs, when it differs from the project's
     /// mode: `read` to read host files, `write` to also change the project,
     /// `network` to also reach the network. Leave it out to use the mode.
@@ -113,7 +119,9 @@ const DESCRIPTION: &str = concat!(
      can write a scratch folder, its TMPDIR, kept for this conversation; commands start there \
      when the project has no folders. HOME is the user's own home folder, so `~` means the \
      same in a command as in `read_folders` and `write_folders`. Anything a command leaves \
-     running in the background is ended when it exits."
+     running in the background is ended when it exits. Use `timeout_ms` to limit a command's \
+     runtime in milliseconds; omit it for no time limit. A timeout stops the command and its \
+     children and returns a timeout error with the output captured so far."
 );
 
 impl Tool for RunCommand {
@@ -134,6 +142,7 @@ impl Tool for RunCommand {
         match error {
             SandboxError::InvalidCommand(_) => ToolExecutionError::invalid_args(error.to_string()),
             SandboxError::Unsupported(_) => ToolExecutionError::not_found(error.to_string()),
+            SandboxError::Timeout { .. } => ToolExecutionError::timeout(error.to_string()),
             SandboxError::Setup(_) | SandboxError::Failed(_) => {
                 ToolExecutionError::other(error.to_string())
             }
@@ -165,7 +174,12 @@ impl Tool for RunCommand {
             }),
         };
         self.sandboxes
-            .run_with(&self.thread, &args.command, grant)
+            .run_with(
+                &self.thread,
+                &args.command,
+                grant,
+                args.timeout_ms.map(|ms| Duration::from_millis(ms.get())),
+            )
             .await
     }
 }
@@ -177,6 +191,73 @@ mod tests {
 
     use super::*;
     use crate::{Project, ProjectFolder, TestRoot, test_sandboxes};
+
+    /// Invented arguments reach the model as actionable errors, before any
+    /// command, file operation, or permission request can run.
+    #[tokio::test]
+    async fn unknown_arguments_return_model_feedback() {
+        let (sandboxes, _scratch) = test_sandboxes();
+        let mut tools = ToolSet::default();
+        tools.add_tool(RunCommand::new(sandboxes.clone(), "thread"));
+        tools.add_tool(crate::ListDirectory::new(sandboxes.clone(), "thread"));
+        tools.add_tool(crate::ReadFile::new(sandboxes.clone(), "thread"));
+        tools.add_tool(crate::WriteFile::new(sandboxes.clone(), "thread"));
+        tools.add_tool(crate::RequestPermissions);
+
+        for (name, mut arguments) in [
+            (RunCommand::NAME, json!({ "command": "echo hello" })),
+            (crate::ListDirectory::NAME, json!({ "path": "." })),
+            (
+                crate::ReadFile::NAME,
+                json!({ "path": "scratch://test.txt" }),
+            ),
+            (
+                crate::WriteFile::NAME,
+                json!({ "path": "scratch://test.txt", "content": "hello" }),
+            ),
+            (crate::RequestPermissions::NAME, json!({ "reason": "Test" })),
+        ] {
+            arguments["timeout"] = json!("60000");
+            let result = tools
+                .execute(name, arguments.to_string(), &mut ToolContext::new())
+                .await;
+            assert_eq!(
+                result.error().unwrap().kind(),
+                rig::tool::ToolErrorKind::InvalidArgs,
+                "{name}"
+            );
+            let feedback = result.output().as_text().unwrap();
+            assert!(feedback.contains("unknown field `timeout`"), "{feedback}");
+            assert!(feedback.contains("expected"), "{feedback}");
+        }
+        sandboxes.shutdown();
+    }
+
+    #[tokio::test]
+    async fn invalid_timeouts_return_model_feedback_before_running() {
+        let (sandboxes, _scratch) = test_sandboxes();
+        let mut tools = ToolSet::default();
+        tools.add_tool(RunCommand::new(sandboxes.clone(), "thread"));
+        for timeout in [json!(0), json!(-1), json!(1.5), json!("60000")] {
+            let result = tools
+                .execute(
+                    RunCommand::NAME,
+                    json!({ "command": "echo hello", "timeout_ms": timeout }).to_string(),
+                    &mut ToolContext::new(),
+                )
+                .await;
+            assert_eq!(
+                result.error().unwrap().kind(),
+                rig::tool::ToolErrorKind::InvalidArgs,
+                "{timeout}"
+            );
+            assert!(
+                result.output().as_text().unwrap().contains("invalid value")
+                    || result.output().as_text().unwrap().contains("invalid type")
+            );
+        }
+        sandboxes.shutdown();
+    }
 
     /// A call runs with the access it was granted, whatever the project's
     /// mode when it starts: read-only in a writable project, and writing in a
@@ -370,10 +451,15 @@ mod tests {
         let tool = RunCommand::new(sandboxes, "thread");
         let args: RunCommandArgs = serde_json::from_value(json!({"command": "ls"})).unwrap();
         assert_eq!(args.command, "ls");
+        assert_eq!(args.timeout_ms, None);
+        let timed: RunCommandArgs =
+            serde_json::from_value(json!({"command": "ls", "timeout_ms": 60000})).unwrap();
+        assert_eq!(timed.timeout_ms.unwrap().get(), 60000);
         let parameters = tool.parameters();
         assert_eq!(parameters["type"], "object");
         assert_eq!(parameters["properties"]["command"]["type"], "string");
         assert_eq!(parameters["required"], json!(["command"]));
+        assert_eq!(parameters["properties"]["timeout_ms"]["minimum"], 1);
         assert!(
             parameters["properties"]["access"].is_object(),
             "{parameters}"

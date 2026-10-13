@@ -3,7 +3,7 @@
 use serde::Serialize;
 
 /// What a command did, as the model receives it.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct CommandOutput {
     /// The exit code. A command ended by a signal reports `-1`.
     pub exit_code: i32,

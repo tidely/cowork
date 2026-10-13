@@ -298,6 +298,29 @@ pub trait SteeringHook: Send + Sync {
     fn take_pending(&self) -> Option<Message>;
 }
 
+/// A safe request boundary: the model response and all its tools have
+/// finished, but queued steering has not yet been delivered. Replacing
+/// request context here never removes unresolved tool calls or user steering.
+pub struct RequestBoundary<'a> {
+    pub history: &'a [Message],
+    /// Messages added to the complete transcript since this run began.
+    pub added_messages: usize,
+    pub usage: Usage,
+    /// Tool results were not included in the provider's last usage count.
+    pub tool_result_tokens: u64,
+}
+
+/// Optionally substitutes request context while the complete event history
+/// remains intact. The hook may use `Agent::summarize`, which retains tools
+/// without dispatching them. Dropping the run also cancels the hook.
+pub trait ContextHook: Send + Sync {
+    fn before_request<'a>(
+        &'a self,
+        agent: &'a Agent,
+        boundary: RequestBoundary<'a>,
+    ) -> BoxFuture<'a, Option<Vec<Message>>>;
+}
+
 /// A provider-independent, streaming tool loop.
 pub struct Agent {
     model: DynModel<Completion>,
@@ -307,6 +330,7 @@ pub struct Agent {
     /// `None` lets every call run.
     tool_hook: Option<Arc<dyn ToolHook>>,
     steering_hook: Option<Arc<dyn SteeringHook>>,
+    context_hook: Option<Arc<dyn ContextHook>>,
 }
 
 impl Agent {
@@ -318,6 +342,7 @@ impl Agent {
             additional_params: None,
             tool_hook: None,
             steering_hook: None,
+            context_hook: None,
         }
     }
 
@@ -328,6 +353,11 @@ impl Agent {
 
     pub fn steering_hook(mut self, hook: Arc<dyn SteeringHook>) -> Self {
         self.steering_hook = Some(hook);
+        self
+    }
+
+    pub fn context_hook(mut self, hook: Arc<dyn ContextHook>) -> Self {
+        self.context_hook = Some(hook);
         self
     }
 
@@ -343,6 +373,75 @@ impl Agent {
 }
 
 impl Agent {
+    /// Makes one summary request with exactly this agent's prompt prefix and
+    /// tools. Tool calls are never dispatched and invalidate the summary.
+    /// The caller's history is borrowed, so every failure leaves it intact.
+    pub async fn summarize(&self, prompt: Message, history: &[Message]) -> Result<(String, Usage)> {
+        let started = std::time::Instant::now();
+        let mut first_output = None;
+        let mut request = CompletionRequest::new(prompt)
+            .messages(history.to_vec())
+            .tools(self.tools.tool_definitions());
+        if let Some(preamble) = &self.preamble {
+            request = request.preamble(preamble.clone());
+        }
+        if let Some(params) = &self.additional_params {
+            request = request.additional_params(params.clone());
+        }
+        let mut stream = self
+            .model
+            .stream(request)
+            .context("failed to start summary")?;
+        while let Some(item) = stream.next().await {
+            let item = item.context("summary stream failed")?;
+            if matches!(
+                item,
+                Item::Event(StreamEvent::Text { .. } | StreamEvent::Reasoning { .. })
+            ) {
+                first_output.get_or_insert_with(|| started.elapsed());
+            }
+        }
+        let response = stream.finish().await.context("summary did not finish")?;
+        // Input counts include cached tokens. Report the actual cache counter
+        // and split prompt evaluation from new reasoning/text generation;
+        // these metrics contain no conversation content.
+        let milliseconds = |key| {
+            response
+                .raw
+                .get(key)
+                .and_then(serde_json::Value::as_u64)
+                .map(|ns| ns as f64 / 1_000_000.)
+        };
+        eprintln!(
+            "compaction metrics: input_tokens={:?} cached_input_tokens={:?} output_tokens={:?} first_output_ms={:?} load_ms={:?} prompt_eval_ms={:?} generation_ms={:?} total_ms={}",
+            response.usage.input_tokens,
+            response.usage.cached_input_tokens,
+            response.usage.output_tokens,
+            first_output.map(|time| time.as_millis()),
+            milliseconds("load_duration"),
+            milliseconds("prompt_eval_duration"),
+            milliseconds("eval_duration"),
+            started.elapsed().as_millis(),
+        );
+        if let Some(failure) = rig::message::turn_failure(
+            &response.choice,
+            Some(&response.stop()),
+            response.finish_reason().as_ref(),
+        ) {
+            anyhow::bail!(failure);
+        }
+        let mut text = String::new();
+        for content in response.choice.iter() {
+            match content {
+                AssistantContent::Text(part) => text.push_str(&part.text),
+                AssistantContent::ToolCall(_) => anyhow::bail!("summary attempted to call a tool"),
+                _ => {}
+            }
+        }
+        anyhow::ensure!(!text.trim().is_empty(), "summary was empty");
+        Ok((text, response.usage))
+    }
+
     async fn decide(&self, call: &ToolCall) -> ToolDecision {
         match &self.tool_hook {
             Some(hook) => hook.before_tool_call(call).await,
@@ -367,12 +466,16 @@ impl Agent {
     ) -> Result<()> {
         let mut fold = TurnFold::default();
         let mut prompt_recorded = false;
+        let initial_history_len = history.len();
+        // Request context may shrink; the caller's history always gains
+        // exactly the messages described by the emitted ordinary-run events.
+        let mut request_history = history.clone();
         loop {
             let mut request = CompletionRequest::new(prompt.clone())
                 .messages(if prompt_recorded {
-                    history[..history.len() - 1].to_vec()
+                    request_history[..request_history.len() - 1].to_vec()
                 } else {
-                    history.clone()
+                    request_history.clone()
                 })
                 .tools(self.tools.tool_definitions());
 
@@ -384,6 +487,7 @@ impl Agent {
             }
             if !prompt_recorded {
                 history.push(prompt.clone());
+                request_history.push(prompt.clone());
             }
             prompt_recorded = true;
 
@@ -450,7 +554,12 @@ impl Agent {
                     "the folded reply is the one Rig returned"
                 );
             }
+            let usage = match &ended {
+                AgentEvent::TurnEnded { usage, .. } => *usage,
+                _ => unreachable!(),
+            };
             emit(ended);
+            request_history.extend(reply.clone());
             history.extend(reply);
             if let Some(response) = &response
                 && let Some(failure) = rig::message::turn_failure(
@@ -464,6 +573,7 @@ impl Agent {
 
             let calls = fold.pending_calls().to_vec();
             let had_calls = !calls.is_empty();
+            let mut tool_result_tokens = 0;
             for call in calls {
                 let name = call.function.name.as_str();
                 let result = match &call.function.invalid_arguments {
@@ -500,10 +610,36 @@ impl Agent {
                     result,
                 };
                 if let Some(results) = fold.apply(&event)?.message {
+                    tool_result_tokens = serde_json::to_vec(&results)
+                        .map_or(0, |bytes| (bytes.len() as u64).div_ceil(4));
                     history.push(results.clone());
+                    request_history.push(results.clone());
                     prompt = results;
                 }
                 emit(event);
+            }
+            if (had_calls
+                || interrupted
+                || self
+                    .steering_hook
+                    .as_ref()
+                    .is_some_and(|hook| hook.has_pending()))
+                && let Some(hook) = &self.context_hook
+                && let Some(replacement) = hook
+                    .before_request(
+                        self,
+                        RequestBoundary {
+                            history: &request_history,
+                            added_messages: history.len() - initial_history_len,
+                            usage,
+                            tool_result_tokens,
+                        },
+                    )
+                    .await
+                && !replacement.is_empty()
+            {
+                request_history = replacement;
+                prompt = request_history.last().expect("nonempty context").clone();
             }
             if let Some(steering) = self
                 .steering_hook
@@ -513,7 +649,9 @@ impl Agent {
                 let event = AgentEvent::Steered {
                     prompt: steering.clone(),
                 };
-                history.extend(fold.apply(&event)?.message);
+                let message = fold.apply(&event)?.message;
+                request_history.extend(message.clone());
+                history.extend(message);
                 emit(event);
                 prompt = steering;
             } else if !had_calls {
@@ -522,7 +660,10 @@ impl Agent {
                 }
                 // Cancellation can race the boundary check. Continue from
                 // the finalized reply without inventing another user prompt.
-                prompt = history.last().expect("the initial prompt exists").clone();
+                prompt = request_history
+                    .last()
+                    .expect("the initial prompt exists")
+                    .clone();
             }
         }
     }
@@ -564,6 +705,100 @@ mod tests {
             }))
             .collect::<Vec<_>>();
         assert_eq!(replayed, history);
+    }
+
+    #[tokio::test]
+    async fn summary_preserves_request_prefix_and_history() {
+        let model = MockCompletionModel::from_stream_turns([
+            vec![
+                MockStreamEvent::Text("Summary.".into()),
+                MockStreamEvent::FinalResponse(mock_final_with_total_tokens(10)),
+            ],
+            vec![
+                MockStreamEvent::Text("Reply.".into()),
+                MockStreamEvent::FinalResponse(mock_final_with_total_tokens(20)),
+            ],
+        ]);
+        let mut tools = ToolSet::default();
+        tools.add_tool(tools::Calculate);
+        let agent = Agent::new(model.clone().erase(), tools)
+            .preamble("Stable system prompt")
+            .additional_params(serde_json::json!({"num_ctx": 131072}));
+        let history = vec![Message::user("Earlier conversation")];
+        let (summary, _) = agent
+            .summarize(Message::user("Summarize"), &history)
+            .await
+            .unwrap();
+        assert_eq!(summary, "Summary.");
+        assert_eq!(history, vec![Message::user("Earlier conversation")]);
+        agent
+            .run(Message::user("Continue"), &mut history.clone(), |_| {})
+            .await
+            .unwrap();
+        let requests = model.requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].system_instructions(),
+            requests[1].system_instructions()
+        );
+        // Rig combines adjacent user messages while retaining content order.
+        let [Message::System { .. }, Message::User { content }] =
+            requests[0].chat_history.as_slice()
+        else {
+            panic!("unexpected summary request");
+        };
+        assert_eq!(
+            content
+                .iter()
+                .filter_map(|part| match part {
+                    UserContent::Text(text) => Some(text.text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            ["Earlier conversation", "Summarize"]
+        );
+        assert!(requests[0].tool_choice.is_none());
+        assert_eq!(requests[0].tools, requests[1].tools);
+        assert_eq!(requests[0].additional_params, requests[1].additional_params);
+        assert!(!requests[0].tools.is_empty());
+    }
+
+    #[tokio::test]
+    async fn summary_rejects_empty_and_tool_output_without_dispatch() {
+        for text in [None, Some("A mixed tool summary")] {
+            let mut turn = vec![MockStreamEvent::tool_call(
+                "c",
+                "calculate",
+                serde_json::json!({"operation":"add", "a":1, "b":2}),
+            )];
+            if let Some(text) = text {
+                turn.push(MockStreamEvent::Text(text.into()));
+            }
+            turn.push(MockStreamEvent::FinalResponse(
+                mock_final_with_total_tokens(10),
+            ));
+            let model = MockCompletionModel::from_stream_turns([turn]);
+            let history = vec![Message::user("Original")];
+            let mut tools = ToolSet::default();
+            tools.add_tool(tools::Calculate);
+            assert!(
+                Agent::new(model.clone().erase(), tools)
+                    .summarize(Message::user("Summarize"), &history)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(model.requests().len(), 1);
+            assert_eq!(history, vec![Message::user("Original")]);
+        }
+        let model = MockCompletionModel::from_stream_turns([vec![MockStreamEvent::FinalResponse(
+            mock_final_with_total_tokens(10),
+        )]]);
+        assert!(
+            Agent::new(model.erase(), ToolSet::default())
+                .summarize(Message::user("Summarize"), &[])
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

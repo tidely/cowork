@@ -188,7 +188,7 @@ impl AgentToolCall {
             "respond_to_comment" => "Replied to comment".into(),
             "read_file" => "Read file".into(),
             "write_file" => "Wrote to file".into(),
-            "list_directory" => "Listed directories".into(),
+            "list_directory" => "Listed directory".into(),
             "request_permissions" => "Requested permissions".into(),
             name => format!("Ran {}", name),
         }
@@ -289,7 +289,7 @@ mod tool_call_tests {
             ("respond_to_comment", "Replied to comment"),
             ("read_file", "Read file"),
             ("write_file", "Wrote to file"),
-            ("list_directory", "Listed directories"),
+            ("list_directory", "Listed directory"),
             ("request_permissions", "Requested permissions"),
             ("other_tool", "Ran other_tool"),
         ] {

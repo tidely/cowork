@@ -215,6 +215,7 @@ fn test_cowork(
         stage_before_settings: MainStage::Thread,
         selected_provider: None,
         settings_provider_step: Default::default(),
+        compaction_settings: Default::default(),
         profile: Profile::local(local_participant_id),
         shown_profiles: HashMap::new(),
         profile_error: None,

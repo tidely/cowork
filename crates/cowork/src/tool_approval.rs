@@ -102,6 +102,11 @@ impl ApprovalRights {
 #[allow(clippy::large_enum_variant)]
 pub(crate) enum RunUpdate {
     Event(AgentEvent),
+    CompactionStarted,
+    CompactionFinished {
+        context: Option<crate::protocol::CompactedContext>,
+        usage: rig::completion::Usage,
+    },
     SteeringConsumed {
         group: crate::timeline::UserMessageGroup,
         aliases: Vec<String>,

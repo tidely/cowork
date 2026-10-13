@@ -6,6 +6,34 @@ Yrs document, and the protocol between host and collaborators.
 
 ## Status
 
+Ollama context compaction runs before a new agent run and between model
+requests within a run, after all tool results and before queued steering.
+This includes queued and scheduled runs. The host triggers it when the last measured
+context (plus unmeasured tool-result or streamed-output estimates) reaches both the configured percentage
+and minimum used tokens (defaults: 80% and 65,536). Windows no larger than the
+minimum cannot compact. Settings are local to the host for this session.
+A single summary request appends a user instruction to the current request
+history, preserving the ordinary system prompt, tools, and model options; it
+never executes tool calls. Empty, failed, or tool-bearing summaries are rejected,
+and the ordinary run continues with its old context. Stop cancels the whole run.
+A successful summary (including its wrapper) must also be smaller than the
+previous request history in encoded bytes. Only model request history replaces the earlier
+transcript prefix with a summary user message; the complete transcript and
+timeline stay intact. Host events and snapshots mirror the summary boundary and
+compacting indicator. Usage includes successful summary requests. The context
+estimate immediately after compaction counts summary bytes, excluding system,
+tools, wrapper, and the next prompt until normal provider usage arrives.
+Mid-run summaries carry the current environment note, so project access
+information remains available. The loop keeps the complete event transcript
+separate from its shrinking request context; steering arriving during a summary
+joins the next request after compaction. Compaction never interrupts a model
+response while it streams, so a single long response can still exhaust the
+context window before reaching a safe boundary.
+Completed summary requests log token and timing diagnostics without message
+content: total input, cached input, output, time to first output, model loading,
+prompt evaluation, and generation. Input tokens include cache hits; a large
+input count alone does not imply that the entire conversation was re-evaluated.
+
 All five steps of the [implementation order](#implementation-order) are done:
 participant identity, the protocol version handshake, shared model selection
 from the host's catalog (grouped by provider), shared stopping,
@@ -14,7 +42,9 @@ navigation, and empty-item removal, the draft
 synced through the host with host-coordinated submission, presence, and
 attachment transfer. Multiple queued submissions and a cancellable steering batch are host-owned,
 mirrored in snapshots and delivered at safe agent boundaries; queued runs continue
-one at a time after normal completion. Peer permissions are also implemented: `ReadOnly`, `Write`,
+one at a time after normal completion. Stop pauses pending delivery, including
+when completion races Stop; an idle composer with an empty draft offers an
+explicit Resume messages button. Peer permissions are also implemented: `ReadOnly`, `Write`,
 and `Admin`, defaulting to `Write`.
 The right-aligned titlebar gateway opens a nonmodal sharing popover with sharing
 and link actions; the host also manages live defaults before sharing and per-connection
@@ -469,8 +499,12 @@ included in late-join transfers. The 32 MB message attachment limit also applies
 to the combined steering batch.
 
 Normally completed runs automatically start one pending run. Stopping or failure
-keeps pending submissions visible and cancellable; clicking idle Send with an
-empty draft resumes the pending messages, without creating a new submission.
+keeps pending submissions visible and cancellable. Stop also wins over a
+completion already on its way to the UI, preventing automatic queue advancement.
+An idle composer with an empty draft shows a labelled **Resume messages** button
+with a play icon. Clicking it (or pressing the submit shortcut) resumes pending
+steering first, then queued messages in FIFO order, without creating a new submission.
+Steering already delivered remains in the conversation.
 Sending a new draft resumes the agent and any pending steering. Archived threads do not start queued
 runs. Queues are session state, like threads, and are not saved across app restarts.
 
@@ -498,12 +532,13 @@ A single-block submission looks like the current user message.
   item is submitted in the thread, and never changes afterwards. Renaming
   shows everywhere in the UI, but the agent keeps knowing them by one name,
   and nothing it was already sent changes.
-- The host keeps a **transcript** of everything the agent was sent and
-  replied, including reasoning, tool calls, and tool results, and sends it
-  verbatim as the history of the next run. Each request therefore extends
-  the previous one exactly, keeping the provider's prompt cache valid. A
-  run that is stopped or fails keeps its prompt and every turn it
-  completed.
+- The host keeps a **transcript** of ordinary agent runs, including prompts,
+  reasoning, tool calls, and tool results. Between compactions each request
+  extends the previous one exactly, keeping the provider's prompt cache
+  valid. After compaction, requests use the summary followed by transcript
+  messages after its boundary; the full transcript remains available for
+  display and sharing. A run that is stopped or fails keeps its prompt and
+  every turn it completed.
 - Every participant mirrors the transcript and the prompt names. The
   host forwards what its agent loop reports, as it happens, in
   `AgentEvent`: Rig's stream events (each part of the reply starting,
@@ -841,7 +876,7 @@ can still be reported. Runtime permission denials use the separate
 
 | Message                                      | Purpose                                                                                                                                                                                                                                                                                                                        |
 | -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `Welcome`                                    | Participant UUID, timeline and transcript snapshot (models, run state, prompt names, project folder names and mode), draft and receiving peer's `draft_generation`, participants, profiles, presence, stored attachment IDs, and peer permissions; explicit submission sequence and pending groups are included; peer-specific |
+| `Welcome`                                    | Participant UUID, timeline and transcript snapshot (models, run state, compacted context and status, prompt names, project folder names and mode), draft and receiving peer's `draft_generation`, participants, profiles, presence, stored attachment IDs, and peer permissions; explicit submission sequence and pending groups are included; peer-specific |
 | `Rejected`                                   | Join refused (e.g. protocol version); stable handshake encoding, then disconnect; peer-specific                                                                                                                                                                                                                                |
 | `PermissionDenied`                           | Runtime denial with participant UUID, operation, and reason (`NotParticipant`, `InsufficientMode`, `HostOnly`, or `StaleDraftGeneration`); peer-specific, connection stays open                                                                                                                                                |
 | `DraftReset`                                 | `{ generation, state }`: peer-specific authoritative draft; matching epoch merges, newer epoch replaces, older epoch is ignored                                                                                                                                                                                                |
@@ -862,6 +897,8 @@ can still be reported. Runtime permission denials use the separate
 | `UserMessage`                                | A delivered immediate submission with creators and attachment references instead of bytes; advances the submission sequence                                                                                                                                                                                                    |
 | `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and whether it completed, was stopped, or failed (with a message)                                                                                                                                                                                    |
 | `AgentEvent`                                 | What the host's agent loop reported during a run, which everyone folds into the agent message and transcript                                                                                                                                                                                                                   |
+| `CompactionStarted` | The active run is generating a summary; mirrored context indicator animates |
+| `CompactionFinished` | Ends summary generation; a successful summary and transcript boundary replace request context, while `None` preserves the previous context |
 | `PromptNamed`                                | A participant's prompt name, fixed on their first submitted item                                                                                                                                                                                                                                                               |
 | `ToolApprovalRequested`                      | A run waits for the named call of its last reply to be allowed or denied                                                                                                                                                                                                                                                       |
 | `ToolApprovalResolved`                       | The waiting call was decided; its result follows as an `AgentEvent`                                                                                                                                                                                                                                                            |

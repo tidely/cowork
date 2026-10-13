@@ -17,7 +17,10 @@
 //!
 //! Commands start in the first project folder, or scratch without one.
 //! HOME is the real home; TMPDIR/TMP/TEMP point to scratch. Commands
-//! have no time/output/resource limits; stopping the run ends them and any
+//! have no output/resource limits and no time limit unless `run_command`
+//! supplies a positive `timeout_ms`. Its runtime starts at process launch;
+//! on expiry the command and its children are ended, and a timeout error
+//! keeps captured stdout/stderr. Stopping the run also ends commands and any
 //! background processes. See `docs/permissions.md` for approval behavior.
 
 /// Where each thread's scratch folder is, under Cowork's home
