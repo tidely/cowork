@@ -21,7 +21,8 @@ const MAX_ATTACHMENT_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 /// Largest encoded image sent to the model, in line with common provider limits.
 pub(crate) const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 
-/// Text is inlined into the prompt, so keep it well within `OLLAMA_CONTEXT_TOKENS`.
+/// Text is inlined into the prompt; cap each attachment independently of the
+/// configurable context window.
 pub(crate) const MAX_TEXT_ATTACHMENT_BYTES: u64 = 256 * 1024;
 /// Largest total of the attachments submitted together.
 pub(crate) const MAX_MESSAGE_ATTACHMENT_BYTES: u64 = 32 * 1024 * 1024;

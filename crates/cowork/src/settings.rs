@@ -29,8 +29,8 @@ pub(crate) enum SettingsPage {
     /// The LLM providers and their models, to pick the model new chats start
     /// with and discover models again; see `provider_setup.rs`.
     Providers,
-    /// When long conversations are summarized into a fresh context.
-    Compaction,
+    /// The default context window and when conversations are summarized.
+    Context,
 }
 
 impl SettingsPage {
@@ -38,14 +38,14 @@ impl SettingsPage {
     pub(crate) const ALL: [SettingsPage; 3] = [
         SettingsPage::Profile,
         SettingsPage::Providers,
-        SettingsPage::Compaction,
+        SettingsPage::Context,
     ];
 
     pub(crate) fn label(self) -> &'static str {
         match self {
             SettingsPage::Profile => "Profile",
             SettingsPage::Providers => "Providers",
-            SettingsPage::Compaction => "Compaction",
+            SettingsPage::Context => "Context",
         }
     }
 
@@ -53,7 +53,7 @@ impl SettingsPage {
         match self {
             SettingsPage::Profile => AssetIconName::CircleUser,
             SettingsPage::Providers => AssetIconName::Bot,
-            SettingsPage::Compaction => AssetIconName::FileText,
+            SettingsPage::Context => AssetIconName::FileText,
         }
     }
 }
@@ -75,7 +75,7 @@ impl Cowork {
         match page {
             SettingsPage::Profile => self.profile_error = None,
             SettingsPage::Providers => self.settings_provider_step = ProviderStep::Providers,
-            SettingsPage::Compaction => {}
+            SettingsPage::Context => {}
         }
         // The composer is hidden, so it must not keep taking keystrokes.
         window.blur(cx);
@@ -101,7 +101,7 @@ impl Cowork {
         match page {
             SettingsPage::Profile => self.render_profile_page(cx).into_any_element(),
             SettingsPage::Providers => self.render_providers_page(cx).into_any_element(),
-            SettingsPage::Compaction => self.render_compaction_page(cx).into_any_element(),
+            SettingsPage::Context => self.render_context_page(cx).into_any_element(),
         }
     }
 

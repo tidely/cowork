@@ -345,7 +345,7 @@ impl Cowork {
         let compact_through = thread.read(cx).transcript.end().0;
         let context_tokens = thread.read(cx).live_context_tokens().unwrap_or(0);
         let threshold = self
-            .compaction_settings
+            .context_settings
             .threshold(thread.read(cx).max_tokens());
         let compact =
             threshold.is_some_and(|threshold| context_tokens >= threshold) && !history.is_empty();

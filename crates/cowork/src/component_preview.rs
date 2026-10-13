@@ -307,7 +307,7 @@ pub fn run_compaction() -> anyhow::Result<()> {
                     cx,
                 ))),
                 titlebar: Some(gpui::TitlebarOptions {
-                    title: Some("Cowork compaction preview".into()),
+                    title: Some("Cowork context preview".into()),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -328,35 +328,31 @@ pub fn run_compaction() -> anyhow::Result<()> {
 }
 
 struct CompactionPreview {
-    settings: crate::compaction_settings::CompactionSettings,
+    settings: crate::context_settings::ContextSettings,
 }
 
 impl Render for CompactionPreview {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        use crate::{
-            compaction_settings::{context_details, context_ring, controls},
-            usage::ContextUsage,
-        };
+        use crate::context_settings::{context_details, context_ring, controls};
         let settings = self.settings;
         div().size_full().bg(cx.theme().background).text_color(cx.theme().foreground)
             .id("compaction-preview").overflow_y_scroll()
             .child(div().p_8().flex().flex_col().gap_4()
-                .child(div().text_lg().child("Compaction"))
+                .child(div().text_lg().child("Context"))
                 .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                    .child("Adjust the settings to see the trigger move. The minimum can delay compaction beyond the chosen percentage."))
+                    .child("Adjust the window and compaction settings to see the indicators change. The minimum can delay compaction beyond the chosen percentage."))
                 .child(controls(settings, cx, |this, settings, cx| { this.settings = settings; cx.notify(); }))
                 .children([
-                    ("Room to keep working", 52_429, 131_072, false),
-                    ("Near the compaction trigger", 100_925, 131_072, false),
-                    ("Compacting conversation", 106_168, 131_072, true),
-                    ("A smaller context window", 24_576, 32_768, false),
-                ].map(|(label, tokens, max_tokens, compacting)| {
-                    let usage = ContextUsage { tokens, max_tokens };
+                    ("Room to keep working", 40, false),
+                    ("Near the compaction trigger", settings.threshold_percent.saturating_sub(3), false),
+                    ("Compacting conversation", settings.threshold_percent.saturating_add(1), true),
+                ].map(|(label, percent, compacting)| {
+                    let usage = settings.example_usage(percent);
                     let hover = settings;
                     div().flex().items_center().justify_between().gap_6().py_3()
                         .child(div().flex_1().flex().flex_col().gap_2()
                             .child(div().text_sm().child(label))
-                            .child(div().id(SharedString::from(format!("preview-ring-{max_tokens}-{tokens}")))
+                            .child(div().id(SharedString::from(format!("preview-ring-{label}")))
                                 .size(px(28.)).flex().items_center().justify_center()
                                 .child(context_ring(usage, compacting, cx))
                                 .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::element(move |_, cx| context_details(usage, Some(hover), compacting, cx)).py_2().px_3().build(window, cx))))

@@ -57,7 +57,7 @@ mod draft_editing;
 
 mod highlight;
 
-mod compaction_settings;
+mod context_settings;
 mod model_picker;
 mod models;
 mod participant;
@@ -154,7 +154,7 @@ struct Cowork {
     selected_provider: Option<models::ModelProvider>,
     /// Which step the Providers settings page shows.
     settings_provider_step: ProviderStep,
-    compaction_settings: compaction_settings::CompactionSettings,
+    context_settings: context_settings::ContextSettings,
     profile: Profile,
     /// Everyone's profile as the active thread shows them, refreshed at the
     /// start of every render; see [`Cowork::profiles_for`].
@@ -825,7 +825,7 @@ pub fn run() -> anyhow::Result<()> {
                         stage_before_settings: MainStage::Welcome,
                         selected_provider: None,
                         settings_provider_step: ProviderStep::default(),
-                        compaction_settings: compaction_settings::CompactionSettings::default(),
+                        context_settings: context_settings::ContextSettings::default(),
                         profile: Profile::local(local_participant_id),
                         shown_profiles: HashMap::new(),
                         profile_error: None,

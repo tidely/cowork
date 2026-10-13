@@ -3,6 +3,118 @@
 use super::*;
 
 #[gpui::test]
+fn context_window_changes_update_local_and_archived_threads(cx: &mut gpui::TestAppContext) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("test runtime");
+    let (cowork, _, cx) = attachment_test_cowork(cx, runtime.handle().clone());
+    cowork.update_in(cx, |cowork, window, cx| {
+        cowork.set_models(test_catalog(), cx);
+        cowork.new_thread_model = Some(ollama_qwen());
+        let local = cowork.active_thread(cx).expect("local thread");
+        local.update(cx, |thread, cx| {
+            thread.select_model(ollama_qwen(), cx).unwrap();
+            thread.context_tokens = Some(24_576);
+        });
+        let archived = Cowork::new_empty_local_thread(
+            ThreadDraft::new(cowork.local_participant_id),
+            cowork.local_participant_id,
+            cowork.models.clone(),
+            Some(ollama_qwen()),
+            cx,
+        );
+        cowork.thread_store.update(cx, |store, _| {
+            store.archived.push_front(archived.clone());
+        });
+        cowork.set_context_settings(
+            crate::context_settings::ContextSettings {
+                window_tokens: 32_768,
+                min_tokens: 8_192,
+                ..Default::default()
+            },
+            cx,
+        );
+        let usage = crate::usage::ContextUsage::of(Some(local.read(cx)), 0);
+        assert_eq!(usage.max_tokens, 32_768);
+        assert_eq!(usage.percent(), 75.);
+        assert_eq!(
+            cowork.context_settings.threshold(usage.max_tokens),
+            Some(26_215)
+        );
+        assert_eq!(archived.read(cx).max_tokens(), 32_768);
+        assert_eq!(
+            cowork.models.get(&ollama_qwen()).unwrap().max_tokens,
+            32_768
+        );
+        assert_eq!(
+            cowork.models.get(&recommended_qwen()).unwrap().max_tokens,
+            32_768
+        );
+        cowork.open_settings(SettingsPage::Context, window, cx);
+    });
+    cowork.read_with(cx, |cowork, _| {
+        assert_eq!(
+            cowork.main_stage,
+            MainStage::Settings(SettingsPage::Context)
+        );
+    });
+}
+
+#[gpui::test]
+fn context_settings_page_is_rendered(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    cowork.update_in(cx, |cowork, window, cx| {
+        cowork.open_settings(SettingsPage::Context, window, cx);
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("context-page").is_some());
+}
+
+#[gpui::test]
+fn context_window_changes_reach_peers_and_respect_their_host(cx: &mut gpui::TestAppContext) {
+    let mut pair = Collaboration::start(cx);
+    pair.host.update(pair.cx, |cowork, cx| {
+        cowork.set_models(test_catalog(), cx);
+        cowork.set_context_settings(
+            crate::context_settings::ContextSettings {
+                window_tokens: 32_768,
+                ..Default::default()
+            },
+            cx,
+        );
+    });
+    pair.wait_until("the updated context window reaches the peer", |pair| {
+        pair.collaborator_thread()
+            .unwrap()
+            .read_with(pair.cx, |thread, _| thread.max_tokens() == 32_768)
+    });
+    pair.collaborator.update(pair.cx, |cowork, cx| {
+        cowork.set_models(test_catalog(), cx);
+        cowork.set_context_settings(
+            crate::context_settings::ContextSettings {
+                window_tokens: 16_384,
+                ..Default::default()
+            },
+            cx,
+        );
+        assert_eq!(
+            cowork.models.get(&ollama_qwen()).unwrap().max_tokens,
+            16_384
+        );
+        assert_eq!(
+            cowork.active_thread(cx).unwrap().read(cx).max_tokens(),
+            32_768
+        );
+    });
+    pair.settle();
+    assert_eq!(
+        pair.host_thread
+            .read_with(pair.cx, |thread, _| thread.max_tokens()),
+        32_768
+    );
+}
+
+#[gpui::test]
 fn provider_setup_selects_the_new_threads_model(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     cx.update(|_, cx| {

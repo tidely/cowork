@@ -41,7 +41,7 @@ use crate::{
         AttachmentSource, FileAttachment, FileAttachmentContent, MAX_TEXT_ATTACHMENT_BYTES,
     },
     composer_attachments::PendingAttachment,
-    model_picker::{ModelPickerItems, OLLAMA_CONTEXT_TOKENS, language_model_groups},
+    model_picker::{ModelPickerItems, language_model_groups},
     models::{ModelCatalog, ModelInfo, ModelProvider, ModelRef},
     participant::ParticipantId,
     profile::{Profile, participant_name, profile_picture},
@@ -134,7 +134,8 @@ fn catalog_of(models: &[ModelRef]) -> ModelCatalog {
                 .map(|model| {
                     let info = ModelInfo {
                         name: model.id.clone(),
-                        max_tokens: OLLAMA_CONTEXT_TOKENS,
+                        max_tokens: crate::context_settings::ContextSettings::default()
+                            .window_tokens,
                     };
                     (model.id.clone(), info)
                 }),
@@ -215,7 +216,7 @@ fn test_cowork(
         stage_before_settings: MainStage::Thread,
         selected_provider: None,
         settings_provider_step: Default::default(),
-        compaction_settings: Default::default(),
+        context_settings: Default::default(),
         profile: Profile::local(local_participant_id),
         shown_profiles: HashMap::new(),
         profile_error: None,

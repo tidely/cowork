@@ -17,13 +17,11 @@ use rig::providers::ollama::Ollama;
 use crate::{
     Cowork,
     assets::OLLAMA_AVATAR_PATH,
-    compaction_settings::{context_details, context_ring},
+    context_settings::{context_details, context_ring},
     models::{ModelCatalog, ModelInfo, ModelProvider, ModelRef},
     thread::{Thread, ThreadOwnership},
     usage::ContextUsage,
 };
-
-pub(crate) const OLLAMA_CONTEXT_TOKENS: u64 = 16 * 8_192;
 
 impl ModelProvider {
     pub(crate) fn label(self) -> &'static str {
@@ -197,7 +195,7 @@ impl Cowork {
                                 let info = ModelInfo {
                                     name,
                                     // Ollama's listing does not report a maximum.
-                                    max_tokens: OLLAMA_CONTEXT_TOKENS,
+                                    max_tokens: this.context_settings.window_tokens,
                                 };
                                 (model.id, info)
                             }),
@@ -349,7 +347,7 @@ impl Cowork {
             .as_ref()
             .and_then(WeakEntity::upgrade)
             .is_none_or(|thread| thread.read(cx).is_host())
-            .then_some(self.compaction_settings);
+            .then_some(self.context_settings);
         div()
             .id("context-indicator")
             .debug_selector(|| "context-indicator".to_owned())

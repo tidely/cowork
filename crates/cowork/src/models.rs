@@ -65,6 +65,16 @@ impl ModelCatalog {
         }
     }
 
+    /// Ollama's listing has no window size: every discovered model uses the
+    /// session's configured window. Publishing this catalog keeps peers aligned.
+    pub(crate) fn set_context_window(&mut self, tokens: u64) {
+        for models in self.providers.values_mut() {
+            for info in models.values_mut() {
+                info.max_tokens = tokens;
+            }
+        }
+    }
+
     pub(crate) fn get(&self, model: &ModelRef) -> Option<&ModelInfo> {
         self.providers.get(&model.provider)?.get(&model.id)
     }
