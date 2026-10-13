@@ -86,7 +86,7 @@ async fn steering_is_delivered_after_loop_compaction() {
     while let Ok(update) = receiver.try_recv() {
         match update {
             RunUpdate::CompactionFinished { context, .. } => {
-                assert_eq!(context.unwrap().through, 3);
+                assert_eq!(context.unwrap().resume_at.0, 3);
                 finished = true;
             }
             RunUpdate::Event(AgentEvent::Steered { .. }) => assert!(finished),
@@ -135,8 +135,8 @@ async fn compaction_runs_between_tool_turns_and_preserves_full_history() {
                         .summary
                         .contains("<environment>project path</environment>")
                 );
-                assert_eq!(context.through, 7 + replayed.len() as u64);
-                boundaries.push(context.through);
+                assert_eq!(context.resume_at.0, 7 + replayed.len() as u64);
+                boundaries.push(context.resume_at.0);
             }
             _ => panic!("unexpected update"),
         }

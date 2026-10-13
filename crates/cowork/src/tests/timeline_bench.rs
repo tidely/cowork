@@ -339,6 +339,8 @@ pub(super) struct BenchRoot {
     draws: usize,
 }
 
+/// Used only by `generation_profile`, which is Linux-only.
+#[cfg(target_os = "linux")]
 impl BenchRoot {
     pub(super) fn stage(cowork: Entity<Cowork>) -> Self {
         Self {
@@ -464,23 +466,26 @@ pub(super) fn timeline(count: usize, response: &str, cx: &mut gpui::App) -> Vec<
     (0..count)
         .map(|index| {
             if index % 2 == 0 {
-                TimelineMessage::User(UserMessageGroup {
-                    id: Uuid::new_v4(),
-                    blocks: vec![PromptBlock {
+                TimelineMessage::User(
+                    UserMessageGroup {
                         id: Uuid::new_v4(),
-                        author,
-                        text: "Explain the implementation and its validation.".into(),
-                        attachments: Vec::new(),
-                    }],
-                    comments: Vec::new(),
-                    comments_folded: false,
-                })
+                        blocks: vec![PromptBlock {
+                            id: Uuid::new_v4(),
+                            author,
+                            text: "Explain the implementation and its validation.".into(),
+                            attachments: Vec::new(),
+                        }],
+                        comments: Vec::new(),
+                        comments_folded: false,
+                    }
+                    .into(),
+                )
             } else {
                 let mut message = AgentMessage::new(
                     Uuid::new_v4(),
                     None,
                     SystemTime::UNIX_EPOCH,
-                    0,
+                    crate::transcript::TranscriptIndex(0),
                     AgentRun::Ended {
                         outcome: RunOutcome::Completed,
                         duration: Duration::from_secs(1),
@@ -496,7 +501,7 @@ pub(super) fn timeline(count: usize, response: &str, cx: &mut gpui::App) -> Vec<
                     },
                     cx,
                 );
-                message.committed = OutputMark {
+                message.ui.committed = OutputMark {
                     steps: 1,
                     tail: response.len(),
                     answered: 0,
@@ -551,7 +556,7 @@ fn timeline_bench() {
                     let reply_views: Vec<_> = messages
                         .iter()
                         .filter_map(|message| match message {
-                            TimelineMessage::Agent(message) => Some(message.text_view.clone()),
+                            TimelineMessage::Agent(message) => Some(message.ui.text_view.clone()),
                             TimelineMessage::User(_) => None,
                         })
                         .collect();

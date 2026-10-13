@@ -357,40 +357,44 @@ fn assert_backslash_selection_creates_comment(
         // Stands in for the composer, which has focus before commenting.
         let composer = Cowork::new_draft_editor("", window, cx);
         let timeline = vec![TimelineMessage::Agent(AgentMessage {
-            id: if target_comment_reply {
-                Uuid::new_v4()
-            } else {
-                message_id
+            record: crate::timeline::AgentRunRecord {
+                id: if target_comment_reply {
+                    Uuid::new_v4()
+                } else {
+                    message_id
+                },
+                comment_group_id: None,
+                started_at: SystemTime::UNIX_EPOCH,
+                prompt: crate::transcript::TranscriptIndex(0),
+                pending_events: Vec::new(),
+                run: crate::protocol::AgentRun::Ended {
+                    outcome: crate::protocol::RunOutcome::Completed,
+                    duration: std::time::Duration::ZERO,
+                },
+                awaiting_approval: None,
+                steering: Vec::new(),
             },
-            comment_group_id: None,
-            started_at: SystemTime::UNIX_EPOCH,
-            comment_responses: target_comment_reply
-                .then(|| AgentCommentResponse {
-                    id: message_id,
-                    comment_id: Uuid::new_v4(),
-                    response: markdown.into(),
-                    response_view: text_view.clone(),
-                })
-                .into_iter()
-                .collect(),
-            prompt: 0,
-            pending_events: Vec::new(),
-            run: crate::protocol::AgentRun::Ended {
-                outcome: crate::protocol::RunOutcome::Completed,
-                duration: std::time::Duration::ZERO,
+            ui: crate::timeline::AgentMessageUi {
+                output: crate::timeline::AgentOutput {
+                    thinking_complete: true,
+                    text: main_text.into(),
+                    ..Default::default()
+                },
+                committed: Default::default(),
+                comment_calls_checked: 0,
+                step_views: Vec::new(),
+                text_view: main_text_view,
+                comment_responses: target_comment_reply
+                    .then(|| AgentCommentResponse {
+                        id: message_id,
+                        comment_id: Uuid::new_v4(),
+                        response: markdown.into(),
+                        response_view: text_view.clone(),
+                    })
+                    .into_iter()
+                    .collect(),
+                work_expanded: false,
             },
-            output: crate::timeline::AgentOutput {
-                thinking_complete: true,
-                text: main_text.into(),
-                ..Default::default()
-            },
-            committed: Default::default(),
-            comment_calls_checked: 0,
-            awaiting_approval: None,
-            steering: Vec::new(),
-            step_views: Vec::new(),
-            work_expanded: false,
-            text_view: main_text_view,
         })];
         let thread = cx.new(|_| test_thread(thread_id, timeline, draft));
         let thread_store = cx.new(|_| ThreadStore {
@@ -684,28 +688,32 @@ fn commenting_on_a_long_response_keeps_the_timeline_scroll_position(cx: &mut gpu
     let message_id = Uuid::new_v4();
     let (root, cx) = cx.add_window_view(|window, cx| {
         let timeline = vec![TimelineMessage::Agent(AgentMessage {
-            id: message_id,
-            comment_group_id: None,
-            started_at: SystemTime::UNIX_EPOCH,
-            comment_responses: Vec::new(),
-            prompt: 0,
-            pending_events: Vec::new(),
-            run: crate::protocol::AgentRun::Ended {
-                outcome: crate::protocol::RunOutcome::Completed,
-                duration: std::time::Duration::ZERO,
+            record: crate::timeline::AgentRunRecord {
+                id: message_id,
+                comment_group_id: None,
+                started_at: SystemTime::UNIX_EPOCH,
+                prompt: crate::transcript::TranscriptIndex(0),
+                pending_events: Vec::new(),
+                run: crate::protocol::AgentRun::Ended {
+                    outcome: crate::protocol::RunOutcome::Completed,
+                    duration: std::time::Duration::ZERO,
+                },
+                awaiting_approval: None,
+                steering: Vec::new(),
             },
-            output: crate::timeline::AgentOutput {
-                thinking_complete: true,
-                text: markdown.clone(),
-                ..Default::default()
+            ui: crate::timeline::AgentMessageUi {
+                output: crate::timeline::AgentOutput {
+                    thinking_complete: true,
+                    text: markdown.clone(),
+                    ..Default::default()
+                },
+                committed: Default::default(),
+                comment_calls_checked: 0,
+                step_views: Vec::new(),
+                text_view: cx.new(|cx| TextViewState::markdown(&markdown, cx)),
+                comment_responses: Vec::new(),
+                work_expanded: false,
             },
-            committed: Default::default(),
-            comment_calls_checked: 0,
-            awaiting_approval: None,
-            steering: Vec::new(),
-            step_views: Vec::new(),
-            work_expanded: false,
-            text_view: cx.new(|cx| TextViewState::markdown(&markdown, cx)),
         })];
         let draft = ThreadDraft::new(ParticipantId::new());
         let thread = cx.new(|_| test_thread(thread_id, timeline, draft));

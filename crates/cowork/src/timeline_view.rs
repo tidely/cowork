@@ -34,7 +34,7 @@ use crate::{
     thread_draft::{CARET_LABEL_DURATION, EditorSlot, RemoteCaret},
     timeline::{
         AgentMessage, AgentStep, AgentToolCall, MessageAuthor, StepView, ThreadMessageId,
-        TimelineMessage, UserComment, UserCommentBody, UserMessageGroup,
+        TimelineMessage, UserComment, UserCommentBody,
     },
     tool_approval::{self, ApprovalRights},
     tool_call_card::ToolCallCard,
@@ -152,37 +152,37 @@ impl Cowork {
         let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
             return;
         };
-        let (message_id, source_range) = {
-            let thread = thread.read(cx);
-            let mut targets = thread
-                .timeline
-                .iter()
-                .filter_map(|entry| match entry {
-                    TimelineMessage::Agent(message) => Some(
-                        std::iter::once((message.id, message.text_view.clone())).chain(
-                            message
-                                .comment_responses
-                                .iter()
-                                .map(|response| (response.id, response.response_view.clone())),
-                        ),
-                    ),
-                    TimelineMessage::User(_) => None,
-                })
-                .flatten()
-                .collect::<Vec<_>>();
-            targets.sort_by_key(|(message_id, _)| *message_id != preferred_message_id);
-            let Some(target) = targets.into_iter().find_map(|(message_id, text_view)| {
-                let thread_message_id = ThreadMessageId {
-                    thread_id,
-                    message_id,
+        let (message_id, source_range) =
+            {
+                let thread = thread.read(cx);
+                let mut targets =
+                    thread
+                        .timeline
+                        .iter()
+                        .filter_map(|entry| match entry {
+                            TimelineMessage::Agent(message) => Some(
+                                std::iter::once((message.record.id, message.ui.text_view.clone()))
+                                    .chain(message.ui.comment_responses.iter().map(|response| {
+                                        (response.id, response.response_view.clone())
+                                    })),
+                            ),
+                            TimelineMessage::User(_) => None,
+                        })
+                        .flatten()
+                        .collect::<Vec<_>>();
+                targets.sort_by_key(|(message_id, _)| *message_id != preferred_message_id);
+                let Some(target) = targets.into_iter().find_map(|(message_id, text_view)| {
+                    let thread_message_id = ThreadMessageId {
+                        thread_id,
+                        message_id,
+                    };
+                    self.selected_message_source_range(thread_message_id, &text_view, cx)
+                        .map(|source_range| (message_id, source_range))
+                }) else {
+                    return;
                 };
-                self.selected_message_source_range(thread_message_id, &text_view, cx)
-                    .map(|source_range| (message_id, source_range))
-            }) else {
-                return;
+                target
             };
-            target
-        };
 
         let draft_id = thread.read(cx).draft().id;
         let Some(comment_id) = self.update_draft(draft_id, cx, |draft| {
@@ -223,13 +223,14 @@ impl Cowork {
         let threads = self.thread_store.read(cx).threads.clone();
         for thread in threads {
             let toggled = thread.update(cx, |thread, _| {
-                for entry in &mut thread.timeline {
-                    if let TimelineMessage::User(group) = entry
-                        && group.id == group_id
-                    {
-                        group.comments_folded = !group.comments_folded;
-                        return true;
+                if let Some(message) = thread.timeline.iter_mut().find_map(|entry| match entry {
+                    TimelineMessage::User(message) if message.record.id == group_id => {
+                        Some(message)
                     }
+                    _ => None,
+                }) {
+                    message.ui.comments_folded = !message.ui.comments_folded;
+                    return true;
                 }
                 thread.toggle_pending_comments(group_id)
             });
@@ -484,32 +485,37 @@ impl Cowork {
     pub(crate) fn render_user_message_group(
         &self,
         index: usize,
-        group: &UserMessageGroup,
+        group: &crate::timeline::UserMessage,
         cards: Vec<Vec<AttachmentCard>>,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let comments = group
+            .record
+            .comments
+            .iter()
+            .map(crate::timeline::SubmittedComment::to_view)
+            .collect::<Vec<_>>();
         let mut rows = Vec::new();
-        if !group.comments.is_empty() {
+        if !group.record.comments.is_empty() {
             let mut content = vec![
                 Self::render_comment_group_toggle(
-                    group.id,
-                    group.comments.len(),
-                    group.comments_folded,
+                    group.record.id,
+                    group.record.comments.len(),
+                    group.ui.comments_folded,
                     cx,
                 )
                 .into_any_element(),
             ];
-            if !group.comments_folded {
+            if !group.ui.comments_folded {
                 content.extend(
-                    group
-                        .comments
+                    comments
                         .iter()
                         .map(|comment| self.render_composer_comment(comment, cx)),
                 );
             }
-            rows.push(self.render_comment_group_row(&group.comments, content, cx));
+            rows.push(self.render_comment_group_row(&comments, content, cx));
         }
-        for (block_index, (block, cards)) in group.blocks.iter().zip(cards).enumerate() {
+        for (block_index, (block, cards)) in group.record.blocks.iter().zip(cards).enumerate() {
             let mut content = Vec::new();
             if !cards.is_empty() {
                 content.push(
@@ -719,17 +725,11 @@ impl Cowork {
             return;
         };
         thread.update(cx, |thread, _| {
-            for entry in &mut thread.timeline {
-                if let TimelineMessage::Agent(message) = entry
-                    && message.id == message_id
-                {
-                    if !message.output.thinking_in_progress(step_index)
-                        && let Some(view) = message.step_views.get_mut(step_index)
-                    {
-                        view.set_expanded(!view.expanded());
-                    }
-                    break;
-                }
+            if let Some(message) = thread.agent_message_mut(message_id.into_bytes())
+                && !message.ui.output.thinking_in_progress(step_index)
+                && let Some(view) = message.ui.step_views.get_mut(step_index)
+            {
+                view.set_expanded(!view.expanded());
             }
         });
         cx.notify();
@@ -744,10 +744,11 @@ impl Cowork {
         view: &Entity<TextViewState>,
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
-        let message_id = message.id;
-        let in_progress = message.output.thinking_in_progress(step_index);
+        let message_id = message.record.id;
+        let in_progress = message.ui.output.thinking_in_progress(step_index);
         let expanded = in_progress
             || message
+                .ui
                 .step_views
                 .get(step_index)
                 .is_some_and(StepView::expanded);
@@ -807,7 +808,7 @@ impl Cowork {
         expanded: bool,
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
-        let message_id = message.id;
+        let message_id = message.record.id;
         let running = call.result.is_none() && message.is_generating();
         let summary = if let Some(command) = call.command_preview().filter(|_| !running) {
             let block = CodeBlock::from_code(command.as_str(), Some("sh"));
@@ -990,20 +991,23 @@ impl Cowork {
                 ));
             }
         };
-        for step_index in message.output.work() {
+        for step_index in message.ui.output.work() {
             let (Some(step), Some(view)) = (
-                message.output.steps.get(step_index),
-                message.step_views.get(step_index),
+                message.ui.output.steps.get(step_index),
+                message.ui.step_views.get(step_index),
             ) else {
                 continue;
             };
             match (step, view) {
                 (AgentStep::ToolCall(call), _) if awaiting_step == Some(step_index) => {
-                    calls.push(
-                        self.render_tool_approval(
-                            thread_id, message.id, step_index, call, rights, cx,
-                        ),
-                    );
+                    calls.push(self.render_tool_approval(
+                        thread_id,
+                        message.record.id,
+                        step_index,
+                        call,
+                        rights,
+                        cx,
+                    ));
                 }
                 (AgentStep::ToolCall(call), view) => calls.push(Self::render_tool_call(
                     thread_id,
@@ -1049,12 +1053,12 @@ impl Cowork {
         message: &AgentMessage,
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
-        let message_id = message.id;
+        let message_id = message.record.id;
         // Shimmering while the agent works, to draw the eye; static after.
-        let label = match message.run.duration() {
+        let label = match message.record.run.duration() {
             None => ShimmerText::new(format!(
                 "Working for {}",
-                format_duration(message.started_at.elapsed().unwrap_or_default())
+                format_duration(message.record.started_at.elapsed().unwrap_or_default())
             ))
             // The text changes every second; a stable id keeps the sweep
             // going instead of restarting it.
@@ -1064,7 +1068,7 @@ impl Cowork {
                 format!("Worked for {}", format_duration(duration)).into_any_element()
             }
         };
-        let outcome = match message.run.outcome() {
+        let outcome = match message.record.run.outcome() {
             Some(RunOutcome::Stopped) => {
                 Some(("Stopped", cx.theme().muted_foreground.opacity(0.7)))
             }
@@ -1100,7 +1104,7 @@ impl Cowork {
                             .child(div().text_color(color).child(outcome))
                     }))
                     .child(
-                        Icon::new(if message.work_expanded {
+                        Icon::new(if message.ui.work_expanded {
                             AssetIconName::ChevronDown
                         } else {
                             AssetIconName::ChevronRight
@@ -1116,13 +1120,8 @@ impl Cowork {
             return;
         };
         thread.update(cx, |thread, _| {
-            for entry in &mut thread.timeline {
-                if let TimelineMessage::Agent(message) = entry
-                    && message.id == message_id
-                {
-                    message.work_expanded = !message.work_expanded;
-                    break;
-                }
+            if let Some(message) = thread.agent_message_mut(message_id.into_bytes()) {
+                message.ui.work_expanded = !message.ui.work_expanded;
             }
         });
         cx.notify();
@@ -1305,18 +1304,23 @@ impl Cowork {
         message: &AgentMessage,
         timeline: &[TimelineMessage],
         comments: &[UserComment],
-        submitted_comments: &[UserComment],
+        submitted_comments: &[crate::timeline::SubmittedComment],
         wrap_width: gpui::Pixels,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let waiting = message.is_generating()
-            && message.output.steps.is_empty()
-            && message.output.text.is_empty();
+            && message.ui.output.steps.is_empty()
+            && message.ui.output.text.is_empty();
+        let submitted_comments = submitted_comments
+            .iter()
+            .map(crate::timeline::SubmittedComment::to_view)
+            .collect::<Vec<_>>();
         let mut submitted_comment_content = Vec::new();
-        for comment in submitted_comments {
+        for comment in &submitted_comments {
             submitted_comment_content.push(self.render_composer_comment(comment, cx));
             if let Some(response) = message
+                .ui
                 .comment_responses
                 .iter()
                 .find(|response| response.comment_id == comment.id)
@@ -1360,22 +1364,23 @@ impl Cowork {
         let message_content = self.render_agent_text(
             ThreadMessageId {
                 thread_id,
-                message_id: message.id,
+                message_id: message.record.id,
             },
-            &message.output.text,
-            &message.text_view,
+            &message.ui.output.text,
+            &message.ui.text_view,
             comments,
             wrap_width,
             window,
             cx,
         );
 
-        let message_id = message.id;
+        let message_id = message.record.id;
         // Only surfaced when the agent said nothing itself.
         let failure = message
+            .record
             .run
             .failure()
-            .filter(|_| message.output.text.is_empty())
+            .filter(|_| message.ui.output.text.is_empty())
             .map(|failure| {
                 div()
                     .text_color(cx.theme().danger)
@@ -1383,12 +1388,12 @@ impl Cowork {
             });
         // A plain reply that completed needs no summary.
         let summarized = message.is_generating()
-            || message.output.work().next().is_some()
-            || !matches!(message.run.outcome(), Some(RunOutcome::Completed));
+            || message.ui.output.work().next().is_some()
+            || !matches!(message.record.run.outcome(), Some(RunOutcome::Completed));
         let summary = summarized.then(|| Self::render_work_summary(thread_id, message, cx));
         // A call waiting for approval shows even in collapsed work, as the
         // run cannot go on until someone sees it.
-        let work = if message.work_expanded || message.awaiting_approval.is_some() {
+        let work = if message.ui.work_expanded || message.record.awaiting_approval.is_some() {
             let rights = self
                 .thread_store
                 .read(cx)
@@ -1400,6 +1405,7 @@ impl Cowork {
             None
         };
         let steering = message
+            .record
             .steering
             .iter()
             .filter_map(|id| {
@@ -1407,7 +1413,7 @@ impl Cowork {
                     .iter()
                     .enumerate()
                     .find_map(|(group_index, entry)| match entry {
-                        TimelineMessage::User(group) if group.id == *id => {
+                        TimelineMessage::User(group) if group.record.id == *id => {
                             Some((group_index, group))
                         }
                         _ => None,
@@ -1415,7 +1421,7 @@ impl Cowork {
             })
             .collect::<Vec<_>>();
 
-        let failed = message.run.failure().is_some();
+        let failed = message.record.run.failure().is_some();
         let agent_row = |this: &Self, content: Vec<gpui::AnyElement>, cx: &Context<Self>| {
             div()
                 .on_mouse_down(
@@ -1462,7 +1468,7 @@ impl Cowork {
         }
         let mut steering = steering.into_iter();
         let show_steering = |this: &mut Self,
-                             group: Option<(usize, &UserMessageGroup)>,
+                             group: Option<(usize, &crate::timeline::UserMessage)>,
                              content: &mut Vec<gpui::AnyElement>,
                              rows: &mut Vec<gpui::AnyElement>,
                              cx: &mut Context<Self>| {
@@ -1507,7 +1513,7 @@ impl Cowork {
     fn user_group_cards(
         &self,
         thread_id: Uuid,
-        group: &UserMessageGroup,
+        group: &crate::timeline::UserMessage,
         cx: &App,
     ) -> Vec<Vec<AttachmentCard>> {
         self.thread_store
@@ -1516,6 +1522,7 @@ impl Cowork {
             .map(|thread| {
                 let draft = thread.read(cx).draft();
                 group
+                    .record
                     .blocks
                     .iter()
                     .map(|block| {
@@ -1539,7 +1546,7 @@ impl Cowork {
         index: usize,
         timeline: &[TimelineMessage],
         comments: &[UserComment],
-        submitted_comments: &[UserComment],
+        submitted_comments: &[crate::timeline::SubmittedComment],
         wrap_width: gpui::Pixels,
         window: &mut Window,
         cx: &mut Context<Self>,

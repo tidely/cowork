@@ -471,11 +471,12 @@ fn submitting_keeps_focus_on_an_item_that_stays(cx: &mut gpui::TestAppContext) {
         let remaining = thread.draft().items();
         assert_eq!(remaining.len(), 1);
         assert_eq!(remaining[0].id, comment);
-        let [TimelineMessage::User(message), ..] = thread.timeline.as_slice() else {
+        let timeline = &thread.timeline;
+        let [TimelineMessage::User(message), ..] = timeline.as_slice() else {
             panic!("expected the submitted message first");
         };
-        assert_eq!(message.blocks.len(), 1);
-        assert_eq!(message.blocks[0].text, "question");
+        assert_eq!(message.record.blocks.len(), 1);
+        assert_eq!(message.record.blocks[0].text, "question");
         assert_eq!(thread.summary.title, "question");
     });
 }

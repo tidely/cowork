@@ -139,7 +139,10 @@ impl GenerationCompaction {
                     *self.latest_context_tokens.lock().unwrap() =
                         (summary.len() as u64).div_ceil(4);
                     (
-                        Some(protocol::CompactedContext { through, summary }),
+                        Some(crate::transcript::Compaction {
+                            resume_at: crate::transcript::TranscriptIndex(through),
+                            summary,
+                        }),
                         Some(replacement),
                         usage,
                     )
@@ -331,16 +334,15 @@ impl Cowork {
         let GenerationPlan {
             thread_id,
             mut prompt,
-            mut history,
             comment_group_id,
             turn_comments,
             scheduled,
         } = plan;
         let thread = self.thread_store.read(cx).thread(thread_id, cx)?;
-        if thread.read(cx).compacted_context.is_some() {
-            history = thread.read(cx).request_history();
-        }
-        let compact_through = thread.read(cx).transcript.len() as u64;
+        // Capture context and its original boundary together, before recording
+        // the new run's prompt. A summary must never cover that later prompt.
+        let mut history = thread.read(cx).request_history();
+        let compact_through = thread.read(cx).transcript.end().0;
         let context_tokens = thread.read(cx).live_context_tokens().unwrap_or(0);
         let threshold = self
             .compaction_settings

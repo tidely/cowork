@@ -160,8 +160,10 @@ fn prompts(
             .timeline
             .iter()
             .filter_map(|message| match message {
-                TimelineMessage::User(group) => Some(group.blocks[0].text.clone()),
-                TimelineMessage::Agent(_) => None,
+                crate::timeline::TimelineMessage::User(group) => {
+                    Some(group.record.blocks[0].text.clone())
+                }
+                crate::timeline::TimelineMessage::Agent(_) => None,
             })
             .collect()
     })

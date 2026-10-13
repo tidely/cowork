@@ -64,7 +64,7 @@ fn wait_for_approval_of(
 fn awaiting(thread: &Entity<Thread>, cx: &mut gpui::VisualTestContext) -> Option<CallId> {
     thread.read_with(cx, |thread, _| {
         thread.timeline.iter().rev().find_map(|entry| match entry {
-            TimelineMessage::Agent(message) => Some(message.awaiting_approval.clone()),
+            TimelineMessage::Agent(message) => Some(message.record.awaiting_approval.clone()),
             TimelineMessage::User(_) => None,
         })?
     })

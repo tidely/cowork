@@ -719,6 +719,66 @@ impl Drop for TestRoot {
 mod tests {
     use super::*;
 
+    /// Exercise native denied-path enforcement with synthetic content even on
+    /// hosts without credential folders. Metadata visibility is backend-specific;
+    /// content reads, directory entries, and writes must still be protected.
+    #[cfg(unix)]
+    #[test]
+    fn denied_paths_protect_contents_inside_a_writable_project() {
+        if !v1::platform_support().is_supported {
+            return;
+        }
+        let root = TestRoot::new();
+        let root_path = std::fs::canonicalize(&root.0).unwrap();
+        let denied = root_path.join("denied");
+        let scratch = root_path.join("scratch");
+        std::fs::create_dir_all(&denied).unwrap();
+        std::fs::create_dir_all(&scratch).unwrap();
+        let secret = denied.join("synthetic.txt");
+        std::fs::write(&secret, "synthetic protected content\n").unwrap();
+        let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
+        let command = format!(
+            "/bin/cat {} >/dev/null 2>/dev/null && echo read-allowed || echo read-denied; \
+             /bin/ls -A {} >\"$TMPDIR/listing\" 2>/dev/null; \
+             test ! -s \"$TMPDIR/listing\" && echo listing-hidden; \
+             {{ printf changed >> {}; }} 2>/dev/null && echo write-allowed || echo write-denied",
+            quote(&secret),
+            quote(&denied),
+            quote(&secret),
+        );
+        let project = Project {
+            folders: vec![ProjectFolder {
+                name: "project".into(),
+                path: root_path,
+            }],
+            access: Access::Write,
+        };
+        let mut request = request(
+            &command,
+            &project,
+            &Folders::default(),
+            &scratch,
+            &HashMap::new(),
+        )
+        .unwrap();
+        request
+            .filesystem
+            .as_mut()
+            .unwrap()
+            .denied_paths
+            .push(denied.to_string_lossy().into_owned());
+        let output = execute(request, &AtomicBool::new(false), None).unwrap();
+        assert_eq!(output.exit_code, 0, "{output:?}");
+        assert_eq!(
+            output.stdout, "read-denied\nlisting-hidden\nwrite-denied\n",
+            "{output:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(secret).unwrap(),
+            "synthetic protected content\n"
+        );
+    }
+
     fn folder(root: &Path, name: &str) -> ProjectFolder {
         let path = root.join(name);
         std::fs::create_dir_all(&path).unwrap();

@@ -31,22 +31,34 @@ pub(crate) enum MessageAuthor {
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone)]
 pub(crate) enum TimelineMessage {
-    User(UserMessageGroup),
+    User(UserMessage),
     Agent(AgentMessage),
 }
 
+/// Shared run identity and replay metadata; no derived output or GPUI views.
 #[derive(Clone)]
-pub(crate) struct AgentMessage {
+pub(crate) struct AgentRunRecord {
     pub(crate) id: Uuid,
     pub(crate) comment_group_id: Option<Uuid>,
     /// When the host started generating this message.
     pub(crate) started_at: SystemTime,
     /// See [`protocol::AgentMessage::prompt`].
-    pub(crate) prompt: usize,
+    pub(crate) prompt: crate::transcript::TranscriptIndex,
     /// See [`protocol::AgentMessage::pending_events`].
     pub(crate) pending_events: Vec<protocol::Json<AgentEvent>>,
     pub(crate) run: AgentRun,
 
+    /// The tool call the run is waiting for someone to allow or deny. Kept
+    /// beside `output` rather than in it, since the output is refolded on
+    /// every event. One at most, as the agent runs calls one at a time.
+    pub(crate) awaiting_approval: Option<CallId>,
+    /// See [`protocol::AgentMessage::steering`].
+    pub(crate) steering: Vec<Uuid>,
+}
+
+/// Local presentation and interaction state, owned beside the shared run record.
+#[derive(Clone)]
+pub(crate) struct AgentMessageUi {
     /// What the message shows, derived from its run's output as Rig has it;
     /// see `transcript.rs`.
     pub(crate) output: AgentOutput,
@@ -64,17 +76,68 @@ pub(crate) struct AgentMessage {
     /// How many of `output`'s tool calls have been checked for replies to
     /// comments.
     pub(crate) comment_calls_checked: usize,
-    /// The tool call the run is waiting for someone to allow or deny. Kept
-    /// beside `output` rather than in it, since the output is refolded on
-    /// every event. One at most, as the agent runs calls one at a time.
-    pub(crate) awaiting_approval: Option<CallId>,
-    /// See [`protocol::AgentMessage::steering`].
-    pub(crate) steering: Vec<Uuid>,
-
     // Local view state.
     /// Whether the agent's work (everything but its response) is shown. Open
     /// while the run is going, and closed when it ends.
     pub(crate) work_expanded: bool,
+}
+
+/// A resident timeline entry. Shared metadata and local presentation have
+/// distinct fields, but share their lifetime while all history is in memory.
+#[derive(Clone)]
+pub(crate) struct AgentMessage {
+    pub(crate) record: AgentRunRecord,
+    pub(crate) ui: AgentMessageUi,
+}
+
+#[derive(Clone)]
+pub(crate) struct UserMessage {
+    pub(crate) record: SubmittedGroup,
+    pub(crate) ui: UserMessageUi,
+}
+
+#[derive(Clone)]
+pub(crate) struct UserMessageUi {
+    pub(crate) comments_folded: bool,
+}
+
+impl From<UserMessageGroup> for UserMessage {
+    fn from(group: UserMessageGroup) -> Self {
+        Self {
+            record: SubmittedGroup {
+                id: group.id,
+                blocks: group.blocks,
+                comments: group
+                    .comments
+                    .into_iter()
+                    .map(|comment| {
+                        let UserCommentBody::Submitted(body) = comment.body else {
+                            unreachable!("timeline comments have been submitted");
+                        };
+                        SubmittedComment {
+                            id: comment.id,
+                            author: comment.author,
+                            reference: comment.reference,
+                            body,
+                        }
+                    })
+                    .collect(),
+            },
+            ui: UserMessageUi {
+                comments_folded: group.comments_folded,
+            },
+        }
+    }
+}
+
+impl TimelineMessage {
+    /// Only shared records cross the wire; entities and local folding never do.
+    pub(crate) fn to_protocol(&self) -> protocol::TimelineMessage {
+        match self {
+            Self::User(message) => protocol::TimelineMessage::User(message.record.to_protocol()),
+            Self::Agent(message) => protocol::TimelineMessage::Agent(message.record.to_protocol()),
+        }
+    }
 }
 
 /// What an agent message shows: a function of its run's output alone, the
@@ -432,6 +495,58 @@ pub(crate) struct UserMessageGroup {
     pub(crate) comments_folded: bool,
 }
 
+/// Shared submission content, without draft editor entities or local folding.
+#[derive(Clone)]
+pub(crate) struct SubmittedGroup {
+    pub(crate) id: Uuid,
+    pub(crate) comments: Vec<SubmittedComment>,
+    pub(crate) blocks: Vec<PromptBlock>,
+}
+
+#[derive(Clone)]
+pub(crate) struct SubmittedComment {
+    pub(crate) id: Uuid,
+    pub(crate) author: ParticipantId,
+    pub(crate) reference: CommentReference,
+    pub(crate) body: SharedString,
+}
+
+impl SubmittedComment {
+    /// Reuse the draft comment renderer only at the leaf that needs its shape.
+    pub(crate) fn to_view(&self) -> UserComment {
+        UserComment {
+            id: self.id,
+            author: self.author,
+            reference: self.reference.clone(),
+            presence: ItemPresence::default(),
+            body: UserCommentBody::Submitted(self.body.clone()),
+        }
+    }
+}
+
+impl SubmittedGroup {
+    pub(crate) fn to_protocol(&self) -> protocol::UserMessage {
+        protocol::UserMessage {
+            id: self.id.into_bytes(),
+            blocks: self.blocks.iter().map(PromptBlock::to_protocol).collect(),
+            comments: self
+                .comments
+                .iter()
+                .map(|comment| protocol::UserComment {
+                    id: comment.id.into_bytes(),
+                    author: comment.author.into_bytes(),
+                    reference: protocol::CommentReference {
+                        message_id: comment.reference.message_id.into_bytes(),
+                        range: comment.reference.range.clone(),
+                        quote: comment.reference.quote.clone(),
+                    },
+                    body: comment.body.to_string(),
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct PromptBlock {
     pub(crate) id: Uuid,
@@ -585,61 +700,68 @@ impl AgentMessage {
         id: Uuid,
         comment_group_id: Option<Uuid>,
         started_at: SystemTime,
-        prompt: usize,
+        prompt: crate::transcript::TranscriptIndex,
         run: AgentRun,
         pending_events: Vec<protocol::Json<AgentEvent>>,
         cx: &mut impl AppContext,
     ) -> Self {
+        let work_expanded = run.is_generating();
         Self {
-            id,
-            comment_group_id,
-            started_at,
-            prompt,
-            pending_events,
-            work_expanded: run.is_generating(),
-            run,
-            // What an empty output shows: the model is not reasoning yet.
-            output: AgentOutput {
-                thinking_complete: true,
-                ..AgentOutput::default()
+            record: AgentRunRecord {
+                id,
+                comment_group_id,
+                started_at,
+                prompt,
+                pending_events,
+                run,
+                awaiting_approval: None,
+                steering: Vec::new(),
             },
-            committed: OutputMark::default(),
-            comment_calls_checked: 0,
-            awaiting_approval: None,
-            steering: Vec::new(),
-            step_views: Vec::new(),
-            text_view: cx.new(|cx| TextViewState::markdown("", cx)),
-            comment_responses: Vec::new(),
+            ui: AgentMessageUi {
+                work_expanded,
+                output: AgentOutput {
+                    thinking_complete: true,
+                    ..AgentOutput::default()
+                },
+                committed: OutputMark::default(),
+                comment_calls_checked: 0,
+                step_views: Vec::new(),
+                text_view: cx.new(|cx| TextViewState::markdown("", cx)),
+                comment_responses: Vec::new(),
+            },
         }
     }
 
     /// Shows `output` afresh, with new views and everything collapsed.
     #[cfg(test)]
     pub(crate) fn show_output(&mut self, output: AgentOutput, cx: &mut impl AppContext) {
-        self.output = output;
-        self.step_views = self
+        self.ui.output = output;
+        self.ui.step_views = self
+            .ui
             .output
             .steps
             .iter()
             .map(|step| StepView::new(step, cx))
             .collect();
-        self.text_view = cx.new(|cx| TextViewState::markdown(&self.output.text, cx));
+        self.ui.text_view = cx.new(|cx| TextViewState::markdown(&self.ui.output.text, cx));
     }
 
     pub(crate) fn is_generating(&self) -> bool {
-        self.run.is_generating()
+        self.record.run.is_generating()
     }
 
     /// Where the call awaiting approval is among `output`'s steps. Rig may
     /// mint the same id for id-less calls of different replies, and only the
     /// last reply's calls can be waiting, so it is the latest with that id.
     pub(crate) fn awaiting_approval_step(&self) -> Option<usize> {
-        let awaiting = self.awaiting_approval.as_ref()?;
-        self.output.steps.iter().rposition(
+        let awaiting = self.record.awaiting_approval.as_ref()?;
+        self.ui.output.steps.iter().rposition(
             |step| matches!(step, AgentStep::ToolCall(call) if call.call.id == *awaiting),
         )
     }
+}
 
+impl AgentRunRecord {
     pub(crate) fn to_protocol(&self) -> protocol::AgentMessage {
         protocol::AgentMessage {
             id: self.id.into_bytes(),
@@ -668,27 +790,18 @@ impl protocol::AgentMessage {
             self.pending_events,
             cx,
         );
-        message.awaiting_approval = self
+        message.record.awaiting_approval = self
             .awaiting_approval
             .map(|call| call.to_call_id().expect("validated with the snapshot"));
-        message.steering = self.steering.into_iter().map(Uuid::from_bytes).collect();
+        message.record.steering = self.steering.into_iter().map(Uuid::from_bytes).collect();
         message
-    }
-}
-
-impl TimelineMessage {
-    pub(crate) fn to_protocol(&self) -> protocol::TimelineMessage {
-        match self {
-            Self::User(message) => protocol::TimelineMessage::User(message.to_protocol()),
-            Self::Agent(message) => protocol::TimelineMessage::Agent(message.to_protocol()),
-        }
     }
 }
 
 impl protocol::TimelineMessage {
     pub(crate) fn into_native(self, cx: &mut impl AppContext) -> TimelineMessage {
         match self {
-            Self::User(message) => TimelineMessage::User(message.into_native()),
+            Self::User(message) => TimelineMessage::User(message.into_native().into()),
             Self::Agent(message) => TimelineMessage::Agent(message.into_native(cx)),
         }
     }

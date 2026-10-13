@@ -120,19 +120,24 @@ fn a_collaborators_file_is_uploaded_and_stored(cx: &mut gpui::TestAppContext) {
         collaborator_thread.read_with(this.cx, |thread, _| thread.submission_count() == 1)
     });
     collaborator_thread.read_with(session.cx, |thread, _| {
-        let [TimelineMessage::User(message), ..] = thread.timeline.as_slice() else {
+        let timeline = &thread.timeline;
+        let [TimelineMessage::User(message), ..] = timeline.as_slice() else {
             panic!("expected the submitted message first");
         };
-        assert_eq!(message.blocks[0].attachments, std::slice::from_ref(&record));
+        assert_eq!(
+            message.record.blocks[0].attachments,
+            std::slice::from_ref(&record)
+        );
         assert!(thread.draft().files.contains_key(&record.id));
     });
     host_thread.read_with(session.cx, |thread, _| {
         let files = &thread.draft().files;
-        let [TimelineMessage::User(message), ..] = thread.timeline.as_slice() else {
+        let timeline = &thread.timeline;
+        let [TimelineMessage::User(message), ..] = timeline.as_slice() else {
             panic!("expected the submitted message first");
         };
         let RigMessage::User { content } =
-            agent_message(None, &message.blocks, files, &HashMap::new())
+            agent_message(None, &message.record.blocks, files, &HashMap::new())
         else {
             panic!("expected a user message");
         };
@@ -146,7 +151,7 @@ fn a_collaborators_file_is_uploaded_and_stored(cx: &mut gpui::TestAppContext) {
             == host_thread.read_with(this.cx, |thread, _| thread.conversation())
     });
     collaborator_thread.read_with(session.cx, |thread, _| {
-        assert_eq!(thread.transcript.len(), 1);
+        assert_eq!(thread.transcript.messages.len(), 1);
         assert_eq!(thread.prompt_names.len(), 1);
     });
 }
@@ -461,17 +466,20 @@ fn joining_peers_are_sent_the_files_they_do_not_have(cx: &mut gpui::TestAppConte
     cx.update(gpui_component::init);
     let joiner = ParticipantId::new();
     let (timeline_records, timeline_files) = attached([text_attachment("old.txt", "old")]);
-    let timeline = vec![TimelineMessage::User(UserMessageGroup {
-        id: Uuid::new_v4(),
-        comments: Vec::new(),
-        blocks: vec![PromptBlock {
+    let timeline = vec![TimelineMessage::User(
+        UserMessageGroup {
             id: Uuid::new_v4(),
-            author: ParticipantId::new(),
-            text: "earlier".into(),
-            attachments: timeline_records.clone(),
-        }],
-        comments_folded: false,
-    })];
+            comments: Vec::new(),
+            blocks: vec![PromptBlock {
+                id: Uuid::new_v4(),
+                author: ParticipantId::new(),
+                text: "earlier".into(),
+                attachments: timeline_records.clone(),
+            }],
+            comments_folded: false,
+        }
+        .into(),
+    )];
     let thread = cx.new(|_| {
         let mut draft = ThreadDraft::new(ParticipantId::new());
         let block = draft.create_prompt(draft.author.as_uuid(), "");

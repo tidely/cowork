@@ -152,7 +152,7 @@ impl Cowork {
                     ))
                     .child(self.render_user_message_group(
                         start_index + index,
-                        &pending.group,
+                        &pending.group.into(),
                         cards,
                         cx,
                     ))

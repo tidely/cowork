@@ -102,7 +102,6 @@ impl Thread {
 struct GenerationPlan {
     thread_id: Uuid,
     prompt: RigMessage,
-    history: Vec<RigMessage>,
     comment_group_id: Option<Uuid>,
     turn_comments: Arc<TurnComments>,
     /// Whether a scheduled task started the run, which nobody may be
@@ -362,20 +361,18 @@ impl Cowork {
         self.attachment_errors
             .retain(|error| error.draft_id != draft_id);
 
-        let (timeline, files, history, mut prompt_names) = match &active_thread {
+        let (timeline, files, mut prompt_names) = match &active_thread {
             Some(thread) => {
                 let thread = thread.read(cx);
                 (
                     thread.timeline.clone(),
                     thread.draft().files.clone(),
-                    thread.transcript.clone(),
                     thread.prompt_names.clone(),
                 )
             }
             None => (
                 Vec::new(),
                 self.new_thread_draft.files.clone(),
-                Vec::new(),
                 HashMap::new(),
             ),
         };
@@ -430,7 +427,7 @@ impl Cowork {
                 thread.publish(protocol::HostMessage::UserMessage(
                     submitted_group.to_protocol(),
                 ));
-                thread.timeline.push(TimelineMessage::User(submitted_group));
+                thread.append_user_group(submitted_group);
                 thread.name_in_prompts(prompt_names, cx);
             });
             thread_id
@@ -443,7 +440,7 @@ impl Cowork {
             );
             let thread = Self::new_local_thread(
                 Self::thread_title(&title),
-                vec![TimelineMessage::User(submitted_group)],
+                vec![TimelineMessage::User(submitted_group.into())],
                 draft,
                 self.local_participant_id,
                 self.models.clone(),
@@ -465,7 +462,6 @@ impl Cowork {
             GenerationPlan {
                 thread_id,
                 prompt,
-                history,
                 comment_group_id,
                 turn_comments,
                 scheduled: false,
@@ -636,7 +632,6 @@ impl Cowork {
         let plan = GenerationPlan {
             thread_id: state.instance_id,
             prompt,
-            history: state.transcript.clone(),
             comment_group_id: (!group.comments.is_empty()).then_some(group.id),
             turn_comments,
             scheduled: false,
@@ -696,7 +691,6 @@ impl Cowork {
             .entry(author)
             .or_insert_with(|| participant_name(author, profiles.get(&author)));
         let prompt = agent_message(None, &blocks, &HashMap::new(), &prompt_names);
-        let history = state.transcript.clone();
         let thread_id = state.instance_id;
         let group = UserMessageGroup {
             id: Uuid::new_v4(),
@@ -713,7 +707,7 @@ impl Cowork {
             }
             thread.submission_sequence += 1;
             thread.publish(protocol::HostMessage::UserMessage(group.to_protocol()));
-            thread.timeline.push(TimelineMessage::User(group));
+            thread.append_user_group(group);
             thread.name_in_prompts(prompt_names, cx);
         });
         let message_id = self
@@ -721,7 +715,6 @@ impl Cowork {
                 GenerationPlan {
                     thread_id,
                     prompt,
-                    history,
                     comment_group_id: None,
                     turn_comments: Arc::new(TurnComments::new(0)),
                     scheduled: true,
@@ -826,8 +819,8 @@ impl Cowork {
                     matches!(
                         entry,
                         TimelineMessage::Agent(message)
-                            if message.id == comment.reference.message_id
-                                || message.comment_responses.iter().any(|response| {
+                            if message.record.id == comment.reference.message_id
+                                || message.ui.comment_responses.iter().any(|response| {
                                     response.id == comment.reference.message_id
                                 })
                     )

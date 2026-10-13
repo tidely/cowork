@@ -15,6 +15,7 @@ use tokio_util::{
 use crate::models::{ModelCatalog, ModelRef};
 pub(crate) use crate::project_mode::ProjectMode;
 pub(crate) use crate::thread::{PeerMode, PeerPermissions, PermissionDenied};
+use crate::transcript::{Compaction, Transcript, TranscriptIndex};
 
 /// Bounds how much memory a single frame from a peer can make us buffer.
 ///
@@ -39,7 +40,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 29;
+pub(crate) const PROTOCOL_VERSION: u32 = 30;
 
 /// A request from a collaborator to the host.
 ///
@@ -286,7 +287,7 @@ pub(crate) enum HostMessage {
     /// Only a validated, smaller summary replaces request history. None
     /// reports a failed attempt without changing the last successful summary.
     CompactionFinished {
-        context: Option<CompactedContext>,
+        context: Option<Compaction>,
     },
     /// `participant` is called `name` in prompts from now on. Sent when their
     /// first item is submitted; a name never changes afterwards.
@@ -430,27 +431,18 @@ pub(crate) struct ThreadSnapshot {
     pub(crate) peer_permissions: PeerPermissions,
     /// The context window use the provider last measured, if any.
     pub(crate) context_tokens: Option<u64>,
-    pub(crate) compacted_context: Option<CompactedContext>,
     pub(crate) compacting: bool,
     /// Bytes of agent output streamed since `context_tokens` was measured.
     pub(crate) streamed_bytes: u64,
     pub(crate) messages: Vec<TimelineMessage>,
     /// Rig messages need JSON's self-describing format; postcard alone cannot decode them.
-    pub(crate) transcript: Vec<Json<rig::completion::Message>>,
+    pub(crate) transcript: Json<Transcript>,
     /// Everyone's name in prompts, sorted by participant.
     pub(crate) prompt_names: Vec<(uuid::Bytes, String)>,
     /// The names of the project's folders; see
     /// [`HostMessage::ProjectFoldersChanged`].
     pub(crate) project_folders: Vec<String>,
     pub(crate) project_mode: ProjectMode,
-}
-
-/// A summary replaces only this prefix of the complete transcript when
-/// constructing model requests; rendered messages retain their original indices.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct CompactedContext {
-    pub(crate) through: u64,
-    pub(crate) summary: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -511,7 +503,7 @@ pub(crate) struct AgentMessage {
     /// Where the prompt this message answers is in the transcript. Each run
     /// adds exactly its prompt there, with `AgentStarted`, so its output is
     /// the entries after it, up to the next agent message's prompt.
-    pub(crate) prompt: usize,
+    pub(crate) prompt: TranscriptIndex,
     /// The run's events since its output last joined the transcript, exactly
     /// as the host folded them. While generating, they are the turn in
     /// progress, which someone joining folds on from. Once a run is stopped
@@ -900,7 +892,6 @@ mod tests {
             model: Some(sample_model()),
             peer_permissions: PeerPermissions::default(),
             context_tokens: Some(4_096),
-            compacted_context: None,
             compacting: false,
             streamed_bytes: 120,
             messages: vec![
@@ -933,7 +924,7 @@ mod tests {
                     id: [4; 16],
                     comment_group_id: Some([2; 16]),
                     started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-                    prompt: 0,
+                    prompt: TranscriptIndex(0),
                     pending_events: vec![json("{}")],
                     run: AgentRun::Ended {
                         outcome: RunOutcome::Failed("Failed".into()),
@@ -945,7 +936,12 @@ mod tests {
                     steering: vec![[5; 16]],
                 }),
             ],
-            transcript: vec![json(r#"{"role":"user"}"#), json(r#"{"role":"assistant"}"#)],
+            transcript: {
+                let mut transcript = Transcript::default();
+                transcript.append(rig::completion::Message::user("Question"));
+                transcript.append(rig::completion::Message::assistant("Answer"));
+                transcript.to_protocol()
+            },
             prompt_names: vec![([11; 16], "Ada".into())],
             project_folders: vec!["zed".into(), "cowork".into()],
             project_mode: ProjectMode::Write,

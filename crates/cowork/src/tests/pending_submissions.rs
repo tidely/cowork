@@ -193,7 +193,7 @@ fn completed_runs_start_one_queued_message_but_stopping_preserves_pending(
         assert_eq!(thread.pending_submissions().len(), 1);
         assert_eq!(thread.pending_submissions()[0].group.blocks[0].text, "second queued");
         assert_eq!(thread.submission_count(), 2);
-        assert!(thread.timeline.iter().any(|entry| matches!(entry, TimelineMessage::User(group) if group.blocks[0].text == "first queued")));
+        assert!(thread.timeline.iter().any(|entry| matches!(entry, TimelineMessage::User(group) if group.record.blocks[0].text == "first queued")));
     });
     let next = thread.read_with(session.cx, |thread, _| {
         thread.running_agent_message_id().unwrap()
@@ -292,7 +292,7 @@ fn stop_wins_late_completion_and_resume_delivers_steering_before_the_queue(
         assert_eq!(thread.read(cx).pending_submissions().len(), 2);
         assert_eq!(thread.read(cx).submission_count(), 3);
         assert!(thread.read(cx).timeline.iter().any(|entry| matches!(
-            entry, TimelineMessage::User(group) if group.blocks[0].text == "steer first"
+            entry, TimelineMessage::User(group) if group.record.blocks[0].text == "steer first"
         )));
         for (expected, remaining) in [("queue one", 1), ("queue two", 0)] {
             let id = thread.read(cx).running_agent_message_id().unwrap();
@@ -310,8 +310,9 @@ fn stop_wins_late_completion_and_resume_delivers_steering_before_the_queue(
             let state = thread.read(cx);
             assert!(state.generating);
             assert_eq!(state.pending_submissions().len(), remaining);
-            let latest = state.timeline.iter().rev().find_map(|entry| match entry {
-                TimelineMessage::User(group) => Some(group.blocks[0].text.as_str()),
+            let timeline = &state.timeline;
+            let latest = timeline.iter().rev().find_map(|entry| match entry {
+                TimelineMessage::User(group) => Some(group.record.blocks[0].text.as_str()),
                 _ => None,
             });
             assert_eq!(latest, Some(expected));
@@ -366,21 +367,21 @@ fn consumed_steering_cannot_be_cancelled_and_mirrors_keep_the_prompt_out_of_outp
         let TimelineMessage::User(steering) = &state.timeline[1] else {
             panic!("steering follows the message it was delivered into");
         };
-        assert_eq!(steering.id, id);
-        assert_eq!(agent.steering, vec![id]);
+        assert_eq!(steering.record.id, id);
+        assert_eq!(agent.record.steering, vec![id]);
         assert!(matches!(
-            &agent.output.steps[..],
+            &agent.ui.output.steps[..],
             [AgentStep::Steering, AgentStep::Text(text)] if text == "updated answer"
         ));
-        assert_eq!(agent.output.text, "updated answer");
-        assert_eq!(state.transcript.len(), 3);
+        assert_eq!(agent.ui.output.text, "updated answer");
+        assert_eq!(state.transcript.messages.len(), 3);
     });
     let mirror = session.collaborator_thread().unwrap();
     session.wait_until(
         "steering transcript and output reach the mirror",
         |session| {
             mirror.read_with(session.cx, |thread, _| {
-                thread.transcript.len() == 3 && thread.pending_submissions().is_empty()
+                thread.transcript.messages.len() == 3 && thread.pending_submissions().is_empty()
             })
         },
     );
@@ -392,9 +393,9 @@ fn consumed_steering_cannot_be_cancelled_and_mirrors_keep_the_prompt_out_of_outp
         let TimelineMessage::Agent(agent) = &thread.timeline[0] else {
             panic!("the mirror orders the timeline alike");
         };
-        assert_eq!(agent.steering.len(), 1);
+        assert_eq!(agent.record.steering.len(), 1);
         assert!(matches!(thread.timeline[1], TimelineMessage::User(_)));
-        assert!(matches!(agent.output.steps[0], AgentStep::Steering));
+        assert!(matches!(agent.ui.output.steps[0], AgentStep::Steering));
     });
     task.abort();
 }

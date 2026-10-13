@@ -42,6 +42,7 @@ use rig::{
     streaming::StreamEvent,
     tool::Tool as _,
 };
+use serde::{Deserialize, Serialize};
 use tools::{RespondToComment, RespondToCommentArgs, TurnComments};
 use uuid::Uuid;
 
@@ -49,11 +50,112 @@ use crate::{
     protocol::{self, AgentRun, Json, RunOutcome},
     thread::Thread,
     timeline::{
-        AgentCommentResponse, AgentMessage, AgentOutput, AgentStep, AgentToolCall, OutputMark,
-        StepView, TimelineMessage,
+        AgentCommentResponse, AgentMessage, AgentMessageUi, AgentOutput, AgentStep, AgentToolCall,
+        OutputMark, StepView, TimelineMessage,
     },
     usage::usage_tokens,
 };
+
+/// An absolute position in the original sequence of completed Rig messages.
+/// Compaction never changes these positions, and UUIDs identify runs rather
+/// than individual messages in this sequence.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub(crate) struct TranscriptIndex(pub(crate) u64);
+
+/// A complete replacement for the original prefix `[0, resume_at)`.
+/// Summary requests themselves never join the original messages.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Compaction {
+    pub(crate) resume_at: TranscriptIndex,
+    pub(crate) summary: String,
+}
+
+/// LLM state only: original messages and successive summaries of their prefix.
+/// Run identities, unfinished events, and local views belong to the timeline.
+///
+/// All messages remain resident today. Offloading could add a
+/// `start: TranscriptIndex`, the absolute position of `messages[0]`, keeping a
+/// contiguous tail. An absolute position would then map to the resident vector
+/// at `index - start`; removing a persisted prefix would advance `start` without
+/// changing run references or compaction boundaries. Missing ranges would need
+/// loading before access, and the absolute end would be `start + messages.len()`.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct Transcript {
+    pub(crate) messages: Vec<RigMessage>,
+    compactions: Vec<Compaction>,
+}
+
+impl Transcript {
+    pub(crate) fn end(&self) -> TranscriptIndex {
+        TranscriptIndex(self.messages.len() as u64)
+    }
+
+    pub(crate) fn append(&mut self, message: RigMessage) -> TranscriptIndex {
+        let index = self.end();
+        self.messages.push(message);
+        index
+    }
+
+    pub(crate) fn latest_compaction(&self) -> Option<&Compaction> {
+        self.compactions.last()
+    }
+
+    /// Accept only nonempty summaries within the original transcript, with
+    /// nondecreasing coverage. A replacement at the same boundary is valid.
+    pub(crate) fn install_compaction(&mut self, compaction: Compaction) -> anyhow::Result<()> {
+        compaction.validate(self.end(), self.latest_compaction())?;
+        self.compactions.push(compaction);
+        Ok(())
+    }
+
+    pub(crate) fn request_history(&self) -> Vec<RigMessage> {
+        match self.latest_compaction() {
+            Some(compaction) => std::iter::once(RigMessage::user(format!(
+                "Summary of the conversation so far:\n{}",
+                compaction.summary
+            )))
+            .chain(
+                self.messages[compaction.resume_at.0 as usize..]
+                    .iter()
+                    .cloned(),
+            )
+            .collect(),
+            None => self.messages.clone(),
+        }
+    }
+
+    pub(crate) fn to_protocol(&self) -> Json<Self> {
+        Json::from_value(self).expect("a transcript encodes as JSON")
+    }
+}
+
+impl Compaction {
+    fn validate(&self, end: TranscriptIndex, previous: Option<&Self>) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self.resume_at.0 > 0
+                && self.resume_at <= end
+                && previous.is_none_or(|previous| self.resume_at >= previous.resume_at)
+                && !self.summary.trim().is_empty(),
+            "invalid compacted context"
+        );
+        Ok(())
+    }
+}
+
+impl Json<Transcript> {
+    /// Decode the whole LLM state once and validate all prefix summaries before
+    /// a snapshot is installed. JSON validity alone does not establish coverage.
+    pub(crate) fn to_transcript(&self) -> anyhow::Result<Transcript> {
+        let transcript = self.parse().context("invalid transcript from host")?;
+        let mut previous = None;
+        for compaction in &transcript.compactions {
+            compaction.validate(transcript.end(), previous)?;
+            previous = Some(compaction);
+        }
+        Ok(transcript)
+    }
+}
 
 impl Json<RigMessage> {
     pub(crate) fn from_rig(message: &RigMessage) -> Self {
@@ -126,8 +228,10 @@ pub(crate) fn validate_agent_runs(
 ) -> anyhow::Result<()> {
     let prompts = messages
         .iter()
-        .map(|message| message.prompt)
-        .collect::<Vec<_>>();
+        .map(|message| {
+            usize::try_from(message.prompt.0).context("transcript index does not fit in memory")
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     for (index, prompt) in prompts.iter().enumerate() {
         anyhow::ensure!(
             matches!(transcript.get(*prompt), Some(RigMessage::User { .. })),
@@ -190,25 +294,28 @@ impl Thread {
             .apply(&decoded)
             .context("the host sent an agent event out of order")?;
         let completed = folded.message.is_some();
-        self.transcript.extend(folded.message);
+        self.transcript.messages.extend(folded.message);
         self.measure_agent_event(&decoded);
         let partial = self.agent_turn.partial();
         let Some(message) = agent_message(&mut self.timeline, message_id) else {
             return Ok(());
         };
         if completed {
-            message.pending_events.clear();
+            message.record.pending_events.clear();
         } else {
-            message.pending_events.push(event);
+            message.record.pending_events.push(event);
         }
         // A call that returned no longer waits, however the host decided.
         if let AgentEvent::ToolResult { call, .. } = &decoded
-            && message.awaiting_approval.as_ref() == Some(call)
+            && message.record.awaiting_approval.as_ref() == Some(call)
         {
-            message.awaiting_approval = None;
+            message.record.awaiting_approval = None;
         }
-        let completed = completed.then(|| self.transcript.last()).flatten();
-        message.advance(completed, partial.as_ref(), cx);
+        let completed = completed.then(|| self.transcript.messages.last()).flatten();
+        let generating = message.is_generating();
+        message
+            .ui
+            .advance(completed, partial.as_ref(), generating, cx);
         self.show_comment_responses(message_id, cx);
         Ok(())
     }
@@ -227,16 +334,16 @@ impl Thread {
         let message = agent_message(&mut self.timeline, message_id)
             .filter(|message| message.is_generating())
             .context("the host asked to approve a call of a run that is not going")?;
-        message.awaiting_approval = Some(call);
+        message.record.awaiting_approval = Some(call);
         Ok(())
     }
 
     /// Stops showing `call` as waiting for approval; its result follows.
     pub(crate) fn resolve_tool_approval(&mut self, message_id: Uuid, call: &CallId) {
         if let Some(message) = agent_message(&mut self.timeline, message_id)
-            && message.awaiting_approval.as_ref() == Some(call)
+            && message.record.awaiting_approval.as_ref() == Some(call)
         {
-            message.awaiting_approval = None;
+            message.record.awaiting_approval = None;
         }
     }
 
@@ -258,12 +365,12 @@ impl Thread {
         let Some(message) = self.agent_message_mut(id) else {
             return;
         };
-        message.run = AgentRun::Ended { outcome, duration };
+        message.record.run = AgentRun::Ended { outcome, duration };
         // A run that ends no longer waits for anything.
-        message.awaiting_approval = None;
+        message.record.awaiting_approval = None;
         // The work collapses under its summary, leaving the response.
-        message.work_expanded = false;
-        message.advance(None, partial.as_ref(), cx);
+        message.ui.work_expanded = false;
+        message.ui.advance(None, partial.as_ref(), false, cx);
     }
 
     /// Shows the output of every agent message of a timeline fresh from a
@@ -276,26 +383,32 @@ impl Thread {
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| match entry {
-                TimelineMessage::Agent(message) => Some((index, message.prompt)),
+                TimelineMessage::Agent(message) => Some((index, message.record.prompt.0 as usize)),
                 TimelineMessage::User(_) => None,
             })
             .unzip();
-        let outputs = run_outputs(&prompts, self.transcript.len());
+        let outputs = run_outputs(&prompts, self.transcript.messages.len());
         self.agent_turn = TurnFold::default();
         for (index, output) in indices.into_iter().zip(outputs) {
             let TimelineMessage::Agent(message) = &mut self.timeline[index] else {
                 unreachable!("an agent message's index");
             };
-            let mut fold = fold_after(&self.transcript, &output);
-            for event in &message.pending_events {
+            let mut fold = fold_after(&self.transcript.messages, &output);
+            for event in &message.record.pending_events {
                 let event = event
                     .to_agent()
                     .expect("pending events validated with the snapshot");
                 fold.apply(&event)
                     .expect("pending events validated with the snapshot");
             }
-            message.restore(&self.transcript[output], fold.partial().as_ref(), cx);
-            let message_id = message.id;
+            let generating = message.is_generating();
+            message.ui.restore(
+                &self.transcript.messages[output],
+                fold.partial().as_ref(),
+                generating,
+                cx,
+            );
+            let message_id = message.record.id;
             if message.is_generating() {
                 self.agent_turn = fold;
             }
@@ -329,12 +442,13 @@ impl Thread {
             return;
         };
         let calls = message
+            .ui
             .output
             .tool_calls()
-            .skip(message.comment_calls_checked)
+            .skip(message.ui.comment_calls_checked)
             .map(|call| call.call.clone())
             .collect::<Vec<_>>();
-        message.comment_calls_checked = message.output.tool_calls().count();
+        message.ui.comment_calls_checked = message.ui.output.tool_calls().count();
         for call in &calls {
             self.show_comment_response(message_id, call, cx);
         }
@@ -362,16 +476,23 @@ impl Thread {
         }
         // The prompt named the submission's comments by their position.
         let comment_group = self.timeline.iter().find_map(|entry| match entry {
-            TimelineMessage::Agent(message) if message.id == message_id => message.comment_group_id,
+            TimelineMessage::Agent(message) if message.record.id == message_id => {
+                message.record.comment_group_id
+            }
             _ => None,
         });
         let comments = self
             .timeline
             .iter()
             .find_map(|entry| match entry {
-                TimelineMessage::User(group) if Some(group.id) == comment_group => {
-                    Some(group.comments.iter().map(|comment| comment.id).collect())
-                }
+                TimelineMessage::User(group) if Some(group.record.id) == comment_group => Some(
+                    group
+                        .record
+                        .comments
+                        .iter()
+                        .map(|comment| comment.id)
+                        .collect(),
+                ),
                 _ => None,
             })
             .unwrap_or_else(Vec::new);
@@ -394,13 +515,14 @@ impl Thread {
             return;
         };
         if message
+            .ui
             .comment_responses
             .iter()
             .any(|response| response.comment_id == comment_id)
         {
             return;
         }
-        message.comment_responses.push(AgentCommentResponse {
+        message.ui.comment_responses.push(AgentCommentResponse {
             // Derived rather than random, so every participant names the
             // reply alike and comments on it reach the same one.
             id: Uuid::new_v5(&message_id, call.id.to_string().as_bytes()),
@@ -545,15 +667,16 @@ impl AgentOutput {
     }
 }
 
-impl AgentMessage {
+impl AgentMessageUi {
     /// Shows a run's output after its fold moved on: `completed`, a message
     /// it has just added to the transcript, if any, then `partial`, the
     /// message it is folding. Only the part after the committed mark is
     /// redone, and the text views only get what that part added.
-    fn advance(
+    pub(crate) fn advance(
         &mut self,
         completed: Option<&RigMessage>,
         partial: Option<&RigMessage>,
+        generating: bool,
         cx: &mut impl AppContext,
     ) {
         let from = self.committed;
@@ -573,7 +696,7 @@ impl AgentMessage {
             self.committed = self.output.mark();
         }
         self.output.extend(partial);
-        self.set_thinking_complete(partial);
+        self.set_thinking_complete(partial, generating);
         self.show_steps(first_changed, &old_texts, cx);
         let response = self.output.response();
         let old_response = std::mem::replace(&mut self.output.text, response);
@@ -605,10 +728,11 @@ impl AgentMessage {
     /// Shows `output`, a run's transcript entries, followed by `partial`, the
     /// message it is folding, in a message fresh from a snapshot. The text
     /// views are shown whole, as history rather than as a stream.
-    fn restore(
+    pub(crate) fn restore(
         &mut self,
         output: &[RigMessage],
         partial: Option<&RigMessage>,
+        generating: bool,
         cx: &mut impl AppContext,
     ) {
         for message in output {
@@ -616,7 +740,7 @@ impl AgentMessage {
         }
         self.committed = self.output.mark();
         self.output.extend(partial);
-        self.set_thinking_complete(partial);
+        self.set_thinking_complete(partial, generating);
         self.output.text = self.output.response();
         self.step_views = self
             .output
@@ -629,9 +753,8 @@ impl AgentMessage {
 
     /// Thinking is complete unless the model is still reasoning. Thinking in
     /// progress cannot be expanded by hand, so it completes collapsed.
-    fn set_thinking_complete(&mut self, partial: Option<&RigMessage>) {
-        self.output.thinking_complete =
-            !(self.is_generating() && AgentOutput::still_reasoning(partial));
+    fn set_thinking_complete(&mut self, partial: Option<&RigMessage>, generating: bool) {
+        self.output.thinking_complete = !(generating && AgentOutput::still_reasoning(partial));
     }
 }
 
@@ -655,7 +778,7 @@ fn show_tail(
 /// fields.
 fn agent_message(timeline: &mut [TimelineMessage], id: Uuid) -> Option<&mut AgentMessage> {
     timeline.iter_mut().find_map(|entry| match entry {
-        TimelineMessage::Agent(message) if message.id == id => Some(message),
+        TimelineMessage::Agent(message) if message.record.id == id => Some(message),
         _ => None,
     })
 }
@@ -669,6 +792,88 @@ mod tests {
         ToolName, UserContent,
     };
     use serde_json::json;
+
+    #[test]
+    fn compactions_keep_original_positions_and_round_trip_their_history() {
+        let mut transcript = Transcript::default();
+        let first = transcript.append(RigMessage::user("Original request"));
+        let second = transcript.append(RigMessage::assistant("Original answer"));
+        assert_eq!((first, second), (TranscriptIndex(0), TranscriptIndex(1)));
+
+        let boundary = transcript.end();
+        // A new conversation prompt may arrive before the summary finishes.
+        let third = transcript.append(RigMessage::user("Continue"));
+        transcript
+            .install_compaction(Compaction {
+                resume_at: boundary,
+                summary: "Earlier conversation".into(),
+            })
+            .unwrap();
+        assert_eq!(third, TranscriptIndex(2));
+        assert_eq!(
+            transcript.request_history(),
+            vec![
+                RigMessage::user("Summary of the conversation so far:\nEarlier conversation"),
+                RigMessage::user("Continue"),
+            ]
+        );
+        transcript
+            .install_compaction(Compaction {
+                resume_at: transcript.end(),
+                summary: "Everything so far".into(),
+            })
+            .unwrap();
+        assert_eq!(transcript.compactions.len(), 2);
+        assert_eq!(
+            transcript.messages,
+            vec![
+                RigMessage::user("Original request"),
+                RigMessage::assistant("Original answer"),
+                RigMessage::user("Continue"),
+            ]
+        );
+
+        let bytes = postcard::to_stdvec(&transcript.to_protocol()).unwrap();
+        // The entire value travels as one JSON string, with no per-message
+        // wrappers or intermediate transcript representation.
+        assert_eq!(
+            bytes,
+            postcard::to_stdvec(&serde_json::to_string(&transcript).unwrap()).unwrap()
+        );
+        let wire: Json<Transcript> = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(wire.to_transcript().unwrap(), transcript);
+    }
+
+    #[test]
+    fn invalid_compactions_leave_context_unchanged_and_are_rejected_in_snapshots() {
+        let mut transcript = Transcript::default();
+        transcript.append(RigMessage::user("Request"));
+        transcript.append(RigMessage::assistant("Answer"));
+        transcript
+            .install_compaction(Compaction {
+                resume_at: TranscriptIndex(2),
+                summary: "Summary".into(),
+            })
+            .unwrap();
+        let original = transcript.clone();
+        for (boundary, summary) in [
+            (0, "Invalid"),
+            (1, "Backward"),
+            (3, "Beyond end"),
+            (2, "  "),
+            (u64::MAX, "Overflow"),
+        ] {
+            let invalid = Compaction {
+                resume_at: TranscriptIndex(boundary),
+                summary: summary.into(),
+            };
+            assert!(transcript.install_compaction(invalid.clone()).is_err());
+            assert_eq!(transcript, original);
+            let mut invalid_transcript = transcript.clone();
+            invalid_transcript.compactions.push(invalid);
+            assert!(invalid_transcript.to_protocol().to_transcript().is_err());
+        }
+    }
 
     /// A prompt with an image, a reply with reasoning and a tool call, and
     /// the tool's result come back from the wire exactly as they were

@@ -182,6 +182,14 @@ async fn commands_are_confined() {
             // Seatbelt refuses the listing. Neither may expose host entries.
             let denied = run(&sandboxes, &format!("ls -A '{}'", path.display())).await;
             assert_eq!(denied.stdout, "", "credentials stay hidden: {denied:?}");
+            #[cfg(target_os = "macos")]
+            assert_ne!(
+                denied.exit_code, 0,
+                "credential listing is denied: {denied:?}"
+            );
+            // Bubblewrap hides entries entirely. mxc's Seatbelt profile permits
+            // file metadata, so existence is not a portable denial guarantee.
+            #[cfg(target_os = "linux")]
             if let Ok(mut entries) = std::fs::read_dir(&path)
                 && let Some(Ok(entry)) = entries.next()
             {

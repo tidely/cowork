@@ -15,43 +15,50 @@ fn titled_thread(title: &str, timeline: Vec<TimelineMessage>) -> (Uuid, Thread) 
 }
 
 fn prompt(text: &str) -> TimelineMessage {
-    TimelineMessage::User(UserMessageGroup {
-        id: Uuid::new_v4(),
-        comments: Vec::new(),
-        blocks: vec![PromptBlock {
+    TimelineMessage::User(
+        UserMessageGroup {
             id: Uuid::new_v4(),
-            author: ParticipantId::new(),
-            text: text.into(),
-            attachments: Vec::new(),
-        }],
-        comments_folded: false,
-    })
+            comments: Vec::new(),
+            blocks: vec![PromptBlock {
+                id: Uuid::new_v4(),
+                author: ParticipantId::new(),
+                text: text.into(),
+                attachments: Vec::new(),
+            }],
+            comments_folded: false,
+        }
+        .into(),
+    )
 }
 
 fn reply(text: &str, cx: &mut App) -> TimelineMessage {
     TimelineMessage::Agent(AgentMessage {
-        id: Uuid::new_v4(),
-        comment_group_id: None,
-        started_at: SystemTime::UNIX_EPOCH,
-        comment_responses: Vec::new(),
-        prompt: 0,
-        pending_events: Vec::new(),
-        run: AgentRun::Ended {
-            outcome: RunOutcome::Completed,
-            duration: Duration::ZERO,
+        record: crate::timeline::AgentRunRecord {
+            id: Uuid::new_v4(),
+            comment_group_id: None,
+            started_at: SystemTime::UNIX_EPOCH,
+            prompt: crate::transcript::TranscriptIndex(0),
+            pending_events: Vec::new(),
+            run: AgentRun::Ended {
+                outcome: RunOutcome::Completed,
+                duration: Duration::ZERO,
+            },
+            awaiting_approval: None,
+            steering: Vec::new(),
         },
-        output: AgentOutput {
-            thinking_complete: true,
-            text: text.into(),
-            ..Default::default()
+        ui: crate::timeline::AgentMessageUi {
+            output: AgentOutput {
+                thinking_complete: true,
+                text: text.into(),
+                ..Default::default()
+            },
+            committed: Default::default(),
+            comment_calls_checked: 0,
+            step_views: Vec::new(),
+            text_view: cx.new(|cx| TextViewState::markdown(text, cx)),
+            comment_responses: Vec::new(),
+            work_expanded: false,
         },
-        committed: Default::default(),
-        comment_calls_checked: 0,
-        awaiting_approval: None,
-        steering: Vec::new(),
-        step_views: Vec::new(),
-        work_expanded: false,
-        text_view: cx.new(|cx| TextViewState::markdown(text, cx)),
     })
 }
 

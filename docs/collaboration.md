@@ -6,6 +6,16 @@ Yrs document, and the protocol between host and collaborators.
 
 ## Status
 
+The LLM transcript is a separate value containing the original Rig messages and
+all accepted prefix compactions. Absolute message indices remain unchanged; the
+latest summary is used for requests. UUIDs and unfinished events belong to shared
+timeline run records. Each resident timeline entry holds its shared record and
+local presentation in separate fields; records and views share a lifetime while
+all history stays in memory. Only records cross the sharing boundary. Welcome
+snapshots carry the whole `Transcript` as one `Json<Transcript>` value, including
+original messages and compactions, plus the run records and their JSON-wrapped pending events. All history and local views remain
+in memory; there is no transcript offloading or history paging.
+
 Ollama context compaction runs before a new agent run and between model
 requests within a run, after all tool results and before queued steering.
 This includes queued and scheduled runs. The host triggers it when the last measured
@@ -536,7 +546,8 @@ A single-block submission looks like the current user message.
   reasoning, tool calls, and tool results. Between compactions each request
   extends the previous one exactly, keeping the provider's prompt cache
   valid. After compaction, requests use the summary followed by transcript
-  messages after its boundary; the full transcript remains available for
+  messages after its exclusive `resume_at` boundary; all accepted summaries
+  are retained, with nondecreasing prefix coverage. The full transcript remains available for
   display and sharing. A run that is stopped or fails keeps its prompt and
   every turn it completed.
 - Every participant mirrors the transcript and the prompt names. The
@@ -574,19 +585,22 @@ A single-block submission looks like the current user message.
   "Worked for" once it ends, with whether it was stopped or failed. That
   line and whether it is open are local. A failure message is kept apart
   from the agent's output, and shown only when there is none.
-- The transcript is kept as Rig messages; they and the agent events travel
-  as JSON, which postcard cannot represent directly. Their encoding is
+- The transcript contains Rig messages and compactions, sent together as one
+  JSON value; individual live messages and agent events also travel as JSON, which postcard cannot represent directly. Their encoding is
   Rig's, so upgrading Rig bumps the protocol version. A prompt joins the
   transcript with `AgentStarted`, including its files' content, images as
   base64, so attachment bytes also travel inline besides as
-  `AttachmentData`. A `Welcome` carries the transcript and, for each agent
+  `AttachmentData`. Summary instructions and summary responses never become
+  original transcript messages. A `Welcome` carries the whole `Json<Transcript>`
+  (original Rig messages and prefix compactions in one JSON value) and, for each agent
   message, where its prompt is, its pending events, and whether its run
   has ended. The joiner folds each run's pending events, which rebuilds the
   message it was folding exactly, and so shows what everyone else does. For
   the running message, it keeps that fold, so someone joining mid-turn
   folds the rest of it. Before that, the
   joiner checks that the snapshot fits its transcript: every prompt is a
-  user message there, in order, only the last run can still be
+  user message there, in order, all timeline UUIDs are unique, every compaction
+  has a nonempty summary and valid nondecreasing boundary, only the last run can still be
   generating, and no run's pending events complete a message the
   transcript lacks. A frame larger than 1 GiB cannot be sent; the
   collaborator is then disconnected.

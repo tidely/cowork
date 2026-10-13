@@ -40,7 +40,7 @@ use crate::{
     project_mode::ProjectMode,
     protocol,
     timeline::{AgentMessage, TimelineMessage},
-    transcript::validate_agent_runs,
+    transcript::{Transcript, validate_agent_runs},
 };
 
 /// How many thread events a collaborator may fall behind before the host
@@ -149,8 +149,7 @@ pub(crate) struct Thread {
     /// after compaction. Requests use `request_history` to substitute a
     /// summary for an earlier prefix. Everyone mirrors this full history; see
     /// `transcript.rs`.
-    pub(crate) transcript: Vec<RigMessage>,
-    pub(crate) compacted_context: Option<protocol::CompactedContext>,
+    pub(crate) transcript: Transcript,
     pub(crate) compacting: bool,
     /// Folds the running agent's events into the transcript's next message.
     /// The events it has folded so far are the running message's pending
@@ -204,7 +203,7 @@ pub(crate) struct Thread {
 /// alongside it so installation does not decode the same messages again.
 pub(crate) struct PreparedWelcome {
     welcome: protocol::Welcome,
-    transcript: Vec<RigMessage>,
+    transcript: Transcript,
 }
 
 impl Thread {
@@ -226,8 +225,7 @@ impl Thread {
             participant_id,
             participants: Vec::new(),
             profiles: HashMap::new(),
-            transcript: Vec::new(),
-            compacted_context: None,
+            transcript: Transcript::default(),
             compacting: false,
             agent_turn: TurnFold::default(),
             prompt_names: HashMap::new(),
@@ -511,8 +509,7 @@ impl Thread {
             participant_id: ParticipantId::from_bytes(welcome.participant_id),
             participants: Vec::new(),
             profiles: HashMap::new(),
-            transcript: Vec::new(),
-            compacted_context: None,
+            transcript: Transcript::default(),
             compacting: false,
             agent_turn: TurnFold::default(),
             prompt_names: HashMap::new(),
@@ -574,13 +571,16 @@ impl Thread {
                 "oversized pending submission"
             );
         }
-        let transcript = parse_transcript(&welcome.thread.transcript)?;
-        if let Some(context) = &welcome.thread.compacted_context {
+        let transcript = welcome.thread.transcript.to_transcript()?;
+        let mut message_ids = std::collections::HashSet::new();
+        for message in &welcome.thread.messages {
+            let id = match message {
+                protocol::TimelineMessage::User(group) => group.id,
+                protocol::TimelineMessage::Agent(run) => run.id,
+            };
             anyhow::ensure!(
-                context.through > 0
-                    && context.through <= transcript.len() as u64
-                    && !context.summary.trim().is_empty(),
-                "invalid compacted context"
+                message_ids.insert(id),
+                "duplicate timeline message identity"
             );
         }
         anyhow::ensure!(!welcome.thread.compacting || welcome.thread.messages.iter().any(|message| matches!(message, protocol::TimelineMessage::Agent(message) if matches!(message.run, protocol::AgentRun::Generating))), "compaction without an active run");
@@ -593,7 +593,8 @@ impl Thread {
                 protocol::TimelineMessage::User(_) => None,
             })
             .collect::<Vec<_>>();
-        validate_agent_runs(&transcript, &agent_messages).context("invalid host snapshot")?;
+        validate_agent_runs(&transcript.messages, &agent_messages)
+            .context("invalid host snapshot")?;
         Ok(PreparedWelcome {
             welcome,
             transcript,
@@ -666,7 +667,6 @@ impl Thread {
         self.models = Arc::new(std::mem::take(&mut thread.models));
         self.model = thread.model.take();
         self.context_tokens = thread.context_tokens;
-        self.compacted_context = thread.compacted_context.take();
         self.compacting = thread.compacting;
         self.streamed_bytes = thread.streamed_bytes;
         self.transcript = transcript;
@@ -695,7 +695,10 @@ impl Thread {
             .collect();
         let (summary, timeline) = thread.into_native(cx);
         self.summary = summary;
-        self.set_timeline(timeline);
+        self.generating = timeline.iter().any(
+            |entry| matches!(entry, TimelineMessage::Agent(message) if message.is_generating()),
+        );
+        self.timeline = timeline;
         self.restore_agent_output(cx);
         Ok(())
     }
@@ -756,7 +759,6 @@ impl Thread {
             model: self.model.clone(),
             peer_permissions: self.peer_permissions.clone(),
             context_tokens: self.context_tokens,
-            compacted_context: self.compacted_context.clone(),
             compacting: self.compacting,
             streamed_bytes: self.streamed_bytes,
             messages: self
@@ -764,11 +766,7 @@ impl Thread {
                 .iter()
                 .map(TimelineMessage::to_protocol)
                 .collect(),
-            transcript: self
-                .transcript
-                .iter()
-                .map(protocol::Json::from_rig)
-                .collect(),
+            transcript: self.transcript.to_protocol(),
             prompt_names: self
                 .prompt_names
                 .iter()
@@ -1065,7 +1063,7 @@ impl Thread {
                 TimelineMessage::User(group) => Some(group),
                 TimelineMessage::Agent(_) => None,
             })
-            .flat_map(|group| &group.blocks)
+            .flat_map(|group| &group.record.blocks)
             .flat_map(|block| &block.attachments)
             .filter(|record| eligible(record))
             .map(|record| record.id);
@@ -1320,7 +1318,7 @@ impl Thread {
     /// The agent message currently being generated, if any.
     pub(crate) fn running_agent_message_id(&self) -> Option<Uuid> {
         self.timeline.iter().rev().find_map(|entry| match entry {
-            TimelineMessage::Agent(message) if message.is_generating() => Some(message.id),
+            TimelineMessage::Agent(message) if message.is_generating() => Some(message.record.id),
             _ => None,
         })
     }
@@ -1520,8 +1518,7 @@ impl Thread {
             protocol::HostMessage::ThreadTitled(title) => self.summary.title = title,
             protocol::HostMessage::UserMessage(message) => {
                 self.submission_sequence += 1;
-                self.timeline
-                    .push(TimelineMessage::User(message.into_native()));
+                self.append_user_group(message.into_native());
             }
             protocol::HostMessage::PendingSubmissions { sequence, pending } => {
                 self.submission_sequence = sequence;
@@ -1552,9 +1549,9 @@ impl Thread {
                 // Steering joins the timeline when it joins the run, after
                 // the agent message, which shows it where its prompt landed.
                 if let Some(message) = agent_id.and_then(|id| self.agent_message_mut(id)) {
-                    message.steering.push(group.id);
+                    message.record.steering.push(group.id);
                 }
-                self.timeline.push(TimelineMessage::User(group));
+                self.append_user_group(group);
             }
             protocol::HostMessage::CompactionStarted => {
                 anyhow::ensure!(
@@ -1570,20 +1567,10 @@ impl Thread {
                 );
                 self.compacting = false;
                 if let Some(context) = context {
-                    anyhow::ensure!(
-                        context.through > 0
-                            && context.through <= self.transcript.len() as u64
-                            && self
-                                .compacted_context
-                                .as_ref()
-                                .is_none_or(|previous| context.through >= previous.through)
-                            && !context.summary.trim().is_empty(),
-                        "invalid compacted context"
-                    );
+                    self.transcript.install_compaction(context.clone())?;
                     self.context_tokens =
                         Some((context.summary.len() as u64).div_ceil(BYTES_PER_TOKEN));
                     self.streamed_bytes = 0;
-                    self.compacted_context = Some(context);
                 }
             }
             protocol::HostMessage::AgentStarted {
@@ -1592,16 +1579,21 @@ impl Thread {
                 started_at,
                 prompt,
             } => {
-                self.transcript.push(prompt.to_rig()?);
-                self.timeline.push(TimelineMessage::Agent(AgentMessage::new(
+                anyhow::ensure!(
+                    !self.timeline.iter().any(|entry| matches!(entry, TimelineMessage::Agent(message) if message.record.id == Uuid::from_bytes(id))),
+                    "duplicate agent run identity"
+                );
+                let prompt_index = self.transcript.append(prompt.to_rig()?);
+                let message = AgentMessage::new(
                     Uuid::from_bytes(id),
                     comment_group_id.map(Uuid::from_bytes),
                     started_at,
-                    self.transcript.len() - 1,
+                    prompt_index,
                     protocol::AgentRun::Generating,
                     Vec::new(),
                     cx,
-                )));
+                );
+                self.timeline.push(TimelineMessage::Agent(message));
                 self.generating = true;
                 self.agent_turn = TurnFold::default();
             }
@@ -1689,7 +1681,7 @@ impl Thread {
         self.timeline
             .iter()
             .filter_map(|message| match message {
-                TimelineMessage::Agent(message) => message.run.duration(),
+                TimelineMessage::Agent(message) => message.record.run.duration(),
                 TimelineMessage::User(_) => None,
             })
             .sum()
@@ -1698,15 +1690,7 @@ impl Thread {
     /// The complete transcript stays available to render and validate old
     /// runs; only requests substitute a successful summary for its prefix.
     pub(crate) fn request_history(&self) -> Vec<RigMessage> {
-        match &self.compacted_context {
-            Some(context) => std::iter::once(RigMessage::user(format!(
-                "Summary of the conversation so far:\n{}",
-                context.summary
-            )))
-            .chain(self.transcript[context.through as usize..].iter().cloned())
-            .collect(),
-            None => self.transcript.clone(),
-        }
+        self.transcript.request_history()
     }
 
     /// How much of the context window the thread fills right now: the last
@@ -1728,7 +1712,7 @@ impl Thread {
             .timeline
             .iter()
             .filter_map(|message| match message {
-                TimelineMessage::User(group) => Some(&group.blocks),
+                TimelineMessage::User(group) => Some(&group.record.blocks),
                 TimelineMessage::Agent(_) => None,
             })
             .flatten()
@@ -1748,8 +1732,9 @@ impl Thread {
             .iter()
             .filter_map(|message| match message {
                 TimelineMessage::Agent(message) => Some(AgentShown {
-                    output: message.output.clone(),
+                    output: message.ui.output.clone(),
                     comment_responses: message
+                        .ui
                         .comment_responses
                         .iter()
                         .map(|response| CommentResponseShown {
@@ -1775,17 +1760,14 @@ impl Thread {
         }
     }
 
-    fn set_timeline(&mut self, timeline: Vec<TimelineMessage>) {
-        self.generating = timeline.iter().any(
-            |message| matches!(message, TimelineMessage::Agent(message) if message.is_generating()),
-        );
-        self.timeline = timeline;
+    pub(crate) fn append_user_group(&mut self, group: crate::timeline::UserMessageGroup) {
+        self.timeline.push(TimelineMessage::User(group.into()));
     }
 
     pub(crate) fn agent_message_mut(&mut self, id: uuid::Bytes) -> Option<&mut AgentMessage> {
         let id = Uuid::from_bytes(id);
         self.timeline.iter_mut().find_map(|entry| match entry {
-            TimelineMessage::Agent(message) if message.id == id => Some(message),
+            TimelineMessage::Agent(message) if message.record.id == id => Some(message),
             _ => None,
         })
     }
@@ -1799,7 +1781,7 @@ pub(crate) struct Conversation {
     pub(crate) timeline: Vec<protocol::TimelineMessage>,
     /// What each agent message shows, which is derived rather than sent.
     pub(crate) agent_output: Vec<AgentShown>,
-    pub(crate) transcript: Vec<RigMessage>,
+    pub(crate) transcript: Transcript,
     pub(crate) prompt_names: Vec<PromptName>,
     /// The bytes of each file in the timeline, `None` while missing.
     pub(crate) files: Vec<(uuid::Bytes, Option<Vec<u8>>)>,
@@ -1827,18 +1809,6 @@ pub(crate) struct CommentResponseShown {
     pub(crate) id: Uuid,
     pub(crate) comment_id: Uuid,
     pub(crate) response: String,
-}
-
-fn parse_transcript(transcript: &[protocol::Json<RigMessage>]) -> anyhow::Result<Vec<RigMessage>> {
-    transcript
-        .iter()
-        .enumerate()
-        .map(|(index, message)| {
-            message
-                .to_rig()
-                .with_context(|| format!("invalid transcript message {index} from host"))
-        })
-        .collect()
 }
 
 impl protocol::ThreadSnapshot {

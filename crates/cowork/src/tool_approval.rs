@@ -104,7 +104,7 @@ pub(crate) enum RunUpdate {
     Event(AgentEvent),
     CompactionStarted,
     CompactionFinished {
-        context: Option<crate::protocol::CompactedContext>,
+        context: Option<crate::transcript::Compaction>,
         usage: rig::completion::Usage,
     },
     SteeringConsumed {

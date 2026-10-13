@@ -539,11 +539,14 @@ fn compaction_replaces_request_prefix_but_keeps_complete_transcript() {
     let mut thread = local_thread();
     let first = rig::completion::Message::user("Original request");
     let later = rig::completion::Message::user("Next request");
-    thread.transcript = vec![first.clone(), later.clone()];
-    thread.compacted_context = Some(protocol::CompactedContext {
-        through: 1,
-        summary: "First summary".into(),
-    });
+    thread.transcript.messages = vec![first.clone(), later.clone()];
+    thread
+        .transcript
+        .install_compaction(crate::transcript::Compaction {
+            resume_at: crate::transcript::TranscriptIndex(1),
+            summary: "First summary".into(),
+        })
+        .unwrap();
     assert_eq!(
         thread.request_history(),
         vec![
@@ -551,22 +554,28 @@ fn compaction_replaces_request_prefix_but_keeps_complete_transcript() {
             later.clone()
         ]
     );
-    thread.compacted_context = Some(protocol::CompactedContext {
-        through: 2,
-        summary: "Second summary".into(),
-    });
+    thread
+        .transcript
+        .install_compaction(crate::transcript::Compaction {
+            resume_at: crate::transcript::TranscriptIndex(2),
+            summary: "Second summary".into(),
+        })
+        .unwrap();
     assert_eq!(
         thread.request_history(),
         vec![rig::completion::Message::user(
             "Summary of the conversation so far:\nSecond summary"
         )]
     );
-    assert_eq!(thread.transcript, vec![first, later]);
+    assert_eq!(thread.transcript.messages, vec![first, later]);
     let snapshot = thread.to_protocol();
     let bytes = postcard::to_stdvec(&snapshot).unwrap();
     let decoded: protocol::ThreadSnapshot = postcard::from_bytes(&bytes).unwrap();
-    assert_eq!(decoded.compacted_context, thread.compacted_context);
-    assert_eq!(decoded.transcript.len(), 2);
+    assert_eq!(decoded.transcript, thread.transcript.to_protocol());
+    assert_eq!(
+        decoded.transcript.to_transcript().unwrap().messages.len(),
+        2
+    );
 }
 
 #[gpui::test]
@@ -574,12 +583,16 @@ fn compaction_events_preserve_previous_context_on_failure_and_stop(cx: &mut gpui
     let mut thread = local_thread();
     thread
         .transcript
+        .messages
         .push(rig::completion::Message::user("Earlier request"));
-    let previous = protocol::CompactedContext {
-        through: 1,
+    let previous = crate::transcript::Compaction {
+        resume_at: crate::transcript::TranscriptIndex(1),
         summary: "Earlier summary".into(),
     };
-    thread.compacted_context = Some(previous.clone());
+    thread
+        .transcript
+        .install_compaction(previous.clone())
+        .unwrap();
     let id = Uuid::new_v4().into_bytes();
     thread
         .try_apply_for_test(
@@ -601,7 +614,7 @@ fn compaction_events_preserve_previous_context_on_failure_and_stop(cx: &mut gpui
             cx,
         )
         .unwrap();
-    assert_eq!(thread.compacted_context, Some(previous.clone()));
+    assert_eq!(thread.transcript.latest_compaction(), Some(&previous));
     assert!(!thread.compacting);
     thread
         .try_apply_for_test(protocol::HostMessage::CompactionStarted, cx)
@@ -617,8 +630,8 @@ fn compaction_events_preserve_previous_context_on_failure_and_stop(cx: &mut gpui
         )
         .unwrap();
     assert!(!thread.compacting);
-    assert_eq!(thread.compacted_context, Some(previous));
-    assert_eq!(thread.transcript.len(), 2);
+    assert_eq!(thread.transcript.latest_compaction(), Some(&previous));
+    assert_eq!(thread.transcript.messages.len(), 2);
 }
 
 #[gpui::test]
@@ -626,6 +639,7 @@ fn compaction_snapshot_restores_summary_and_full_transcript(cx: &mut gpui::TestA
     let mut host = local_thread();
     let peer = add_peer(&mut host);
     host.transcript
+        .messages
         .push(rig::completion::Message::user("Earlier request"));
     let id = Uuid::new_v4().into_bytes();
     host.try_apply_for_test(
@@ -642,9 +656,9 @@ fn compaction_snapshot_restores_summary_and_full_transcript(cx: &mut gpui::TestA
         .unwrap();
     host.try_apply_for_test(
         protocol::HostMessage::CompactionFinished {
-            context: Some(protocol::CompactedContext {
+            context: Some(crate::transcript::Compaction {
                 // A loop boundary can summarize every recorded message.
-                through: 2,
+                resume_at: crate::transcript::TranscriptIndex(2),
                 summary: "Summary".into(),
             }),
         },
@@ -668,5 +682,76 @@ fn compaction_snapshot_restores_summary_and_full_transcript(cx: &mut gpui::TestA
     );
     assert_eq!(restored.request_history(), host.request_history());
     assert_eq!(restored.transcript, host.transcript);
-    assert_eq!(restored.compacted_context, host.compacted_context);
+    assert_eq!(
+        restored.transcript.to_protocol(),
+        host.transcript.to_protocol()
+    );
+}
+
+#[gpui::test]
+fn compaction_retains_local_views_and_ui_changes_do_not_change_shared_records(
+    cx: &mut gpui::TestAppContext,
+) {
+    let mut thread = local_thread();
+    let id = Uuid::new_v4().into_bytes();
+    thread
+        .try_apply_for_test(
+            protocol::HostMessage::AgentStarted {
+                id,
+                comment_group_id: None,
+                started_at: std::time::SystemTime::now(),
+                prompt: protocol::Json::from_rig(&rig::completion::Message::user("Request")),
+            },
+            cx,
+        )
+        .unwrap();
+    let view = thread.agent_message_mut(id).unwrap().ui.text_view.clone();
+    let records = thread.to_protocol().messages;
+    thread.agent_message_mut(id).unwrap().ui.work_expanded = false;
+    assert_eq!(thread.to_protocol().messages, records);
+
+    thread
+        .try_apply_for_test(protocol::HostMessage::CompactionStarted, cx)
+        .unwrap();
+    thread
+        .try_apply_for_test(
+            protocol::HostMessage::CompactionFinished {
+                context: Some(crate::transcript::Compaction {
+                    resume_at: thread.transcript.end(),
+                    summary: "Summary".into(),
+                }),
+            },
+            cx,
+        )
+        .unwrap();
+    let ui = &thread.agent_message_mut(id).unwrap().ui;
+    assert_eq!(ui.text_view.entity_id(), view.entity_id());
+    assert!(!ui.work_expanded);
+    assert_eq!(thread.to_protocol().messages, records);
+    assert_eq!(thread.transcript.messages.len(), 1);
+
+    let mut welcome = protocol::Welcome {
+        participant_id: thread.participant_id.into_bytes(),
+        thread: thread.to_protocol(),
+        draft: thread.draft.encode_state(),
+        draft_generation: 0,
+        presence: Vec::new(),
+        stored_attachments: Vec::new(),
+    };
+    welcome
+        .thread
+        .messages
+        .push(protocol::TimelineMessage::User(protocol::UserMessage {
+            id,
+            blocks: Vec::new(),
+            comments: Vec::new(),
+        }));
+    let error = Thread::prepare_welcome(welcome)
+        .err()
+        .expect("duplicate UUID rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("duplicate timeline message identity")
+    );
 }

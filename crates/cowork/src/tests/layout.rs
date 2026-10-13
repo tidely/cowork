@@ -199,7 +199,7 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
             message_id,
             None,
             SystemTime::UNIX_EPOCH,
-            0,
+            crate::transcript::TranscriptIndex(0),
             crate::protocol::AgentRun::Ended {
                 outcome: crate::protocol::RunOutcome::Completed,
                 duration: Duration::from_secs(1),
@@ -331,6 +331,7 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
                 panic!("expected the agent message");
             };
             message
+                .ui
                 .step_views
                 .iter()
                 .enumerate()
@@ -372,7 +373,7 @@ fn steering_shows_where_it_joined_the_work(cx: &mut gpui::TestAppContext) {
             message_id,
             None,
             SystemTime::UNIX_EPOCH,
-            0,
+            crate::transcript::TranscriptIndex(0),
             crate::protocol::AgentRun::Ended {
                 outcome: crate::protocol::RunOutcome::Completed,
                 duration: Duration::from_secs(1),
@@ -380,7 +381,7 @@ fn steering_shows_where_it_joined_the_work(cx: &mut gpui::TestAppContext) {
             Vec::new(),
             cx,
         );
-        message.steering = vec![steering_id];
+        message.record.steering = vec![steering_id];
         message.show_output(
             crate::timeline::AgentOutput {
                 steps: vec![
@@ -410,7 +411,7 @@ fn steering_shows_where_it_joined_the_work(cx: &mut gpui::TestAppContext) {
                 thread_id,
                 vec![
                     TimelineMessage::Agent(message),
-                    TimelineMessage::User(steering),
+                    TimelineMessage::User(steering.into()),
                 ],
                 ThreadDraft::new(ParticipantId::new()),
             )
@@ -468,17 +469,20 @@ fn selected_user_message_text_copies(cx: &mut gpui::TestAppContext) {
     let thread_id = Uuid::new_v4();
     let block_id = Uuid::new_v4();
     let (root, cx) = cx.add_window_view(|window, cx| {
-        let timeline = vec![TimelineMessage::User(UserMessageGroup {
-            id: Uuid::new_v4(),
-            comments: Vec::new(),
-            blocks: vec![PromptBlock {
-                id: block_id,
-                author: ParticipantId::new(),
-                text: "Copy these words".into(),
-                attachments: Vec::new(),
-            }],
-            comments_folded: false,
-        })];
+        let timeline = vec![TimelineMessage::User(
+            UserMessageGroup {
+                id: Uuid::new_v4(),
+                comments: Vec::new(),
+                blocks: vec![PromptBlock {
+                    id: block_id,
+                    author: ParticipantId::new(),
+                    text: "Copy these words".into(),
+                    attachments: Vec::new(),
+                }],
+                comments_folded: false,
+            }
+            .into(),
+        )];
         let thread =
             cx.new(|_| test_thread(thread_id, timeline, ThreadDraft::new(ParticipantId::new())));
         let thread_store = cx.new(|_| ThreadStore {

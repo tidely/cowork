@@ -40,17 +40,20 @@ fn first_message_titles_an_empty_pre_shared_thread() {
         Some("Collaborate on this prompt".into())
     );
 
-    let existing_timeline = vec![TimelineMessage::User(UserMessageGroup {
-        id: Uuid::new_v4(),
-        comments: Vec::new(),
-        blocks: vec![PromptBlock {
+    let existing_timeline = vec![TimelineMessage::User(
+        UserMessageGroup {
             id: Uuid::new_v4(),
-            author: ParticipantId::new(),
-            text: "Existing message".into(),
-            attachments: Vec::new(),
-        }],
-        comments_folded: false,
-    })];
+            comments: Vec::new(),
+            blocks: vec![PromptBlock {
+                id: Uuid::new_v4(),
+                author: ParticipantId::new(),
+                text: "Existing message".into(),
+                attachments: Vec::new(),
+            }],
+            comments_folded: false,
+        }
+        .into(),
+    )];
     assert_eq!(
         Cowork::title_for_first_message(&existing_timeline, "Later message"),
         None
@@ -316,7 +319,7 @@ fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_a
                 let TimelineMessage::Agent(message) = &host.timeline[1] else {
                     panic!("expected the agent message");
                 };
-                let calls = message.output.tool_calls().collect::<Vec<_>>();
+                let calls = message.ui.output.tool_calls().collect::<Vec<_>>();
                 assert_eq!(calls.len(), 1);
                 assert_eq!(calls[0].result.is_some(), !matches!(join_at, JoinAt::Call));
             }
@@ -376,7 +379,7 @@ fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_a
             panic!("expected the agent's reply");
         };
         assert_eq!(
-            message.output.thinking().collect::<Vec<_>>(),
+            message.ui.output.thinking().collect::<Vec<_>>(),
             ["Weighing options."]
         );
         // Text before the tool call is work; the response is what follows.
@@ -385,22 +388,22 @@ fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_a
             AgentStep::Text(work),
             AgentStep::ToolCall(call),
             AgentStep::Text(_),
-        ] = &message.output.steps[..]
+        ] = &message.ui.output.steps[..]
         else {
             panic!("expected thinking, text, a call, and the response");
         };
         assert_eq!(work, "Here is the answer.");
-        assert_eq!(message.output.text, " Done.");
-        assert!(!message.work_expanded);
+        assert_eq!(message.ui.output.text, " Done.");
+        assert!(!message.ui.work_expanded);
         assert_eq!(call.call.function.name, "respond_to_comment");
         assert!(call.arguments_text().contains("comment_1"));
         assert_eq!(call.result_text().as_deref(), Some("Recorded"));
-        assert!(!message.step_views.iter().any(StepView::expanded));
-        assert!(message.output.thinking_complete);
+        assert!(!message.ui.step_views.iter().any(StepView::expanded));
+        assert!(message.ui.output.thinking_complete);
         assert!(!message.is_generating());
-        assert_eq!(message.run.failure(), None);
-        assert!(message.pending_events.is_empty());
-        let [response] = message.comment_responses.as_slice() else {
+        assert_eq!(message.record.run.failure(), None);
+        assert!(message.record.pending_events.is_empty());
+        let [response] = message.ui.comment_responses.as_slice() else {
             panic!("expected the reply to the comment");
         };
         assert_eq!(response.response, "Because of this.");
@@ -413,7 +416,7 @@ fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_a
             RigMessage::Assistant(reply),
             RigMessage::User { .. },
             RigMessage::Assistant(_),
-        ] = collaborator.transcript.as_slice()
+        ] = collaborator.transcript.messages.as_slice()
         else {
             panic!("expected prompt, reply, tool result, reply");
         };
@@ -478,8 +481,8 @@ fn failed_run_without_rig_output_shows_its_failure(cx: &mut gpui::TestAppContext
             panic!("expected agent message");
         };
         // The failure is not agent output, so it stays out of the text.
-        assert!(message.output.text.is_empty());
-        assert_eq!(message.run.failure(), Some("Model unavailable"));
+        assert!(message.ui.output.text.is_empty());
+        assert_eq!(message.record.run.failure(), Some("Model unavailable"));
         assert_eq!(restored.conversation(), view.host.read(cx).conversation());
     });
 }
@@ -550,12 +553,12 @@ fn separate_runs_reconstruct_only_their_own_tool_calls(cx: &mut gpui::TestAppCon
             ThreadSharing::NotShared,
             cx,
         );
-        let calls = restored
-            .timeline
+        let timeline = &restored.timeline;
+        let calls = timeline
             .iter()
             .filter_map(|entry| match entry {
                 TimelineMessage::Agent(message) => {
-                    Some(message.output.tool_calls().collect::<Vec<_>>())
+                    Some(message.ui.output.tool_calls().collect::<Vec<_>>())
                 }
                 _ => None,
             })
@@ -642,21 +645,24 @@ fn failed_run_keeps_output_the_transcript_never_got_for_joiners(cx: &mut gpui::T
         let TimelineMessage::Agent(restored) = &restored.timeline[1] else {
             panic!("expected agent message");
         };
-        let calls = restored.output.tool_calls().collect::<Vec<_>>();
+        let calls = restored.ui.output.tool_calls().collect::<Vec<_>>();
         assert_eq!(calls[0].call.function.name, "respond_to_comment");
         assert!(calls[0].result.is_none());
         assert_eq!(
-            restored.output.thinking().collect::<Vec<_>>(),
+            restored.ui.output.thinking().collect::<Vec<_>>(),
             ["Weighing options."]
         );
         // The run stopped at a tool call, so all its text is work.
-        assert_eq!(restored.output.text, "");
+        assert_eq!(restored.ui.output.text, "");
         assert!(matches!(
-            &restored.output.steps[1],
+            &restored.ui.output.steps[1],
             AgentStep::Text(text) if text == "Here is the answer."
         ));
-        assert_eq!(restored.comment_responses.len(), 1);
-        assert_eq!(restored.comment_responses[0].response, "Because of this.");
+        assert_eq!(restored.ui.comment_responses.len(), 1);
+        assert_eq!(
+            restored.ui.comment_responses[0].response,
+            "Because of this."
+        );
     });
 }
 
@@ -744,10 +750,14 @@ fn incremental_output_matches_a_fresh_derivation_after_every_event(cx: &mut gpui
         let TimelineMessage::Agent(message) = &host.timeline[2] else {
             panic!("expected the second run's message");
         };
-        assert_eq!(message.output.thinking().collect::<Vec<_>>(), ["Two sums."]);
-        assert_eq!(message.output.text, "3 and 7.");
+        assert_eq!(
+            message.ui.output.thinking().collect::<Vec<_>>(),
+            ["Two sums."]
+        );
+        assert_eq!(message.ui.output.text, "3 and 7.");
         assert!(
             message
+                .ui
                 .output
                 .tool_calls()
                 .all(|call| call.result_text().as_deref() == Some("sum"))
@@ -804,10 +814,10 @@ fn a_restated_part_shows_as_rig_accumulates_it(cx: &mut gpui::TestAppContext) {
             panic!("expected the agent message");
         };
         assert_eq!(
-            message.output.thinking().collect::<Vec<_>>(),
+            message.ui.output.thinking().collect::<Vec<_>>(),
             ["Considered."]
         );
-        assert_eq!(message.output.text, "Yes.");
+        assert_eq!(message.ui.output.text, "Yes.");
         let welcome = protocol::Welcome {
             draft_generation: 0,
             participant_id: ParticipantId::new().into_bytes(),
@@ -832,10 +842,10 @@ fn a_restated_part_shows_as_rig_accumulates_it(cx: &mut gpui::TestAppContext) {
             panic!("expected the agent message");
         };
         assert_eq!(
-            message.output.thinking().collect::<Vec<_>>(),
+            message.ui.output.thinking().collect::<Vec<_>>(),
             ["Considered."]
         );
-        let [_, RigMessage::Assistant(reply)] = host.transcript.as_slice() else {
+        let [_, RigMessage::Assistant(reply)] = host.transcript.messages.as_slice() else {
             panic!("expected the prompt and the reply");
         };
         assert!(matches!(
@@ -891,8 +901,14 @@ fn snapshots_with_agent_runs_the_transcript_cannot_hold_are_rejected(
         };
 
         // The prompt must be a user message: here it is the agent's reply.
-        assert!(with_agent_message(&|message| message.prompt = 1).is_err());
-        assert!(with_agent_message(&|message| message.prompt = 99).is_err());
+        assert!(
+            with_agent_message(&|message| message.prompt = crate::transcript::TranscriptIndex(1))
+                .is_err()
+        );
+        assert!(
+            with_agent_message(&|message| message.prompt = crate::transcript::TranscriptIndex(99))
+                .is_err()
+        );
         // Events completing a turn would have joined the transcript.
         let more = model_turn([streamed_text("answer", "More", false)], 1)
             .into_iter()
@@ -915,15 +931,14 @@ fn snapshots_with_agent_runs_the_transcript_cannot_hold_are_rejected(
             .find(|message| matches!(message, protocol::TimelineMessage::Agent(_)))
             .cloned()
             .expect("an agent message");
-        two_generating
-            .thread
-            .transcript
-            .push(protocol::Json::from_rig(&RigMessage::user("Next")));
+        let mut transcript = two_generating.thread.transcript.to_transcript().unwrap();
+        let second_prompt = transcript.append(RigMessage::user("Next"));
+        two_generating.thread.transcript = transcript.to_protocol();
         let protocol::TimelineMessage::Agent(mut second) = first.clone() else {
             unreachable!();
         };
         second.id = Uuid::new_v4().into_bytes();
-        second.prompt = two_generating.thread.transcript.len() - 1;
+        second.prompt = second_prompt;
         second.pending_events.clear();
         let protocol::TimelineMessage::Agent(mut first) = first else {
             unreachable!();
@@ -944,10 +959,10 @@ fn snapshots_with_agent_runs_the_transcript_cannot_hold_are_rejected(
         assert!(Thread::validate_welcome(&two_generating).is_err());
 
         let mut invalid_json = welcome;
-        invalid_json.thread.transcript[0] = postcard::from_bytes(
+        invalid_json.thread.transcript = postcard::from_bytes(
             &postcard::to_stdvec("not json").expect("encode invalid JSON string"),
         )
-        .expect("decode an untrusted transcript message");
+        .expect("decode an untrusted transcript");
         view.host.update(cx, |thread, cx| {
             let snapshot = postcard::to_stdvec(&thread.to_protocol()).unwrap();
             let draft = thread.draft().encode_state();
@@ -1007,17 +1022,17 @@ fn expanded_thinking_stays_open_as_the_run_continues(cx: &mut gpui::TestAppConte
             let message = thread
                 .agent_message_mut(message_id.into_bytes())
                 .expect("the agent message");
-            assert!(message.output.thinking_complete);
-            assert!(matches!(message.output.steps[0], AgentStep::Thinking(_)));
-            assert!(!message.step_views[0].expanded());
-            message.step_views[0].set_expanded(true);
+            assert!(message.ui.output.thinking_complete);
+            assert!(matches!(message.ui.output.steps[0], AgentStep::Thinking(_)));
+            assert!(!message.ui.step_views[0].expanded());
+            message.ui.step_views[0].set_expanded(true);
             for event in events.iter().skip(thinking_done) {
                 thread.apply_for_test(event.clone(), cx);
             }
             let message = thread
                 .agent_message_mut(message_id.into_bytes())
                 .expect("the agent message");
-            assert!(message.step_views[0].expanded());
+            assert!(message.ui.step_views[0].expanded());
         });
     });
 }
@@ -1075,16 +1090,16 @@ fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
                 AgentStep::Thinking(first),
                 AgentStep::ToolCall(_),
                 AgentStep::Thinking(second),
-            ] = &message.output.steps[..]
+            ] = &message.ui.output.steps[..]
             else {
                 panic!("expected thinking, a call, and thinking");
             };
             assert_eq!((first.as_str(), second.as_str()), ("Add first.", "Now "));
-            assert!(!message.output.thinking_in_progress(0));
-            assert!(message.output.thinking_in_progress(2));
-            assert_eq!(message.step_views.len(), 3);
-            assert!(!message.step_views[0].expanded());
-            assert!(message.work_expanded, "work shows while the run goes");
+            assert!(!message.ui.output.thinking_in_progress(0));
+            assert!(message.ui.output.thinking_in_progress(2));
+            assert_eq!(message.ui.step_views.len(), 3);
+            assert!(!message.ui.step_views[0].expanded());
+            assert!(message.ui.work_expanded, "work shows while the run goes");
 
             for event in turn.iter().skip(second_thinking_started) {
                 thread.apply_for_test(agent_event(message_id, event.clone()), cx);
@@ -1103,13 +1118,16 @@ fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
             panic!("expected the agent message");
         };
         assert_eq!(
-            message.output.thinking().collect::<Vec<_>>(),
+            message.ui.output.thinking().collect::<Vec<_>>(),
             ["Add first.", "Now answer."]
         );
-        assert!(matches!(message.output.steps[1], AgentStep::ToolCall(_)));
-        assert_eq!(message.output.text, "It is 3.");
-        assert!(message.output.thinking_complete);
-        assert!(!message.work_expanded, "work collapses when the run ends");
+        assert!(matches!(message.ui.output.steps[1], AgentStep::ToolCall(_)));
+        assert_eq!(message.ui.output.text, "It is 3.");
+        assert!(message.ui.output.thinking_complete);
+        assert!(
+            !message.ui.work_expanded,
+            "work collapses when the run ends"
+        );
 
         let welcome = protocol::Welcome {
             draft_generation: 0,
@@ -1481,8 +1499,8 @@ fn renaming_never_changes_what_the_agent_was_sent(cx: &mut gpui::TestAppContext)
     // The prompt is recorded before the run starts, and this test's run
     // never does.
     let first_prompt = thread.read_with(cx, |thread, _| {
-        assert_eq!(thread.transcript.len(), 1);
-        thread.transcript[0].clone()
+        assert_eq!(thread.transcript.messages.len(), 1);
+        thread.transcript.messages[0].clone()
     });
     // The first prompt tells the agent where its commands run.
     let [note, first] = prompt_texts(&first_prompt).try_into().expect("two parts");
@@ -1514,14 +1532,14 @@ fn renaming_never_changes_what_the_agent_was_sent(cx: &mut gpui::TestAppContext)
     cx.run_until_parked();
 
     thread.read_with(cx, |thread, _| {
-        assert_eq!(thread.transcript.len(), 2);
+        assert_eq!(thread.transcript.messages.len(), 2);
         assert_eq!(
-            prompt_texts(&thread.transcript[0]),
+            prompt_texts(&thread.transcript.messages[0]),
             prompt_texts(&first_prompt)
         );
         // The project did not change, so the note is not repeated.
         assert_eq!(
-            prompt_texts(&thread.transcript[1]),
+            prompt_texts(&thread.transcript.messages[1]),
             [format!("{derived_name}:\nsecond")]
         );
     });
@@ -1572,7 +1590,7 @@ fn a_stopped_run_keeps_its_outcome_and_collapses_its_work(cx: &mut gpui::TestApp
                 .agent_message_mut(message_id.into_bytes())
                 .expect("the agent message");
             // Until a tool call follows, the text may be the response.
-            assert_eq!(message.output.text, "Let me check.");
+            assert_eq!(message.ui.output.text, "Let me check.");
             for event in turn.iter().skip(2) {
                 thread.apply_for_test(agent_event(message_id, event.clone()), cx);
             }
@@ -1589,11 +1607,14 @@ fn a_stopped_run_keeps_its_outcome_and_collapses_its_work(cx: &mut gpui::TestApp
         let TimelineMessage::Agent(message) = &host.timeline[0] else {
             panic!("expected the agent message");
         };
-        assert_eq!(message.run.outcome(), Some(&protocol::RunOutcome::Stopped));
-        assert_eq!(message.run.failure(), None);
-        assert!(!message.work_expanded);
-        assert_eq!(message.output.text, "");
-        assert_eq!(message.output.work().collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(
+            message.record.run.outcome(),
+            Some(&protocol::RunOutcome::Stopped)
+        );
+        assert_eq!(message.record.run.failure(), None);
+        assert!(!message.ui.work_expanded);
+        assert_eq!(message.ui.output.text, "");
+        assert_eq!(message.ui.output.work().collect::<Vec<_>>(), [0, 1]);
 
         let welcome = protocol::Welcome {
             draft_generation: 0,
@@ -1614,7 +1635,7 @@ fn a_stopped_run_keeps_its_outcome_and_collapses_its_work(cx: &mut gpui::TestApp
             panic!("expected the agent message");
         };
         assert!(
-            !restored.work_expanded,
+            !restored.ui.work_expanded,
             "a joiner sees ended runs collapsed"
         );
     });

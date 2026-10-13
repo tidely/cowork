@@ -22,6 +22,10 @@ change project folders; scratch is always writable. Writing other folders
 requires approval unless already granted. Merely reading another folder
 does not. Network allows outbound connections, excluding host loopback.
 
+On macOS, the command sandbox blocks credential contents and directory listings,
+but mxc's generated profile can still expose existence metadata for known paths.
+Credential locations are listed in `crates/sandbox/src/settings.rs`.
+
 | File tool | Read | Write | Write + Network |
 |---|---|---|---|
 | `read_file`, `list_directory` | Automatic | Automatic | Automatic |

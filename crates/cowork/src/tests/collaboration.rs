@@ -83,10 +83,11 @@ fn the_host_accepts_one_submission_per_sequence(cx: &mut gpui::TestAppContext) {
     assert!(session.items(&host_thread).is_empty());
     assert!(session.items(&collaborator_thread).is_empty());
     host_thread.read_with(session.cx, |thread, _| {
-        let [TimelineMessage::User(message), ..] = thread.timeline.as_slice() else {
+        let timeline = &thread.timeline;
+        let [TimelineMessage::User(message), ..] = timeline.as_slice() else {
             panic!("expected the submitted message first");
         };
-        assert_eq!(message.blocks[0].text, "from the host");
+        assert_eq!(message.record.blocks[0].text, "from the host");
     });
 
     // The test's agent never answers, so end its run by hand.
@@ -264,10 +265,9 @@ fn rebasing_keeps_local_edits_the_host_has_not_seen(cx: &mut gpui::TestAppContex
             models: ModelCatalog::default(),
             model: None,
             context_tokens: None,
-            compacted_context: None,
             compacting: false,
             streamed_bytes: 0,
-            transcript: Vec::new(),
+            transcript: crate::transcript::Transcript::default().to_protocol(),
             prompt_names: Vec::new(),
             project_folders: Vec::new(),
             project_mode: Default::default(),
@@ -399,10 +399,11 @@ fn a_submission_includes_the_last_keystroke(cx: &mut gpui::TestAppContext) {
         host_thread.read_with(this.cx, |thread, _| thread.submission_count() == 1)
     });
     host_thread.read_with(session.cx, |thread, _| {
-        let [TimelineMessage::User(message), ..] = thread.timeline.as_slice() else {
+        let timeline = &thread.timeline;
+        let [TimelineMessage::User(message), ..] = timeline.as_slice() else {
             panic!("expected the submitted message first");
         };
-        assert_eq!(message.blocks[0].text, "from the host?");
+        assert_eq!(message.record.blocks[0].text, "from the host?");
     });
 }
 

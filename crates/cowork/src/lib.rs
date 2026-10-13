@@ -288,11 +288,11 @@ impl Cowork {
         let comments = messages
             .iter()
             .filter_map(|message| match message {
-                TimelineMessage::User(group) => Some(group.comments.as_slice()),
+                TimelineMessage::User(group) => Some(group.record.comments.as_slice()),
                 TimelineMessage::Agent(_) => None,
             })
             .flatten()
-            .cloned()
+            .map(timeline::SubmittedComment::to_view)
             .chain(draft_comments)
             .collect::<Vec<_>>();
         let sidebar_width = if self.sidebar_open {
@@ -336,31 +336,35 @@ impl Cowork {
             let steering = messages
                 .iter()
                 .filter_map(|message| match message {
-                    TimelineMessage::Agent(message) => Some(message.steering.iter().copied()),
+                    TimelineMessage::Agent(message) => {
+                        Some(message.record.steering.iter().copied())
+                    }
                     TimelineMessage::User(_) => None,
                 })
                 .flatten()
                 .collect::<HashSet<_>>();
-            let user_stable = |group: &timeline::UserMessageGroup| {
-                group.comments.is_empty()
+            let user_stable = |group: &timeline::UserMessage| {
+                group.record.comments.is_empty()
                     && group
+                        .record
                         .blocks
                         .iter()
                         .all(|block| block.attachments.is_empty())
             };
             for (index, message) in messages.iter().enumerate() {
                 if let TimelineMessage::User(group) = message
-                    && steering.contains(&group.id)
+                    && steering.contains(&group.record.id)
                 {
                     continue;
                 }
                 let submitted_comments = match message {
                     TimelineMessage::Agent(message) => message
+                        .record
                         .comment_group_id
                         .and_then(|group_id| {
                             messages.iter().find_map(|entry| match entry {
-                                TimelineMessage::User(group) if group.id == group_id => {
-                                    Some(group.comments.as_slice())
+                                TimelineMessage::User(group) if group.record.id == group_id => {
+                                    Some(group.record.comments.as_slice())
                                 }
                                 _ => None,
                             })
@@ -374,27 +378,27 @@ impl Cowork {
                         !message.is_generating()
                             && messages.iter().all(|entry| match entry {
                                 TimelineMessage::User(group)
-                                    if message.steering.contains(&group.id) =>
+                                    if message.record.steering.contains(&group.record.id) =>
                                 {
                                     user_stable(group)
                                 }
                                 _ => true,
                             })
-                            && !message.work_expanded
-                            && message.awaiting_approval.is_none()
-                            && message.comment_group_id.is_none()
-                            && message.comment_responses.is_empty()
-                            && !message.output.text.contains("![")
-                            && !message.output.text.to_ascii_lowercase().contains("<img")
+                            && !message.ui.work_expanded
+                            && message.record.awaiting_approval.is_none()
+                            && message.record.comment_group_id.is_none()
+                            && message.ui.comment_responses.is_empty()
+                            && !message.ui.output.text.contains("![")
+                            && !message.ui.output.text.to_ascii_lowercase().contains("<img")
                             && !comments
                                 .iter()
-                                .any(|comment| comment.reference.message_id == message.id)
+                                .any(|comment| comment.reference.message_id == message.record.id)
                     }
                 };
                 let (message_id, source) = match message {
-                    TimelineMessage::User(group) => (group.id, None),
+                    TimelineMessage::User(group) => (group.record.id, None),
                     TimelineMessage::Agent(message) => {
-                        (message.id, Some(message.text_view.clone()))
+                        (message.record.id, Some(message.ui.text_view.clone()))
                     }
                 };
                 let owner = cx.entity().downgrade();

@@ -248,10 +248,11 @@ impl Fixture {
         );
         let thread = self.thread.read(cx);
         anyhow::ensure!(
-            thread.transcript == expected,
+            thread.transcript.messages == expected,
             "production transcript differs from Rig"
         );
-        let Some(TimelineMessage::Agent(message)) = thread.timeline.last() else {
+        let timeline = &thread.timeline;
+        let Some(TimelineMessage::Agent(message)) = timeline.last() else {
             anyhow::bail!("missing live message")
         };
         anyhow::ensure!(
@@ -259,7 +260,10 @@ impl Fixture {
             "unfinished run"
         );
         // Synthetic history has no transcript: validate only the real run.
-        validate_agent_runs(&thread.transcript, &[&message.to_protocol()])?;
+        validate_agent_runs(
+            &thread.transcript.messages,
+            &[&message.record.to_protocol()],
+        )?;
         anyhow::ensure!(expected.len() == 2, "expected one tool-free turn");
         let Message::Assistant(reply) = &expected[1] else {
             anyhow::bail!("missing reply")
@@ -274,6 +278,7 @@ impl Fixture {
             }
         }
         let shown: String = message
+            .ui
             .output
             .steps
             .iter()
@@ -283,7 +288,7 @@ impl Fixture {
             })
             .collect();
         anyhow::ensure!(
-            message.output.text == answer && shown == reasoning,
+            message.ui.output.text == answer && shown == reasoning,
             "final output differs"
         );
         anyhow::ensure!(

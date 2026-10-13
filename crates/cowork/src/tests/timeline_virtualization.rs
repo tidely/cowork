@@ -32,9 +32,10 @@ impl Fixture {
                 .enumerate()
                 .filter_map(|(index, message)| match message {
                     TimelineMessage::User(group) => {
-                        group.blocks[0].text = user_text(index);
+                        group.record.blocks[0].text = user_text(index);
                         let selector: &'static str = Box::leak(
-                            format!("timeline-user-text-{}", group.blocks[0].id).into_boxed_str(),
+                            format!("timeline-user-text-{}", group.record.blocks[0].id)
+                                .into_boxed_str(),
                         );
                         Some((index, selector))
                     }
@@ -288,11 +289,15 @@ fn late_offscreen_source_parse_invalidates_height_and_keeps_follow_bottom_pinned
     // cached height and request the owner frame that follows the new bottom.
     let replacement = "A late parsed paragraph grows an offscreen completed reply.\n\n".repeat(80);
     fixture.thread.update(cx, |thread, cx| {
-        let TimelineMessage::Agent(message) = &mut thread.timeline[1] else {
+        let crate::timeline::TimelineMessage::Agent(record) = &thread.timeline[1] else {
             panic!("the benchmark's second row is a completed agent reply");
         };
-        message.output.text = replacement.clone();
+        let message = thread
+            .agent_message_mut(record.record.id.into_bytes())
+            .unwrap();
+        message.ui.output.text = replacement.clone();
         message
+            .ui
             .text_view
             .update(cx, |view, cx| view.set_text(&replacement, cx));
     });

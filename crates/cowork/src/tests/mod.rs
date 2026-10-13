@@ -549,28 +549,32 @@ impl<'a> Collaboration<'a> {
                     .map(|index| format!("Paragraph {index}: a response to scroll past.\n\n"))
                     .collect::<String>();
                 vec![TimelineMessage::Agent(AgentMessage {
-                    id: Uuid::new_v4(),
-                    comment_group_id: None,
-                    started_at: SystemTime::UNIX_EPOCH,
-                    comment_responses: Vec::new(),
-                    prompt: 0,
-                    pending_events: Vec::new(),
-                    run: crate::protocol::AgentRun::Ended {
-                        outcome: crate::protocol::RunOutcome::Completed,
-                        duration: std::time::Duration::ZERO,
+                    record: crate::timeline::AgentRunRecord {
+                        id: Uuid::new_v4(),
+                        comment_group_id: None,
+                        started_at: SystemTime::UNIX_EPOCH,
+                        prompt: crate::transcript::TranscriptIndex(0),
+                        pending_events: Vec::new(),
+                        run: crate::protocol::AgentRun::Ended {
+                            outcome: crate::protocol::RunOutcome::Completed,
+                            duration: std::time::Duration::ZERO,
+                        },
+                        awaiting_approval: None,
+                        steering: Vec::new(),
                     },
-                    output: crate::timeline::AgentOutput {
-                        thinking_complete: true,
-                        text: text.clone(),
-                        ..Default::default()
+                    ui: crate::timeline::AgentMessageUi {
+                        output: crate::timeline::AgentOutput {
+                            thinking_complete: true,
+                            text: text.clone(),
+                            ..Default::default()
+                        },
+                        committed: Default::default(),
+                        comment_calls_checked: 0,
+                        step_views: Vec::new(),
+                        text_view: cx.new(|cx| TextViewState::markdown(&text, cx)),
+                        comment_responses: Vec::new(),
+                        work_expanded: false,
                     },
-                    committed: Default::default(),
-                    comment_calls_checked: 0,
-                    awaiting_approval: None,
-                    steering: Vec::new(),
-                    step_views: Vec::new(),
-                    work_expanded: false,
-                    text_view: cx.new(|cx| TextViewState::markdown(&text, cx)),
                 })]
             } else {
                 Vec::new()
@@ -581,9 +585,10 @@ impl<'a> Collaboration<'a> {
                 let TimelineMessage::Agent(message) = &thread.timeline[0] else {
                     unreachable!("the long history's agent message");
                 };
-                let reply = RigMessage::assistant(message.output.text.clone());
+                let reply = RigMessage::assistant(message.ui.output.text.clone());
                 thread
                     .transcript
+                    .messages
                     .extend([RigMessage::user("Long history prompt"), reply]);
             }
             assert!(thread.set_model_catalog(test_catalog(), cx));

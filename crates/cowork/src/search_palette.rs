@@ -30,7 +30,7 @@ use uuid::Uuid;
 use crate::{
     Cowork,
     thread::ThreadSharing,
-    timeline::{AgentMessage, TimelineMessage, UserMessageGroup},
+    timeline::{AgentMessage, TimelineMessage},
 };
 
 /// How many chars of a message an excerpt shows before the match. Enough to
@@ -275,11 +275,11 @@ fn push_on_one_line(line: &mut String, text: &str) {
 /// and what the agent finally replied, without its work along the way.
 fn searchable_texts(timeline: &[TimelineMessage]) -> impl Iterator<Item = &str> {
     timeline.iter().flat_map(|message| match message {
-        TimelineMessage::User(UserMessageGroup { blocks, .. }) => {
-            Either::Left(blocks.iter().map(|block| block.text.as_str()))
+        TimelineMessage::User(group) => {
+            Either::Left(group.record.blocks.iter().map(|block| block.text.as_str()))
         }
-        TimelineMessage::Agent(AgentMessage { output, .. }) => {
-            Either::Right(iter::once(output.text.as_str()))
+        TimelineMessage::Agent(AgentMessage { ui, .. }) => {
+            Either::Right(iter::once(ui.output.text.as_str()))
         }
     })
 }
