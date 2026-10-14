@@ -357,6 +357,39 @@ impl Cowork {
                 {
                     continue;
                 }
+                // Pre-run compaction covers the history before the new prompt.
+                // Keep its marker outside the deferred message row so it stays
+                // visible even when history is culled.
+                if let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) {
+                    let thread = thread.read(cx);
+                    let run = match message {
+                        TimelineMessage::User(_) => messages.get(index + 1),
+                        TimelineMessage::Agent(_)
+                            if index == 0
+                                || !matches!(messages[index - 1], TimelineMessage::User(_)) =>
+                        {
+                            Some(message)
+                        }
+                        _ => None,
+                    };
+                    if let Some(TimelineMessage::Agent(run)) = run {
+                        for (marker, _) in thread
+                            .transcript
+                            .compactions()
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, compaction)| compaction.resume_at == run.record.prompt)
+                        {
+                            timeline_messages.push(
+                                div()
+                                    .w_full()
+                                    .px(px(40.))
+                                    .child(Self::render_compaction_marker(marker, false, cx))
+                                    .into_any_element(),
+                            );
+                        }
+                    }
+                }
                 let submitted_comments = match message {
                     TimelineMessage::Agent(message) => message
                         .record

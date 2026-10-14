@@ -36,7 +36,13 @@ previous request history in encoded bytes. Only model request history replaces t
 transcript prefix with a summary user message; the complete transcript and
 timeline stay intact. Host events and snapshots mirror the summary boundary and
 compacting indicator. Usage includes successful summary requests. The context
-estimate immediately after compaction counts summary bytes, excluding system,
+indicator is also shown inline as “Compacting context…” while a summary runs.
+Every accepted summary leaves a “Context compacted” divider at its original
+transcript boundary: before the next prompt for pre-run compaction, or between
+work steps for mid-run compaction. Collapsed work keeps its dividers visible
+above the response. Failed, skipped, and canceled summaries leave no divider;
+snapshots restore all accepted dividers from the transcript's compaction history.
+The context estimate immediately after compaction counts summary bytes, excluding system,
 tools, wrapper, and the next prompt until normal provider usage arrives.
 Mid-run summaries carry the current environment note, so project access
 information remains available. The loop keeps the complete event transcript

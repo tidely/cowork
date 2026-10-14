@@ -294,7 +294,8 @@ fn tool_call(name: &str, arguments: serde_json::Value) -> ToolCall {
 }
 
 /// Opens a focused, interactive example of compaction settings and the
-/// composer's context ring. No provider or running agent is needed.
+/// composer's context ring and inline thread indicators. No provider or running
+/// agent is needed.
 pub fn run_compaction() -> anyhow::Result<()> {
     gpui_platform::application()
         .with_assets(crate::assets::Assets)
@@ -303,7 +304,7 @@ pub fn run_compaction() -> anyhow::Result<()> {
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(gpui::Bounds::centered(
                     None,
-                    size(px(820.), px(680.)),
+                    size(px(820.), px(900.)),
                     cx,
                 ))),
                 titlebar: Some(gpui::TitlebarOptions {
@@ -335,10 +336,51 @@ impl Render for CompactionPreview {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::context_settings::{context_details, context_ring, controls};
         let settings = self.settings;
+        let message = |author: &'static str, text: &'static str| {
+            div()
+                .flex()
+                .items_start()
+                .gap_3()
+                .child(
+                    div()
+                        .w(px(52.))
+                        .flex_none()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(author),
+                )
+                .child(div().flex_1().min_w_0().text_sm().child(text))
+        };
+        let example = |title: &'static str| {
+            div()
+                .p_5()
+                .rounded_lg()
+                .border_1()
+                .border_color(cx.theme().border)
+                .flex()
+                .flex_col()
+                .gap_4()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(title),
+                )
+        };
         div().size_full().bg(cx.theme().background).text_color(cx.theme().foreground)
             .id("compaction-preview").overflow_y_scroll()
             .child(div().p_8().flex().flex_col().gap_4()
-                .child(div().text_lg().child("Context"))
+                .child(div().text_lg().child("Compaction in a conversation"))
+                .child(example("Compaction completed between messages")
+                    .child(message("You", "Check how thread sharing works."))
+                    .child(message("Cowork", "The host forwards updates to collaborators and keeps their drafts in sync."))
+                    .child(div().ml(px(64.)).child(crate::Cowork::render_compaction_marker(0, false, cx)))
+                    .child(message("You", "Now add an inline indicator when context is compacted.")))
+                .child(example("Compaction happening during a reply")
+                    .child(message("You", "Review the thread UI and add the indicators."))
+                    .child(message("Cowork", "Working · Read thread.rs · Read timeline_view.rs"))
+                    .child(div().ml(px(64.)).child(crate::Cowork::render_compaction_marker(1, true, cx))))
+                .child(div().mt_4().text_lg().child("Context settings"))
                 .child(div().text_sm().text_color(cx.theme().muted_foreground)
                     .child("Adjust the window and compaction settings to see the indicators change. The minimum can delay compaction beyond the chosen percentage."))
                 .child(controls(settings, cx, |this, settings, cx| { this.settings = settings; cx.notify(); }))

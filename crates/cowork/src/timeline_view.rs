@@ -86,6 +86,51 @@ enum WorkPiece {
 }
 
 impl Cowork {
+    /// A quiet divider for accepted summaries, or an animated status while the
+    /// host is summarizing. These are local views of mirrored transcript state.
+    pub(crate) fn render_compaction_marker(
+        index: usize,
+        compacting: bool,
+        cx: &App,
+    ) -> gpui::AnyElement {
+        let label = if compacting {
+            ShimmerText::new("Compacting context…")
+                .id(("compacting-context", index))
+                .text_color(cx.theme().muted_foreground)
+                .into_any_element()
+        } else {
+            div().child("Context compacted").into_any_element()
+        };
+        let line = || div().flex_1().h(px(1.)).bg(cx.theme().border);
+        div()
+            .id((
+                if compacting {
+                    "compaction-status"
+                } else {
+                    "compaction-marker"
+                },
+                index,
+            ))
+            .debug_selector(move || {
+                if compacting {
+                    "compacting-context".into()
+                } else {
+                    format!("compaction-marker-{index}")
+                }
+            })
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_3()
+            .py_1()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(line())
+            .child(label)
+            .child(line())
+            .into_any_element()
+    }
+
     fn selected_message_source_range(
         &self,
         thread_message_id: ThreadMessageId,
@@ -974,6 +1019,7 @@ impl Cowork {
         thread_id: Uuid,
         message: &AgentMessage,
         rights: ApprovalRights,
+        compactions: &[(usize, usize)],
         cx: &Context<Self>,
     ) -> Vec<WorkPiece> {
         let awaiting_step = message.awaiting_approval_step();
@@ -992,6 +1038,12 @@ impl Cowork {
             }
         };
         for step_index in message.ui.output.work() {
+            for &(index, _) in compactions.iter().filter(|(_, step)| *step == step_index) {
+                flush(&mut calls, &mut rendered);
+                rendered.push(WorkPiece::Shown(Self::render_compaction_marker(
+                    index, false, cx,
+                )));
+            }
             let (Some(step), Some(view)) = (
                 message.ui.output.steps.get(step_index),
                 message.ui.step_views.get(step_index),
@@ -1309,7 +1361,26 @@ impl Cowork {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let (compacting, compactions) = self
+            .thread_store
+            .read(cx)
+            .thread(thread_id, cx)
+            .map(|thread| {
+                let thread = thread.read(cx);
+                let next_prompt = timeline[index + 1..].iter().find_map(|entry| match entry {
+                    TimelineMessage::Agent(message) => Some(message.record.prompt),
+                    TimelineMessage::User(_) => None,
+                });
+                (
+                    message.is_generating() && thread.compacting,
+                    thread
+                        .transcript
+                        .compaction_steps(message.record.prompt, next_prompt),
+                )
+            })
+            .unwrap_or_default();
         let waiting = message.is_generating()
+            && !compacting
             && message.ui.output.steps.is_empty()
             && message.ui.output.text.is_empty();
         let submitted_comments = submitted_comments
@@ -1400,7 +1471,7 @@ impl Cowork {
                 .thread(thread_id, cx)
                 .map(|thread| ApprovalRights::of(thread.read(cx)))
                 .unwrap_or_default();
-            Some(self.render_work(thread_id, message, rights, cx))
+            Some(self.render_work(thread_id, message, rights, &compactions, cx))
         } else {
             None
         };
@@ -1493,6 +1564,19 @@ impl Cowork {
         // that has taken one its transcript has yet to show.
         for group in steering {
             show_steering(self, Some(group), &mut content, &mut rows, cx);
+        }
+        // When work is collapsed its internal boundaries remain visible beside
+        // the summary. Expanded work places them between the actual steps; the
+        // boundary before the response (or next request) belongs here.
+        for &(marker, step) in &compactions {
+            if !(message.ui.work_expanded || message.record.awaiting_approval.is_some())
+                || !message.ui.output.work().any(|index| index == step)
+            {
+                content.push(Self::render_compaction_marker(marker, false, cx));
+            }
+        }
+        if compacting {
+            content.push(Self::render_compaction_marker(index, true, cx));
         }
         content.extend(message_content);
         content.extend(failure.map(IntoElement::into_any_element));

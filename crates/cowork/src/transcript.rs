@@ -101,6 +101,81 @@ impl Transcript {
         self.compactions.last()
     }
 
+    pub(crate) fn compactions(&self) -> &[Compaction] {
+        &self.compactions
+    }
+
+    /// Place summaries inside a run after the steps covered by their original
+    /// transcript boundary. Tool-result messages update calls without adding a
+    /// step; adjacent text and reasoning parts each share a step, as in `push`.
+    /// Counting without constructing output keeps rendering independent of
+    /// transcript text size and avoids creating any new views.
+    pub(crate) fn compaction_steps(
+        &self,
+        prompt: TranscriptIndex,
+        next_prompt: Option<TranscriptIndex>,
+    ) -> Vec<(usize, usize)> {
+        #[derive(Clone, Copy, PartialEq)]
+        enum StepKind {
+            Thinking,
+            Text,
+            ToolCall,
+            Steering,
+        }
+        let mut markers = Vec::new();
+        let mut cursor = prompt.0 as usize + 1;
+        let mut steps = 0;
+        let mut last = None;
+        for (index, compaction) in self
+            .compactions
+            .iter()
+            .enumerate()
+            .filter(|(_, compaction)| {
+                compaction.resume_at > prompt
+                    && next_prompt.is_none_or(|end| compaction.resume_at < end)
+            })
+        {
+            for message in &self.messages[cursor..compaction.resume_at.0 as usize] {
+                let mut add = |kind: StepKind, empty: bool| {
+                    if matches!(kind, StepKind::Thinking | StepKind::Text)
+                        && (last == Some(kind) || empty)
+                    {
+                        return;
+                    }
+                    steps += 1;
+                    last = Some(kind);
+                };
+                match message {
+                    RigMessage::Assistant(reply) => {
+                        for part in &reply.content {
+                            match part {
+                                AssistantContent::Reasoning(reasoning) => {
+                                    add(StepKind::Thinking, reasoning.text.is_empty());
+                                }
+                                AssistantContent::Text(text) => {
+                                    add(StepKind::Text, text.text.is_empty())
+                                }
+                                AssistantContent::ToolCall(_) => add(StepKind::ToolCall, false),
+                                _ => {}
+                            }
+                        }
+                    }
+                    RigMessage::User { content }
+                        if content
+                            .iter()
+                            .any(|item| !matches!(item, UserContent::ToolResult(_))) =>
+                    {
+                        add(StepKind::Steering, false);
+                    }
+                    _ => {}
+                }
+            }
+            cursor = compaction.resume_at.0 as usize;
+            markers.push((index, steps));
+        }
+        markers
+    }
+
     /// Accept only nonempty summaries within the original transcript, with
     /// nondecreasing coverage. A replacement at the same boundary is valid.
     pub(crate) fn install_compaction(&mut self, compaction: Compaction) -> anyhow::Result<()> {
@@ -792,6 +867,62 @@ mod tests {
         ToolName, UserContent,
     };
     use serde_json::json;
+
+    #[test]
+    fn compaction_markers_follow_original_steps_and_keep_repeated_boundaries() {
+        let call_id = CallId::from_wire("lookup");
+        let tool = ToolName::new("read_file").unwrap();
+        let mut transcript = Transcript::default();
+        transcript.append(RigMessage::user("Earlier prompt"));
+        transcript.append(RigMessage::assistant("Earlier reply"));
+        let prompt = transcript.append(RigMessage::user("Continue"));
+        transcript.append(RigMessage::Assistant(AssistantMessage::new(vec![
+            AssistantContent::Reasoning(Reasoning::new("Check")),
+            AssistantContent::Reasoning(Reasoning::new(" the file")),
+            AssistantContent::text("Looking"),
+            AssistantContent::text(" now"),
+            AssistantContent::ToolCall(ToolCall::new(
+                call_id.clone(),
+                ToolFunction::new(tool.clone(), json!({"path": "file"})),
+            )),
+        ])));
+        transcript.append(RigMessage::tool_result(call_id, tool, "Contents"));
+        transcript.append(RigMessage::user("Steering"));
+        transcript.append(RigMessage::assistant("Answer"));
+        for boundary in [2, 5, 5, 6, 7] {
+            transcript
+                .install_compaction(Compaction {
+                    resume_at: TranscriptIndex(boundary),
+                    summary: "Summary".into(),
+                })
+                .unwrap();
+        }
+        // The pre-run boundary is handled outside the run. Tool results do
+        // not add a step, repeated summaries each retain their own marker,
+        // and a boundary at the next prompt belongs before that prompt.
+        assert_eq!(
+            transcript.compaction_steps(prompt, Some(TranscriptIndex(7))),
+            vec![(1, 3), (2, 3), (3, 4)]
+        );
+        assert_eq!(
+            transcript.compaction_steps(prompt, None),
+            vec![(1, 3), (2, 3), (3, 4), (4, 5)]
+        );
+        let restored = transcript.to_protocol().to_transcript().unwrap();
+        for (index, steps) in transcript.compaction_steps(prompt, None) {
+            let mut output = AgentOutput::default();
+            for message in &transcript.messages
+                [prompt.0 as usize + 1..transcript.compactions[index].resume_at.0 as usize]
+            {
+                output.push(message);
+            }
+            assert_eq!(steps, output.steps.len());
+        }
+        assert_eq!(
+            restored.compaction_steps(prompt, None),
+            transcript.compaction_steps(prompt, None)
+        );
+    }
 
     #[test]
     fn compactions_keep_original_positions_and_round_trip_their_history() {

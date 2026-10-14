@@ -4,6 +4,159 @@
 use super::*;
 use gpui_component::WindowExt as _;
 
+#[gpui::test]
+fn inline_compaction_status_becomes_persistent_dividers(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let message_id = Uuid::new_v4();
+    cx.update(|_, cx| {
+        cowork.update(cx, |cowork, cx| {
+            let message = AgentMessage::new(
+                message_id,
+                None,
+                SystemTime::now(),
+                crate::transcript::TranscriptIndex(0),
+                protocol::AgentRun::Generating,
+                Vec::new(),
+                cx,
+            );
+            let thread_id = Uuid::new_v4();
+            let thread = cx.new(|_| {
+                let mut thread = test_thread(
+                    thread_id,
+                    vec![TimelineMessage::Agent(message)],
+                    ThreadDraft::new(ParticipantId::new()),
+                );
+                thread.transcript.append(RigMessage::user("Request"));
+                thread.generating = true;
+                thread.compacting = true;
+                thread
+            });
+            cowork
+                .thread_store
+                .update(cx, |store, _| store.threads.push_back(thread));
+            cowork.active_thread_id = Some(thread_id);
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("compacting-context").is_some());
+    assert!(cx.debug_bounds("compaction-marker-0").is_none());
+
+    // A rejected summary removes the live status without creating history.
+    cx.update(|_, cx| {
+        cowork.update(cx, |cowork, cx| {
+            cowork
+                .active_thread(cx)
+                .unwrap()
+                .update(cx, |thread, _| thread.compacting = false);
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("compacting-context").is_none());
+    assert!(cx.debug_bounds("compaction-marker-0").is_none());
+
+    // Successive accepted summaries at the same boundary both remain visible,
+    // even with work collapsed and while another summary runs.
+    cx.update(|_, cx| {
+        cowork.update(cx, |cowork, cx| {
+            cowork.active_thread(cx).unwrap().update(cx, |thread, _| {
+                for _ in 0..2 {
+                    thread
+                        .transcript
+                        .install_compaction(crate::transcript::Compaction {
+                            resume_at: thread.transcript.end(),
+                            summary: "Summary".into(),
+                        })
+                        .unwrap();
+                }
+                thread
+                    .agent_message_mut(message_id.into_bytes())
+                    .unwrap()
+                    .ui
+                    .work_expanded = false;
+                thread.compacting = true;
+            });
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+    let first = cx.debug_bounds("compaction-marker-0").unwrap();
+    let second = cx.debug_bounds("compaction-marker-1").unwrap();
+    let running = cx.debug_bounds("compacting-context").unwrap();
+    assert!(first.bottom() <= second.top());
+    assert!(second.bottom() <= running.top());
+
+    cx.update(|_, cx| {
+        cowork.update(cx, |cowork, cx| {
+            cowork.active_thread(cx).unwrap().update(cx, |thread, _| {
+                thread.compacting = false;
+                thread.generating = false;
+                thread
+                    .agent_message_mut(message_id.into_bytes())
+                    .unwrap()
+                    .record
+                    .run = protocol::AgentRun::Ended {
+                    outcome: protocol::RunOutcome::Stopped,
+                    duration: Duration::from_secs(1),
+                };
+            });
+            cx.notify();
+        })
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("compacting-context").is_none());
+    assert!(cx.debug_bounds("compaction-marker-0").is_some());
+    assert!(cx.debug_bounds("compaction-marker-1").is_some());
+
+    // Once the next run starts at that transcript boundary, its dividers sit
+    // before the submitted prompt, rather than between prompt and response.
+    let block_id = Uuid::new_v4();
+    cx.update(|_, cx| {
+        cowork.update(cx, |cowork, cx| {
+            cowork.active_thread(cx).unwrap().update(cx, |thread, cx| {
+                let prompt = thread.transcript.append(RigMessage::user("Next request"));
+                let group = UserMessageGroup {
+                    id: Uuid::new_v4(),
+                    comments: Vec::new(),
+                    comments_folded: false,
+                    blocks: vec![PromptBlock {
+                        id: block_id,
+                        author: thread.participant_id(),
+                        text: "Next request".into(),
+                        attachments: Vec::new(),
+                    }],
+                };
+                thread.timeline.push(TimelineMessage::User(group.into()));
+                thread
+                    .timeline
+                    .push(TimelineMessage::Agent(AgentMessage::new(
+                        Uuid::new_v4(),
+                        None,
+                        SystemTime::now(),
+                        prompt,
+                        protocol::AgentRun::Ended {
+                            outcome: protocol::RunOutcome::Completed,
+                            duration: Duration::from_secs(1),
+                        },
+                        Vec::new(),
+                        cx,
+                    )));
+                thread
+                    .transcript
+                    .append(RigMessage::assistant("Next answer"));
+                thread.restore_agent_output(cx);
+            });
+            cx.notify();
+        });
+    });
+    cx.run_until_parked();
+    let user_selector = Box::leak(format!("timeline-user-text-{block_id}").into_boxed_str());
+    let prompt = cx.debug_bounds(user_selector).unwrap();
+    assert!(cx.debug_bounds("compaction-marker-0").unwrap().bottom() <= prompt.top());
+    assert!(cx.debug_bounds("compaction-marker-1").unwrap().bottom() <= prompt.top());
+}
+
 struct MouseDragTestView {
     editor: Entity<TextareaState>,
 }
