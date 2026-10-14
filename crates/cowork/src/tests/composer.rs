@@ -499,7 +499,7 @@ fn generation_button_switches_between_stop_and_steer_for_the_whole_draft(
             cx,
         );
         let id = thread.read(cx).instance_id;
-        thread.update(cx, |thread, _| thread.generating = true);
+        thread.update(cx, |thread, cx| thread.set_generating_for_test(true, cx));
         cowork
             .thread_store
             .update(cx, |store, _| store.threads.push_front(thread));
@@ -539,7 +539,7 @@ fn idle_pending_messages_show_resume_until_a_new_draft_is_written(cx: &mut gpui:
             cx,
         );
         let id = thread.read(cx).instance_id;
-        thread.update(cx, |thread, _| thread.generating = true);
+        thread.update(cx, |thread, cx| thread.set_generating_for_test(true, cx));
         cowork
             .thread_store
             .update(cx, |store, _| store.threads.push_front(thread.clone()));
@@ -554,7 +554,7 @@ fn idle_pending_messages_show_resume_until_a_new_draft_is_written(cx: &mut gpui:
             },
             cx,
         ));
-        thread.update(cx, |thread, _| thread.generating = false);
+        thread.update(cx, |thread, cx| thread.set_generating_for_test(false, cx));
         cowork.focus_composer(window, cx);
         cx.notify();
     });

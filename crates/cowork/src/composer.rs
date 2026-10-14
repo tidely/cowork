@@ -290,7 +290,7 @@ impl Cowork {
             .is_some_and(|draft_id| self.draft_is_loading_attachments(draft_id, cx));
         let generating = active_thread
             .as_ref()
-            .is_some_and(|thread| thread.read(cx).generating);
+            .is_some_and(|thread| thread.read(cx).is_generating());
         let active_model = self.active_model(cx);
         let model_unavailable = active_model
             .as_ref()

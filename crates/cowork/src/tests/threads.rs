@@ -372,8 +372,8 @@ fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_a
         assert_eq!(collaborator.model().cloned(), Some(ollama_qwen()));
         assert_eq!(collaborator.max_tokens(), 65_536);
         assert_eq!(collaborator.context_tokens, Some(2_048));
-        assert!(!host.generating);
-        assert!(!collaborator.generating);
+        assert!(!host.is_generating());
+        assert!(!collaborator.is_generating());
 
         let TimelineMessage::Agent(message) = &collaborator.timeline[1] else {
             panic!("expected the agent's reply");
@@ -388,7 +388,7 @@ fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_a
             AgentStep::Text(work),
             AgentStep::ToolCall(call),
             AgentStep::Text(_),
-        ] = &message.ui.output.steps[..]
+        ] = message.ui.output.steps()
         else {
             panic!("expected thinking, text, a call, and the response");
         };
@@ -398,7 +398,7 @@ fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_a
         assert_eq!(call.call.function.name, "respond_to_comment");
         assert!(call.arguments_text().contains("comment_1"));
         assert_eq!(call.result_text().as_deref(), Some("Recorded"));
-        assert!(!message.ui.step_views.iter().any(StepView::expanded));
+        assert!(!message.ui.views().any(StepView::expanded));
         assert!(message.ui.output.thinking_complete);
         assert!(!message.is_generating());
         assert_eq!(message.record.run.failure(), None);
@@ -655,7 +655,7 @@ fn failed_run_keeps_output_the_transcript_never_got_for_joiners(cx: &mut gpui::T
         // The run stopped at a tool call, so all its text is work.
         assert_eq!(restored.ui.output.text, "");
         assert!(matches!(
-            &restored.ui.output.steps[1],
+            &restored.ui.output.steps()[1],
             AgentStep::Text(text) if text == "Here is the answer."
         ));
         assert_eq!(restored.ui.comment_responses.len(), 1);
@@ -1023,16 +1023,19 @@ fn expanded_thinking_stays_open_as_the_run_continues(cx: &mut gpui::TestAppConte
                 .agent_message_mut(message_id.into_bytes())
                 .expect("the agent message");
             assert!(message.ui.output.thinking_complete);
-            assert!(matches!(message.ui.output.steps[0], AgentStep::Thinking(_)));
-            assert!(!message.ui.step_views[0].expanded());
-            message.ui.step_views[0].set_expanded(true);
+            assert!(matches!(
+                message.ui.output.steps()[0],
+                AgentStep::Thinking(_)
+            ));
+            assert!(!message.ui.step_view(0).unwrap().expanded());
+            message.ui.step_view_mut(0).unwrap().set_expanded(true);
             for event in events.iter().skip(thinking_done) {
                 thread.apply_for_test(event.clone(), cx);
             }
             let message = thread
                 .agent_message_mut(message_id.into_bytes())
                 .expect("the agent message");
-            assert!(message.ui.step_views[0].expanded());
+            assert!(message.ui.step_view(0).unwrap().expanded());
         });
     });
 }
@@ -1090,15 +1093,15 @@ fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
                 AgentStep::Thinking(first),
                 AgentStep::ToolCall(_),
                 AgentStep::Thinking(second),
-            ] = &message.ui.output.steps[..]
+            ] = message.ui.output.steps()
             else {
                 panic!("expected thinking, a call, and thinking");
             };
             assert_eq!((first.as_str(), second.as_str()), ("Add first.", "Now "));
             assert!(!message.ui.output.thinking_in_progress(0));
             assert!(message.ui.output.thinking_in_progress(2));
-            assert_eq!(message.ui.step_views.len(), 3);
-            assert!(!message.ui.step_views[0].expanded());
+            assert_eq!(message.ui.views().count(), 3);
+            assert!(!message.ui.step_view(0).unwrap().expanded());
             assert!(message.ui.work_expanded, "work shows while the run goes");
 
             for event in turn.iter().skip(second_thinking_started) {
@@ -1121,7 +1124,10 @@ fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
             message.ui.output.thinking().collect::<Vec<_>>(),
             ["Add first.", "Now answer."]
         );
-        assert!(matches!(message.ui.output.steps[1], AgentStep::ToolCall(_)));
+        assert!(matches!(
+            message.ui.output.steps()[1],
+            AgentStep::ToolCall(_)
+        ));
         assert_eq!(message.ui.output.text, "It is 3.");
         assert!(message.ui.output.thinking_complete);
         assert!(
@@ -1517,8 +1523,8 @@ fn renaming_never_changes_what_the_agent_was_sent(cx: &mut gpui::TestAppContext)
             cx,
         );
     });
-    thread.update(cx, |thread, _| {
-        thread.generating = false;
+    thread.update(cx, |thread, cx| {
+        thread.set_generating_for_test(false, cx);
         let actor = thread.participant_id();
         thread
             .with_authorized::<EditDraft, _>(actor, |auth| {

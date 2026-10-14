@@ -119,7 +119,7 @@ impl Cowork {
         let generating = self
             .active_thread_id
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
-            .is_some_and(|thread| thread.read(cx).generating);
+            .is_some_and(|thread| thread.read(cx).is_generating());
         let empty = self.active_thread(cx).is_none_or(|thread| {
             thread
                 .read(cx)
@@ -191,7 +191,7 @@ impl Cowork {
         {
             let requested = thread.update(cx, |thread, _| {
                 if thread.draft().items().iter().all(DraftItem::is_empty)
-                    && (thread.generating || thread.pending.is_empty())
+                    && (thread.is_generating() || thread.pending.is_empty())
                 {
                     return false;
                 }
@@ -347,14 +347,13 @@ impl Cowork {
             Self::take_submission(&mut self.new_thread_draft)
         };
         let Some((comments, blocks, comments_folded)) = submission else {
-            if let Some(thread) = active_thread
-                .as_ref()
-                .filter(|thread| !thread.read(cx).generating && !thread.read(cx).pending.is_empty())
-            {
+            if let Some(thread) = active_thread.as_ref().filter(|thread| {
+                !thread.read(cx).is_generating() && !thread.read(cx).pending.is_empty()
+            }) {
                 // Taking the (empty) draft above checked current permission;
                 // resume consumes an accepted submission, never a new sequence.
                 self.start_next_pending(thread, cx);
-                return thread.read(cx).generating;
+                return thread.read(cx).is_generating();
             }
             return false;
         };
@@ -388,7 +387,7 @@ impl Cowork {
         }
         if let Some(thread) = active_thread
             .as_ref()
-            .filter(|thread| thread.read(cx).generating)
+            .filter(|thread| thread.read(cx).is_generating())
         {
             let group = UserMessageGroup {
                 id: Uuid::new_v4(),
@@ -596,7 +595,7 @@ impl Cowork {
     /// leaves accepted drafts visible and cancellable until the user resumes.
     pub(super) fn start_next_pending(&mut self, thread: &Entity<Thread>, cx: &mut Context<Self>) {
         let state = thread.read(cx);
-        if state.generating
+        if state.is_generating()
             || state.runnable_model().is_none()
             || self
                 .thread_store
@@ -666,7 +665,7 @@ impl Cowork {
         if !state.is_host() {
             return Err("Only your own threads can be continued.".into());
         }
-        if state.generating {
+        if state.is_generating() {
             return Err("The thread was already running.".into());
         }
         if state.model() != Some(model) {

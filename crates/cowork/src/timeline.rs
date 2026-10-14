@@ -1,14 +1,17 @@
 //! A thread's submitted messages and the agent's replies, and their wire
 //! form.
 
-use std::{ops::Range, time::SystemTime};
+use std::{collections::BTreeMap, ops::Range, time::SystemTime};
 
 use agent::AgentEvent;
 use draft::AttachmentRecord;
 use gpui::{AppContext, Entity, SharedString};
 use gpui_base::{TextViewState, input::TextareaState};
 use rig::{
-    completion::message::ToolResultContent,
+    completion::{
+        AssistantContent, Message as RigMessage,
+        message::{ToolResultContent, UserContent},
+    },
     message::{CallId, ToolCall},
 };
 use uuid::Uuid;
@@ -18,12 +21,57 @@ use crate::{
     participant::ParticipantId,
     protocol::{self, AgentRun},
     thread_draft::ItemPresence,
+    transcript::{TranscriptBoundary, TranscriptIndex},
 };
 
 #[derive(Clone, Copy)]
 pub(crate) enum MessageAuthor {
     User(ParticipantId),
     Agent,
+}
+
+/// A folded content part's original location, independent of visible rows.
+/// A streaming part keeps this key when its message joins the transcript;
+/// coalesced text and reasoning keep the key of their first part.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct ContentId {
+    message: TranscriptIndex,
+    part: usize,
+}
+
+impl std::fmt::Display for ContentId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}-{}", self.message.0, self.part)
+    }
+}
+
+/// Orthogonal activity is owned by the thread's one active execution. Ended
+/// run records retain replay tails, but cannot carry a live activity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RunActivity {
+    Working,
+    AwaitingApproval,
+    Compacting,
+}
+
+/// Local views keyed by source identity. Only reconciliation can add/remove
+/// views, keeping their variants in step with the folded content.
+#[derive(Clone, Default)]
+pub(crate) struct StepViews(BTreeMap<ContentId, StepView>);
+
+impl AgentMessageUi {
+    pub(crate) fn step_view(&self, index: usize) -> Option<&StepView> {
+        self.step_views.0.get(self.output.sources.get(index)?)
+    }
+
+    pub(crate) fn step_view_mut(&mut self, index: usize) -> Option<&mut StepView> {
+        self.step_views.0.get_mut(self.output.sources.get(index)?)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn views(&self) -> impl Iterator<Item = &StepView> {
+        self.step_views.0.values()
+    }
 }
 
 // A thread holds a handful of these, so boxing the larger variant would
@@ -65,10 +113,10 @@ pub(crate) struct AgentMessageUi {
     /// How much of `output` comes from the run's transcript entries, which
     /// never change; the rest comes from the message the run is folding.
     pub(crate) committed: OutputMark,
-    /// How each of `output`'s steps is shown, position for position, and the
-    /// view of its text. Kept in step with `output`, but not part of it: the
-    /// output is refolded on every event, and this state must outlive that.
-    pub(crate) step_views: Vec<StepView>,
+    /// Views and expansion keyed by each step's original content position.
+    /// Reconciliation keeps variants in step with `output`, while preserving
+    /// local state across refolding and changes to visible timeline rows.
+    pub(crate) step_views: StepViews,
     pub(crate) text_view: Entity<TextViewState>,
     /// The replies to comments among `output`'s tool calls. Kept rather than
     /// derived each time, since comments on a reply refer to its view.
@@ -143,11 +191,12 @@ impl TimelineMessage {
 /// What an agent message shows: a function of its run's output alone, the
 /// Rig messages it added to the transcript followed by the one it is
 /// folding, as far as it has come. Every copy of the thread derives the same
-/// from the same messages; see `AgentOutput::of`.
+/// from the same messages; see `AgentOutput::from_transcript`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct AgentOutput {
     /// Everything the agent produced, in order.
-    pub(crate) steps: Vec<AgentStep>,
+    steps: Vec<AgentStep>,
+    sources: Vec<ContentId>,
     /// False only while the model is still reasoning: the run is generating
     /// and reasoning is the last part of the reply streaming. The last step
     /// is then the thinking in progress.
@@ -392,6 +441,44 @@ mod tool_call_tests {
 }
 
 impl AgentOutput {
+    pub(crate) fn from_transcript(messages: &[RigMessage], start: TranscriptIndex) -> Self {
+        let mut output = Self::default();
+        for (offset, message) in messages.iter().enumerate() {
+            output.push(message, TranscriptIndex(start.0 + offset as u64));
+        }
+        output
+    }
+
+    pub(crate) fn steps(&self) -> &[AgentStep] {
+        &self.steps
+    }
+
+    pub(crate) fn content_id(&self, index: usize) -> ContentId {
+        self.sources[index]
+    }
+
+    /// The insertion point before content that starts at this boundary.
+    /// Computed from the same fold that creates the steps, never a second fold.
+    pub(crate) fn step_at_boundary(&self, boundary: TranscriptBoundary) -> usize {
+        self.sources
+            .partition_point(|source| source.message < boundary.0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(steps: Vec<AgentStep>, text: String, thinking_complete: bool) -> Self {
+        let sources = (0..steps.len())
+            .map(|part| ContentId {
+                message: TranscriptIndex(0),
+                part,
+            })
+            .collect();
+        Self {
+            steps,
+            sources,
+            text,
+            thinking_complete,
+        }
+    }
     pub(crate) fn tool_calls(&self) -> impl DoubleEndedIterator<Item = &AgentToolCall> {
         self.steps.iter().filter_map(|step| match step {
             AgentStep::ToolCall(call) => Some(call),
@@ -725,7 +812,7 @@ impl AgentMessage {
                 },
                 committed: OutputMark::default(),
                 comment_calls_checked: 0,
-                step_views: Vec::new(),
+                step_views: StepViews::default(),
                 text_view: cx.new(|cx| TextViewState::markdown("", cx)),
                 comment_responses: Vec::new(),
             },
@@ -736,13 +823,21 @@ impl AgentMessage {
     #[cfg(test)]
     pub(crate) fn show_output(&mut self, output: AgentOutput, cx: &mut impl AppContext) {
         self.ui.output = output;
-        self.ui.step_views = self
-            .ui
-            .output
-            .steps
-            .iter()
-            .map(|step| StepView::new(step, cx))
-            .collect();
+        self.ui.step_views = StepViews(
+            self.ui
+                .output
+                .sources
+                .iter()
+                .copied()
+                .zip(
+                    self.ui
+                        .output
+                        .steps
+                        .iter()
+                        .map(|step| StepView::new(step, cx)),
+                )
+                .collect(),
+        );
         self.ui.text_view = cx.new(|cx| TextViewState::markdown(&self.ui.output.text, cx));
     }
 
@@ -804,5 +899,283 @@ impl protocol::TimelineMessage {
             Self::User(message) => TimelineMessage::User(message.into_native().into()),
             Self::Agent(message) => TimelineMessage::Agent(message.into_native(cx)),
         }
+    }
+}
+
+impl AgentOutput {
+    /// Adds what `message`, the next message of a run's output, shows.
+    fn push(&mut self, message: &RigMessage, index: TranscriptIndex) {
+        match message {
+            RigMessage::Assistant(reply) => {
+                for (part_index, part) in reply.content.iter().enumerate() {
+                    let source = ContentId {
+                        message: index,
+                        part: part_index,
+                    };
+                    match part {
+                        AssistantContent::Reasoning(reasoning) => {
+                            self.push_thinking(&reasoning.text, source);
+                        }
+                        AssistantContent::Text(text) => self.push_text(&text.text, source),
+                        AssistantContent::ToolCall(call) => {
+                            self.sources.push(source);
+                            self.steps.push(AgentStep::ToolCall(AgentToolCall {
+                                call: call.clone(),
+                                result: None,
+                            }));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            RigMessage::User { content } => {
+                for item in content {
+                    if let UserContent::ToolResult(result) = item {
+                        self.record_tool_result(&result.call, &result.content);
+                    }
+                }
+                // A run's own user messages carry tool results only; any
+                // other content is a steering prompt delivered into it.
+                if content
+                    .iter()
+                    .any(|item| !matches!(item, UserContent::ToolResult(_)))
+                {
+                    self.sources.push(ContentId {
+                        message: index,
+                        part: 0,
+                    });
+                    self.steps.push(AgentStep::Steering);
+                }
+            }
+            RigMessage::System { .. } => {}
+        }
+    }
+
+    /// Continues the thinking the output ends with, or starts new thinking
+    /// if it ends with something else.
+    fn push_thinking(&mut self, text: &str, source: ContentId) {
+        match self.steps.last_mut() {
+            Some(AgentStep::Thinking(thinking)) => thinking.push_str(text),
+            _ if text.is_empty() => {}
+            _ => {
+                self.sources.push(source);
+                self.steps.push(AgentStep::Thinking(text.to_owned()));
+            }
+        }
+    }
+
+    /// Continues the text the output ends with, or starts new text.
+    fn push_text(&mut self, text: &str, source: ContentId) {
+        match self.steps.last_mut() {
+            Some(AgentStep::Text(existing)) => existing.push_str(text),
+            _ if text.is_empty() => {}
+            _ => {
+                self.sources.push(source);
+                self.steps.push(AgentStep::Text(text.to_owned()));
+            }
+        }
+    }
+
+    fn extend(&mut self, message: Option<&RigMessage>, index: TranscriptIndex) {
+        if let Some(message) = message {
+            self.push(message, index);
+        }
+    }
+
+    fn tool_calls_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut AgentToolCall> {
+        self.steps.iter_mut().filter_map(|step| match step {
+            AgentStep::ToolCall(call) => Some(call),
+            AgentStep::Thinking(_) | AgentStep::Text(_) | AgentStep::Steering => None,
+        })
+    }
+
+    /// Records what the tool returned for `call`. Results answer the latest
+    /// reply, and Rig may mint the same id for id-less calls of different
+    /// replies, so the latest call with that id is the one answered.
+    fn record_tool_result(&mut self, call: &CallId, content: &[ToolResultContent]) {
+        if let Some(tool_call) = self
+            .tool_calls_mut()
+            .rfind(|tool_call| tool_call.call.id == *call)
+        {
+            tool_call.result = Some(content.to_vec());
+        };
+    }
+
+    /// Where the output ends now, as its committed part.
+    fn mark(&self) -> OutputMark {
+        let answered = self
+            .tool_calls()
+            .take_while(|call| call.result.is_some())
+            .count();
+        debug_assert!(
+            self.tool_calls()
+                .skip(answered)
+                .all(|call| call.result.is_none()),
+            "committed calls are answered in order"
+        );
+        OutputMark {
+            steps: self.steps.len(),
+            tail: match self.steps.last() {
+                Some(AgentStep::Thinking(text) | AgentStep::Text(text)) => text.len(),
+                _ => 0,
+            },
+            answered,
+        }
+    }
+
+    /// Drops everything after `mark`, the committed part: what the message a
+    /// run is folding added, including results for committed calls.
+    fn rewind(&mut self, mark: OutputMark) {
+        self.steps.truncate(mark.steps);
+        self.sources.truncate(mark.steps);
+        if let Some(AgentStep::Thinking(text) | AgentStep::Text(text)) = self.steps.last_mut() {
+            text.truncate(mark.tail);
+        }
+        for call in self.tool_calls_mut().skip(mark.answered) {
+            call.result = None;
+        }
+    }
+
+    /// Whether `partial`, the message a run is folding, shows the model
+    /// still reasoning: it is the reply streaming, ending in reasoning that
+    /// has some text, which is then the output's last step.
+    fn still_reasoning(partial: Option<&RigMessage>) -> bool {
+        matches!(
+            partial,
+            Some(RigMessage::Assistant(reply))
+                if matches!(
+                    reply.content.last(),
+                    Some(AssistantContent::Reasoning(reasoning))
+                        if !reasoning.text.is_empty()
+                )
+        )
+    }
+}
+
+impl AgentMessageUi {
+    /// Shows a run's output after its fold moved on: `completed`, a message
+    /// it has just added to the transcript, if any, then `partial`, the
+    /// message it is folding. Only the part after the committed mark is
+    /// redone, and the text views only get what that part added.
+    pub(crate) fn advance(
+        &mut self,
+        completed: Option<(TranscriptIndex, &RigMessage)>,
+        partial: Option<&RigMessage>,
+        next: TranscriptIndex,
+        generating: bool,
+        cx: &mut impl AppContext,
+    ) {
+        let from = self.committed;
+        // Only the last committed step, if it is thinking or text, and the
+        // steps after it can change what they show.
+        let first_changed = from.steps.saturating_sub(1);
+        let old_texts = self.output.steps[first_changed..]
+            .iter()
+            .map(|step| match step {
+                AgentStep::Thinking(text) | AgentStep::Text(text) => Some(text.clone()),
+                AgentStep::ToolCall(_) | AgentStep::Steering => None,
+            })
+            .collect::<Vec<_>>();
+        self.output.rewind(from);
+        if let Some((index, completed)) = completed {
+            self.output.push(completed, index);
+            self.committed = self.output.mark();
+        }
+        self.output.extend(partial, next);
+        self.set_thinking_complete(partial, generating);
+        self.show_steps(first_changed, &old_texts, cx);
+        let response = self.output.response();
+        let old_response = std::mem::replace(&mut self.output.text, response);
+        show_tail(&self.text_view, &self.output.text, 0, &old_response, cx);
+    }
+
+    /// Brings the step views, which showed steps `..first` as they are now
+    /// followed by steps whose thinking or text was `old`, to showing
+    /// `output.steps`. A step that stays what it was keeps its view state.
+    fn show_steps(&mut self, first: usize, old: &[Option<String>], cx: &mut impl AppContext) {
+        let Some(&first_id) = self.output.sources.get(first) else {
+            self.step_views.0.clear();
+            return;
+        };
+        let mut previous = self.step_views.0.split_off(&first_id);
+        for (index, step) in self.output.steps.iter().enumerate().skip(first) {
+            let id = self.output.sources[index];
+            let view = match (previous.remove(&id), step) {
+                (Some(StepView::Thinking { view, expanded }), AgentStep::Thinking(text)) => {
+                    update_step_text(&view, text, old.get(index - first), cx);
+                    StepView::Thinking { view, expanded }
+                }
+                (Some(StepView::Text { view }), AgentStep::Text(text)) => {
+                    update_step_text(&view, text, old.get(index - first), cx);
+                    StepView::Text { view }
+                }
+                (Some(view @ StepView::ToolCall { .. }), AgentStep::ToolCall(_)) => view,
+                (Some(StepView::Steering), AgentStep::Steering) => StepView::Steering,
+                (_, step) => StepView::new(step, cx),
+            };
+            self.step_views.0.insert(id, view);
+        }
+    }
+
+    /// Shows `output`, a run's transcript entries, followed by `partial`, the
+    /// message it is folding, in a message fresh from a snapshot. The text
+    /// views are shown whole, as history rather than as a stream.
+    pub(crate) fn restore(
+        &mut self,
+        output: &[RigMessage],
+        start: TranscriptIndex,
+        partial: Option<&RigMessage>,
+        next: TranscriptIndex,
+        generating: bool,
+        cx: &mut impl AppContext,
+    ) {
+        self.output = AgentOutput::from_transcript(output, start);
+        self.committed = self.output.mark();
+        self.output.extend(partial, next);
+        self.set_thinking_complete(partial, generating);
+        self.output.text = self.output.response();
+        self.step_views = StepViews(
+            self.output
+                .sources
+                .iter()
+                .copied()
+                .zip(self.output.steps.iter().map(|step| StepView::new(step, cx)))
+                .collect(),
+        );
+        self.text_view = cx.new(|cx| TextViewState::markdown(&self.output.text, cx));
+    }
+
+    /// Thinking is complete unless the model is still reasoning. Thinking in
+    /// progress cannot be expanded by hand, so it completes collapsed.
+    fn set_thinking_complete(&mut self, partial: Option<&RigMessage>, generating: bool) {
+        self.output.thinking_complete = !(generating && AgentOutput::still_reasoning(partial));
+    }
+}
+
+/// Brings `view` from showing `new[..from]` followed by `old_tail` to showing
+/// `new`, appending when `new` extends that, as it does while a run streams.
+fn show_tail(
+    view: &gpui::Entity<TextViewState>,
+    new: &str,
+    from: usize,
+    old_tail: &str,
+    cx: &mut impl AppContext,
+) {
+    match new[from..].strip_prefix(old_tail) {
+        Some("") => {}
+        Some(added) => view.update(cx, |view, cx| view.push_str(added, cx)),
+        None => view.update(cx, |view, cx| view.set_text(new, cx)),
+    }
+}
+
+fn update_step_text(
+    view: &Entity<TextViewState>,
+    text: &str,
+    old: Option<&Option<String>>,
+    cx: &mut impl AppContext,
+) {
+    match old {
+        Some(Some(old)) => show_tail(view, text, 0, old, cx),
+        _ => view.update(cx, |view, cx| view.set_text(text, cx)),
     }
 }

@@ -34,10 +34,7 @@ use anyhow::Context as _;
 use gpui::AppContext;
 use gpui_base::TextViewState;
 use rig::{
-    completion::{
-        AssistantContent, Message as RigMessage,
-        message::{ToolResultContent, UserContent},
-    },
+    completion::Message as RigMessage,
     message::{CallId, ToolCall},
     streaming::StreamEvent,
     tool::Tool as _,
@@ -49,10 +46,7 @@ use uuid::Uuid;
 use crate::{
     protocol::{self, AgentRun, Json, RunOutcome},
     thread::Thread,
-    timeline::{
-        AgentCommentResponse, AgentMessage, AgentMessageUi, AgentOutput, AgentStep, AgentToolCall,
-        OutputMark, StepView, TimelineMessage,
-    },
+    timeline::{AgentCommentResponse, AgentMessage, TimelineMessage},
     usage::usage_tokens,
 };
 
@@ -62,6 +56,11 @@ use crate::{
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct TranscriptIndex(pub(crate) u64);
+
+/// A gap in the original transcript, distinct from the index of a message.
+/// Boundaries describe coverage and insertion; content identities name parts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct TranscriptBoundary(pub(crate) TranscriptIndex);
 
 /// A complete replacement for the original prefix `[0, resume_at)`.
 /// Summary requests themselves never join the original messages.
@@ -105,77 +104,6 @@ impl Transcript {
         &self.compactions
     }
 
-    /// Place summaries inside a run after the steps covered by their original
-    /// transcript boundary. Tool-result messages update calls without adding a
-    /// step; adjacent text and reasoning parts each share a step, as in `push`.
-    /// Counting without constructing output keeps rendering independent of
-    /// transcript text size and avoids creating any new views.
-    pub(crate) fn compaction_steps(
-        &self,
-        prompt: TranscriptIndex,
-        next_prompt: Option<TranscriptIndex>,
-    ) -> Vec<(usize, usize)> {
-        #[derive(Clone, Copy, PartialEq)]
-        enum StepKind {
-            Thinking,
-            Text,
-            ToolCall,
-            Steering,
-        }
-        let mut markers = Vec::new();
-        let mut cursor = prompt.0 as usize + 1;
-        let mut steps = 0;
-        let mut last = None;
-        for (index, compaction) in self
-            .compactions
-            .iter()
-            .enumerate()
-            .filter(|(_, compaction)| {
-                compaction.resume_at > prompt
-                    && next_prompt.is_none_or(|end| compaction.resume_at < end)
-            })
-        {
-            for message in &self.messages[cursor..compaction.resume_at.0 as usize] {
-                let mut add = |kind: StepKind, empty: bool| {
-                    if matches!(kind, StepKind::Thinking | StepKind::Text)
-                        && (last == Some(kind) || empty)
-                    {
-                        return;
-                    }
-                    steps += 1;
-                    last = Some(kind);
-                };
-                match message {
-                    RigMessage::Assistant(reply) => {
-                        for part in &reply.content {
-                            match part {
-                                AssistantContent::Reasoning(reasoning) => {
-                                    add(StepKind::Thinking, reasoning.text.is_empty());
-                                }
-                                AssistantContent::Text(text) => {
-                                    add(StepKind::Text, text.text.is_empty())
-                                }
-                                AssistantContent::ToolCall(_) => add(StepKind::ToolCall, false),
-                                _ => {}
-                            }
-                        }
-                    }
-                    RigMessage::User { content }
-                        if content
-                            .iter()
-                            .any(|item| !matches!(item, UserContent::ToolResult(_))) =>
-                    {
-                        add(StepKind::Steering, false);
-                    }
-                    _ => {}
-                }
-            }
-            cursor = compaction.resume_at.0 as usize;
-            markers.push((index, steps));
-        }
-        markers
-    }
-
     /// Accept only nonempty summaries within the original transcript, with
     /// nondecreasing coverage. A replacement at the same boundary is valid.
     pub(crate) fn install_compaction(&mut self, compaction: Compaction) -> anyhow::Result<()> {
@@ -206,6 +134,10 @@ impl Transcript {
 }
 
 impl Compaction {
+    pub(crate) fn boundary(&self) -> TranscriptBoundary {
+        TranscriptBoundary(self.resume_at)
+    }
+
     fn validate(&self, end: TranscriptIndex, previous: Option<&Self>) -> anyhow::Result<()> {
         anyhow::ensure!(
             self.resume_at.0 > 0
@@ -300,6 +232,7 @@ fn fold_after(transcript: &[RigMessage], output: &Range<usize>) -> TurnFold {
 pub(crate) fn validate_agent_runs(
     transcript: &[RigMessage],
     messages: &[&protocol::AgentMessage],
+    compacting: bool,
 ) -> anyhow::Result<()> {
     let prompts = messages
         .iter()
@@ -343,6 +276,14 @@ pub(crate) fn validate_agent_runs(
                 "agent message {index} awaits approval of a call that is not waiting"
             );
         }
+        if compacting && message.run.is_generating() {
+            anyhow::ensure!(
+                message.awaiting_approval.is_none()
+                    && fold.pending_calls().is_empty()
+                    && fold.partial().is_none(),
+                "compaction is not at a request boundary"
+            );
+        }
     }
     Ok(())
 }
@@ -365,13 +306,14 @@ impl Thread {
     ) -> anyhow::Result<()> {
         let decoded = event.to_agent()?;
         let folded = self
-            .agent_turn
+            .active_turn(message_id)?
             .apply(&decoded)
             .context("the host sent an agent event out of order")?;
         let completed = folded.message.is_some();
         self.transcript.messages.extend(folded.message);
         self.measure_agent_event(&decoded);
-        let partial = self.agent_turn.partial();
+        let partial = self.active_turn(message_id)?.partial();
+        let next = self.transcript.end();
         let Some(message) = agent_message(&mut self.timeline, message_id) else {
             return Ok(());
         };
@@ -386,11 +328,23 @@ impl Thread {
         {
             message.record.awaiting_approval = None;
         }
-        let completed = completed.then(|| self.transcript.messages.last()).flatten();
+        let completed = completed.then(|| {
+            (
+                TranscriptIndex(next.0 - 1),
+                self.transcript.messages.last().unwrap(),
+            )
+        });
         let generating = message.is_generating();
         message
             .ui
-            .advance(completed, partial.as_ref(), generating, cx);
+            .advance(completed, partial.as_ref(), next, generating, cx);
+        if self.run_activity(message_id) == Some(crate::timeline::RunActivity::AwaitingApproval)
+            && self
+                .agent_message_mut(message_id.into_bytes())
+                .is_some_and(|run| run.record.awaiting_approval.is_none())
+        {
+            self.approval_activity(message_id, None)?;
+        }
         self.show_comment_responses(message_id, cx);
         Ok(())
     }
@@ -403,9 +357,10 @@ impl Thread {
         call: CallId,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            is_pending(&self.agent_turn, &call),
+            is_pending(self.active_turn(message_id)?, &call),
             "the host asked to approve a call that is not waiting for its result"
         );
+        self.approval_activity(message_id, Some(&call))?;
         let message = agent_message(&mut self.timeline, message_id)
             .filter(|message| message.is_generating())
             .context("the host asked to approve a call of a run that is not going")?;
@@ -419,6 +374,7 @@ impl Thread {
             && message.record.awaiting_approval.as_ref() == Some(call)
         {
             message.record.awaiting_approval = None;
+            _ = self.approval_activity(message_id, None);
         }
     }
 
@@ -431,12 +387,14 @@ impl Thread {
         duration: std::time::Duration,
         cx: &mut impl AppContext,
     ) {
-        let partial = self.agent_turn.partial();
-        self.generating = false;
+        let Some(turn) = self.take_active_turn(Uuid::from_bytes(id)) else {
+            return;
+        };
+        let partial = turn.partial();
+        let next = self.transcript.end();
         // A request that was stopped or failed before it reported usage
         // never adds its partial output to the transcript.
         self.streamed_bytes = 0;
-        self.agent_turn = TurnFold::default();
         let Some(message) = self.agent_message_mut(id) else {
             return;
         };
@@ -445,14 +403,14 @@ impl Thread {
         message.record.awaiting_approval = None;
         // The work collapses under its summary, leaving the response.
         message.ui.work_expanded = false;
-        message.ui.advance(None, partial.as_ref(), false, cx);
+        message.ui.advance(None, partial.as_ref(), next, false, cx);
     }
 
     /// Shows the output of every agent message of a timeline fresh from a
     /// snapshot, and resumes folding the running one. A run's partial message
     /// is rebuilt by folding its pending events, as it was where they were
     /// folded. The snapshot must have passed [`validate_agent_runs`].
-    pub(crate) fn restore_agent_output(&mut self, cx: &mut impl AppContext) {
+    pub(crate) fn restore_agent_output(&mut self, compacting: bool, cx: &mut impl AppContext) {
         let (indices, prompts): (Vec<_>, Vec<_>) = self
             .timeline
             .iter()
@@ -463,7 +421,7 @@ impl Thread {
             })
             .unzip();
         let outputs = run_outputs(&prompts, self.transcript.messages.len());
-        self.agent_turn = TurnFold::default();
+        let mut active = None;
         for (index, output) in indices.into_iter().zip(outputs) {
             let TimelineMessage::Agent(message) = &mut self.timeline[index] else {
                 unreachable!("an agent message's index");
@@ -478,17 +436,20 @@ impl Thread {
             }
             let generating = message.is_generating();
             message.ui.restore(
-                &self.transcript.messages[output],
+                &self.transcript.messages[output.clone()],
+                TranscriptIndex(output.start as u64),
                 fold.partial().as_ref(),
+                TranscriptIndex(output.end as u64),
                 generating,
                 cx,
             );
             let message_id = message.record.id;
             if message.is_generating() {
-                self.agent_turn = fold;
+                active = Some((message_id, fold));
             }
             self.show_comment_responses(message_id, cx);
         }
+        self.restore_execution(active, compacting);
     }
 
     /// Counts an event towards the context window estimate; see
@@ -608,247 +569,6 @@ impl Thread {
     }
 }
 
-impl AgentOutput {
-    /// Adds what `message`, the next message of a run's output, shows.
-    fn push(&mut self, message: &RigMessage) {
-        match message {
-            RigMessage::Assistant(reply) => {
-                for part in &reply.content {
-                    match part {
-                        AssistantContent::Reasoning(reasoning) => {
-                            self.push_thinking(&reasoning.text);
-                        }
-                        AssistantContent::Text(text) => self.push_text(&text.text),
-                        AssistantContent::ToolCall(call) => {
-                            self.steps.push(AgentStep::ToolCall(AgentToolCall {
-                                call: call.clone(),
-                                result: None,
-                            }));
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            RigMessage::User { content } => {
-                for item in content {
-                    if let UserContent::ToolResult(result) = item {
-                        self.record_tool_result(&result.call, &result.content);
-                    }
-                }
-                // A run's own user messages carry tool results only; any
-                // other content is a steering prompt delivered into it.
-                if content
-                    .iter()
-                    .any(|item| !matches!(item, UserContent::ToolResult(_)))
-                {
-                    self.steps.push(AgentStep::Steering);
-                }
-            }
-            RigMessage::System { .. } => {}
-        }
-    }
-
-    /// Continues the thinking the output ends with, or starts new thinking
-    /// if it ends with something else.
-    fn push_thinking(&mut self, text: &str) {
-        match self.steps.last_mut() {
-            Some(AgentStep::Thinking(thinking)) => thinking.push_str(text),
-            _ if text.is_empty() => {}
-            _ => self.steps.push(AgentStep::Thinking(text.to_owned())),
-        }
-    }
-
-    /// Continues the text the output ends with, or starts new text.
-    fn push_text(&mut self, text: &str) {
-        match self.steps.last_mut() {
-            Some(AgentStep::Text(existing)) => existing.push_str(text),
-            _ if text.is_empty() => {}
-            _ => self.steps.push(AgentStep::Text(text.to_owned())),
-        }
-    }
-
-    fn extend(&mut self, message: Option<&RigMessage>) {
-        if let Some(message) = message {
-            self.push(message);
-        }
-    }
-
-    fn tool_calls_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut AgentToolCall> {
-        self.steps.iter_mut().filter_map(|step| match step {
-            AgentStep::ToolCall(call) => Some(call),
-            AgentStep::Thinking(_) | AgentStep::Text(_) | AgentStep::Steering => None,
-        })
-    }
-
-    /// Records what the tool returned for `call`. Results answer the latest
-    /// reply, and Rig may mint the same id for id-less calls of different
-    /// replies, so the latest call with that id is the one answered.
-    fn record_tool_result(&mut self, call: &CallId, content: &[ToolResultContent]) {
-        if let Some(tool_call) = self
-            .tool_calls_mut()
-            .rfind(|tool_call| tool_call.call.id == *call)
-        {
-            tool_call.result = Some(content.to_vec());
-        };
-    }
-
-    /// Where the output ends now, as its committed part.
-    fn mark(&self) -> OutputMark {
-        let answered = self
-            .tool_calls()
-            .take_while(|call| call.result.is_some())
-            .count();
-        debug_assert!(
-            self.tool_calls()
-                .skip(answered)
-                .all(|call| call.result.is_none()),
-            "committed calls are answered in order"
-        );
-        OutputMark {
-            steps: self.steps.len(),
-            tail: match self.steps.last() {
-                Some(AgentStep::Thinking(text) | AgentStep::Text(text)) => text.len(),
-                _ => 0,
-            },
-            answered,
-        }
-    }
-
-    /// Drops everything after `mark`, the committed part: what the message a
-    /// run is folding added, including results for committed calls.
-    fn rewind(&mut self, mark: OutputMark) {
-        self.steps.truncate(mark.steps);
-        if let Some(AgentStep::Thinking(text) | AgentStep::Text(text)) = self.steps.last_mut() {
-            text.truncate(mark.tail);
-        }
-        for call in self.tool_calls_mut().skip(mark.answered) {
-            call.result = None;
-        }
-    }
-
-    /// Whether `partial`, the message a run is folding, shows the model
-    /// still reasoning: it is the reply streaming, ending in reasoning that
-    /// has some text, which is then the output's last step.
-    fn still_reasoning(partial: Option<&RigMessage>) -> bool {
-        matches!(
-            partial,
-            Some(RigMessage::Assistant(reply))
-                if matches!(
-                    reply.content.last(),
-                    Some(AssistantContent::Reasoning(reasoning))
-                        if !reasoning.text.is_empty()
-                )
-        )
-    }
-}
-
-impl AgentMessageUi {
-    /// Shows a run's output after its fold moved on: `completed`, a message
-    /// it has just added to the transcript, if any, then `partial`, the
-    /// message it is folding. Only the part after the committed mark is
-    /// redone, and the text views only get what that part added.
-    pub(crate) fn advance(
-        &mut self,
-        completed: Option<&RigMessage>,
-        partial: Option<&RigMessage>,
-        generating: bool,
-        cx: &mut impl AppContext,
-    ) {
-        let from = self.committed;
-        // Only the last committed step, if it is thinking or text, and the
-        // steps after it can change what they show.
-        let first_changed = from.steps.saturating_sub(1);
-        let old_texts = self.output.steps[first_changed..]
-            .iter()
-            .map(|step| match step {
-                AgentStep::Thinking(text) | AgentStep::Text(text) => Some(text.clone()),
-                AgentStep::ToolCall(_) | AgentStep::Steering => None,
-            })
-            .collect::<Vec<_>>();
-        self.output.rewind(from);
-        if let Some(completed) = completed {
-            self.output.push(completed);
-            self.committed = self.output.mark();
-        }
-        self.output.extend(partial);
-        self.set_thinking_complete(partial, generating);
-        self.show_steps(first_changed, &old_texts, cx);
-        let response = self.output.response();
-        let old_response = std::mem::replace(&mut self.output.text, response);
-        show_tail(&self.text_view, &self.output.text, 0, &old_response, cx);
-    }
-
-    /// Brings the step views, which showed steps `..first` as they are now
-    /// followed by steps whose thinking or text was `old`, to showing
-    /// `output.steps`. A step that stays what it was keeps its view state.
-    fn show_steps(&mut self, first: usize, old: &[Option<String>], cx: &mut impl AppContext) {
-        self.step_views.truncate(self.output.steps.len());
-        for (index, step) in self.output.steps.iter().enumerate().skip(first) {
-            match (self.step_views.get_mut(index), step) {
-                (Some(StepView::Thinking { view, .. }), AgentStep::Thinking(text))
-                | (Some(StepView::Text { view }), AgentStep::Text(text)) => {
-                    match old.get(index - first) {
-                        Some(Some(old)) => show_tail(view, text, 0, old, cx),
-                        _ => view.update(cx, |view, cx| view.set_text(text, cx)),
-                    }
-                }
-                (Some(StepView::ToolCall { .. }), AgentStep::ToolCall(_))
-                | (Some(StepView::Steering), AgentStep::Steering) => {}
-                (Some(shown), step) => *shown = StepView::new(step, cx),
-                (None, step) => self.step_views.push(StepView::new(step, cx)),
-            }
-        }
-    }
-
-    /// Shows `output`, a run's transcript entries, followed by `partial`, the
-    /// message it is folding, in a message fresh from a snapshot. The text
-    /// views are shown whole, as history rather than as a stream.
-    pub(crate) fn restore(
-        &mut self,
-        output: &[RigMessage],
-        partial: Option<&RigMessage>,
-        generating: bool,
-        cx: &mut impl AppContext,
-    ) {
-        for message in output {
-            self.output.push(message);
-        }
-        self.committed = self.output.mark();
-        self.output.extend(partial);
-        self.set_thinking_complete(partial, generating);
-        self.output.text = self.output.response();
-        self.step_views = self
-            .output
-            .steps
-            .iter()
-            .map(|step| StepView::new(step, cx))
-            .collect();
-        self.text_view = cx.new(|cx| TextViewState::markdown(&self.output.text, cx));
-    }
-
-    /// Thinking is complete unless the model is still reasoning. Thinking in
-    /// progress cannot be expanded by hand, so it completes collapsed.
-    fn set_thinking_complete(&mut self, partial: Option<&RigMessage>, generating: bool) {
-        self.output.thinking_complete = !(generating && AgentOutput::still_reasoning(partial));
-    }
-}
-
-/// Brings `view` from showing `new[..from]` followed by `old_tail` to showing
-/// `new`, appending when `new` extends that, as it does while a run streams.
-fn show_tail(
-    view: &gpui::Entity<TextViewState>,
-    new: &str,
-    from: usize,
-    old_tail: &str,
-    cx: &mut impl AppContext,
-) {
-    match new[from..].strip_prefix(old_tail) {
-        Some("") => {}
-        Some(added) => view.update(cx, |view, cx| view.push_str(added, cx)),
-        None => view.update(cx, |view, cx| view.set_text(new, cx)),
-    }
-}
-
 /// Agent message `id` of `timeline`, borrowed apart from the thread's other
 /// fields.
 fn agent_message(timeline: &mut [TimelineMessage], id: Uuid) -> Option<&mut AgentMessage> {
@@ -862,6 +582,8 @@ fn agent_message(timeline: &mut [TimelineMessage], id: Uuid) -> Option<&mut Agen
 mod tests {
     use super::*;
 
+    use crate::timeline::AgentOutput;
+    use rig::completion::AssistantContent;
     use rig::message::{
         AssistantMessage, ImageMediaType, Origin, Reasoning, StopReason, ToolCall, ToolFunction,
         ToolName, UserContent,
@@ -897,31 +619,31 @@ mod tests {
                 })
                 .unwrap();
         }
-        // The pre-run boundary is handled outside the run. Tool results do
-        // not add a step, repeated summaries each retain their own marker,
-        // and a boundary at the next prompt belongs before that prompt.
+        let markers = |transcript: &Transcript, next: Option<TranscriptIndex>| {
+            let output = AgentOutput::from_transcript(
+                &transcript.messages[prompt.0 as usize + 1..],
+                TranscriptIndex(prompt.0 + 1),
+            );
+            transcript
+                .compactions()
+                .iter()
+                .enumerate()
+                .filter(|(_, summary)| {
+                    summary.resume_at > prompt && next.is_none_or(|end| summary.resume_at < end)
+                })
+                .map(|(index, summary)| (index, output.step_at_boundary(summary.boundary())))
+                .collect::<Vec<_>>()
+        };
         assert_eq!(
-            transcript.compaction_steps(prompt, Some(TranscriptIndex(7))),
+            markers(&transcript, Some(TranscriptIndex(7))),
             vec![(1, 3), (2, 3), (3, 4)]
         );
         assert_eq!(
-            transcript.compaction_steps(prompt, None),
+            markers(&transcript, None),
             vec![(1, 3), (2, 3), (3, 4), (4, 5)]
         );
         let restored = transcript.to_protocol().to_transcript().unwrap();
-        for (index, steps) in transcript.compaction_steps(prompt, None) {
-            let mut output = AgentOutput::default();
-            for message in &transcript.messages
-                [prompt.0 as usize + 1..transcript.compactions[index].resume_at.0 as usize]
-            {
-                output.push(message);
-            }
-            assert_eq!(steps, output.steps.len());
-        }
-        assert_eq!(
-            restored.compaction_steps(prompt, None),
-            transcript.compaction_steps(prompt, None)
-        );
+        assert_eq!(markers(&restored, None), markers(&transcript, None));
     }
 
     #[test]

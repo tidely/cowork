@@ -11,6 +11,47 @@ use crate::{
     thread::{Thread, ThreadSharing},
 };
 
+impl Thread {
+    /// UI fixtures use the same execution lifecycle as real runs rather than
+    /// assigning independent activity flags.
+    pub(crate) fn set_generating_for_test(
+        &mut self,
+        generating: bool,
+        cx: &mut impl gpui::AppContext,
+    ) {
+        let id = self.timeline.iter().find_map(|entry| match entry {
+            crate::timeline::TimelineMessage::Agent(run) if run.is_generating() => {
+                Some(run.record.id)
+            }
+            _ => None,
+        });
+        if generating && !self.is_generating() {
+            if let Some(id) = id {
+                self.restore_execution(Some((id, agent::TurnFold::default())), false);
+            } else {
+                self.apply_for_test(
+                    protocol::HostMessage::AgentStarted {
+                        id: Uuid::new_v4().into_bytes(),
+                        comment_group_id: None,
+                        started_at: std::time::SystemTime::now(),
+                        prompt: protocol::Json::from_rig(&rig::completion::Message::user(
+                            "Fixture prompt",
+                        )),
+                    },
+                    cx,
+                );
+            }
+        } else if !generating && let Some(id) = id {
+            self.end_agent_run(
+                id.into_bytes(),
+                protocol::RunOutcome::Stopped,
+                std::time::Duration::ZERO,
+                cx,
+            );
+        }
+    }
+}
+
 /// Simulates a client that does not honor its local permission or epoch guards.
 /// The real host receiver still validates every request delivered this way.
 pub(crate) fn request_unchecked(thread: &Thread, request: protocol::CollaboratorMessage) -> bool {

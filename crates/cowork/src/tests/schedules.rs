@@ -335,7 +335,7 @@ fn a_due_run_starts_in_a_new_thread_and_records_how_it_ended(cx: &mut gpui::Test
         let thread = thread.read(cx);
         assert_eq!(thread.summary.title, "Morning briefing");
         assert_eq!(thread.model(), Some(&ollama_qwen()));
-        assert!(thread.generating);
+        assert!(thread.is_generating());
         // The user's own new-thread draft is untouched, and stays open.
         assert_eq!(cowork.active_thread_id, None);
         let task = cowork.scheduler.task(task_id).unwrap();
@@ -408,7 +408,7 @@ fn continuing_runs_wait_for_their_thread_and_bring_it_back(cx: &mut gpui::TestAp
     // Someone is chatting in the thread, so the next run waits for them.
     cowork.update(cx, |cowork, cx| {
         let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
-        thread.update(cx, |thread, _| thread.generating = true);
+        thread.update(cx, |thread, cx| thread.set_generating_for_test(true, cx));
         cowork.run_scheduled_task_now(task_id, cx);
         let task = cowork.scheduler.task(task_id).unwrap();
         assert_eq!(cowork.task_status(task, cx), TaskStatus::WaitingForThread);
@@ -416,7 +416,7 @@ fn continuing_runs_wait_for_their_thread_and_bring_it_back(cx: &mut gpui::TestAp
     assert_eq!(running_thread(&cowork, cx), None);
     cowork.update(cx, |cowork, cx| {
         let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
-        thread.update(cx, |thread, _| thread.generating = false);
+        thread.update(cx, |thread, cx| thread.set_generating_for_test(false, cx));
         cowork.run_next_scheduled(at(SATURDAY, 9, 5), cx);
     });
     assert_eq!(running_thread(&cowork, cx), Some(thread_id));

@@ -341,7 +341,7 @@ impl Cowork {
             .and_then(|model| self.models.get(model))
             .map_or(0, |info| info.max_tokens);
         let usage = ContextUsage::of(thread.map(|thread| thread.read(cx)), new_thread_max_tokens);
-        let compacting = thread.is_some_and(|thread| thread.read(cx).compacting);
+        let compacting = thread.is_some_and(|thread| thread.read(cx).is_compacting());
         let thread = thread.map(Entity::downgrade);
         let settings = thread
             .as_ref()
@@ -369,7 +369,7 @@ impl Cowork {
                     );
                     let compacting = thread
                         .as_ref()
-                        .is_some_and(|thread| thread.read(cx).compacting);
+                        .is_some_and(|thread| thread.read(cx).is_compacting());
                     context_details(usage, settings, compacting, cx)
                 })
                 .py_2()

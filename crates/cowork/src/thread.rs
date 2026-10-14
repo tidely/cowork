@@ -150,11 +150,9 @@ pub(crate) struct Thread {
     /// summary for an earlier prefix. Everyone mirrors this full history; see
     /// `transcript.rs`.
     pub(crate) transcript: Transcript,
-    pub(crate) compacting: bool,
-    /// Folds the running agent's events into the transcript's next message.
-    /// The events it has folded so far are the running message's pending
-    /// events.
-    pub(crate) agent_turn: TurnFold,
+    /// Execution has one owner. Replay records and their unfinished output
+    /// survive it, but activity and the live fold disappear together on stop.
+    active_run: Option<ActiveRun>,
     /// The name each author is given in prompts, fixed when their first
     /// item is submitted so that renaming never changes the transcript and
     /// the agent knows everyone by one name. Mirrored like the transcript.
@@ -186,7 +184,6 @@ pub(crate) struct Thread {
     peer_draft_generations: HashMap<ParticipantId, u64>,
     /// The local mirror's epoch, installed only with authoritative draft state.
     draft_generation: u64,
-    pub(crate) generating: bool,
     pub(crate) sharing: ThreadSharing,
     ownership: ThreadOwnership,
     /// The folders the thread works in, in the order the host added them.
@@ -196,6 +193,86 @@ pub(crate) struct Thread {
     /// Whether the project is open for writing or only reading. Chosen by
     /// the host and mirrored. Not yet given to the agent.
     project_mode: ProjectMode,
+}
+
+struct ActiveRun {
+    id: Uuid,
+    activity: crate::timeline::RunActivity,
+    turn: TurnFold,
+}
+
+impl Thread {
+    pub(crate) fn is_generating(&self) -> bool {
+        self.active_run.is_some()
+    }
+
+    pub(crate) fn is_compacting(&self) -> bool {
+        self.active_run
+            .as_ref()
+            .is_some_and(|run| run.activity == crate::timeline::RunActivity::Compacting)
+    }
+
+    pub(crate) fn run_activity(&self, id: Uuid) -> Option<crate::timeline::RunActivity> {
+        self.active_run
+            .as_ref()
+            .filter(|run| run.id == id)
+            .map(|run| run.activity)
+    }
+
+    pub(crate) fn active_turn(&mut self, id: Uuid) -> anyhow::Result<&mut TurnFold> {
+        anyhow::ensure!(!self.is_compacting(), "the active run is compacting");
+        Ok(&mut self
+            .active_run
+            .as_mut()
+            .filter(|run| run.id == id)
+            .context("event is not for the active run")?
+            .turn)
+    }
+
+    pub(crate) fn approval_activity(
+        &mut self,
+        id: Uuid,
+        call: Option<&rig::message::CallId>,
+    ) -> anyhow::Result<()> {
+        let run = self
+            .active_run
+            .as_mut()
+            .filter(|run| run.id == id)
+            .context("activity is not for the active run")?;
+        anyhow::ensure!(
+            run.activity != crate::timeline::RunActivity::Compacting,
+            "the active run is compacting"
+        );
+        if let Some(call) = call {
+            anyhow::ensure!(
+                run.turn
+                    .pending_calls()
+                    .iter()
+                    .any(|pending| pending.id == *call),
+                "approval is not for a pending call"
+            );
+            run.activity = crate::timeline::RunActivity::AwaitingApproval;
+        } else {
+            run.activity = crate::timeline::RunActivity::Working;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn take_active_turn(&mut self, id: Uuid) -> Option<TurnFold> {
+        (self.active_run.as_ref()?.id == id).then(|| self.active_run.take().unwrap().turn)
+    }
+
+    /// Called after validating and folding a snapshot, including its live
+    /// activity. It replaces execution atomically rather than restoring flags.
+    pub(crate) fn restore_execution(&mut self, run: Option<(Uuid, TurnFold)>, compacting: bool) {
+        self.active_run = run.map(|(id, turn)| ActiveRun {
+            id, turn,
+            activity: if compacting { crate::timeline::RunActivity::Compacting }
+                else if self.timeline.iter().any(|entry| matches!(entry, TimelineMessage::Agent(run) if run.record.id == id && run.record.awaiting_approval.is_some())) {
+                    crate::timeline::RunActivity::AwaitingApproval
+                } else { crate::timeline::RunActivity::Working },
+        });
+    }
 }
 
 /// A host snapshot whose transcript and agent runs have been checked before
@@ -226,8 +303,7 @@ impl Thread {
             participants: Vec::new(),
             profiles: HashMap::new(),
             transcript: Transcript::default(),
-            compacting: false,
-            agent_turn: TurnFold::default(),
+            active_run: None,
             prompt_names: HashMap::new(),
             tokens_used: 0,
             model,
@@ -245,7 +321,6 @@ impl Thread {
             peer_permissions: PeerPermissions::default(),
             peer_draft_generations: HashMap::new(),
             draft_generation: 0,
-            generating: false,
             sharing: ThreadSharing::NotShared,
             ownership: ThreadOwnership::Local,
             project_folders: Vec::new(),
@@ -510,8 +585,7 @@ impl Thread {
             participants: Vec::new(),
             profiles: HashMap::new(),
             transcript: Transcript::default(),
-            compacting: false,
-            agent_turn: TurnFold::default(),
+            active_run: None,
             prompt_names: HashMap::new(),
             tokens_used: 0,
             model: None,
@@ -526,7 +600,6 @@ impl Thread {
             peer_permissions: PeerPermissions::default(),
             peer_draft_generations: HashMap::new(),
             draft_generation: 0,
-            generating: false,
             sharing,
             ownership: ThreadOwnership::Remote,
             project_folders: Vec::new(),
@@ -593,8 +666,12 @@ impl Thread {
                 protocol::TimelineMessage::User(_) => None,
             })
             .collect::<Vec<_>>();
-        validate_agent_runs(&transcript.messages, &agent_messages)
-            .context("invalid host snapshot")?;
+        validate_agent_runs(
+            &transcript.messages,
+            &agent_messages,
+            welcome.thread.compacting,
+        )
+        .context("invalid host snapshot")?;
         Ok(PreparedWelcome {
             welcome,
             transcript,
@@ -667,7 +744,6 @@ impl Thread {
         self.models = Arc::new(std::mem::take(&mut thread.models));
         self.model = thread.model.take();
         self.context_tokens = thread.context_tokens;
-        self.compacting = thread.compacting;
         self.streamed_bytes = thread.streamed_bytes;
         self.transcript = transcript;
         self.prompt_names = std::mem::take(&mut thread.prompt_names)
@@ -693,13 +769,11 @@ impl Thread {
                 )
             })
             .collect();
+        let compacting = thread.compacting;
         let (summary, timeline) = thread.into_native(cx);
         self.summary = summary;
-        self.generating = timeline.iter().any(
-            |entry| matches!(entry, TimelineMessage::Agent(message) if message.is_generating()),
-        );
         self.timeline = timeline;
-        self.restore_agent_output(cx);
+        self.restore_agent_output(compacting, cx);
         Ok(())
     }
 
@@ -759,7 +833,7 @@ impl Thread {
             model: self.model.clone(),
             peer_permissions: self.peer_permissions.clone(),
             context_tokens: self.context_tokens,
-            compacting: self.compacting,
+            compacting: self.is_compacting(),
             streamed_bytes: self.streamed_bytes,
             messages: self
                 .timeline
@@ -1554,24 +1628,29 @@ impl Thread {
                 self.append_user_group(group);
             }
             protocol::HostMessage::CompactionStarted => {
+                let run = self
+                    .active_run
+                    .as_mut()
+                    .context("compaction requires an active run")?;
                 anyhow::ensure!(
-                    self.generating && !self.compacting,
-                    "compaction requires an active run"
+                    run.activity == crate::timeline::RunActivity::Working,
+                    "compaction requires a working run"
                 );
-                self.compacting = true;
+                anyhow::ensure!(
+                    run.turn.pending_calls().is_empty() && run.turn.partial().is_none(),
+                    "compaction requires a request boundary"
+                );
+                run.activity = crate::timeline::RunActivity::Compacting;
             }
             protocol::HostMessage::CompactionFinished { context } => {
-                anyhow::ensure!(
-                    self.compacting && self.generating,
-                    "compaction is not running"
-                );
-                self.compacting = false;
+                anyhow::ensure!(self.is_compacting(), "compaction is not running");
                 if let Some(context) = context {
                     self.transcript.install_compaction(context.clone())?;
                     self.context_tokens =
                         Some((context.summary.len() as u64).div_ceil(BYTES_PER_TOKEN));
                     self.streamed_bytes = 0;
                 }
+                self.active_run.as_mut().unwrap().activity = crate::timeline::RunActivity::Working;
             }
             protocol::HostMessage::AgentStarted {
                 id,
@@ -1583,6 +1662,7 @@ impl Thread {
                     !self.timeline.iter().any(|entry| matches!(entry, TimelineMessage::Agent(message) if message.record.id == Uuid::from_bytes(id))),
                     "duplicate agent run identity"
                 );
+                anyhow::ensure!(!self.is_generating(), "a run is already active");
                 let prompt_index = self.transcript.append(prompt.to_rig()?);
                 let message = AgentMessage::new(
                     Uuid::from_bytes(id),
@@ -1594,8 +1674,11 @@ impl Thread {
                     cx,
                 );
                 self.timeline.push(TimelineMessage::Agent(message));
-                self.generating = true;
-                self.agent_turn = TurnFold::default();
+                self.active_run = Some(ActiveRun {
+                    id: Uuid::from_bytes(id),
+                    activity: crate::timeline::RunActivity::Working,
+                    turn: TurnFold::default(),
+                });
             }
             protocol::HostMessage::AgentEvent { id, event } => {
                 self.apply_agent_event(Uuid::from_bytes(id), event, cx)?;
@@ -1609,7 +1692,6 @@ impl Thread {
                 outcome,
                 duration,
             } => {
-                self.compacting = false;
                 self.end_agent_run(id, outcome, duration, cx);
             }
             protocol::HostMessage::ToolApprovalRequested { id, call } => {

@@ -263,6 +263,7 @@ impl Fixture {
         validate_agent_runs(
             &thread.transcript.messages,
             &[&message.record.to_protocol()],
+            false,
         )?;
         anyhow::ensure!(expected.len() == 2, "expected one tool-free turn");
         let Message::Assistant(reply) = &expected[1] else {

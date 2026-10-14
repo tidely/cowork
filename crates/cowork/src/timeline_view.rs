@@ -36,6 +36,7 @@ use crate::{
         AgentMessage, AgentStep, AgentToolCall, MessageAuthor, StepView, ThreadMessageId,
         TimelineMessage, UserComment, UserCommentBody,
     },
+    timeline_projection::{RunItem, RunProjection},
     tool_approval::{self, ApprovalRights},
     tool_call_card::ToolCallCard,
 };
@@ -77,13 +78,6 @@ pub(crate) struct ShownSegments {
 /// How long newly split segments may stay unparsed before they are shown
 /// anyway.
 const SEGMENT_PARSE_TIMEOUT: Duration = Duration::from_secs(1);
-
-/// A piece of an agent message's work, as [`Cowork::render_work`] lays it
-/// out: something the agent did, or where a steering message joined.
-enum WorkPiece {
-    Shown(gpui::AnyElement),
-    Steering,
-}
 
 impl Cowork {
     /// A quiet divider for accepted summaries, or an animated status while the
@@ -596,7 +590,7 @@ impl Cowork {
         }
 
         div()
-            .id(("timeline-message", index))
+            .id(format!("timeline-user-{}", group.record.id))
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _, window, cx| {
@@ -772,7 +766,7 @@ impl Cowork {
         thread.update(cx, |thread, _| {
             if let Some(message) = thread.agent_message_mut(message_id.into_bytes())
                 && !message.ui.output.thinking_in_progress(step_index)
-                && let Some(view) = message.ui.step_views.get_mut(step_index)
+                && let Some(view) = message.ui.step_view_mut(step_index)
             {
                 view.set_expanded(!view.expanded());
             }
@@ -794,8 +788,7 @@ impl Cowork {
         let expanded = in_progress
             || message
                 .ui
-                .step_views
-                .get(step_index)
+                .step_view(step_index)
                 .is_some_and(StepView::expanded);
         div()
             .w_full()
@@ -804,7 +797,10 @@ impl Cowork {
             .gap_2()
             .child(
                 div()
-                    .id(format!("toggle-thinking-{message_id}-{step_index}"))
+                    .id(format!(
+                        "toggle-thinking-{message_id}-{}",
+                        message.ui.output.content_id(step_index)
+                    ))
                     .debug_selector(move || format!("toggle-thinking-{message_id}-{step_index}"))
                     .h(px(24.))
                     .flex()
@@ -897,7 +893,10 @@ impl Cowork {
             .flex_col()
             .child(
                 div()
-                    .id(format!("tool-call-{message_id}-{step_index}"))
+                    .id(format!(
+                        "tool-call-{message_id}-{}",
+                        message.ui.output.content_id(step_index)
+                    ))
                     .debug_selector(move || format!("tool-call-{message_id}-{step_index}"))
                     .h(px(20.))
                     .w_full()
@@ -926,7 +925,10 @@ impl Cowork {
             .when(expanded, |this| {
                 this.child(
                     div()
-                        .id(format!("tool-call-details-{message_id}-{step_index}"))
+                        .id(format!(
+                            "tool-call-details-{message_id}-{}",
+                            message.ui.output.content_id(step_index)
+                        ))
                         .debug_selector(move || {
                             format!("tool-call-details-{message_id}-{step_index}")
                         })
@@ -1009,92 +1011,6 @@ impl Cowork {
             card
         };
         div().w_full().my_1().child(card).into_any_element()
-    }
-
-    /// An agent message's work in order: its steps except the response,
-    /// with where each steering message joined. Consecutive tool calls sit
-    /// back to back; everything else gets the timeline's usual spacing.
-    fn render_work(
-        &self,
-        thread_id: Uuid,
-        message: &AgentMessage,
-        rights: ApprovalRights,
-        compactions: &[(usize, usize)],
-        cx: &Context<Self>,
-    ) -> Vec<WorkPiece> {
-        let awaiting_step = message.awaiting_approval_step();
-        let mut rendered = Vec::new();
-        let mut calls = Vec::new();
-        let flush = |calls: &mut Vec<gpui::AnyElement>, rendered: &mut Vec<WorkPiece>| {
-            if !calls.is_empty() {
-                rendered.push(WorkPiece::Shown(
-                    div()
-                        .w_full()
-                        .flex()
-                        .flex_col()
-                        .children(calls.drain(..))
-                        .into_any_element(),
-                ));
-            }
-        };
-        for step_index in message.ui.output.work() {
-            for &(index, _) in compactions.iter().filter(|(_, step)| *step == step_index) {
-                flush(&mut calls, &mut rendered);
-                rendered.push(WorkPiece::Shown(Self::render_compaction_marker(
-                    index, false, cx,
-                )));
-            }
-            let (Some(step), Some(view)) = (
-                message.ui.output.steps.get(step_index),
-                message.ui.step_views.get(step_index),
-            ) else {
-                continue;
-            };
-            match (step, view) {
-                (AgentStep::ToolCall(call), _) if awaiting_step == Some(step_index) => {
-                    calls.push(self.render_tool_approval(
-                        thread_id,
-                        message.record.id,
-                        step_index,
-                        call,
-                        rights,
-                        cx,
-                    ));
-                }
-                (AgentStep::ToolCall(call), view) => calls.push(Self::render_tool_call(
-                    thread_id,
-                    message,
-                    step_index,
-                    call,
-                    view.expanded(),
-                    cx,
-                )),
-                (AgentStep::Thinking(_), StepView::Thinking { view, .. }) => {
-                    flush(&mut calls, &mut rendered);
-                    rendered.push(WorkPiece::Shown(Self::render_thinking(
-                        thread_id, message, step_index, view, cx,
-                    )));
-                }
-                (AgentStep::Text(_), StepView::Text { view }) => {
-                    flush(&mut calls, &mut rendered);
-                    rendered.push(WorkPiece::Shown(
-                        TextView::new(view)
-                            .selection_format(SelectionFormat::Plain)
-                            .style(Self::markdown_style(cx))
-                            .w_full()
-                            .into_any_element(),
-                    ));
-                }
-                (AgentStep::Steering, _) => {
-                    flush(&mut calls, &mut rendered);
-                    rendered.push(WorkPiece::Steering);
-                }
-                // The views are kept in step with the output.
-                _ => {}
-            }
-        }
-        flush(&mut calls, &mut rendered);
-        rendered
     }
 
     /// The line summing up an agent message's work, which opens and closes
@@ -1185,7 +1101,7 @@ impl Cowork {
         if self.working_refresh.is_some()
             || !self
                 .active_thread(cx)
-                .is_some_and(|thread| thread.read(cx).generating)
+                .is_some_and(|thread| thread.read(cx).is_generating())
         {
             return;
         }
@@ -1361,28 +1277,21 @@ impl Cowork {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let (compacting, compactions) = self
+        let projection = self
             .thread_store
             .read(cx)
             .thread(thread_id, cx)
             .map(|thread| {
                 let thread = thread.read(cx);
-                let next_prompt = timeline[index + 1..].iter().find_map(|entry| match entry {
-                    TimelineMessage::Agent(message) => Some(message.record.prompt),
-                    TimelineMessage::User(_) => None,
-                });
-                (
-                    message.is_generating() && thread.compacting,
-                    thread
-                        .transcript
-                        .compaction_steps(message.record.prompt, next_prompt),
+                RunProjection::new(
+                    index,
+                    message,
+                    timeline,
+                    thread.transcript.compactions(),
+                    thread.run_activity(message.record.id),
                 )
             })
-            .unwrap_or_default();
-        let waiting = message.is_generating()
-            && !compacting
-            && message.ui.output.steps.is_empty()
-            && message.ui.output.text.is_empty();
+            .unwrap_or_else(|| RunProjection::new(index, message, timeline, &[], None));
         let submitted_comments = submitted_comments
             .iter()
             .map(crate::timeline::SubmittedComment::to_view)
@@ -1462,36 +1371,12 @@ impl Cowork {
             || message.ui.output.work().next().is_some()
             || !matches!(message.record.run.outcome(), Some(RunOutcome::Completed));
         let summary = summarized.then(|| Self::render_work_summary(thread_id, message, cx));
-        // A call waiting for approval shows even in collapsed work, as the
-        // run cannot go on until someone sees it.
-        let work = if message.ui.work_expanded || message.record.awaiting_approval.is_some() {
-            let rights = self
-                .thread_store
-                .read(cx)
-                .thread(thread_id, cx)
-                .map(|thread| ApprovalRights::of(thread.read(cx)))
-                .unwrap_or_default();
-            Some(self.render_work(thread_id, message, rights, &compactions, cx))
-        } else {
-            None
-        };
-        let steering = message
-            .record
-            .steering
-            .iter()
-            .filter_map(|id| {
-                timeline
-                    .iter()
-                    .enumerate()
-                    .find_map(|(group_index, entry)| match entry {
-                        TimelineMessage::User(group) if group.record.id == *id => {
-                            Some((group_index, group))
-                        }
-                        _ => None,
-                    })
-            })
-            .collect::<Vec<_>>();
-
+        let rights = self
+            .thread_store
+            .read(cx)
+            .thread(thread_id, cx)
+            .map(|thread| ApprovalRights::of(thread.read(cx)))
+            .unwrap_or_default();
         let failed = message.record.run.failure().is_some();
         let agent_row = |this: &Self, content: Vec<gpui::AnyElement>, cx: &Context<Self>| {
             div()
@@ -1529,62 +1414,101 @@ impl Cowork {
         let mut rows = Vec::new();
         let mut content = submitted_comment_content;
         content.extend(summary);
-        if waiting {
-            content.push(
-                ShimmerText::new("Thinking\u{2026}")
-                    .id(("agent-waiting", index))
-                    .text_color(cx.theme().muted_foreground)
-                    .into_any_element(),
-            );
-        }
-        let mut steering = steering.into_iter();
-        let show_steering = |this: &mut Self,
-                             group: Option<(usize, &crate::timeline::UserMessage)>,
-                             content: &mut Vec<gpui::AnyElement>,
-                             rows: &mut Vec<gpui::AnyElement>,
-                             cx: &mut Context<Self>| {
-            let Some((group_index, group)) = group else {
-                return;
-            };
-            if !content.is_empty() {
-                rows.push(agent_row(this, std::mem::take(content), cx));
+        let mut calls = Vec::new();
+        let flush = |calls: &mut Vec<gpui::AnyElement>, content: &mut Vec<gpui::AnyElement>| {
+            if !calls.is_empty() {
+                content.push(
+                    div()
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .children(calls.drain(..))
+                        .into_any_element(),
+                );
             }
-            let cards = this.user_group_cards(thread_id, group, cx);
-            rows.push(this.render_user_message_group(group_index, group, cards, cx));
         };
-        for piece in work.into_iter().flatten() {
-            match piece {
-                WorkPiece::Shown(element) => content.push(element),
-                WorkPiece::Steering => {
-                    show_steering(self, steering.next(), &mut content, &mut rows, cx)
+        let awaiting = message.awaiting_approval_step();
+        let mut response = Some(message_content);
+        for item in projection.into_items() {
+            match item {
+                RunItem::Content(step_index) => {
+                    let step = &message.ui.output.steps()[step_index];
+                    let view = message
+                        .ui
+                        .step_view(step_index)
+                        .expect("folded content has its view");
+                    if let AgentStep::ToolCall(call) = step {
+                        calls.push(if awaiting == Some(step_index) {
+                            self.render_tool_approval(
+                                thread_id, message_id, step_index, call, rights, cx,
+                            )
+                        } else {
+                            Self::render_tool_call(
+                                thread_id,
+                                message,
+                                step_index,
+                                call,
+                                view.expanded(),
+                                cx,
+                            )
+                        });
+                    } else {
+                        flush(&mut calls, &mut content);
+                        content.push(match (step, view) {
+                            (AgentStep::Thinking(_), StepView::Thinking { view, .. }) => {
+                                Self::render_thinking(thread_id, message, step_index, view, cx)
+                            }
+                            (AgentStep::Text(_), StepView::Text { view }) => TextView::new(view)
+                                .selection_format(SelectionFormat::Plain)
+                                .style(Self::markdown_style(cx))
+                                .w_full()
+                                .into_any_element(),
+                            _ => unreachable!("reconciled content and view variants agree"),
+                        });
+                    }
+                }
+                item => {
+                    flush(&mut calls, &mut content);
+                    match item {
+                        RunItem::Steering(group_index) => {
+                            if !content.is_empty() {
+                                rows.push(agent_row(self, std::mem::take(&mut content), cx));
+                            }
+                            let TimelineMessage::User(group) = &timeline[group_index] else {
+                                unreachable!("projected submission");
+                            };
+                            let cards = self.user_group_cards(thread_id, group, cx);
+                            rows.push(self.render_user_message_group(
+                                group_index,
+                                group,
+                                cards,
+                                cx,
+                            ));
+                        }
+                        RunItem::Compaction(id) => {
+                            content.push(Self::render_compaction_marker(id.0, false, cx))
+                        }
+                        RunItem::Activity(crate::timeline::RunActivity::Compacting) => {
+                            content.push(Self::render_compaction_marker(index, true, cx))
+                        }
+                        RunItem::Activity(_) => content.push(
+                            ShimmerText::new("Thinking…")
+                                .id(("agent-waiting", index))
+                                .text_color(cx.theme().muted_foreground)
+                                .into_any_element(),
+                        ),
+                        RunItem::Response => content.extend(response.take().unwrap()),
+                        RunItem::Content(_) => unreachable!(),
+                    }
                 }
             }
         }
-        // Collapsed work leaves every steering message here, as does a run
-        // that has taken one its transcript has yet to show.
-        for group in steering {
-            show_steering(self, Some(group), &mut content, &mut rows, cx);
-        }
-        // When work is collapsed its internal boundaries remain visible beside
-        // the summary. Expanded work places them between the actual steps; the
-        // boundary before the response (or next request) belongs here.
-        for &(marker, step) in &compactions {
-            if !(message.ui.work_expanded || message.record.awaiting_approval.is_some())
-                || !message.ui.output.work().any(|index| index == step)
-            {
-                content.push(Self::render_compaction_marker(marker, false, cx));
-            }
-        }
-        if compacting {
-            content.push(Self::render_compaction_marker(index, true, cx));
-        }
-        content.extend(message_content);
         content.extend(failure.map(IntoElement::into_any_element));
         if !content.is_empty() || rows.is_empty() {
             rows.push(agent_row(self, content, cx));
         }
         div()
-            .id(("timeline-message", index))
+            .id(format!("timeline-run-{message_id}"))
             .w_full()
             .flex()
             .flex_col()

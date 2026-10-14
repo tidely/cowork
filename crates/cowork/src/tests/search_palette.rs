@@ -47,14 +47,10 @@ fn reply(text: &str, cx: &mut App) -> TimelineMessage {
             steering: Vec::new(),
         },
         ui: crate::timeline::AgentMessageUi {
-            output: AgentOutput {
-                thinking_complete: true,
-                text: text.into(),
-                ..Default::default()
-            },
+            output: AgentOutput::for_test(Vec::new(), text.into(), true),
             committed: Default::default(),
             comment_calls_checked: 0,
-            step_views: Vec::new(),
+            step_views: Default::default(),
             text_view: cx.new(|cx| TextViewState::markdown(text, cx)),
             comment_responses: Vec::new(),
             work_expanded: false,

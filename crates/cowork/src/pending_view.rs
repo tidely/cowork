@@ -2,6 +2,8 @@
 //! separators distinguish delivery timing; steering shares one batch, while
 //! each queued submission has its own boundary and cancellation.
 
+use crate::timeline_projection::PendingItem;
+
 use gpui::{AnyElement, App, Context, IntoElement, canvas, div, prelude::*, px, size};
 use gpui_component::{
     ActiveTheme as _, Sizable as _,
@@ -103,17 +105,17 @@ impl Cowork {
         &self,
         thread_id: Uuid,
         start_index: usize,
+        items: &[PendingItem],
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
         let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
             return Vec::new();
         };
         let state = thread.read(cx);
-        let mut pending = state.pending_submissions().to_vec();
-        if pending.is_empty() {
+        if items.is_empty() {
             return Vec::new();
         }
-        pending.sort_by_key(|pending| pending.mode != SubmissionMode::Steering);
+        let pending = state.pending_submissions().to_vec();
         let can_cancel = state.can_control_generation();
         let cards = pending
             .iter()
@@ -133,7 +135,24 @@ impl Cowork {
             })
             .collect::<Vec<_>>();
         let mut rows = Vec::with_capacity(pending.len() + 1);
-        for (index, (pending, cards)) in pending.into_iter().zip(cards).enumerate() {
+        let mut cards = cards.into_iter().map(Some).collect::<Vec<_>>();
+        for (position, item) in items.iter().enumerate() {
+            let index = match *item {
+                PendingItem::DraftBoundary => {
+                    rows.push(
+                        div()
+                            .mt_6()
+                            .child(self.pending_separator("Draft", false, None, cx))
+                            .into_any_element(),
+                    );
+                    continue;
+                }
+                PendingItem::Submission(index) => index,
+            };
+            let pending = &pending[index];
+            let cards = cards[index]
+                .take()
+                .expect("one projected row per pending submission");
             let label = match pending.mode {
                 SubmissionMode::Steering => "Steering",
                 SubmissionMode::Queue => "Queued",
@@ -151,20 +170,14 @@ impl Cowork {
                         cx,
                     ))
                     .child(self.render_user_message_group(
-                        start_index + index,
-                        &pending.group.into(),
+                        start_index + position,
+                        &pending.group.clone().into(),
                         cards,
                         cx,
                     ))
                     .into_any_element(),
             );
         }
-        rows.push(
-            div()
-                .mt_6()
-                .child(self.pending_separator("Draft", false, None, cx))
-                .into_any_element(),
-        );
         rows
     }
 }

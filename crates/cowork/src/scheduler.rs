@@ -269,7 +269,7 @@ impl Cowork {
                 store
                     .thread(thread_id, cx)
                     .or_else(|| store.archived_thread(thread_id, cx))
-                    .is_some_and(|thread| thread.read(cx).generating)
+                    .is_some_and(|thread| thread.read(cx).is_generating())
             });
         if thread_busy {
             Some(Blocked::Thread)

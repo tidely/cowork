@@ -564,14 +564,14 @@ impl<'a> Collaboration<'a> {
                         steering: Vec::new(),
                     },
                     ui: crate::timeline::AgentMessageUi {
-                        output: crate::timeline::AgentOutput {
-                            thinking_complete: true,
-                            text: text.clone(),
-                            ..Default::default()
-                        },
+                        output: crate::timeline::AgentOutput::for_test(
+                            Vec::new(),
+                            text.clone(),
+                            true,
+                        ),
                         committed: Default::default(),
                         comment_calls_checked: 0,
-                        step_views: Vec::new(),
+                        step_views: Default::default(),
                         text_view: cx.new(|cx| TextViewState::markdown(&text, cx)),
                         comment_responses: Vec::new(),
                         work_expanded: false,

@@ -494,11 +494,11 @@ pub(super) fn timeline(count: usize, response: &str, cx: &mut gpui::App) -> Vec<
                     cx,
                 );
                 message.show_output(
-                    AgentOutput {
-                        steps: vec![AgentStep::Text(response.into())],
-                        thinking_complete: true,
-                        text: response.into(),
-                    },
+                    AgentOutput::for_test(
+                        vec![AgentStep::Text(response.into())],
+                        response.into(),
+                        true,
+                    ),
                     cx,
                 );
                 message.ui.committed = OutputMark {

@@ -375,14 +375,10 @@ fn assert_backslash_selection_creates_comment(
                 steering: Vec::new(),
             },
             ui: crate::timeline::AgentMessageUi {
-                output: crate::timeline::AgentOutput {
-                    thinking_complete: true,
-                    text: main_text.into(),
-                    ..Default::default()
-                },
+                output: crate::timeline::AgentOutput::for_test(Vec::new(), main_text.into(), true),
                 committed: Default::default(),
                 comment_calls_checked: 0,
-                step_views: Vec::new(),
+                step_views: Default::default(),
                 text_view: main_text_view,
                 comment_responses: target_comment_reply
                     .then(|| AgentCommentResponse {
@@ -702,14 +698,10 @@ fn commenting_on_a_long_response_keeps_the_timeline_scroll_position(cx: &mut gpu
                 steering: Vec::new(),
             },
             ui: crate::timeline::AgentMessageUi {
-                output: crate::timeline::AgentOutput {
-                    thinking_complete: true,
-                    text: markdown.clone(),
-                    ..Default::default()
-                },
+                output: crate::timeline::AgentOutput::for_test(Vec::new(), markdown.clone(), true),
                 committed: Default::default(),
                 comment_calls_checked: 0,
-                step_views: Vec::new(),
+                step_views: Default::default(),
                 text_view: cx.new(|cx| TextViewState::markdown(&markdown, cx)),
                 comment_responses: Vec::new(),
                 work_expanded: false,

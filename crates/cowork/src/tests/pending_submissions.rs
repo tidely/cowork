@@ -189,7 +189,7 @@ fn completed_runs_start_one_queued_message_but_stopping_preserves_pending(
         )
     });
     thread.read_with(session.cx, |thread, _| {
-        assert!(thread.generating);
+        assert!(thread.is_generating());
         assert_eq!(thread.pending_submissions().len(), 1);
         assert_eq!(thread.pending_submissions()[0].group.blocks[0].text, "second queued");
         assert_eq!(thread.submission_count(), 2);
@@ -212,7 +212,7 @@ fn completed_runs_start_one_queued_message_but_stopping_preserves_pending(
         )
     });
     thread.read_with(session.cx, |thread, _| {
-        assert!(!thread.generating);
+        assert!(!thread.is_generating());
         assert_eq!(thread.pending_submissions().len(), 1);
     });
     let sequence = thread.read_with(session.cx, |thread, _| thread.submission_count());
@@ -229,7 +229,7 @@ fn completed_runs_start_one_queued_message_but_stopping_preserves_pending(
             },
             cx
         ));
-        assert!(thread.read(cx).generating);
+        assert!(thread.read(cx).is_generating());
         assert!(thread.read(cx).pending_submissions().is_empty());
         assert_eq!(thread.read(cx).submission_count(), sequence);
         assert!(thread.read(cx).draft().items().is_empty());
@@ -263,7 +263,7 @@ fn stop_wins_late_completion_and_resume_delivers_steering_before_the_queue(
             },
             cx,
         );
-        assert!(!thread.read(cx).generating);
+        assert!(!thread.read(cx).is_generating());
         assert_eq!(thread.read(cx).pending_submissions().len(), 3);
     });
     let mirror = session.collaborator_thread().unwrap();
@@ -271,7 +271,7 @@ fn stop_wins_late_completion_and_resume_delivers_steering_before_the_queue(
         "stopped pending messages reach the collaborator",
         |session| {
             mirror.read_with(session.cx, |thread, _| {
-                !thread.generating && thread.pending_submissions().len() == 3
+                !thread.is_generating() && thread.pending_submissions().len() == 3
             })
         },
     );
@@ -288,7 +288,7 @@ fn stop_wins_late_completion_and_resume_delivers_steering_before_the_queue(
             },
             cx,
         ));
-        assert!(thread.read(cx).generating);
+        assert!(thread.read(cx).is_generating());
         assert_eq!(thread.read(cx).pending_submissions().len(), 2);
         assert_eq!(thread.read(cx).submission_count(), 3);
         assert!(thread.read(cx).timeline.iter().any(|entry| matches!(
@@ -308,7 +308,7 @@ fn stop_wins_late_completion_and_resume_delivers_steering_before_the_queue(
                 cx,
             );
             let state = thread.read(cx);
-            assert!(state.generating);
+            assert!(state.is_generating());
             assert_eq!(state.pending_submissions().len(), remaining);
             let timeline = &state.timeline;
             let latest = timeline.iter().rev().find_map(|entry| match entry {
@@ -370,7 +370,7 @@ fn consumed_steering_cannot_be_cancelled_and_mirrors_keep_the_prompt_out_of_outp
         assert_eq!(steering.record.id, id);
         assert_eq!(agent.record.steering, vec![id]);
         assert!(matches!(
-            &agent.ui.output.steps[..],
+            agent.ui.output.steps(),
             [AgentStep::Steering, AgentStep::Text(text)] if text == "updated answer"
         ));
         assert_eq!(agent.ui.output.text, "updated answer");
@@ -395,7 +395,7 @@ fn consumed_steering_cannot_be_cancelled_and_mirrors_keep_the_prompt_out_of_outp
         };
         assert_eq!(agent.record.steering.len(), 1);
         assert!(matches!(thread.timeline[1], TimelineMessage::User(_)));
-        assert!(matches!(agent.ui.output.steps[0], AgentStep::Steering));
+        assert!(matches!(agent.ui.output.steps()[0], AgentStep::Steering));
     });
     task.abort();
 }
@@ -514,7 +514,7 @@ fn empty_draft_resume_rejects_write_only_peer_before_starting_any_run(
             },
             cx
         ));
-        assert!(!thread.read(cx).generating);
+        assert!(!thread.read(cx).is_generating());
         assert_eq!(thread.read(cx).pending_submissions().len(), 1);
         assert_eq!(thread.read(cx).submission_count(), 1);
     });

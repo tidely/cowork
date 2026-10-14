@@ -615,7 +615,7 @@ fn compaction_events_preserve_previous_context_on_failure_and_stop(cx: &mut gpui
         )
         .unwrap();
     assert_eq!(thread.transcript.latest_compaction(), Some(&previous));
-    assert!(!thread.compacting);
+    assert!(!thread.is_compacting());
     thread
         .try_apply_for_test(protocol::HostMessage::CompactionStarted, cx)
         .unwrap();
@@ -629,7 +629,7 @@ fn compaction_events_preserve_previous_context_on_failure_and_stop(cx: &mut gpui
             cx,
         )
         .unwrap();
-    assert!(!thread.compacting);
+    assert!(!thread.is_compacting());
     assert_eq!(thread.transcript.latest_compaction(), Some(&previous));
     assert_eq!(thread.transcript.messages.len(), 2);
 }

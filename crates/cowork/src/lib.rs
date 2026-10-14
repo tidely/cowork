@@ -4,7 +4,7 @@
 
 use std::{
     cell::Cell,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     rc::Rc,
     sync::{Arc, OnceLock},
 };
@@ -38,6 +38,7 @@ use crate::{
     thread::{Thread, ThreadStore},
     thread_draft::ThreadDraft,
     timeline::{PromptBlock, ThreadMessageId, TimelineMessage},
+    timeline_projection::{TimelineItem, TimelineProjection},
     timeline_view::{SegmentTextView, ShownSegments},
     timeline_virtualization::DeferredTimelineRow,
     top_bar::macos_traffic_light_position,
@@ -85,6 +86,7 @@ mod theme;
 mod thread;
 use thread::{draft as thread_draft, sharing, submission};
 mod timeline;
+mod timeline_projection;
 mod timeline_view;
 mod timeline_virtualization;
 mod tool_approval;
@@ -330,19 +332,19 @@ impl Cowork {
             && !gpui_base::TextSelection::has_selection(window, cx);
         let messages = Rc::new(messages);
         let comments = Rc::new(comments);
+        let projection = active_thread_id
+            .and_then(|id| self.thread_store.read(cx).thread(id, cx))
+            .map(|thread| {
+                let thread = thread.read(cx);
+                TimelineProjection::new(
+                    &messages,
+                    thread.transcript.compactions(),
+                    thread.pending_submissions(),
+                )
+            })
+            .unwrap_or_default();
         let mut timeline_messages = Vec::new();
         if let Some(thread_id) = active_thread_id {
-            // Shown by the agent messages they steer.
-            let steering = messages
-                .iter()
-                .filter_map(|message| match message {
-                    TimelineMessage::Agent(message) => {
-                        Some(message.record.steering.iter().copied())
-                    }
-                    TimelineMessage::User(_) => None,
-                })
-                .flatten()
-                .collect::<HashSet<_>>();
             let user_stable = |group: &timeline::UserMessage| {
                 group.record.comments.is_empty()
                     && group
@@ -351,45 +353,21 @@ impl Cowork {
                         .iter()
                         .all(|block| block.attachments.is_empty())
             };
-            for (index, message) in messages.iter().enumerate() {
-                if let TimelineMessage::User(group) = message
-                    && steering.contains(&group.record.id)
-                {
-                    continue;
-                }
-                // Pre-run compaction covers the history before the new prompt.
-                // Keep its marker outside the deferred message row so it stays
-                // visible even when history is culled.
-                if let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) {
-                    let thread = thread.read(cx);
-                    let run = match message {
-                        TimelineMessage::User(_) => messages.get(index + 1),
-                        TimelineMessage::Agent(_)
-                            if index == 0
-                                || !matches!(messages[index - 1], TimelineMessage::User(_)) =>
-                        {
-                            Some(message)
-                        }
-                        _ => None,
-                    };
-                    if let Some(TimelineMessage::Agent(run)) = run {
-                        for (marker, _) in thread
-                            .transcript
-                            .compactions()
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, compaction)| compaction.resume_at == run.record.prompt)
-                        {
-                            timeline_messages.push(
-                                div()
-                                    .w_full()
-                                    .px(px(40.))
-                                    .child(Self::render_compaction_marker(marker, false, cx))
-                                    .into_any_element(),
-                            );
-                        }
+            for item in projection.history() {
+                let index = match *item {
+                    TimelineItem::Compaction(id) => {
+                        timeline_messages.push(
+                            div()
+                                .w_full()
+                                .px(px(40.))
+                                .child(Self::render_compaction_marker(id.0, false, cx))
+                                .into_any_element(),
+                        );
+                        continue;
                     }
-                }
+                    TimelineItem::Message(index) => index,
+                };
+                let message = &messages[index];
                 let submitted_comments = match message {
                     TimelineMessage::Agent(message) => message
                         .record
@@ -505,7 +483,9 @@ impl Cowork {
         let can_write = composer.is_some();
         let composer = composer.map(|composer| self.render_composer(composer, cx));
         let pending_rows = active_thread_id
-            .map(|thread_id| self.render_pending_messages(thread_id, messages.len(), cx))
+            .map(|thread_id| {
+                self.render_pending_messages(thread_id, messages.len(), projection.pending(), cx)
+            })
             .unwrap_or_default();
 
         div()

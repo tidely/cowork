@@ -20,15 +20,15 @@ fn inline_compaction_status_becomes_persistent_dividers(cx: &mut gpui::TestAppCo
                 cx,
             );
             let thread_id = Uuid::new_v4();
-            let thread = cx.new(|_| {
+            let thread = cx.new(|cx| {
                 let mut thread = test_thread(
                     thread_id,
                     vec![TimelineMessage::Agent(message)],
                     ThreadDraft::new(ParticipantId::new()),
                 );
                 thread.transcript.append(RigMessage::user("Request"));
-                thread.generating = true;
-                thread.compacting = true;
+                thread.set_generating_for_test(true, cx);
+                thread.apply_for_test(protocol::HostMessage::CompactionStarted, cx);
                 thread
             });
             cowork
@@ -45,10 +45,12 @@ fn inline_compaction_status_becomes_persistent_dividers(cx: &mut gpui::TestAppCo
     // A rejected summary removes the live status without creating history.
     cx.update(|_, cx| {
         cowork.update(cx, |cowork, cx| {
-            cowork
-                .active_thread(cx)
-                .unwrap()
-                .update(cx, |thread, _| thread.compacting = false);
+            cowork.active_thread(cx).unwrap().update(cx, |thread, cx| {
+                thread.apply_for_test(
+                    protocol::HostMessage::CompactionFinished { context: None },
+                    cx,
+                )
+            });
             cx.notify();
         })
     });
@@ -60,7 +62,7 @@ fn inline_compaction_status_becomes_persistent_dividers(cx: &mut gpui::TestAppCo
     // even with work collapsed and while another summary runs.
     cx.update(|_, cx| {
         cowork.update(cx, |cowork, cx| {
-            cowork.active_thread(cx).unwrap().update(cx, |thread, _| {
+            cowork.active_thread(cx).unwrap().update(cx, |thread, cx| {
                 for _ in 0..2 {
                     thread
                         .transcript
@@ -75,7 +77,7 @@ fn inline_compaction_status_becomes_persistent_dividers(cx: &mut gpui::TestAppCo
                     .unwrap()
                     .ui
                     .work_expanded = false;
-                thread.compacting = true;
+                thread.apply_for_test(protocol::HostMessage::CompactionStarted, cx);
             });
             cx.notify();
         })
@@ -89,9 +91,8 @@ fn inline_compaction_status_becomes_persistent_dividers(cx: &mut gpui::TestAppCo
 
     cx.update(|_, cx| {
         cowork.update(cx, |cowork, cx| {
-            cowork.active_thread(cx).unwrap().update(cx, |thread, _| {
-                thread.compacting = false;
-                thread.generating = false;
+            cowork.active_thread(cx).unwrap().update(cx, |thread, cx| {
+                thread.set_generating_for_test(false, cx);
                 thread
                     .agent_message_mut(message_id.into_bytes())
                     .unwrap()
@@ -145,7 +146,7 @@ fn inline_compaction_status_becomes_persistent_dividers(cx: &mut gpui::TestAppCo
                 thread
                     .transcript
                     .append(RigMessage::assistant("Next answer"));
-                thread.restore_agent_output(cx);
+                thread.restore_agent_output(false, cx);
             });
             cx.notify();
         });
@@ -390,11 +391,7 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
             AgentStep::Thinking("Check them.".into()),
         ];
         message.show_output(
-            crate::timeline::AgentOutput {
-                steps,
-                thinking_complete: true,
-                text: String::new(),
-            },
+            crate::timeline::AgentOutput::for_test(steps, String::new(), true),
             cx,
         );
         let thread = cx.new(|_| {
@@ -485,8 +482,7 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
             };
             message
                 .ui
-                .step_views
-                .iter()
+                .views()
                 .enumerate()
                 .filter(|(_, view)| view.expanded())
                 .map(|(index, _)| index)
@@ -536,16 +532,16 @@ fn steering_shows_where_it_joined_the_work(cx: &mut gpui::TestAppContext) {
         );
         message.record.steering = vec![steering_id];
         message.show_output(
-            crate::timeline::AgentOutput {
-                steps: vec![
+            crate::timeline::AgentOutput::for_test(
+                vec![
                     AgentStep::Thinking("Before.".into()),
                     AgentStep::Steering,
                     AgentStep::Thinking("After.".into()),
                     AgentStep::Text("Done.".into()),
                 ],
-                thinking_complete: true,
-                text: "Done.".into(),
-            },
+                "Done.".into(),
+                true,
+            ),
             cx,
         );
         let steering = UserMessageGroup {

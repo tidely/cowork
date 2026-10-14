@@ -677,7 +677,7 @@ fn readonly_and_write_cannot_submit_by_keyboard_or_direct_actions(cx: &mut gpui:
         assert_eq!(session.bodies(&host_thread), ["from the host"]);
         session.host_thread.read_with(session.cx, |thread, _| {
             assert_eq!(thread.submission_count(), 0);
-            assert!(!thread.generating);
+            assert!(!thread.is_generating());
             assert!(thread.transcript.messages.is_empty());
             assert_eq!(thread.model().cloned(), Some(ollama_qwen()));
         });
@@ -749,7 +749,7 @@ fn host_acceptance_checks_the_remote_actor_not_the_local_host_mode(cx: &mut gpui
     assert!(session.items(&host_thread).is_empty());
     session.wait_until("authorized submission reaches the mirror", |this| {
         mirror.read_with(this.cx, |thread, _| {
-            thread.submission_count() == 1 && thread.generating
+            thread.submission_count() == 1 && thread.is_generating()
         })
     });
 }

@@ -16,6 +16,14 @@ snapshots carry the whole `Transcript` as one `Json<Transcript>` value, includin
 original messages and compactions, plus the run records and their JSON-wrapped pending events. All history and local views remain
 in memory; there is no transcript offloading or history paging.
 
+The visible timeline is a local, pure projection of these records, summary
+boundaries, pending submissions, and active run activity. It owns placement and
+collapse behavior; synthetic rows never enter the agent transcript or the wire
+history. Folded content carries its original message/part position, and local
+step views are reconciled by those keys rather than display indices. A thread
+owns at most one active execution, whose activity and event fold end together;
+stopped and failed run records still retain their unfinished replay events.
+
 Ollama context compaction runs before a new agent run and between model
 requests within a run, after all tool results and before queued steering.
 This includes queued and scheduled runs. The host triggers it when the last measured
