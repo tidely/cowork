@@ -1001,14 +1001,15 @@ mod tests {
         assert!(filesystem.readonly_paths.contains(&zed_path));
         let writable_paths = vec![scratch_path.clone()];
         #[cfg(unix)]
-        {
+        let writable_paths = {
             let mut writable_paths = writable_paths;
             writable_paths.extend(
                 settings::WRITABLE_DEVICES
                     .iter()
                     .map(|path| (*path).to_owned()),
             );
-        }
+            writable_paths
+        };
         assert_eq!(filesystem.readwrite_paths, writable_paths);
         for path in system_read_paths().unwrap() {
             assert!(
