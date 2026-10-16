@@ -96,12 +96,13 @@ impl Cowork {
     pub(crate) fn render_settings_page(
         &self,
         page: SettingsPage,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         match page {
             SettingsPage::Profile => self.render_profile_page(cx).into_any_element(),
             SettingsPage::Providers => self.render_providers_page(cx).into_any_element(),
-            SettingsPage::Context => self.render_context_page(cx).into_any_element(),
+            SettingsPage::Context => self.render_context_page(window, cx).into_any_element(),
         }
     }
 

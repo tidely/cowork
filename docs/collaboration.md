@@ -32,10 +32,11 @@ stopped and failed run records still retain their unfinished replay events.
 Ollama context compaction runs before a new agent run and between model
 requests within a run, after all tool results and before queued steering.
 This includes queued and scheduled runs. The host triggers it when the last measured
-context (plus unmeasured tool-result or streamed-output estimates) reaches both the configured percentage
-and minimum used tokens (defaults: 80% and 65,536). Windows no larger than the
-minimum cannot compact. The Context settings page also controls the default
-Ollama window (131,072 tokens). Window changes update all local thread catalogs,
+context (plus unmeasured tool-result or streamed-output estimates) reaches the
+configured percentage of the context window (default: 80%), with no minimum-used-token
+floor. The Context settings page also controls the default Ollama window
+(131,072 tokens), accepting custom counts down to 1,024 tokens and stepping through
+powers of two. Window changes update all local thread catalogs,
 including archived threads, and reach collaborators through `ModelCatalogChanged`.
 Discovery uses the current setting. The indicator and examples update immediately;
 runs already in progress keep their captured window and compaction policy until

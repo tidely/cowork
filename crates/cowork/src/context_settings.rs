@@ -1,10 +1,14 @@
 //! The local context settings and the shared context details shown by the
-//! composer and the component preview. The minimum is a floor on context
-//! usage, so lowering the percentage cannot compact a small conversation.
+//! composer and the component preview. Compaction starts at the configured
+//! percentage of the context window.
 
-use gpui::{App, Context, Div, IntoElement, div, prelude::*, px, relative};
+use gpui::{
+    App, Context, Div, Entity, IntoElement, Subscription, Window, div, prelude::*, px, relative,
+};
+use gpui_base::input::{InputEvent, InputState};
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, button::Button, progress::ProgressCircle,
+    ActiveTheme as _, Disableable as _, Sizable as _, button::Button, input::Input,
+    progress::ProgressCircle,
 };
 
 use crate::{
@@ -12,13 +16,14 @@ use crate::{
     usage::{ContextUsage, format_token_count},
 };
 
+const MIN_CONTEXT_TOKENS: u64 = 1_024;
+
 /// App-session policy; like provider selection, this is local to the host.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ContextSettings {
     /// Requested Ollama window for local threads; mirrored in model catalogs.
     pub(crate) window_tokens: u64,
     pub(crate) threshold_percent: u8,
-    pub(crate) min_tokens: u64,
 }
 
 impl Default for ContextSettings {
@@ -26,7 +31,6 @@ impl Default for ContextSettings {
         Self {
             window_tokens: 131_072,
             threshold_percent: 80,
-            min_tokens: 65_536,
         }
     }
 }
@@ -40,15 +44,14 @@ impl ContextSettings {
         }
     }
 
-    /// The first eligible context size. A minimum filling the entire window
-    /// disables compaction rather than leaving no room for its summary.
+    /// The first eligible context size, rounded up to a whole token.
     pub(crate) fn threshold(self, max_tokens: u64) -> Option<u64> {
-        if max_tokens == 0 || self.min_tokens >= max_tokens {
+        if max_tokens == 0 {
             return None;
         }
         let percentage = (u128::from(max_tokens) * u128::from(self.threshold_percent.clamp(1, 95)))
             .div_ceil(100);
-        Some((percentage as u64).max(self.min_tokens))
+        Some(percentage as u64)
     }
 }
 
@@ -70,8 +73,7 @@ pub(crate) fn context_ring(
         .size(px(16.))
 }
 
-/// Context usage and its fixed compaction marker. The marker reflects both
-/// settings, including cases where the minimum delays the chosen percentage.
+/// Context usage and its marker at the configured compaction percentage.
 pub(crate) fn context_details(
     usage: ContextUsage,
     settings: Option<ContextSettings>,
@@ -84,30 +86,12 @@ pub(crate) fn context_details(
     let status = match (compacting, settings, threshold) {
         (true, _, _) => "Compacting conversation…".to_owned(),
         (_, None, _) => "Host controls compaction".to_owned(),
-        (_, Some(settings), Some(tokens)) => {
-            let effective = trigger.unwrap() * 100.;
-            if tokens == settings.min_tokens && effective > f32::from(settings.threshold_percent) {
-                format!(
-                    "Compact at {:.0}% · minimum {} (set to {}%)",
-                    effective,
-                    format_token_count(tokens),
-                    settings.threshold_percent
-                )
-            } else {
-                format!(
-                    "Compact at {}% · {} tokens",
-                    settings.threshold_percent,
-                    format_token_count(tokens)
-                )
-            }
-        }
-        (_, _, None) if usage.max_tokens == 0 => {
-            "Compaction awaits a known context size".to_owned()
-        }
-        (_, Some(settings), None) => format!(
-            "Compaction off · minimum {} is at or above this window",
-            format_token_count(settings.min_tokens)
+        (_, Some(settings), Some(tokens)) => format!(
+            "Compact at {}% · {} tokens",
+            settings.threshold_percent,
+            format_token_count(tokens)
         ),
+        (_, Some(_), None) => "Compaction awaits a known context size".to_owned(),
     };
     div()
         .w(px(260.))
@@ -173,19 +157,97 @@ pub(crate) fn context_details(
         )
 }
 
-/// Small steppers keep the first UI iteration immediately editable without
-/// giving the context tooltip an accidental drag interaction.
+/// Move to an adjacent power of two, including from a custom token count.
+fn step_tokens(value: u64, minimum: u64, up: bool) -> u64 {
+    if up {
+        value
+            .checked_add(1)
+            .and_then(u64::checked_next_power_of_two)
+            .unwrap_or(value)
+            .max(minimum)
+    } else {
+        let previous = value
+            .checked_sub(1)
+            .filter(|value| *value > 0)
+            .map(|value| 1u64 << value.ilog2())
+            .unwrap_or(0);
+        previous.max(minimum)
+    }
+}
+
+/// Keep incomplete edits local; only valid counts reach the host's settings.
+struct TokenInput {
+    settings: ContextSettings,
+    input: Entity<InputState>,
+    _subscription: Subscription,
+}
+
+fn token_input<T: 'static>(
+    key: &'static str,
+    settings: ContextSettings,
+    window: &mut Window,
+    cx: &mut Context<T>,
+    change: fn(&mut T, ContextSettings, &mut Context<T>),
+) -> gpui::Stateful<Div> {
+    let owner = cx.entity().downgrade();
+    let state = window.use_keyed_state(key, cx, |window, cx| {
+        let input = cx.new(|cx| {
+            InputState::new(window, cx).default_value(settings.window_tokens.to_string())
+        });
+        let subscription = cx.subscribe_in(
+            &input,
+            window,
+            move |this: &mut TokenInput, input, event, window, cx| match event {
+                InputEvent::Change => {
+                    if let Ok(value) = input.read(cx).value().trim().parse::<u64>()
+                        && value >= MIN_CONTEXT_TOKENS
+                        && value != this.settings.window_tokens
+                    {
+                        this.settings.window_tokens = value;
+                        let _ = owner.update(cx, |owner, cx| change(owner, this.settings, cx));
+                    }
+                }
+                InputEvent::Blur | InputEvent::PressEnter { .. } => {
+                    input.update(cx, |input, cx| {
+                        input.set_value(this.settings.window_tokens.to_string(), window, cx)
+                    });
+                }
+                _ => {}
+            },
+        );
+        TokenInput {
+            settings,
+            input,
+            _subscription: subscription,
+        }
+    });
+    let input = state.update(cx, |state, cx| {
+        if state.settings.window_tokens != settings.window_tokens {
+            state.input.update(cx, |input, cx| {
+                input.set_value(settings.window_tokens.to_string(), window, cx)
+            });
+        }
+        state.settings = settings;
+        state.input.clone()
+    });
+    div()
+        .id(key)
+        .debug_selector(move || key.to_owned())
+        .child(Input::new(&input).small().w(px(112.)))
+}
+
 pub(crate) fn controls<T: 'static>(
     settings: ContextSettings,
-    cx: &Context<T>,
+    window: &mut Window,
+    cx: &mut Context<T>,
     change: fn(&mut T, ContextSettings, &mut Context<T>),
 ) -> Div {
     let window_down = ContextSettings {
-        window_tokens: settings.window_tokens.saturating_sub(8_192).max(8_192),
+        window_tokens: step_tokens(settings.window_tokens, MIN_CONTEXT_TOKENS, false),
         ..settings
     };
     let window_up = ContextSettings {
-        window_tokens: settings.window_tokens.saturating_add(8_192),
+        window_tokens: step_tokens(settings.window_tokens, MIN_CONTEXT_TOKENS, true),
         ..settings
     };
     let percentage_down = ContextSettings {
@@ -196,37 +258,33 @@ pub(crate) fn controls<T: 'static>(
         threshold_percent: settings.threshold_percent.saturating_add(5).min(95),
         ..settings
     };
-    let minimum_down = ContextSettings {
-        min_tokens: settings.min_tokens.saturating_sub(8_192),
-        ..settings
-    };
-    let minimum_up = ContextSettings {
-        min_tokens: settings.min_tokens.saturating_add(8_192),
-        ..settings
-    };
-    let stepper = |key: &'static str, value: String, down, up, disabled_down, disabled_up| {
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .child(
-                Button::new((key, 0usize))
-                    .label("−")
-                    .small()
-                    .outline()
-                    .disabled(disabled_down)
-                    .on_click(cx.listener(move |this, _, _, cx| change(this, down, cx))),
-            )
-            .child(div().min_w(px(92.)).text_center().text_sm().child(value))
-            .child(
-                Button::new((key, 1usize))
-                    .label("+")
-                    .small()
-                    .outline()
-                    .disabled(disabled_up)
-                    .on_click(cx.listener(move |this, _, _, cx| change(this, up, cx))),
-            )
-    };
+
+    let window_input = token_input("context-window-input", settings, window, cx, change);
+
+    let stepper =
+        |key: &'static str, value: gpui::AnyElement, down, up, disabled_down, disabled_up| {
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .child(
+                    Button::new((key, 0usize))
+                        .label("−")
+                        .small()
+                        .outline()
+                        .disabled(disabled_down)
+                        .on_click(cx.listener(move |this, _, _, cx| change(this, down, cx))),
+                )
+                .child(div().min_w(px(92.)).text_center().text_sm().child(value))
+                .child(
+                    Button::new((key, 1usize))
+                        .label("+")
+                        .small()
+                        .outline()
+                        .disabled(disabled_up)
+                        .on_click(cx.listener(move |this, _, _, cx| change(this, up, cx))),
+                )
+        };
     let row = |title: &'static str, description: &'static str, control: Div| {
         div()
             .flex()
@@ -262,14 +320,14 @@ pub(crate) fn controls<T: 'static>(
         .flex_col()
         .child(row(
             "Default context window",
-            "Tokens available to the agent. Adjust in steps of 8,192.",
+            "Enter a token count (at least 1,024), or step through powers of two.",
             stepper(
                 "context-window",
-                settings.window_tokens.to_string(),
+                window_input.into_any_element(),
                 window_down,
                 window_up,
-                settings.window_tokens <= 8_192,
-                settings.window_tokens == u64::MAX,
+                settings.window_tokens <= MIN_CONTEXT_TOKENS,
+                window_up.window_tokens == settings.window_tokens,
             ),
         ))
         .child(row(
@@ -277,23 +335,13 @@ pub(crate) fn controls<T: 'static>(
             "Summarize before the next response when this limit is reached.",
             stepper(
                 "compaction-percent",
-                format!("{}%", settings.threshold_percent),
+                div()
+                    .child(format!("{}%", settings.threshold_percent))
+                    .into_any_element(),
                 percentage_down,
                 percentage_up,
                 settings.threshold_percent <= 5,
                 settings.threshold_percent >= 95,
-            ),
-        ))
-        .child(row(
-            "Minimum context",
-            "Wait until this many tokens are in use. Adjust in steps of 8,192.",
-            stepper(
-                "compaction-minimum",
-                settings.min_tokens.to_string(),
-                minimum_down,
-                minimum_up,
-                settings.min_tokens == 0,
-                settings.min_tokens == u64::MAX,
             ),
         ))
 }
@@ -316,7 +364,11 @@ impl Cowork {
         cx.notify();
     }
 
-    pub(crate) fn render_context_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_context_page(
+        &self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let settings = self.context_settings;
         div().id("context-page").debug_selector(|| "context-page".to_owned())
             .flex_1().min_h_0().min_w_0().rounded_tl(px(12.)).border_t_1().border_l_1()
@@ -325,9 +377,9 @@ impl Cowork {
                 .child(div().text_lg().child("Context"))
                 .child(div().text_sm().text_color(cx.theme().muted_foreground)
                     .child("Choose how much context the agent can use and when long conversations are summarized."))
-                .child(controls(settings, cx, Self::set_context_settings))
+                .child(controls(settings, window, cx, Self::set_context_settings))
                 .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                    .child("Changes apply for this app session. The window applies to new and existing local chats from their next agent run. Shared chats use their host’s window. Both compaction limits must be reached; windows at or below the minimum cannot compact."))
+                    .child("Changes apply for this app session. The window applies to new and existing local chats from their next agent run. Shared chats use their host’s window. Compaction starts when context usage reaches the selected percentage."))
                 .child(div().pt_4().text_sm().child(format!("Example · {}-token window", settings.window_tokens)))
                 .child(context_details(settings.example_usage(60), Some(settings), false, cx)))
     }
@@ -338,17 +390,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn threshold_obeys_the_minimum_and_leaves_headroom() {
+    fn token_steps_use_adjacent_powers_and_respect_bounds() {
+        for (value, down, up) in [
+            (0, 0, 1),
+            (1, 0, 2),
+            (65_536, 32_768, 131_072),
+            (100_000, 65_536, 131_072),
+            (131_072, 65_536, 262_144),
+            (1u64 << 63, 1u64 << 62, 1u64 << 63),
+            (u64::MAX, 1u64 << 63, u64::MAX),
+        ] {
+            assert_eq!(step_tokens(value, 0, false), down);
+            assert_eq!(step_tokens(value, 0, true), up);
+        }
+        assert_eq!(step_tokens(1_024, MIN_CONTEXT_TOKENS, false), 1_024);
+        assert_eq!(step_tokens(1_025, MIN_CONTEXT_TOKENS, false), 1_024);
+        assert_eq!(step_tokens(1_024, MIN_CONTEXT_TOKENS, true), 2_048);
+        assert_eq!(step_tokens(2_048, MIN_CONTEXT_TOKENS, false), 1_024);
+    }
+
+    #[test]
+    fn threshold_uses_the_percentage_even_for_small_windows() {
         let settings = ContextSettings::default();
         assert_eq!(settings.threshold(131_072), Some(104_858));
         assert_eq!(settings.threshold(81_920), Some(65_536));
-        assert_eq!(settings.threshold(65_536), None);
-        assert_eq!(settings.threshold(32_768), None);
+        assert_eq!(settings.threshold(65_536), Some(52_429));
+        assert_eq!(settings.threshold(32_768), Some(26_215));
+        assert_eq!(settings.threshold(1_024), Some(820));
         assert_eq!(settings.threshold(0), None);
         let earlier = ContextSettings {
             threshold_percent: 20,
             ..settings
         };
-        assert_eq!(earlier.threshold(131_072), Some(65_536));
+        assert_eq!(earlier.threshold(131_072), Some(26_215));
+        assert_eq!(earlier.threshold(1_024), Some(205));
     }
 }

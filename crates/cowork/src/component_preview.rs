@@ -333,9 +333,13 @@ struct CompactionPreview {
 }
 
 impl Render for CompactionPreview {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         use crate::context_settings::{context_details, context_ring, controls};
         let settings = self.settings;
+        let settings_controls = controls(settings, window, cx, |this, settings, cx| {
+            this.settings = settings;
+            cx.notify();
+        });
         let message = |author: &'static str, text: &'static str| {
             div()
                 .flex()
@@ -382,8 +386,8 @@ impl Render for CompactionPreview {
                     .child(div().ml(px(64.)).child(crate::Cowork::render_compaction_marker(1, true, cx))))
                 .child(div().mt_4().text_lg().child("Context settings"))
                 .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                    .child("Adjust the window and compaction settings to see the indicators change. The minimum can delay compaction beyond the chosen percentage."))
-                .child(controls(settings, cx, |this, settings, cx| { this.settings = settings; cx.notify(); }))
+                    .child("Adjust the window and compaction percentage to see the indicators change."))
+                .child(settings_controls)
                 .children([
                     ("Room to keep working", 40, false),
                     ("Near the compaction trigger", settings.threshold_percent.saturating_sub(3), false),

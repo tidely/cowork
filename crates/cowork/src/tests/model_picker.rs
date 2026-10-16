@@ -46,13 +46,35 @@ fn context_window_changes_update_local_and_archived_threads(cx: &mut gpui::TestA
 }
 
 #[gpui::test]
-fn context_settings_page_is_rendered(cx: &mut gpui::TestAppContext) {
+fn context_settings_page_accepts_custom_token_counts(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     cowork.update_in(cx, |cowork, window, cx| {
         cowork.open_settings(SettingsPage::Context, window, cx);
     });
     cx.run_until_parked();
     assert!(cx.debug_bounds("context-page").is_some());
+    for (text, expected) in [
+        ("100000", 100_000),
+        ("1024", 1_024),
+        ("1023", 1_024),
+        ("not a token count", 1_024),
+    ] {
+        let bounds = cx
+            .debug_bounds("context-window-input")
+            .expect("editable token count");
+        cx.simulate_click(bounds.center(), gpui::Modifiers::default());
+        cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-a"
+        } else {
+            "ctrl-a"
+        });
+        cx.simulate_input(text);
+        cx.run_until_parked();
+        assert_eq!(
+            cowork.read_with(cx, |cowork, _| cowork.context_settings.window_tokens),
+            expected
+        );
+    }
 }
 
 #[gpui::test]

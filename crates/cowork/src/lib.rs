@@ -662,7 +662,7 @@ impl Render for Cowork {
                             })
                             .map(|this| match self.main_stage {
                                 MainStage::Settings(page) => {
-                                    this.child(self.render_settings_page(page, cx))
+                                    this.child(self.render_settings_page(page, window, cx))
                                 }
                                 MainStage::Archive => this.child(self.render_archive_page(cx)),
                                 MainStage::Schedules => this.child(self.render_schedules_page(cx)),
