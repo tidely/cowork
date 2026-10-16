@@ -122,28 +122,32 @@ impl Cowork {
                     .iter()
                     .filter(|pending| pending.mode == SubmissionMode::Queue),
             );
-        let mut rows = Vec::with_capacity(pending.len() + 1);
-        for (position, pending) in ordered.enumerate() {
-            let cards = {
-                let state = thread.read(cx);
-                pending
-                    .group
-                    .blocks
-                    .iter()
-                    .map(|block| {
-                        block
-                            .attachments
-                            .iter()
-                            .map(|record| AttachmentCard::new(state.draft(), record))
-                            .collect()
-                    })
-                    .collect()
-            };
-            let label = match pending.mode {
-                SubmissionMode::Steering => "Steering",
-                SubmissionMode::Queue => "Queued",
-            };
-            rows.push(
+        let draft_row = div()
+            .mt_6()
+            .child(self.pending_separator("Draft", false, None, cx))
+            .into_any_element();
+        ordered
+            .enumerate()
+            .map(|(position, pending)| {
+                let cards = {
+                    let state = thread.read(cx);
+                    pending
+                        .group
+                        .blocks
+                        .iter()
+                        .map(|block| {
+                            block
+                                .attachments
+                                .iter()
+                                .map(|record| AttachmentCard::new(state.draft(), record))
+                                .collect()
+                        })
+                        .collect()
+                };
+                let label = match pending.mode {
+                    SubmissionMode::Steering => "Steering",
+                    SubmissionMode::Queue => "Queued",
+                };
                 div()
                     .mt_6()
                     .flex()
@@ -161,15 +165,9 @@ impl Cowork {
                         cards,
                         cx,
                     ))
-                    .into_any_element(),
-            );
-        }
-        rows.push(
-            div()
-                .mt_6()
-                .child(self.pending_separator("Draft", false, None, cx))
-                .into_any_element(),
-        );
-        rows
+                    .into_any_element()
+            })
+            .chain(std::iter::once(draft_row))
+            .collect()
     }
 }
