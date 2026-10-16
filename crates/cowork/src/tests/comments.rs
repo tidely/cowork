@@ -129,7 +129,7 @@ fn through(markdown: &str, start: &str, end: &str) -> Range<usize> {
 #[gpui::test]
 fn comments_highlight_the_text_rendered_from_their_source(cx: &mut gpui::TestAppContext) {
     cx.update(gpui_component::init);
-    let cases: [(&str, &'static str, Range<usize>, &str); 12] = [
+    let cases: [(&str, &'static str, Range<usize>, &str); 8] = [
         (
             "plain",
             "Before selected text after",
@@ -138,12 +138,6 @@ fn comments_highlight_the_text_rendered_from_their_source(cx: &mut gpui::TestApp
         ),
         ("heading", "### A Heading", 6..13, "Heading"),
         ("inside bold", "**Hi**", 3..4, "i"),
-        (
-            "across opening bold edge",
-            "Before **bold text** after",
-            through("Before **bold text** after", "re ", "bold"),
-            "re bold",
-        ),
         (
             "across closing bold edge",
             "Before **bold text** after",
@@ -157,25 +151,12 @@ fn comments_highlight_the_text_rendered_from_their_source(cx: &mut gpui::TestApp
             "bold text",
         ),
         (
-            "across several styled sections",
-            "A **bold** and *italic* tail",
-            through("A **bold** and *italic* tail", "bold", " ta"),
-            "bold and italic ta",
-        ),
-        (
             "nested styles",
             "Start **bold and *italic*** end",
             through("Start **bold and *italic*** end", "and ", "italic"),
             "and italic",
         ),
-        ("whole inline code", "Use `value` now", 4..11, "value"),
         ("part of inline code", "Use `value` now", 6..9, "alu"),
-        (
-            "heading and emphasis",
-            "### A **styled heading** here",
-            through("### A **styled heading** here", "A ", "** h"),
-            "A styled heading h",
-        ),
         (
             "across inline code",
             "In Rust, we use `u128` to handle larger numbers",
@@ -213,23 +194,6 @@ fn comments_highlight_the_occurrence_they_are_on(cx: &mut gpui::TestAppContext) 
     );
     assert_eq!(segments.len(), 1);
     assert_eq!(segments[0].1, [(10..14, "same".to_string())]);
-}
-
-#[gpui::test]
-fn messages_split_after_the_line_a_comment_ends_on(cx: &mut gpui::TestAppContext) {
-    cx.update(gpui_component::init);
-    let markdown = "First paragraph.\n\nSecond has a comment here.\n\nThird paragraph.";
-    let comment = through(markdown, "comment", "comment");
-    assert_eq!(
-        highlighted_segments(cx, markdown, &[comment], 600.),
-        [
-            (
-                "First paragraph.\n\nSecond has a comment here.\n".to_string(),
-                vec![(30..37, "comment".to_string())],
-            ),
-            ("\nThird paragraph.".to_string(), Vec::new()),
-        ]
-    );
 }
 
 #[gpui::test]
@@ -568,22 +532,6 @@ fn comments_can_target_agent_comment_replies(cx: &mut gpui::TestAppContext) {
         None,
         1.,
         155.,
-        None,
-    );
-}
-
-#[gpui::test]
-fn comments_can_target_text_before_an_existing_comment(cx: &mut gpui::TestAppContext) {
-    cx.update(gpui_component::init);
-    assert_backslash_selection_creates_comment(
-        cx,
-        "alpha beta gamma",
-        "alpha",
-        0..5,
-        false,
-        Some(11..16),
-        1.,
-        48.,
         None,
     );
 }

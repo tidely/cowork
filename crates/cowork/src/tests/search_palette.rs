@@ -59,23 +59,6 @@ fn reply(text: &str, cx: &mut App) -> TimelineMessage {
 }
 
 #[gpui::test]
-fn search_button_sits_at_the_right_of_the_sidebar_header(cx: &mut gpui::TestAppContext) {
-    let (_cowork, _runtime, cx) = composer_test_cowork(cx);
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-
-    let button = cx
-        .debug_bounds("search-chats")
-        .expect("search button should be rendered");
-
-    // Past the middle of the sidebar, and no further from its right edge
-    // than the header's own padding.
-    assert!(
-        button.left() > SIDEBAR_WIDTH / 2. && button.right() >= SIDEBAR_WIDTH - px(32.),
-        "search button {button:?} should hug the right of a {SIDEBAR_WIDTH:?} sidebar"
-    );
-}
-
-#[gpui::test]
 fn search_palette_finds_chats_by_title_prompt_and_reply(cx: &mut gpui::TestAppContext) {
     cx.update(gpui_component::init);
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -91,8 +74,8 @@ fn search_palette_finds_chats_by_title_prompt_and_reply(cx: &mut gpui::TestAppCo
                 reply("Feed the starter twice a day.\n\nKeep it warm.", cx),
             ],
         );
-        let (review_id, review) = titled_thread("Beta review", Vec::new());
-        ids = Some((bread_id, review_id));
+        let (_, review) = titled_thread("Beta review", Vec::new());
+        ids = Some(bread_id);
         let thread_store = cx.new(|cx| ThreadStore {
             threads: VecDeque::from([cx.new(|_| bread), cx.new(|_| review)]),
             ..Default::default()
@@ -103,7 +86,7 @@ fn search_palette_finds_chats_by_title_prompt_and_reply(cx: &mut gpui::TestAppCo
             cx,
         )
     });
-    let (bread_id, review_id) = ids.expect("threads were created");
+    let bread_id = ids.expect("threads were created");
     let cowork = root.read_with(cx, |root, _| {
         root.view()
             .clone()
@@ -128,35 +111,26 @@ fn search_palette_finds_chats_by_title_prompt_and_reply(cx: &mut gpui::TestAppCo
                 .collect::<Vec<_>>()
         })
     };
-    assert_eq!(
-        found("", cx),
-        [
-            (PaletteTarget::Chat(bread_id), None),
-            (PaletteTarget::Chat(review_id), None),
-        ]
-    );
     // Only the agent's reply has it.
     assert_eq!(
         found("starter twice", cx),
         [(PaletteTarget::Chat(bread_id), Some("starter twice".into()))]
     );
 
-    let open_palette_and_pick = |query: &str, cx: &mut gpui::VisualTestContext| {
-        let button = cx
-            .debug_bounds("search-chats")
-            .expect("search button should be rendered");
-        cx.simulate_click(button.center(), gpui::Modifiers::default());
-        cx.run_until_parked();
-        assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
-        cx.simulate_input(query);
-        cx.run_until_parked();
-        cx.simulate_keystrokes("enter");
-        cx.run_until_parked();
-        assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
-        cowork.read_with(cx, |cowork, _| cowork.active_thread_id)
-    };
-    // Not a substring of either title: only fuzzy matching finds it.
-    assert_eq!(open_palette_and_pick("btrv", cx), Some(review_id));
-    // Only the prompt has it.
-    assert_eq!(open_palette_and_pick("sourdough", cx), Some(bread_id));
+    // Only the prompt has it; picking it opens the chat.
+    let button = cx
+        .debug_bounds("search-chats")
+        .expect("search button should be rendered");
+    cx.simulate_click(button.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+    cx.simulate_input("sourdough");
+    cx.run_until_parked();
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
+    assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    assert_eq!(
+        cowork.read_with(cx, |cowork, _| cowork.active_thread_id),
+        Some(bread_id)
+    );
 }

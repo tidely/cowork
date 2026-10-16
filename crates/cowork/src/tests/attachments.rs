@@ -124,72 +124,46 @@ fn unplaced_attachments_target_the_focused_block_only(cx: &mut gpui::TestAppCont
 }
 
 #[gpui::test]
-fn dropping_an_image_keeps_the_caret_in_its_block(cx: &mut gpui::TestAppContext) {
+fn dropped_images_land_in_and_keep_focus_on_their_block(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
-    cx.simulate_input("question");
-    cx.run_until_parked();
-    let block = new_thread_items(&cowork, cx)[0].id;
-    let path = std::env::temp_dir().join(format!("cowork-{}.png", Uuid::new_v4()));
-    std::fs::write(&path, encoded_image(2, image::ImageFormat::Png)).expect("write test image");
-    let mut paths = ExternalPaths::default();
-    paths.0.push(path.clone());
-
-    cx.update(|window, cx| {
-        cowork.update(cx, |cowork, cx| {
-            cowork.drop_attachments(&paths, window, cx);
+    let drop_image = |cx: &mut gpui::VisualTestContext| {
+        let path = std::env::temp_dir().join(format!("cowork-{}.png", Uuid::new_v4()));
+        std::fs::write(&path, encoded_image(2, image::ImageFormat::Png)).expect("write test image");
+        let mut paths = ExternalPaths::default();
+        paths.0.push(path.clone());
+        cx.update(|window, cx| {
+            cowork.update(cx, |cowork, cx| cowork.drop_attachments(&paths, window, cx));
         });
-    });
-    cx.run_until_parked();
-    std::fs::remove_file(&path).expect("remove test image");
-
-    let items = new_thread_items(&cowork, cx);
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].id, block);
-    assert!(matches!(
-        &items[0].kind,
-        DraftItemKind::Prompt { attachments } if attachments.len() == 1
-    ));
-    cx.update(|window, cx| {
+        cx.run_until_parked();
+        std::fs::remove_file(&path).expect("remove test image");
+    };
+    let assert_one_block_with = |attachment_count: usize, cx: &mut gpui::VisualTestContext| {
+        let items = new_thread_items(&cowork, cx);
+        assert_eq!(items.len(), 1);
+        let block = items[0].id;
         assert!(matches!(
-            cowork.read(cx).focused_draft_editor(window, cx),
-            Some((_, EditorSlot::Prompt(id), _)) if id == block
+            &items[0].kind,
+            DraftItemKind::Prompt { attachments } if attachments.len() == attachment_count
         ));
-    });
-}
+        cx.update(|window, cx| {
+            assert!(matches!(
+                cowork.read(cx).focused_draft_editor(window, cx),
+                Some((_, EditorSlot::Prompt(id), _)) if id == block
+            ));
+        });
+        block
+    };
 
-#[gpui::test]
-fn dropping_an_image_into_an_empty_composer_focuses_its_block(cx: &mut gpui::TestAppContext) {
-    let (cowork, _runtime, cx) = composer_test_cowork(cx);
-    let path = std::env::temp_dir().join(format!("cowork-{}.png", Uuid::new_v4()));
-    std::fs::write(&path, encoded_image(2, image::ImageFormat::Png)).expect("write test image");
-    let mut paths = ExternalPaths::default();
-    paths.0.push(path.clone());
-
-    cx.update(|window, cx| {
-        cowork.update(cx, |cowork, cx| cowork.drop_attachments(&paths, window, cx));
-    });
-    cx.run_until_parked();
-    std::fs::remove_file(&path).expect("remove test image");
-
-    let items = new_thread_items(&cowork, cx);
-    assert_eq!(items.len(), 1);
-    let block = items[0].id;
-    assert!(matches!(
-        &items[0].kind,
-        DraftItemKind::Prompt { attachments } if attachments.len() == 1
-    ));
-    cx.update(|window, cx| {
-        assert!(matches!(
-            cowork.read(cx).focused_draft_editor(window, cx),
-            Some((_, EditorSlot::Prompt(id), _)) if id == block
-        ));
-    });
+    // Dropped into the empty composer, it starts a block that takes focus.
+    drop_image(cx);
+    let block = assert_one_block_with(1, cx);
     cx.simulate_input("caption");
     cx.run_until_parked();
-    let items = new_thread_items(&cowork, cx);
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].id, block);
-    assert_eq!(items[0].body, "caption");
+    assert_eq!(new_thread_items(&cowork, cx)[0].body, "caption");
+
+    // Dropped while typing in that block, it joins it and the caret stays.
+    drop_image(cx);
+    assert_eq!(assert_one_block_with(2, cx), block);
 }
 
 #[gpui::test]

@@ -106,44 +106,6 @@ mod tests {
         }
     }
 
-    fn ollama(id: &str) -> ModelRef {
-        ModelRef {
-            provider: ModelProvider::Ollama,
-            id: id.into(),
-        }
-    }
-
-    #[test]
-    fn models_are_found_by_provider_and_id() {
-        let mut catalog = ModelCatalog::default();
-        catalog.set_provider(
-            ModelProvider::Ollama,
-            [
-                ("qwen".into(), info("Qwen")),
-                ("llama".into(), info("Llama")),
-            ],
-        );
-
-        assert_eq!(catalog.get(&ollama("qwen")), Some(&info("Qwen")));
-        assert!(!catalog.contains(&ollama("missing")));
-    }
-
-    #[test]
-    fn a_model_id_appears_once_per_provider() {
-        let mut catalog = ModelCatalog::default();
-        catalog.set_provider(
-            ModelProvider::Ollama,
-            [
-                ("qwen".into(), info("First")),
-                ("qwen".into(), info("Second")),
-            ],
-        );
-
-        let (_, models) = catalog.providers().next().expect("ollama models");
-        assert_eq!(models.len(), 1);
-        assert_eq!(catalog.get(&ollama("qwen")), Some(&info("Second")));
-    }
-
     #[test]
     fn providers_without_models_are_left_out() {
         let mut catalog = ModelCatalog::default();

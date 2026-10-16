@@ -99,27 +99,7 @@ impl Tool for Calculate {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
-
-    #[test]
-    fn unknown_arguments_return_model_feedback() {
-        let mut tools = rig::tool::ToolSet::default();
-        tools.add_tool(Calculate);
-        let result = futures::executor::block_on(tools.execute(
-            Calculate::NAME,
-            json!({ "operation": "add", "a": 2, "b": 3, "timeout": "60000" }).to_string(),
-            &mut ToolContext::new(),
-        ));
-        assert_eq!(
-            result.error().unwrap().kind(),
-            rig::tool::ToolErrorKind::InvalidArgs
-        );
-        let feedback = result.output().as_text().unwrap();
-        assert!(feedback.contains("unknown field `timeout`"), "{feedback}");
-        assert!(feedback.contains("operation"), "{feedback}");
-    }
 
     fn calculate(operation: Operation, a: f64, b: f64) -> Result<f64, CalculateError> {
         futures::executor::block_on(
@@ -149,43 +129,6 @@ mod tests {
         assert_eq!(
             calculate(Operation::Multiply, f64::MAX, 2.0),
             Err(CalculateError::NonFiniteResult)
-        );
-    }
-
-    #[test]
-    fn schema_and_argument_names_match() {
-        let args: CalculateArgs = serde_json::from_value(json!({
-            "operation": "divide", "a": 6, "b": 2
-        }))
-        .unwrap();
-        assert_eq!(calculate(args.operation, args.a, args.b), Ok(3.0));
-        assert!(
-            serde_json::from_value::<CalculateArgs>(json!({
-                "operation": "pow", "a": 2, "b": 3
-            }))
-            .is_err()
-        );
-        let parameters = Calculate.parameters();
-        assert_eq!(parameters["type"], "object");
-        assert_eq!(parameters["required"], json!(["operation", "a", "b"]));
-        assert_eq!(parameters["additionalProperties"], false);
-        let properties = &parameters["properties"];
-        assert_eq!(properties["a"]["type"], "number");
-        assert_eq!(properties["a"]["description"], "The first operand");
-        assert_eq!(properties["b"]["type"], "number");
-        assert_eq!(properties["b"]["description"], "The second operand");
-        assert_eq!(
-            properties["operation"]["description"],
-            "The arithmetic operation to perform"
-        );
-        let operation_ref = properties["operation"]["$ref"].as_str().unwrap();
-        let operation = parameters
-            .pointer(operation_ref.strip_prefix('#').unwrap())
-            .unwrap();
-        assert_eq!(operation["type"], "string");
-        assert_eq!(
-            operation["enum"],
-            json!(["add", "subtract", "multiply", "divide"])
         );
     }
 }

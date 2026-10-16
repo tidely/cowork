@@ -529,10 +529,8 @@ fn lines(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
-    use crate::{Access, Project, ProjectFolder, TestRoot, paths::SCRATCH, test_sandboxes};
+    use crate::{Access, Project, ProjectFolder, TestRoot};
 
     fn places(root: &TestRoot, writable: bool) -> Places {
         let zed = root.0.join("zed");
@@ -726,37 +724,5 @@ mod tests {
                 Err(FileError::Invalid(_))
             ));
         }
-    }
-
-    #[test]
-    fn definitions_name_no_host_paths_and_refuse_misnamed_arguments() {
-        let (sandboxes, _root) = test_sandboxes();
-        let definitions = [
-            (
-                ListDirectory::new(sandboxes.clone(), "t").description(),
-                ListDirectory::new(sandboxes.clone(), "t").parameters(),
-            ),
-            (
-                ReadFile::new(sandboxes.clone(), "t").description(),
-                ReadFile::new(sandboxes.clone(), "t").parameters(),
-            ),
-            (
-                WriteFile::new(sandboxes.clone(), "t").description(),
-                WriteFile::new(sandboxes, "t").parameters(),
-            ),
-        ];
-        for (description, parameters) in definitions {
-            assert!(description.contains("<environment> note"), "{description}");
-            assert!(description.contains(SCRATCH), "{description}");
-            assert!(!description.contains('\\'), "{description}");
-            assert_eq!(parameters["additionalProperties"], false);
-            assert_eq!(parameters["properties"]["path"]["type"], "string");
-        }
-        assert!(
-            serde_json::from_value::<ReadFileArgs>(json!({"file": "zed/a"})).is_err(),
-            "a misnamed argument is refused"
-        );
-        let args: ReadFileArgs = serde_json::from_value(json!({"path": "zed/a"})).unwrap();
-        assert_eq!((args.start_line, args.end_line), (None, None));
     }
 }

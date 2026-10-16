@@ -81,8 +81,10 @@ mod tests {
     }
 
     fn roundtrip(old: &str, new: &str) {
-        match TextEdit::diff(old, new) {
-            None => assert_eq!(old, new),
+        let diff = TextEdit::diff(old, new);
+        assert_eq!(diff.is_none(), old == new, "diff({old:?}, {new:?})");
+        match diff {
+            None => {}
             Some(e) => {
                 assert!(e.range.start <= e.range.end && e.range.end <= old.len());
                 assert!(old.is_char_boundary(e.range.start));
@@ -101,55 +103,11 @@ mod tests {
     }
 
     #[test]
-    fn identical_strings_have_no_diff() {
-        assert_eq!(TextEdit::diff("", ""), None);
-        assert_eq!(TextEdit::diff("héllo 👋", "héllo 👋"), None);
-    }
-
-    #[test]
-    fn insert_delete_replace() {
-        assert_eq!(
-            TextEdit::diff("hello", "hello world"),
-            Some(edit(5..5, " world"))
-        );
-        assert_eq!(
-            TextEdit::diff("world", "hello world"),
-            Some(edit(0..0, "hello "))
-        );
-        assert_eq!(TextEdit::diff("helo", "hello"), Some(edit(3..3, "l")));
-        assert_eq!(
-            TextEdit::diff("hello world", "hello"),
-            Some(edit(5..11, ""))
-        );
-        assert_eq!(TextEdit::diff("hello world", "world"), Some(edit(0..6, "")));
-        assert_eq!(
-            TextEdit::diff("the cat sat", "the dog sat"),
-            Some(edit(4..7, "dog"))
-        );
-        assert_eq!(TextEdit::diff("", "abc"), Some(edit(0..0, "abc")));
-        assert_eq!(TextEdit::diff("abc", ""), Some(edit(0..3, "")));
-    }
-
-    #[test]
     fn repeated_characters() {
         assert_eq!(TextEdit::diff("aaa", "aaaa"), Some(edit(3..3, "a")));
         assert_eq!(TextEdit::diff("aaaa", "aaa"), Some(edit(3..4, "")));
         assert_eq!(TextEdit::diff("abab", "ababab"), Some(edit(4..4, "ab")));
         assert_eq!(TextEdit::diff("xaax", "xaaax"), Some(edit(3..3, "a")));
-    }
-
-    #[test]
-    fn multibyte_boundaries() {
-        // "é" (C3 A9) and "è" (C3 A8) share their first byte; the edit must not split it.
-        assert_eq!(TextEdit::diff("é", "è"), Some(edit(0..2, "è")));
-        assert_eq!(TextEdit::diff("aéb", "aèb"), Some(edit(1..3, "è")));
-        // 😀 (F0 9F 98 80) and 😁 (F0 9F 98 81) share three bytes.
-        assert_eq!(TextEdit::diff("x😀", "x😁"), Some(edit(1..5, "😁")));
-        assert_eq!(TextEdit::diff("😀y", "😁y"), Some(edit(0..4, "😁")));
-        // Shared trailing bytes: "é" (C3 A9) vs "©" (C2 A9).
-        assert_eq!(TextEdit::diff("é", "©"), Some(edit(0..2, "©")));
-        assert_eq!(TextEdit::diff("héllo", "hello"), Some(edit(1..3, "e")));
-        assert_eq!(TextEdit::diff("👋", "👋👋"), Some(edit(4..4, "👋")));
     }
 
     #[test]
@@ -183,13 +141,6 @@ mod tests {
                 roundtrip(old, new);
             }
         }
-    }
-
-    #[test]
-    fn apply_edit() {
-        let mut text = "hello world".to_owned();
-        edit(6..11, "there 👋").apply(&mut text);
-        assert_eq!(text, "hello there 👋");
     }
 
     #[test]

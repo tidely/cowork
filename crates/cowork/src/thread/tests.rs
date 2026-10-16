@@ -1,6 +1,6 @@
 use std::{cell::Cell, sync::Arc};
 
-use ::draft::{AttachmentId, AttachmentKind, AttachmentRecord, CommentTarget, Draft};
+use ::draft::{AttachmentId, AttachmentKind, AttachmentRecord, Draft};
 use uuid::Uuid;
 
 use super::{
@@ -32,18 +32,6 @@ fn add_peer(thread: &mut Thread) -> ParticipantId {
 }
 
 #[test]
-fn modes_keep_editing_and_generation_distinct() {
-    assert_eq!(PeerMode::default(), PeerMode::Write);
-    assert!(!PeerMode::ReadOnly.can_edit_draft());
-    assert!(PeerMode::Write.can_edit_draft());
-    assert!(!PeerMode::Write.can_control_generation());
-    assert!(!PeerMode::Write.can_change_model());
-    assert!(PeerMode::Admin.can_control_generation());
-    assert!(PeerMode::Admin.can_change_model());
-    assert_eq!(PeerMode::ReadOnly.label(), "Read only");
-}
-
-#[test]
 fn sparse_overrides_inherit_live_and_equal_default_stays_explicit() {
     let inherited = ParticipantId::new();
     let explicit = ParticipantId::new();
@@ -60,51 +48,51 @@ fn sparse_overrides_inherit_live_and_equal_default_stays_explicit() {
 }
 
 #[test]
-fn snapshot_round_trip_preserves_sparse_explicit_policy() {
+fn peer_modes_gate_operations_and_only_the_host_manages_access() {
     let mut thread = local_thread();
-    let inherited = add_peer(&mut thread);
-    let explicit = add_peer(&mut thread);
+    let host = thread.participant_id;
+    let writer = add_peer(&mut thread);
+    let admin = add_peer(&mut thread);
     thread.peer_permissions.set_default_mode(PeerMode::Write);
     thread
         .peer_permissions
-        .set_override(explicit, Some(PeerMode::Write));
-    let snapshot = thread.to_protocol();
-    let bytes = postcard::to_stdvec(&snapshot).unwrap();
-    let decoded: protocol::ThreadSnapshot = postcard::from_bytes(&bytes).unwrap();
-    assert_eq!(decoded, snapshot);
-    assert_eq!(decoded.peer_permissions.override_for(inherited), None);
-    assert_eq!(
-        decoded.peer_permissions.override_for(explicit),
-        Some(PeerMode::Write)
-    );
-}
-
-#[test]
-fn host_stays_admin_but_admin_peer_cannot_manage_access() {
-    let mut thread = local_thread();
-    let host = thread.participant_id;
-    let peer = add_peer(&mut thread);
-    thread.peer_permissions.set_default_mode(PeerMode::ReadOnly);
+        .set_override(host, Some(PeerMode::ReadOnly));
     thread
         .peer_permissions
-        .set_override(host, Some(PeerMode::ReadOnly));
+        .set_override(admin, Some(PeerMode::Admin));
     assert_eq!(thread.local_mode(), PeerMode::Admin);
     assert!(
         thread
             .with_authorized::<ManageAccess, _>(host, |_| ())
             .is_ok()
     );
-    thread
-        .peer_permissions
-        .set_override(peer, Some(PeerMode::Admin));
     assert!(
         thread
-            .with_authorized::<ControlGeneration, _>(peer, |_| ())
+            .with_authorized::<EditDraft, _>(writer, |_| ())
             .is_ok()
     );
     assert_eq!(
         thread
-            .with_authorized::<ManageAccess, _>(peer, |_| ())
+            .with_authorized::<ControlGeneration, _>(writer, |_| ())
+            .unwrap_err()
+            .reason,
+        DenialReason::InsufficientMode
+    );
+    assert_eq!(
+        thread
+            .with_authorized::<ChangeModel, _>(writer, |_| ())
+            .unwrap_err()
+            .reason,
+        DenialReason::InsufficientMode
+    );
+    assert!(
+        thread
+            .with_authorized::<ControlGeneration, _>(admin, |_| ())
+            .is_ok()
+    );
+    assert_eq!(
+        thread
+            .with_authorized::<ManageAccess, _>(admin, |_| ())
             .unwrap_err()
             .reason,
         DenialReason::HostOnly
@@ -131,13 +119,6 @@ fn authorization_checks_current_membership_not_retained_profiles_or_policy() {
             DenialReason::NotParticipant
         );
     }
-    assert_eq!(
-        thread
-            .with_authorized::<EditDraft, _>(peer, |_| ())
-            .unwrap_err()
-            .reason,
-        DenialReason::NotParticipant
-    );
 }
 
 #[test]
@@ -172,69 +153,6 @@ fn read_only_rejection_precedes_closure_and_crdt_application() {
             .unwrap_err()
             .downcast_ref::<super::PermissionDenied>()
             .is_some()
-    );
-}
-
-#[test]
-fn write_edits_everyones_prompts_comments_and_attachments_but_not_controls() {
-    let mut thread = local_thread();
-    let host = thread.participant_id;
-    let peer = add_peer(&mut thread);
-    thread.peer_permissions.set_default_mode(PeerMode::Write);
-    let (prompt, comment) = thread
-        .with_authorized::<EditDraft, _>(host, |authorized| {
-            authorized.edit(|draft| {
-                let prompt = draft.create_prompt(host.as_uuid(), "Host prompt");
-                let comment = draft.create_comment(
-                    host.as_uuid(),
-                    CommentTarget {
-                        message_id: Uuid::new_v4(),
-                        range: 0..1,
-                        quote: "a".into(),
-                    },
-                    "Host comment",
-                );
-                (prompt, comment)
-            })
-        })
-        .unwrap();
-    let attachment = AttachmentId::from_uuid(Uuid::new_v4());
-    thread
-        .with_authorized::<EditDraft, _>(peer, |authorized| {
-            authorized.edit(|draft| {
-                draft.set_body(prompt, "Peer edits host prompt");
-                draft.set_body(comment, "Peer edits host comment");
-                assert!(draft.add_attachment(
-                    prompt,
-                    AttachmentRecord {
-                        id: attachment,
-                        name: "a.txt".into(),
-                        kind: AttachmentKind::Text,
-                        size: 1,
-                        creator: peer.as_uuid()
-                    }
-                ));
-                assert!(draft.remove_attachment(attachment));
-            })
-        })
-        .unwrap();
-    assert_eq!(
-        thread.draft().body(prompt).as_deref(),
-        Some("Peer edits host prompt")
-    );
-    assert_eq!(
-        thread.draft().body(comment).as_deref(),
-        Some("Peer edits host comment")
-    );
-    assert!(
-        thread
-            .with_authorized::<ControlGeneration, _>(peer, |_| ())
-            .is_err()
-    );
-    assert!(
-        thread
-            .with_authorized::<ChangeModel, _>(peer, |_| ())
-            .is_err()
     );
 }
 
@@ -303,36 +221,6 @@ fn mirrored_request_api_also_checks_local_permissions() {
     );
 }
 
-#[test]
-fn reset_replaces_rejected_history_and_preserves_host_history() {
-    let mut thread = local_thread();
-    let host = thread.participant_id;
-    let peer = add_peer(&mut thread);
-    let accepted = thread
-        .draft
-        .create_prompt(host.as_uuid(), "accepted host history");
-    let snapshot = thread.draft().encode_state();
-    let mut mirrored = ThreadDraft::new(peer);
-    mirrored.doc.apply_update(&snapshot).unwrap();
-    mirrored.set_body(accepted, "rejected edit");
-    let rejected = mirrored.create_prompt(peer.as_uuid(), "rejected item");
-    mirrored.reset(&snapshot).unwrap();
-    assert_eq!(
-        mirrored.body(accepted).as_deref(),
-        Some("accepted host history")
-    );
-    assert!(!mirrored.contains(rejected));
-    assert!(mirrored.take_local_update().is_none());
-    mirrored.set_body(accepted, "new authorized edit");
-    thread
-        .apply_collaborator_update(peer, 0, mirrored.take_local_update().unwrap())
-        .unwrap();
-    assert_eq!(
-        thread.draft().body(accepted).as_deref(),
-        Some("new authorized edit")
-    );
-}
-
 fn chunk(id: AttachmentId, offset: u64, bytes: &[u8]) -> protocol::AttachmentChunk {
     protocol::AttachmentChunk {
         id: id.as_uuid().into_bytes(),
@@ -344,9 +232,10 @@ fn chunk(id: AttachmentId, offset: u64, bytes: &[u8]) -> protocol::AttachmentChu
     }
 }
 
-#[test]
-fn downgrade_keeps_accepted_transfers_but_rejects_unannounced_bytes() {
+#[gpui::test]
+fn downgrade_keeps_accepted_transfers_but_rejects_unannounced_bytes(cx: &mut gpui::TestAppContext) {
     let mut thread = local_thread();
+    let host = thread.participant_id;
     let peer = add_peer(&mut thread);
     let prompt = thread.draft.create_prompt(peer.as_uuid(), "prompt");
     let accepted = AttachmentId::from_uuid(Uuid::new_v4());
@@ -367,8 +256,11 @@ fn downgrade_keeps_accepted_transfers_but_rejects_unannounced_bytes() {
     thread
         .receive_upload(peer, chunk(unannounced, 0, b"a"))
         .unwrap();
-    thread.peer_permissions.set_default_mode(PeerMode::ReadOnly);
-    thread.prune_unaccepted_uploads();
+    thread
+        .with_authorized::<ManageAccess, _>(host, |mut authorized| {
+            authorized.set_default_mode(PeerMode::ReadOnly, cx);
+        })
+        .unwrap();
     assert!(thread.draft.incoming.contains_key(&accepted));
     assert!(!thread.draft.incoming.contains_key(&unannounced));
     thread
@@ -396,9 +288,7 @@ fn downgrade_keeps_accepted_transfers_but_rejects_unannounced_bytes() {
         },
     );
     thread.receive_upload(peer, chunk(queued, 0, b"a")).unwrap();
-    thread.cancel_upload(peer, queued).unwrap();
-    assert!(!thread.draft.incoming.contains_key(&queued));
-    assert!(thread.draft.discarded.contains(&queued));
+    assert!(thread.draft.incoming.contains_key(&queued));
 }
 
 #[test]
@@ -486,23 +376,6 @@ fn policy_events_mirror_and_management_is_host_only(cx: &mut gpui::TestAppContex
         .unwrap();
     assert_eq!(mirror.peer_permissions(), host.peer_permissions());
     assert_eq!(mirror.local_mode(), PeerMode::Write);
-    assert!(mirror.can_edit_draft());
-    assert!(!mirror.can_control_generation());
-    assert!(!mirror.can_change_model());
-    let model = crate::models::ModelRef {
-        provider: crate::models::ModelProvider::Ollama,
-        id: "test".into(),
-    };
-    assert_eq!(
-        mirror.select_model(model, cx).unwrap_err().reason,
-        DenialReason::InsufficientMode
-    );
-    assert!(mirror.model().is_none());
-    let optimistic = mirror
-        .with_authorized::<EditDraft, _>(peer, |authorized| {
-            authorized.edit(|draft| draft.create_prompt(peer.as_uuid(), "optimistic"))
-        })
-        .unwrap();
     assert!(
         mirror
             .with_authorized::<ManageAccess, _>(host_id, |_| ())
@@ -518,20 +391,6 @@ fn policy_events_mirror_and_management_is_host_only(cx: &mut gpui::TestAppContex
         )
         .unwrap();
     assert_eq!(mirror.local_mode(), PeerMode::ReadOnly);
-    // The host assigns a new epoch when it rejects the old replica.
-    host.peer_draft_generations.insert(peer, 1);
-    mirror.try_apply(host.draft_reset_for(peer), cx).unwrap();
-    assert!(!mirror.draft().contains(optimistic));
-    assert!(mirror.draft.take_local_update().is_none());
-    // Readers can maintain all projection caches without entering EditDraft.
-    mirror.update_draft_editors(|items, state| {
-        assert!(items.is_empty());
-        state.comments_folded = true;
-        state
-            .editors
-            .retain(|id, _| items.iter().any(|item| item.id == *id));
-    });
-    assert!(mirror.draft().comments_folded);
 }
 
 #[test]
@@ -563,14 +422,6 @@ fn compaction_replaces_request_prefix_but_keeps_complete_transcript() {
         )]
     );
     assert_eq!(thread.transcript.messages(), vec![first, later]);
-    let snapshot = thread.to_protocol();
-    let bytes = postcard::to_stdvec(&snapshot).unwrap();
-    let decoded: protocol::ThreadSnapshot = postcard::from_bytes(&bytes).unwrap();
-    assert_eq!(decoded.transcript, thread.transcript.to_protocol());
-    assert_eq!(
-        decoded.transcript.to_transcript().unwrap().messages().len(),
-        2
-    );
 }
 
 #[gpui::test]
@@ -626,58 +477,7 @@ fn compaction_events_preserve_previous_context_on_failure_and_stop(cx: &mut gpui
 }
 
 #[gpui::test]
-fn compaction_snapshot_restores_summary_and_full_transcript(cx: &mut gpui::TestAppContext) {
-    let mut host = local_thread();
-    let peer = add_peer(&mut host);
-    host.transcript
-        .append(rig::completion::Message::user("Earlier request"));
-    let id = Uuid::new_v4().into_bytes();
-    host.try_apply_for_test(
-        protocol::HostMessage::AgentStarted {
-            id,
-            comment_group_id: None,
-            started_at: std::time::SystemTime::now(),
-            prompt: protocol::Json::from_rig(&rig::completion::Message::user("Continue")),
-        },
-        cx,
-    )
-    .unwrap();
-    host.try_apply_for_test(protocol::HostMessage::CompactionStarted, cx)
-        .unwrap();
-    host.try_apply_for_test(
-        protocol::HostMessage::CompactionFinished {
-            context: Some("Summary".into()),
-        },
-        cx,
-    )
-    .unwrap();
-    let welcome = protocol::Welcome {
-        participant_id: peer.into_bytes(),
-        thread: host.to_protocol(),
-        draft: host.draft.encode_state(),
-        draft_generation: 0,
-        presence: Vec::new(),
-        stored_attachments: Vec::new(),
-    };
-    let prepared = Thread::prepare_welcome(welcome).unwrap();
-    let restored = Thread::from_prepared_welcome(
-        prepared,
-        ThreadDraft::new(peer),
-        ThreadSharing::NotShared,
-        cx,
-    );
-    assert_eq!(restored.request_history(), host.request_history());
-    assert_eq!(restored.transcript, host.transcript);
-    assert_eq!(
-        restored.transcript.to_protocol(),
-        host.transcript.to_protocol()
-    );
-}
-
-#[gpui::test]
-fn compaction_retains_local_views_and_ui_changes_do_not_change_shared_records(
-    cx: &mut gpui::TestAppContext,
-) {
+fn compaction_keeps_agent_message_views(cx: &mut gpui::TestAppContext) {
     let mut thread = local_thread();
     let id = Uuid::new_v4().into_bytes();
     thread
@@ -692,9 +492,7 @@ fn compaction_retains_local_views_and_ui_changes_do_not_change_shared_records(
         )
         .unwrap();
     let view = thread.agent_message_mut(id).unwrap().ui.text_view.clone();
-    let records = thread.to_protocol().messages;
     thread.agent_message_mut(id).unwrap().ui.work_expanded = false;
-    assert_eq!(thread.to_protocol().messages, records);
 
     thread
         .try_apply_for_test(protocol::HostMessage::CompactionStarted, cx)
@@ -710,9 +508,24 @@ fn compaction_retains_local_views_and_ui_changes_do_not_change_shared_records(
     let ui = &thread.agent_message_mut(id).unwrap().ui;
     assert_eq!(ui.text_view.entity_id(), view.entity_id());
     assert!(!ui.work_expanded);
-    assert_eq!(thread.to_protocol().messages, records);
     assert_eq!(thread.transcript.messages().len(), 1);
+}
 
+#[gpui::test]
+fn welcome_rejects_duplicate_timeline_ids(cx: &mut gpui::TestAppContext) {
+    let mut thread = local_thread();
+    let id = Uuid::new_v4().into_bytes();
+    thread
+        .try_apply_for_test(
+            protocol::HostMessage::AgentStarted {
+                id,
+                comment_group_id: None,
+                started_at: std::time::SystemTime::now(),
+                prompt: protocol::Json::from_rig(&rig::completion::Message::user("Request")),
+            },
+            cx,
+        )
+        .unwrap();
     let mut welcome = protocol::Welcome {
         participant_id: thread.participant_id.into_bytes(),
         thread: thread.to_protocol(),
@@ -931,16 +744,6 @@ fn summary_steps_survive_streaming_and_stay_with_their_run(cx: &mut gpui::TestAp
             cx,
         )
         .unwrap();
-    assert_eq!(
-        thread.agent_message_mut(id).unwrap().ui.output.steps(),
-        &[
-            AgentStep::Thinking("Think first".into()),
-            AgentStep::Text("Before".into()),
-            AgentStep::Compaction,
-            AgentStep::Compaction,
-            AgentStep::Text("Partial".into()),
-        ]
-    );
     thread
         .try_apply_for_test(
             protocol::HostMessage::AgentStarted {

@@ -29,7 +29,7 @@ use gpui_base::{
     input::{InputState, Paste, TextareaState},
 };
 use gpui_component::Root;
-use iroh::{Endpoint, EndpointId, endpoint::presets};
+use iroh::{Endpoint, endpoint::presets};
 use itertools::Itertools;
 use rig::completion::{Message as RigMessage, Usage, message::UserContent};
 use tools::TurnComments;
@@ -45,18 +45,17 @@ use crate::{
     models::{ModelCatalog, ModelInfo, ModelProvider, ModelRef},
     participant::ParticipantId,
     profile::{Profile, participant_name, profile_picture},
-    prompt::agent_message,
     sharing::endpoint_id_input_is_complete,
     sidebar::SIDEBAR_WIDTH,
     submission::ActiveGeneration,
     test_support::*,
     thread::{
-        ControlGeneration, EditDraft, HostPeer, ManageAccess, PeerMode, PeerPermissions, Thread,
-        ThreadHost, ThreadOwnership, ThreadSharing, ThreadStore,
+        EditDraft, HostPeer, ManageAccess, PeerMode, PeerPermissions, Thread, ThreadHost,
+        ThreadOwnership, ThreadSharing, ThreadStore,
     },
     thread_draft::{AttachmentTarget, EditorSlot, ItemPresence, RemoteCaret, ThreadDraft},
     timeline::{
-        AgentCommentResponse, AgentMessage, AgentStep, CommentReference, PromptBlock, StepView,
+        AgentCommentResponse, AgentMessage, AgentStep, CommentReference, PromptBlock,
         ThreadMessageId, TimelineMessage, UserComment, UserCommentBody, UserMessageGroup,
     },
     usage::{ActivityRange, TokenActivity},
@@ -104,6 +103,28 @@ impl Thread {
     fn rebase(&mut self, welcome: protocol::Welcome, cx: &mut impl AppContext) {
         self.try_apply_for_test(protocol::HostMessage::Welcome(Box::new(welcome)), cx)
             .expect("a valid thread snapshot");
+    }
+
+    /// What someone joining now is sent, under an id of their own.
+    fn welcome_for_test(&self) -> protocol::Welcome {
+        protocol::Welcome {
+            draft_generation: 0,
+            participant_id: ParticipantId::new().into_bytes(),
+            thread: self.to_protocol(),
+            draft: self.draft().encode_state(),
+            presence: Vec::new(),
+            stored_attachments: Vec::new(),
+        }
+    }
+
+    /// The thread someone joining with `welcome` gets.
+    fn join_for_test(welcome: protocol::Welcome, cx: &mut impl AppContext) -> Self {
+        Self::from_welcome(
+            welcome,
+            ThreadDraft::new(ParticipantId::new()),
+            ThreadSharing::NotShared,
+            cx,
+        )
     }
 }
 
@@ -381,7 +402,6 @@ fn draft_attachments(draft: &ThreadDraft) -> Vec<FileAttachment> {
 
 struct EmptyThreadTestView {
     thread: Entity<Thread>,
-    draft_id: Uuid,
 }
 
 impl Render for EmptyThreadTestView {

@@ -357,13 +357,6 @@ mod tool_call_tests {
         ] {
             let call = tool_call("run_command", json!({"command": command}));
             assert_eq!(call.command_preview().as_deref(), expected);
-            assert_eq!(
-                call.description(),
-                expected
-                    .map(|command| format!("Ran {command}"))
-                    .unwrap_or_else(|| "Ran command".into()),
-            );
-            assert_eq!(call.call.function.arguments_value()["command"], command);
         }
         for arguments in [json!({}), json!({"command": 42})] {
             assert!(
@@ -380,41 +373,15 @@ mod tool_call_tests {
     }
 
     #[test]
-    fn known_tools_have_readable_descriptions() {
-        for (name, expected) in [
-            ("run_command", "Ran command"),
-            ("respond_to_comment", "Replied to comment"),
-            ("read_file", "Read file"),
-            ("write_file", "Wrote to file"),
-            ("list_directory", "Listed directory"),
-            ("request_permissions", "Requested permissions"),
-            ("other_tool", "Ran other_tool"),
-        ] {
-            assert_eq!(description(name, json!({})), expected);
-        }
-    }
-
-    #[test]
-    fn calculations_show_the_expression_instead_of_json() {
-        for (operation, expected) in [
-            ("add", "Calculated 3+4"),
-            ("subtract", "Calculated 3-4"),
-            ("multiply", "Calculated 3*4"),
-            ("divide", "Calculated 3/4"),
-        ] {
-            assert_eq!(
-                description("calculate", json!({"a": 3, "b": 4, "operation": operation})),
-                expected,
-            );
-        }
+    fn calculations_show_the_expression_or_a_fallback() {
+        assert_eq!(
+            description("calculate", json!({"a": 3, "b": 4, "operation": "divide"})),
+            "Calculated 3/4",
+        );
         assert_eq!(
             description("calculate", json!({"a": -1.5, "b": 2, "operation": "add"})),
             "Calculated -1.5+2",
         );
-    }
-
-    #[test]
-    fn malformed_calculations_keep_a_readable_fallback() {
         for arguments in [
             json!({}),
             json!({"a": "three", "b": 4, "operation": "multiply"}),

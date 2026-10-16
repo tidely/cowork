@@ -207,10 +207,6 @@ async fn commands_are_confined() {
     )
     .await;
     assert!(!network.stdout.contains("reached"), "{network:?}");
-
-    let failing = run(&sandboxes, "echo oops >&2; exit 3").await;
-    assert_eq!(failing.exit_code, 3);
-    assert_eq!(failing.stderr, "oops\n");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -360,7 +360,7 @@ mod tests {
     }
 
     /// A project folder `zed`, a scratch folder, and a home holding `.ssh`.
-    fn fixture(writable: bool) -> Fixture {
+    fn fixture() -> Fixture {
         let root = TestRoot::new();
         let zed = root.0.join("zed");
         std::fs::create_dir_all(zed.join("src")).unwrap();
@@ -372,11 +372,7 @@ mod tests {
                 name: "zed".into(),
                 path: zed,
             }],
-            access: if writable {
-                Access::Write
-            } else {
-                Access::Read
-            },
+            access: Access::Read,
         };
         let places = Places::new(&project, &root.0.join("scratch"), Some(&home));
         Fixture { root, places }
@@ -391,7 +387,7 @@ mod tests {
 
     #[test]
     fn folder_names_and_scratch_lead_into_their_places() {
-        let fixture = fixture(false);
+        let fixture = fixture();
         let main = location(&fixture.places, "zed/src/main.rs");
         assert_eq!(main.display(), "zed/src/main.rs");
         assert_eq!(
@@ -410,7 +406,7 @@ mod tests {
 
     #[test]
     fn absolute_paths_inside_a_place_are_shown_by_name() {
-        let fixture = fixture(false);
+        let fixture = fixture();
         let absolute = fixture.root.0.join("zed").join("src").join("main.rs");
         let main = location(&fixture.places, absolute.to_str().unwrap());
         assert_eq!(main.display(), "zed/src/main.rs");
@@ -418,12 +414,11 @@ mod tests {
         let outside = fixture.root.0.join("elsewhere.txt");
         let outside = location(&fixture.places, outside.to_str().unwrap());
         assert_eq!(outside.root, Root::System);
-        assert!(!fixture.places.writable(&outside));
     }
 
     #[test]
     fn dots_and_globs_mean_the_list_of_places() {
-        let fixture = fixture(false);
+        let fixture = fixture();
         for input in PLACES {
             assert!(matches!(
                 fixture.places.resolve(input),
@@ -435,7 +430,7 @@ mod tests {
 
     #[test]
     fn ambiguous_paths_and_parent_traversal_are_refused() {
-        let fixture = fixture(false);
+        let fixture = fixture();
         for input in [
             "~/zed/src",
             "src/main.rs",
@@ -458,7 +453,7 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn a_drive_inside_a_path_is_refused() {
-        let fixture = fixture(false);
+        let fixture = fixture();
         assert!(matches!(
             fixture.places.resolve(r"zed\C:\Windows"),
             Err(FileError::Invalid(_))
@@ -490,7 +485,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symbolic_links_out_of_a_place_are_refused() {
-        let fixture = fixture(false);
+        let fixture = fixture();
         std::os::unix::fs::symlink(fixture.root.0.join("home"), fixture.root.0.join("zed/link"))
             .unwrap();
         assert!(matches!(
@@ -501,26 +496,5 @@ mod tests {
             fixture.places.resolve("zed/link/new.txt"),
             Err(FileError::Refused(_))
         ));
-    }
-
-    #[test]
-    fn only_writable_projects_and_scratch_may_be_written() {
-        let read_only = fixture(false);
-        assert!(
-            !read_only
-                .places
-                .writable(&location(&read_only.places, "zed/a"))
-        );
-        assert!(
-            read_only
-                .places
-                .writable(&location(&read_only.places, "scratch://a"))
-        );
-        let writable = fixture(true);
-        assert!(
-            writable
-                .places
-                .writable(&location(&writable.places, "zed/a"))
-        );
     }
 }

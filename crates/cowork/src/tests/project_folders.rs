@@ -1,6 +1,6 @@
-//! The project's folders: where they are kept before and after the thread
-//! exists, how collaborators learn of them, and that only the host can
-//! change them.
+//! The project's folders and mode: where they are kept before and after the
+//! thread exists, how collaborators learn of them, and that only the host
+//! can change them.
 
 use std::path::Path;
 
@@ -18,11 +18,6 @@ fn names(folders: &[ProjectFolder]) -> Vec<String> {
 #[gpui::test]
 fn project_folders_move_into_the_new_thread(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
-    // With no folders there is only the add button.
-    assert!(cx.debug_bounds("project-folders-add").is_some());
-    assert!(cx.debug_bounds("project-folders-folder-0").is_none());
-    assert!(cx.debug_bounds("project-folders-separator-0").is_none());
-
     let zed = PathBuf::from("/src/zed");
     let cowork_folder = PathBuf::from("/src/cowork");
     cowork.update(cx, |cowork, cx| {
@@ -30,12 +25,6 @@ fn project_folders_move_into_the_new_thread(cx: &mut gpui::TestAppContext) {
         cowork.remove_project_folder(None, &cowork_folder, cx);
     });
     cx.run_until_parked();
-    assert!(cx.debug_bounds("project-folders-folder-0").is_some());
-    assert!(cx.debug_bounds("project-folders-folder-1").is_none());
-    assert!(cx.debug_bounds("project-folders-add").is_some());
-    // One line, between the folder and the add button.
-    assert!(cx.debug_bounds("project-folders-separator-0").is_some());
-    assert!(cx.debug_bounds("project-folders-separator-1").is_none());
 
     cx.simulate_input("question");
     cx.run_until_parked();
@@ -49,10 +38,10 @@ fn project_folders_move_into_the_new_thread(cx: &mut gpui::TestAppContext) {
         [ProjectFolder::local(zed.clone())]
     );
 
-    // Folders added later go to the thread, once each.
+    // Folders added later go to the thread.
     cowork.update(cx, |cowork, cx| {
         let target = Some(thread.downgrade());
-        cowork.add_project_folders(target, vec![cowork_folder.clone(), zed.clone()], cx);
+        cowork.add_project_folders(target, vec![cowork_folder.clone()], cx);
         let (folders, editable) = cowork.active_project(cx);
         assert!(editable);
         assert_eq!(
@@ -131,7 +120,7 @@ fn the_sandbox_mounts_what_the_host_chose(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
-fn collaborators_see_folder_names_as_the_host_changes_them(cx: &mut gpui::TestAppContext) {
+fn collaborators_mirror_the_project_but_cannot_change_it(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
     let host_thread = session.host_thread.downgrade();
     session.host.update(session.cx, |host, cx| {
@@ -143,10 +132,13 @@ fn collaborators_see_folder_names_as_the_host_changes_them(cx: &mut gpui::TestAp
             ],
             cx,
         );
+        host.set_project_mode(Some(host_thread), ProjectMode::Write, cx);
     });
-    session.wait_until("the collaborator sees both folders", |session| {
+    session.wait_until("the collaborator sees the project", |session| {
         session.collaborator_thread().is_some_and(|thread| {
-            thread.read_with(session.cx, |thread, _| thread.project_folders().len() == 2)
+            thread.read_with(session.cx, |thread, _| {
+                thread.project_folders().len() == 2 && thread.project_mode() == ProjectMode::Write
+            })
         })
     });
     let mirror = session.collaborator_thread().expect("joined thread");
@@ -164,63 +156,46 @@ fn collaborators_see_folder_names_as_the_host_changes_them(cx: &mut gpui::TestAp
         .collaborator
         .read_with(session.cx, |collaborator, cx| {
             assert!(!collaborator.active_project(cx).1);
+            assert_eq!(
+                collaborator.active_project_mode(cx),
+                (ProjectMode::Write, false)
+            );
         });
 
-    session.host.update(session.cx, |host, cx| {
-        host.remove_project_folder(Some(host_thread), Path::new("/home/host/src/zed"), cx);
-    });
-    session.wait_until("the collaborator sees the removal", |session| {
-        mirror.read_with(session.cx, |thread, _| thread.project_folders().len() == 1)
-    });
-    mirror.read_with(session.cx, |thread, _| {
-        assert_eq!(names(thread.project_folders()), ["cowork"]);
-    });
-}
-
-#[gpui::test]
-fn joiners_get_the_folder_names_in_their_snapshot(cx: &mut gpui::TestAppContext) {
-    let session = Collaboration::start(cx);
-    let host_thread = session.host_thread.clone();
-    let welcome = host_thread.update(session.cx, |thread, _| {
-        thread.add_project_folders(vec![PathBuf::from("/home/host/src/zed")]);
-        protocol::Welcome {
-            draft_generation: 0,
-            participant_id: ParticipantId::new().into_bytes(),
-            thread: thread.to_protocol(),
-            draft: thread.draft().encode_state(),
-            presence: Vec::new(),
-            stored_attachments: Vec::new(),
-        }
-    });
-    assert_eq!(welcome.thread.project_folders, ["zed"]);
-    let mirror = session.cx.new(|cx| {
-        Thread::from_welcome(
-            welcome,
-            ThreadDraft::new(ParticipantId::new()),
-            ThreadSharing::NotShared,
-            cx,
-        )
-    });
-    mirror.read_with(session.cx, |thread, _| {
-        assert_eq!(
-            thread.project_folders(),
-            ProjectFolder::mirrored(vec!["zed".into()])
-        );
-    });
-}
-
-#[gpui::test]
-fn only_the_host_changes_the_project(cx: &mut gpui::TestAppContext) {
-    let mut session = Collaboration::start(cx);
-    session.settle();
-    let mirror = session.collaborator_thread().expect("joined thread");
-    mirror.update(session.cx, |thread, _| {
+    mirror.update(session.cx, |thread, cx| {
         assert!(!thread.add_project_folders(vec![PathBuf::from("/home/peer/src")]));
-        assert!(!thread.remove_project_folder(Path::new("/home/peer/src")));
-        assert!(thread.project_folders().is_empty());
+        assert!(!thread.remove_project_folder(Path::new("/home/host/src/zed")));
+        assert!(!thread.set_project_mode(ProjectMode::Read, cx));
+        assert_eq!(names(thread.project_folders()), ["zed", "cowork"]);
+        assert_eq!(thread.project_mode(), ProjectMode::Write);
     });
     session.settle();
     session.host_thread.read_with(session.cx, |thread, _| {
-        assert!(thread.project_folders().is_empty());
+        assert_eq!(names(thread.project_folders()), ["zed", "cowork"]);
+        assert_eq!(thread.project_mode(), ProjectMode::Write);
+    });
+}
+
+#[gpui::test]
+fn joiners_get_the_project_in_their_snapshot(cx: &mut gpui::TestAppContext) {
+    cx.update(gpui_component::init);
+    let thread = cx.new(|_| {
+        test_thread(
+            Uuid::new_v4(),
+            Vec::new(),
+            ThreadDraft::new(ParticipantId::new()),
+        )
+    });
+    cx.update(|cx| {
+        thread.update(cx, |thread, cx| {
+            assert!(thread.add_project_folders(vec![PathBuf::from("/home/host/src/zed")]));
+            thread.set_project_mode(ProjectMode::Write, cx);
+        });
+        let mirror = Thread::join_for_test(thread.read(cx).welcome_for_test(), cx);
+        assert_eq!(
+            mirror.project_folders(),
+            ProjectFolder::mirrored(vec!["zed".into()])
+        );
+        assert_eq!(mirror.project_mode(), ProjectMode::Write);
     });
 }

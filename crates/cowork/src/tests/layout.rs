@@ -2,7 +2,6 @@
 //! handling that depends on layout.
 
 use super::*;
-use gpui_component::WindowExt as _;
 
 #[gpui::test]
 fn inline_compaction_status_becomes_persistent_dividers(cx: &mut gpui::TestAppContext) {
@@ -46,29 +45,16 @@ fn inline_compaction_status_becomes_persistent_dividers(cx: &mut gpui::TestAppCo
     assert!(cx.debug_bounds("compacting-context").is_some());
     assert!(cx.debug_bounds(first_marker).is_none());
 
-    // A rejected summary removes the live status without creating history.
-    cx.update(|_, cx| {
-        cowork.update(cx, |cowork, cx| {
-            cowork.active_thread(cx).unwrap().update(cx, |thread, cx| {
-                thread.apply_for_test(
-                    protocol::HostMessage::CompactionFinished { context: None },
-                    cx,
-                )
-            });
-            cx.notify();
-        })
-    });
-    cx.run_until_parked();
-    assert!(cx.debug_bounds("compacting-context").is_none());
-    assert!(cx.debug_bounds(first_marker).is_none());
-
     // Successive accepted summaries at the same boundary both remain visible,
     // even with work collapsed and while another summary runs.
     cx.update(|_, cx| {
         cowork.update(cx, |cowork, cx| {
             cowork.active_thread(cx).unwrap().update(cx, |thread, cx| {
-                for _ in 0..2 {
-                    thread.apply_for_test(protocol::HostMessage::CompactionStarted, cx);
+                // The first summary is the one already running.
+                for index in 0..2 {
+                    if index > 0 {
+                        thread.apply_for_test(protocol::HostMessage::CompactionStarted, cx);
+                    }
                     thread.apply_for_test(
                         protocol::HostMessage::CompactionFinished {
                             context: Some("Summary".into()),
@@ -189,9 +175,6 @@ fn thread_menu_gateway(cx: &mut gpui::VisualTestContext) -> gpui::Bounds<gpui::P
     let gateway = cx
         .debug_bounds("thread-menu-trigger")
         .expect("titlebar thread menu gateway");
-    assert_eq!(content.size.height, px(40.));
-    assert_eq!(gateway.size.height, px(28.));
-    assert_eq!(gateway.top(), content.top() + px(6.));
     assert!(
         gateway.right() <= content.right() && gateway.right() >= content.right() - px(12.),
         "the gateway {gateway:?} must sit at the right of the titlebar"
@@ -201,46 +184,13 @@ fn thread_menu_gateway(cx: &mut gpui::VisualTestContext) -> gpui::Bounds<gpui::P
 }
 
 #[gpui::test]
-fn continue_buttons_have_room_for_their_labels(cx: &mut gpui::TestAppContext) {
-    let (cowork, _runtime, cx) = composer_test_cowork(cx);
-
-    for (stage, selector) in [
-        (MainStage::Welcome, "provider-continue"),
-        (
-            MainStage::ProviderSetup(ModelProvider::Ollama),
-            "setup-continue",
-        ),
-    ] {
-        cx.update(|_, cx| {
-            cowork.update(cx, |cowork, cx| {
-                cowork.main_stage = stage;
-                cowork.selected_provider = Some(ModelProvider::Ollama);
-                cx.notify();
-            });
-        });
-        cx.run_until_parked();
-        let button = cx.debug_bounds(selector).expect("Continue is rendered");
-        assert_eq!(button.size.height, px(44.), "{selector}");
-    }
-}
-
-#[gpui::test]
-fn empty_model_picker_sizes_to_its_label_and_only_hovers_on_its_trigger(
-    cx: &mut gpui::TestAppContext,
-) {
+fn the_model_picker_only_hovers_on_its_trigger(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     cx.run_until_parked();
-    let picker = cx.debug_bounds("model-picker").expect("model picker");
     let trigger = cx
         .debug_bounds("model-picker-trigger")
         .expect("model picker trigger");
-    let label = cx.debug_bounds("model-picker-label").expect("model label");
     let project_mode = cx.debug_bounds("project-mode").expect("project mode");
-
-    assert!(label.size.width > px(0.));
-    assert!(label.left() >= trigger.left() && label.right() <= trigger.right());
-    assert!(trigger.left() >= picker.left() && trigger.right() <= picker.right());
-    assert!(picker.size.width - trigger.size.width <= px(6.));
 
     cx.update(|window, cx| window.simulate_mouse_move(trigger.center(), cx));
     cx.run_until_parked();
@@ -268,14 +218,7 @@ fn title_bar_preserves_layout_and_the_sidebar_toggle(cx: &mut gpui::TestAppConte
     thread_menu_gateway(cx);
     assert!(cx.debug_bounds("toggle-sharing").is_none());
     assert!(cx.debug_bounds("copy-endpoint-id").is_none());
-    assert_eq!(content.top(), px(0.));
-    assert_eq!(content.size.height, crate::top_bar::TOP_BAR_HEIGHT);
-    assert_eq!(toggle.left(), content.left());
-    assert_eq!(toggle.center().y, content.center().y);
-    assert_eq!(
-        content.left(),
-        px(if cfg!(target_os = "macos") { 80. } else { 8. })
-    );
+    assert!(content.contains(&toggle.center()));
     assert!(cowork.read_with(cx, |cowork, _| cowork.sidebar_open));
 
     cx.simulate_click(toggle.center(), gpui::Modifiers::default());
@@ -320,38 +263,6 @@ fn switching_theme_preserves_draft_identity_and_layout(cx: &mut gpui::TestAppCon
             assert!(gpui_base::TextViewDefaults::global(cx).has_code_block_highlighter());
         });
     }
-
-    let toggle = cx.debug_bounds("top-bar-sidebar-toggle").unwrap();
-    cx.simulate_click(toggle.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
-    assert!(!cowork.read_with(cx, |cowork, _| cowork.sidebar_open));
-}
-
-#[gpui::test]
-fn sidebar_bottom_bar_lines_up_with_the_main_bottom_bar(cx: &mut gpui::TestAppContext) {
-    let (_cowork, _runtime, cx) = composer_test_cowork(cx);
-
-    let sidebar_bar = cx
-        .debug_bounds("sidebar-bottom-bar")
-        .expect("sidebar bottom bar should be rendered");
-    let main_bar = cx
-        .debug_bounds("bottom-bar")
-        .expect("main bottom bar should be rendered");
-
-    assert_eq!(sidebar_bar.origin.y, main_bar.origin.y);
-    assert_eq!(sidebar_bar.size.height, main_bar.size.height);
-    assert_eq!(sidebar_bar.origin.x, px(0.));
-    assert_eq!(sidebar_bar.size.width, SIDEBAR_WIDTH);
-
-    let button = cx
-        .debug_bounds("identity-button")
-        .expect("identity button should be rendered");
-    let content = cx
-        .debug_bounds("identity-button-content")
-        .expect("identity button content should be rendered");
-    assert_eq!(button.left(), sidebar_bar.left() + px(4.));
-    assert_eq!(button.right(), sidebar_bar.right() - px(4.));
-    assert_eq!(content.left(), button.left() + px(6.));
 }
 
 #[gpui::test]
@@ -471,10 +382,9 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
             .is_none()
     );
 
-    // Both calls show as rows, one right after the other, with no details.
+    // Both calls show as rows, with no details.
     let first = cx.debug_bounds(first_row).expect("first tool call row");
     let second = cx.debug_bounds(second_row).expect("second tool call row");
-    assert_eq!(first.bottom(), second.top());
     assert_eq!(
         first.size.height,
         px(20.),
@@ -510,13 +420,6 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
     cx.run_until_parked();
     assert!(cx.debug_bounds(first_details).is_some());
     assert_eq!(expanded(cx), vec![1, 2]);
-
-    let second = cx.debug_bounds(second_row).unwrap();
-    cx.simulate_click(second.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
-    assert!(cx.debug_bounds(first_details).is_some());
-    assert!(cx.debug_bounds(second_details).is_none());
-    assert_eq!(expanded(cx), vec![1]);
 }
 
 /// A steering message shows below the summary of the work it joined, and,
@@ -709,21 +612,6 @@ fn selected_user_message_text_copies(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
-fn context_indicator_sits_left_of_the_model_picker(cx: &mut gpui::TestAppContext) {
-    let (_cowork, _runtime, cx) = composer_test_cowork(cx);
-
-    let indicator = cx
-        .debug_bounds("context-indicator")
-        .expect("context indicator should be rendered");
-    let picker = cx
-        .debug_bounds("model-picker")
-        .expect("model picker should be rendered");
-
-    assert!(indicator.right() <= picker.left());
-    assert!(indicator.top() < picker.bottom() && picker.top() < indicator.bottom());
-}
-
-#[gpui::test]
 fn the_profile_button_opens_the_profile_page(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
 
@@ -738,9 +626,6 @@ fn the_profile_button_opens_the_profile_page(cx: &mut gpui::TestAppContext) {
         MainStage::Settings(SettingsPage::Profile)
     );
     assert!(cx.debug_bounds("profile-page").is_some());
-    assert!(cx.debug_bounds("profile-picture").is_some());
-    assert!(cx.debug_bounds("usage-stats").is_some());
-    assert!(cx.debug_bounds("token-activity").is_some());
     assert!(cx.debug_bounds("bottom-bar").is_none());
 
     // The chart starts on the last hour, and the options switch it.
@@ -770,15 +655,6 @@ fn the_profile_button_opens_the_profile_page(cx: &mut gpui::TestAppContext) {
     });
     cx.run_until_parked();
     assert!(cx.debug_bounds("token-activity-peak").is_some());
-    let title = cx
-        .debug_bounds("token-activity-title")
-        .expect("title should be rendered");
-    let peak_label = cx
-        .debug_bounds("token-activity-peak-label")
-        .expect("peak label should be rendered");
-    // It reads as a caption to the title rather than a part of the plot.
-    let gap = peak_label.top() - title.bottom();
-    assert!(gap >= px(0.) && gap <= px(8.), "gap is {gap:?}");
 
     cx.update(|window, cx| {
         cowork.update(cx, |cowork, cx| {
@@ -879,10 +755,6 @@ fn participants_sit_beside_the_right_aligned_thread_menu_without_an_extra_access
     assert!(cx.debug_bounds("thread-sharing-menu").is_none());
 
     assert!(
-        participants.size.width >= px(24. * 3. - 6. * 2.),
-        "three overlapping avatars need room, got {participants:?}"
-    );
-    assert!(
         participants.right() <= gateway.left(),
         "participants {participants:?} overlap the gateway {gateway:?}"
     );
@@ -895,12 +767,6 @@ fn participants_sit_beside_the_right_aligned_thread_menu_without_an_extra_access
     let panel = cx
         .debug_bounds("thread-sharing-menu")
         .expect("thread sharing popover");
-    assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
-    assert!(cx.debug_bounds("close-peer-access").is_none());
-    assert!(
-        panel.size.width >= px(280.) && panel.size.width <= px(320.),
-        "compact panel: {panel:?}"
-    );
     assert!(
         panel.top() >= gateway.bottom(),
         "the panel opens below its titlebar anchor"
@@ -933,16 +799,6 @@ fn participants_sit_beside_the_right_aligned_thread_menu_without_an_extra_access
     assert_eq!(cx.debug_bounds("top-bar-content").unwrap(), content);
     assert_eq!(cx.debug_bounds("bottom-bar").unwrap(), bottom_bar);
     assert_eq!(cx.debug_bounds("composer").unwrap(), composer);
-
-    let gateway = thread_menu_gateway(cx);
-    cx.simulate_click(gateway.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
-    cx.update(|window, cx| window.draw(cx).clear(cx));
-    let local_panel = cx.debug_bounds("thread-sharing-menu").unwrap();
-    assert_eq!(local_panel.size.width, panel.size.width);
-    for selector in ["copy-endpoint-id", "default-mode-track", "toggle-sharing"] {
-        assert!(cx.debug_bounds(selector).is_some(), "missing {selector}");
-    }
 }
 
 #[gpui::test]

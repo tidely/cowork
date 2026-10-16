@@ -238,27 +238,6 @@ impl Cowork {
     /// items as one user message and starts the agent on it. Without a
     /// thread, the draft starts a new one. Returns whether anything was
     /// submitted. Rejections are shown when the local user submitted.
-    #[cfg(test)]
-    pub(crate) fn accept_submission(
-        &mut self,
-        draft_id: Uuid,
-        active_thread: Option<Entity<Thread>>,
-        actor: ParticipantId,
-        submitted_locally: bool,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        self.accept_submission_mode(
-            draft_id,
-            active_thread,
-            SubmissionRequest {
-                actor,
-                submitted_locally,
-                mode: SubmissionMode::Steering,
-            },
-            cx,
-        )
-    }
-
     pub(crate) fn accept_submission_mode(
         &mut self,
         draft_id: Uuid,

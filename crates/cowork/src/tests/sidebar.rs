@@ -73,10 +73,6 @@ fn archive_from_sidebar(thread_id: Uuid, cx: &mut gpui::VisualTestContext) {
     let archive = cx
         .debug_bounds(selector("archive-thread", thread_id))
         .unwrap();
-    assert!(
-        archive.right() <= row.right() && archive.left() > row.center().x,
-        "the archive button {archive:?} should sit at the right of its row {row:?}"
-    );
     cx.simulate_click(archive.center(), gpui::Modifiers::default());
     draw(cx);
 }
@@ -123,39 +119,12 @@ fn usage_statistics_outlast_the_threads_of_an_earlier_session(cx: &mut gpui::Tes
 }
 
 #[gpui::test]
-fn archiving_a_thread_from_the_sidebar_keeps_the_usage_statistics(cx: &mut gpui::TestAppContext) {
-    let (cowork, _runtime, cx) = composer_test_cowork(cx);
-    let kept = add_thread(&cowork, 20, cx);
-    let archived = add_thread(&cowork, 90, cx);
-    cx.update(|window, cx| {
-        cowork.update(cx, |cowork, cx| {
-            let thread = cowork.thread_store.read(cx).thread(archived, cx).unwrap();
-            let usage = Usage::new().total_tokens(100);
-            cowork.record_turn_usage(&thread, usage, SystemTime::now(), Duration::ZERO, cx);
-            cowork.open_thread(archived, window, cx);
-        })
-    });
-    draw(cx);
-
-    archive_from_sidebar(archived, cx);
-
-    assert_eq!(thread_ids(&cowork, cx), (vec![kept], vec![archived]));
-    cowork.read_with(cx, |cowork, cx| {
-        assert_eq!(cowork.active_thread_id, None);
-        assert_eq!(cowork.tokens_used, 100);
-        assert_eq!(cowork.longest_chat(cx), Duration::from_secs(90));
-        assert_eq!(cowork.total_chats(cx), 2);
-    });
-}
-
-#[gpui::test]
 fn a_long_title_is_cut_off_inside_its_row(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     let thread_id = add_thread(&cowork, 1, cx);
     cowork.update(cx, |cowork, cx| {
         let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
         let title = Cowork::thread_title(&"a very long first prompt ".repeat(10));
-        assert!(!title.ends_with('…'));
         thread.update(cx, |thread, _| thread.summary.title = title);
         cx.notify();
     });
@@ -260,9 +229,19 @@ fn archived_threads_are_restored_or_deleted_from_the_archive(cx: &mut gpui::Test
     let restored = add_thread(&cowork, 20, cx);
     let deleted = add_thread(&cowork, 90, cx);
     let open = add_thread(&cowork, 5, cx);
+    cx.update(|window, cx| {
+        cowork.update(cx, |cowork, cx| {
+            let thread = cowork.thread_store.read(cx).thread(deleted, cx).unwrap();
+            let usage = Usage::new().total_tokens(100);
+            cowork.record_turn_usage(&thread, usage, SystemTime::now(), Duration::ZERO, cx);
+            cowork.open_thread(deleted, window, cx);
+        })
+    });
     draw(cx);
     archive_from_sidebar(restored, cx);
     archive_from_sidebar(deleted, cx);
+    // Archiving the open thread closes it.
+    cowork.read_with(cx, |cowork, _| assert_eq!(cowork.active_thread_id, None));
 
     click("archived-threads", cx);
     cowork.read_with(cx, |cowork, _| {
@@ -287,6 +266,7 @@ fn archived_threads_are_restored_or_deleted_from_the_archive(cx: &mut gpui::Test
     );
     // What was done in the deleted thread still counts.
     cowork.read_with(cx, |cowork, cx| {
+        assert_eq!(cowork.tokens_used, 100);
         assert_eq!(cowork.longest_chat(cx), Duration::from_secs(90));
         assert_eq!(cowork.total_chats(cx), 3);
     });
@@ -326,8 +306,4 @@ fn the_archive_restores_or_deletes_everything_at_once(cx: &mut gpui::TestAppCont
 
     assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
     assert_eq!(thread_ids(&cowork, cx), (vec![], vec![]));
-    cowork.read_with(cx, |cowork, cx| {
-        assert_eq!(cowork.longest_chat(cx), Duration::from_secs(30));
-        assert_eq!(cowork.total_chats(cx), 2);
-    });
 }

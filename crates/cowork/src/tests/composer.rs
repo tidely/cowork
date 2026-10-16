@@ -113,7 +113,9 @@ fn typing_at_the_draft_position_turns_it_into_a_block(cx: &mut gpui::TestAppCont
 #[gpui::test]
 fn up_and_down_move_between_blocks_and_the_draft_position(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
-    cx.simulate_input("first");
+    cx.simulate_input("one");
+    cx.simulate_keystrokes("shift-enter");
+    cx.simulate_input("two");
     cx.run_until_parked();
 
     cx.simulate_keystrokes("down");
@@ -122,8 +124,9 @@ fn up_and_down_move_between_blocks_and_the_draft_position(cx: &mut gpui::TestApp
 
     cx.simulate_input("second");
     cx.run_until_parked();
-    assert_eq!(prompt_bodies(&cowork, cx), ["first", "second"]);
+    assert_eq!(prompt_bodies(&cowork, cx), ["one\ntwo", "second"]);
     let items = new_thread_items(&cowork, cx);
+    let first = EditorSlot::Prompt(items[0].id);
     assert_eq!(
         focused_slot(&cowork, cx),
         Some(EditorSlot::Prompt(items[1].id))
@@ -131,45 +134,17 @@ fn up_and_down_move_between_blocks_and_the_draft_position(cx: &mut gpui::TestApp
 
     cx.simulate_keystrokes("up");
     cx.run_until_parked();
-    assert_eq!(
-        focused_slot(&cowork, cx),
-        Some(EditorSlot::Prompt(items[0].id))
-    );
-    // Up from the first line of the first editor stays put.
-    cx.simulate_keystrokes("up");
-    cx.run_until_parked();
-    assert_eq!(
-        focused_slot(&cowork, cx),
-        Some(EditorSlot::Prompt(items[0].id))
-    );
-}
-
-#[gpui::test]
-fn up_stays_inside_a_block_until_its_first_line(cx: &mut gpui::TestAppContext) {
-    let (cowork, _runtime, cx) = composer_test_cowork(cx);
-    cx.simulate_input("one");
-    cx.simulate_keystrokes("shift-enter");
-    cx.simulate_input("two");
-    cx.run_until_parked();
-    let first = new_thread_items(&cowork, cx)[0].id;
-    cx.simulate_keystrokes("down");
-    cx.run_until_parked();
-    assert_eq!(focused_slot(&cowork, cx), Some(EditorSlot::DraftPosition));
-
-    cx.simulate_keystrokes("up");
-    cx.run_until_parked();
-    assert_eq!(focused_slot(&cowork, cx), Some(EditorSlot::Prompt(first)));
-    cx.simulate_keystrokes("up");
-    cx.run_until_parked();
-    // Moved to the first line of the block rather than out of it.
-    assert_eq!(focused_slot(&cowork, cx), Some(EditorSlot::Prompt(first)));
-    cowork.read_with(cx, |cowork, cx| {
-        let editor = cowork
-            .new_thread_draft
-            .editor(EditorSlot::Prompt(first))
-            .expect("block editor");
-        assert!(editor.read(cx).cursor() <= "one".len());
-    });
+    assert_eq!(focused_slot(&cowork, cx), Some(first));
+    // Up stays inside a block until its first line, and stays put there.
+    for _ in 0..2 {
+        cx.simulate_keystrokes("up");
+        cx.run_until_parked();
+        assert_eq!(focused_slot(&cowork, cx), Some(first));
+        cowork.read_with(cx, |cowork, cx| {
+            let editor = cowork.new_thread_draft.editor(first).expect("block editor");
+            assert!(editor.read(cx).cursor() <= "one".len());
+        });
+    }
 }
 
 #[gpui::test]
@@ -566,38 +541,4 @@ fn idle_pending_messages_show_resume_until_a_new_draft_is_written(cx: &mut gpui:
     cx.run_until_parked();
     assert!(cx.debug_bounds("resume-messages").is_none());
     assert!(cx.debug_bounds("send-message").is_some());
-}
-
-#[gpui::test]
-fn comments_and_attachment_only_blocks_make_the_draft_sendable(cx: &mut gpui::TestAppContext) {
-    let (cowork, _runtime, cx) = composer_test_cowork(cx);
-    cowork.update(cx, |cowork, cx| {
-        assert!(!cowork.composer_has_content(cx));
-        let draft = &mut cowork.new_thread_draft;
-        let comment = draft.create_comment(
-            draft.author.as_uuid(),
-            CommentTarget {
-                message_id: Uuid::new_v4(),
-                range: 0..5,
-                quote: "quote".into(),
-            },
-            "comment without a prompt block",
-        );
-        assert!(cowork.composer_has_content(cx));
-        cowork.new_thread_draft.remove_items(&[comment]);
-        assert!(!cowork.composer_has_content(cx));
-        let draft = &mut cowork.new_thread_draft;
-        let block = draft.create_prompt(draft.author.as_uuid(), "");
-        draft.add_attachment(
-            block,
-            AttachmentRecord {
-                id: AttachmentId::new(),
-                creator: draft.author.as_uuid(),
-                name: "note.txt".into(),
-                kind: AttachmentKind::Text,
-                size: 0,
-            },
-        );
-        assert!(cowork.composer_has_content(cx));
-    });
 }

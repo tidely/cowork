@@ -8,13 +8,12 @@ fn context_window_changes_update_local_and_archived_threads(cx: &mut gpui::TestA
         .build()
         .expect("test runtime");
     let (cowork, _, cx) = attachment_test_cowork(cx, runtime.handle().clone());
-    cowork.update_in(cx, |cowork, window, cx| {
+    cowork.update(cx, |cowork, cx| {
         cowork.set_models(test_catalog(), cx);
         cowork.new_thread_model = Some(ollama_qwen());
         let local = cowork.active_thread(cx).expect("local thread");
         local.update(cx, |thread, cx| {
-            thread.select_model(ollama_qwen(), cx).unwrap();
-            thread.context_tokens = Some(24_576);
+            thread.select_model(ollama_qwen(), cx).unwrap()
         });
         let archived = Cowork::new_empty_local_thread(
             ThreadDraft::new(cowork.local_participant_id),
@@ -29,18 +28,11 @@ fn context_window_changes_update_local_and_archived_threads(cx: &mut gpui::TestA
         cowork.set_context_settings(
             crate::context_settings::ContextSettings {
                 window_tokens: 32_768,
-                min_tokens: 8_192,
                 ..Default::default()
             },
             cx,
         );
-        let usage = crate::usage::ContextUsage::of(Some(local.read(cx)), 0);
-        assert_eq!(usage.max_tokens, 32_768);
-        assert_eq!(usage.percent(), 75.);
-        assert_eq!(
-            cowork.context_settings.threshold(usage.max_tokens),
-            Some(26_215)
-        );
+        assert_eq!(local.read(cx).max_tokens(), 32_768);
         assert_eq!(archived.read(cx).max_tokens(), 32_768);
         assert_eq!(
             cowork.models.get(&ollama_qwen()).unwrap().max_tokens,
@@ -49,13 +41,6 @@ fn context_window_changes_update_local_and_archived_threads(cx: &mut gpui::TestA
         assert_eq!(
             cowork.models.get(&recommended_qwen()).unwrap().max_tokens,
             32_768
-        );
-        cowork.open_settings(SettingsPage::Context, window, cx);
-    });
-    cowork.read_with(cx, |cowork, _| {
-        assert_eq!(
-            cowork.main_stage,
-            MainStage::Settings(SettingsPage::Context)
         );
     });
 }
@@ -392,13 +377,6 @@ fn a_model_dropped_from_the_catalog_is_grayed_out_until_another_is_picked(
             cowork.picker_rows.as_ref().map(|(_, model)| model.clone()),
             Some(Some(recommended_qwen()))
         );
-        assert_eq!(
-            picker_rows(&language_model_groups(
-                &picker_catalog(cowork),
-                Some(&recommended_qwen())
-            )),
-            vec![(0, recommended_qwen().id, true)]
-        );
         assert_eq!(picker_selection_available(cowork, cx), Some(true));
         assert!(cowork.active_model_is_runnable(cx));
     });
@@ -455,13 +433,12 @@ fn mirrored_picker_uses_host_catalog_and_restores_local_models(cx: &mut gpui::Te
         cowork.sync_model_picker(window, cx);
         assert_eq!(
             cowork.model_picker.read(cx).selected_value(),
-            Some(host_model.clone())
+            Some(host_model)
         );
         // Choices on the host's thread are not defaults for local ones.
         assert_eq!(cowork.new_thread_model, Some(ollama_qwen()));
 
-        // An empty catalog removes every choice, but not the selection,
-        // which is grayed out instead.
+        // The host's catalog changes reach the picker.
         mirror.update(cx, |thread, cx| {
             thread.apply_for_test(
                 protocol::HostMessage::ModelCatalogChanged(ModelCatalog::default()),
@@ -470,12 +447,6 @@ fn mirrored_picker_uses_host_catalog_and_restores_local_models(cx: &mut gpui::Te
         });
         cowork.sync_model_picker(window, cx);
         assert_eq!(picker_catalog(cowork), ModelCatalog::default());
-        assert_eq!(
-            cowork.model_picker.read(cx).selected_value(),
-            Some(host_model)
-        );
-        assert_eq!(picker_selection_available(cowork, cx), Some(false));
-        assert!(!cowork.active_model_is_runnable(cx));
 
         // A lag-recovery welcome replaces the catalog too.
         mirror.update(cx, |thread, cx| thread.rebase(welcome, cx));

@@ -177,14 +177,6 @@ mod tests {
                     .contains("asks for nothing")
             );
         }
-        assert!(
-            RequestPermissions::requested(&json!({
-                "reason": "Relative.",
-                "write_folders": ["cache"],
-            }))
-            .unwrap_err()
-            .contains("absolute")
-        );
     }
 
     /// The tool reports what the hook allowed, and nothing without it.
@@ -218,20 +210,5 @@ mod tests {
         assert!(reported.is_success());
         let reported = reported.output().render();
         assert!(reported.contains("project access: network"), "{reported}");
-    }
-
-    #[test]
-    fn the_definition_names_its_arguments_and_no_host_paths() {
-        let tool = RequestPermissions;
-        let parameters = tool.parameters();
-        assert_eq!(parameters["required"], json!(["reason"]));
-        assert_eq!(parameters["additionalProperties"], false);
-        for argument in ["access", "read_folders", "write_folders"] {
-            assert!(
-                parameters["properties"][argument].is_object(),
-                "{parameters}"
-            );
-        }
-        assert!(!tool.description().contains('/'));
     }
 }

@@ -133,41 +133,6 @@ mod tests {
     use crate::test_support::{attached, text_attachment};
 
     #[test]
-    fn attachments_become_ollama_text_and_base64_image_parts() {
-        let author = ParticipantId::from_bytes([7; 16]);
-        let (records, files) = attached([
-            text_attachment("say \"hi\".txt", "hello"),
-            FileAttachment {
-                name: "photo.png".into(),
-                content: FileAttachmentContent::Png(Arc::new(gpui::Image::from_bytes(
-                    gpui::ImageFormat::Png,
-                    vec![1, 2, 3],
-                ))),
-            },
-        ]);
-        let block = PromptBlock {
-            id: Uuid::new_v4(),
-            author,
-            text: "Question".into(),
-            attachments: records,
-        };
-        let RigMessage::User { content } = agent_message(None, &[block], &files, &HashMap::new())
-        else {
-            panic!("expected user message");
-        };
-        assert_eq!(content.len(), 3);
-        assert!(
-            matches!(&content[0], UserContent::Text(text) if text.text == "Mossy Crane:\nQuestion")
-        );
-        assert!(
-            matches!(&content[1], UserContent::Text(text) if text.text == "<file name=\"say &quot;hi&quot;.txt\">\nhello\n</file>")
-        );
-        assert!(matches!(&content[2], UserContent::Image(image)
-            if image.data == rig::message::DocumentSourceKind::Base64("AQID".into())
-                && image.media_type == Some(ImageMediaType::PNG)));
-    }
-
-    #[test]
     fn the_environment_note_is_sent_only_when_it_changed() {
         let note = |text: &str| format!("{}{text}", sandbox::ENVIRONMENT_NOTE_START);
         let texts = |message: &RigMessage| {
@@ -195,12 +160,22 @@ mod tests {
     }
 
     /// Comments come first, then each block under its creator's name with its
-    /// own attachments right after it.
+    /// own attachments right after it: text files as escaped `<file>`
+    /// elements and images as base64 parts.
     #[test]
     fn agent_message_keeps_attachments_with_their_blocks() {
         let alice = ParticipantId::from_bytes([7; 16]);
         let bob = ParticipantId::new();
-        let (records, files) = attached([text_attachment("crash.log", "boom")]);
+        let (records, files) = attached([
+            text_attachment("say \"hi\".log", "boom"),
+            FileAttachment {
+                name: "photo.png".into(),
+                content: FileAttachmentContent::Png(Arc::new(gpui::Image::from_bytes(
+                    gpui::ImageFormat::Png,
+                    vec![1, 2, 3],
+                ))),
+            },
+        ]);
         let blocks = [
             PromptBlock {
                 id: Uuid::new_v4(),
@@ -225,7 +200,15 @@ mod tests {
             .iter()
             .map(|part| match part {
                 UserContent::Text(text) => text.text.clone(),
-                _ => panic!("expected only text parts"),
+                UserContent::Image(image) => {
+                    assert_eq!(
+                        image.data,
+                        rig::message::DocumentSourceKind::Base64("AQID".into())
+                    );
+                    assert_eq!(image.media_type, Some(ImageMediaType::PNG));
+                    "[image]".to_owned()
+                }
+                _ => panic!("expected only text and image parts"),
             })
             .collect::<Vec<_>>();
         assert_eq!(
@@ -233,7 +216,8 @@ mod tests {
             [
                 "Comments first.".to_owned(),
                 "Mossy Crane:\nInvestigate the crash.".to_owned(),
-                "<file name=\"crash.log\">\nboom\n</file>".to_owned(),
+                "<file name=\"say &quot;hi&quot;.log\">\nboom\n</file>".to_owned(),
+                "[image]".to_owned(),
                 "Bob:\nAlso check the logs.".to_owned(),
             ]
         );

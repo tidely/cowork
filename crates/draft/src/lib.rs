@@ -90,6 +90,11 @@ pub struct Draft {
     local_updates: Arc<Mutex<Vec<Vec<u8>>>>,
 }
 
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<Draft>();
+};
+
 impl Default for Draft {
     fn default() -> Self {
         Self::new()

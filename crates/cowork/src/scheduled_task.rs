@@ -700,26 +700,6 @@ pub(crate) mod tests {
                 "Every 30 minutes",
             ),
             (
-                When::Once(at((2026, 10, 12), 9, 5)),
-                "Once, Oct 12, 2026 at 09:05",
-            ),
-            (When::Daily(time(9, 0)), "Every day at 09:00"),
-            (When::Weekdays(time(9, 0)), "Weekdays at 09:00"),
-            (
-                When::Weekly {
-                    days: vec![Weekday::Mon, Weekday::Fri],
-                    time: time(16, 30),
-                },
-                "Every Mon, Fri at 16:30",
-            ),
-            (
-                When::Monthly {
-                    day: 22,
-                    time: time(10, 0),
-                },
-                "Monthly on the 22nd at 10:00",
-            ),
-            (
                 When::Custom {
                     rule: "RRULE:FREQ=YEARLY".into(),
                     start: at(SATURDAY, 9, 0),

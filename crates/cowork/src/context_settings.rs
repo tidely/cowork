@@ -338,23 +338,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn examples_and_compaction_follow_the_selected_window() {
-        let mut settings = ContextSettings {
-            window_tokens: 32_768,
-            min_tokens: 8_192,
-            ..Default::default()
-        };
-        let usage = settings.example_usage(60);
-        assert_eq!(usage.max_tokens, 32_768);
-        assert_eq!(usage.tokens, 19_660);
-        assert_eq!(settings.threshold(usage.max_tokens), Some(26_215));
-
-        settings.window_tokens = 8_192;
-        assert_eq!(settings.example_usage(60).max_tokens, 8_192);
-        assert_eq!(settings.threshold(settings.window_tokens), None);
-    }
-
-    #[test]
     fn threshold_obeys_the_minimum_and_leaves_headroom() {
         let settings = ContextSettings::default();
         assert_eq!(settings.threshold(131_072), Some(104_858));

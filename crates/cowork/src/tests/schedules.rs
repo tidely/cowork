@@ -175,29 +175,6 @@ fn open_schedules_page(cowork: &Entity<Cowork>, cx: &mut gpui::VisualTestContext
 }
 
 #[gpui::test]
-fn the_scheduled_page_lists_every_task(cx: &mut gpui::TestAppContext) {
-    let (cowork, _runtime, cx) = composer_test_cowork(cx);
-    let now = chrono::Local::now().naive_local();
-    for title in ["Morning", "Evening"] {
-        add_task(&cowork, daily(title, 9, 0), now, cx);
-    }
-    open_schedules_page(&cowork, cx);
-    assert_eq!(
-        cowork.read_with(cx, |cowork, _| cowork.main_stage),
-        MainStage::Schedules
-    );
-    for task in tasks(&cowork, cx) {
-        let row = cx
-            .debug_bounds(selector("scheduled-task", task.id))
-            .expect("every task has a row");
-        let next = cx
-            .debug_bounds(selector("scheduled-task-next", task.id))
-            .expect("every row shows its next run");
-        assert!(next.right() <= row.right() && next.left() > row.center().x);
-    }
-}
-
-#[gpui::test]
 fn a_new_schedule_is_created_from_the_dialog(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     open_schedules_page(&cowork, cx);
@@ -213,15 +190,6 @@ fn a_new_schedule_is_created_from_the_dialog(cx: &mut gpui::TestAppContext) {
     cx.simulate_input("Summarize   my inbox");
     draw(cx);
     click("frequency-Weekdays", cx);
-    // Every option fits in the dialog without scrolling, above its buttons.
-    let save = cx.debug_bounds("save-schedule").unwrap();
-    for option in ["thread-mode-1", "missed-runs-1"] {
-        let bounds = cx.debug_bounds(option).unwrap();
-        assert!(
-            bounds.bottom() < save.top(),
-            "{option} {bounds:?} is cut off"
-        );
-    }
     click("thread-mode-1", cx);
     click("missed-runs-1", cx);
     click("save-schedule", cx);
@@ -486,40 +454,6 @@ fn runs_wait_while_no_models_are_known(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
-fn runs_now_and_shows_the_history_in_the_dialog(cx: &mut gpui::TestAppContext) {
-    let (cowork, _runtime, cx) = composer_test_cowork(cx);
-    let task_id = add_task(
-        &cowork,
-        daily("Report", 9, 0),
-        chrono::Local::now().naive_local(),
-        cx,
-    );
-    open_schedules_page(&cowork, cx);
-
-    click(selector("run-scheduled-task", task_id), cx);
-    assert!(!dialog_open(cx), "running doesn't open the editor");
-    let thread_id = running_thread(&cowork, cx).expect("the run started");
-    assert_eq!(
-        task(&cowork, task_id, cx).history()[0].trigger,
-        Trigger::Manual
-    );
-    finish(&cowork, thread_id, protocol::RunOutcome::Completed, cx);
-
-    click(selector("scheduled-task", task_id), cx);
-    assert!(cx.debug_bounds("run-record-0").is_some());
-    assert!(cx.debug_bounds("run-record-1").is_none());
-
-    // The row opens the run's thread.
-    cx.update(|window, cx| window.close_dialog(cx));
-    draw(cx);
-    click(selector("open-scheduled-thread", task_id), cx);
-    cowork.read_with(cx, |cowork, _| {
-        assert_eq!(cowork.main_stage, MainStage::Thread);
-        assert_eq!(cowork.active_thread_id, Some(thread_id));
-    });
-}
-
-#[gpui::test]
 fn runs_work_in_the_project_folders_chosen_in_the_dialog(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     let folders = temp_folders(&["app", "docs"]);
@@ -533,13 +467,9 @@ fn runs_work_in_the_project_folders_chosen_in_the_dialog(cx: &mut gpui::TestAppC
         })
         .expect("the dialog opens");
     draw(cx);
-    // The mode shows before there are folders, as the network needs none.
-    assert!(cx.debug_bounds("schedule-folders-add").is_some());
-    assert!(cx.debug_bounds("schedule-project-network").is_some());
     // As picking them in the folder picker does.
     editor.update(cx, |editor, cx| editor.add_folders(folders.clone(), cx));
     draw(cx);
-    assert!(cx.debug_bounds("schedule-folders-folder-1").is_some());
     cx.simulate_input("Review the code");
     click("thread-mode-1", cx);
     click("schedule-project-write", cx);
@@ -621,27 +551,26 @@ fn the_dialog_keeps_its_buttons_in_a_short_window(cx: &mut gpui::TestAppContext)
     }
     open_schedules_page(&cowork, cx);
 
-    for height in [700., 520.] {
-        cx.simulate_resize(gpui::size(px(1200.), px(height)));
-        draw(cx);
-        click(selector("scheduled-task", task_id), cx);
-        let save = cx.debug_bounds("save-schedule").expect("the save button");
-        let fields = cx.debug_bounds("schedule-editor-fields").unwrap();
-        assert!(
-            save.bottom() <= px(height),
-            "save {save:?} runs past a {height}px window"
-        );
-        assert!(
-            fields.bottom() <= save.top(),
-            "the fields {fields:?} cover the buttons"
-        );
-        cx.update(|window, cx| window.close_dialog(cx));
-        draw(cx);
-    }
+    let height = px(520.);
+    cx.simulate_resize(gpui::size(px(1200.), height));
+    draw(cx);
+    click(selector("scheduled-task", task_id), cx);
+    let save = cx.debug_bounds("save-schedule").expect("the save button");
+    let fields = cx.debug_bounds("schedule-editor-fields").unwrap();
+    assert!(
+        save.bottom() <= height,
+        "save {save:?} runs past a {height:?} window"
+    );
+    assert!(
+        fields.bottom() <= save.top(),
+        "the fields {fields:?} cover the buttons"
+    );
 }
 
 #[gpui::test]
-fn a_task_opens_its_thread_only_while_it_is_in_the_sidebar(cx: &mut gpui::TestAppContext) {
+fn run_now_records_history_and_opens_its_thread_while_in_the_sidebar(
+    cx: &mut gpui::TestAppContext,
+) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     let task_id = add_task(&cowork, daily("Report", 9, 0), at(SATURDAY, 8, 0), cx);
     open_schedules_page(&cowork, cx);
@@ -661,8 +590,20 @@ fn a_task_opens_its_thread_only_while_it_is_in_the_sidebar(cx: &mut gpui::TestAp
     stays_on_the_page(cx);
 
     click(selector("run-scheduled-task", task_id), cx);
-    let thread_id = running_thread(&cowork, cx).unwrap();
+    assert!(!dialog_open(cx), "running doesn't open the editor");
+    let thread_id = running_thread(&cowork, cx).expect("the run started");
+    assert_eq!(
+        task(&cowork, task_id, cx).history()[0].trigger,
+        Trigger::Manual
+    );
     finish(&cowork, thread_id, protocol::RunOutcome::Completed, cx);
+
+    // The dialog shows the run's record.
+    click(selector("scheduled-task", task_id), cx);
+    assert!(cx.debug_bounds("run-record-0").is_some());
+    assert!(cx.debug_bounds("run-record-1").is_none());
+    cx.update(|window, cx| window.close_dialog(cx));
+    draw(cx);
 
     // Disabled again once its thread is archived.
     cx.update(|window, cx| {

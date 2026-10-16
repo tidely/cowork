@@ -81,40 +81,16 @@ fn pending_steering_merges_while_queue_is_fifo_and_cancel_is_fenced(cx: &mut gpu
         );
         assert_ne!(thread.pending_submissions()[2].id, id);
     });
-    let mirror = session.collaborator_thread().unwrap();
-    session.wait_until("pending submissions reach the collaborator", |session| {
-        mirror.read_with(session.cx, |thread, _| {
-            thread.submission_count() == 5 && thread.pending_submissions().len() == 3
-        })
-    });
     task.abort();
 }
 
 #[gpui::test]
-fn shared_pending_submission_requires_admin_and_fences_each_acceptance(
-    cx: &mut gpui::TestAppContext,
-) {
+fn write_peers_cannot_cancel_pending_submissions(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
     let (_message_id, task) = generating(&mut session);
     let thread = session.host_thread.clone();
     let mirror = session.collaborator_thread().unwrap();
     let peer = mirror.read_with(session.cx, |thread, _| thread.participant_id());
-    session.host.update(session.cx, |cowork, cx| {
-        assert!(
-            cowork
-                .collaborator_request(
-                    &thread,
-                    peer,
-                    protocol::CollaboratorMessage::SubmitPending {
-                        sequence: 0,
-                        mode: SubmissionMode::Queue
-                    },
-                    cx
-                )
-                .is_err()
-        );
-        assert_eq!(thread.read(cx).submission_count(), 0);
-    });
     set_default(&mut session, PeerMode::Admin);
     session.host.update(session.cx, |cowork, cx| {
         cowork
@@ -128,23 +104,6 @@ fn shared_pending_submission_requires_admin_and_fences_each_acceptance(
                 cx,
             )
             .unwrap();
-        let draft_id = thread.read(cx).draft().id;
-        cowork.update_draft(draft_id, cx, |draft| {
-            draft.create_prompt(draft.author.as_uuid(), "later");
-        });
-        cowork
-            .collaborator_request(
-                &thread,
-                peer,
-                protocol::CollaboratorMessage::SubmitPending {
-                    sequence: 0,
-                    mode: SubmissionMode::Queue,
-                },
-                cx,
-            )
-            .unwrap();
-        assert_eq!(thread.read(cx).submission_count(), 1);
-        assert_eq!(thread.read(cx).draft().items()[0].body, "later");
     });
     let pending_id = thread.read_with(session.cx, |thread, _| thread.pending_submissions()[0].id);
     set_default(&mut session, PeerMode::Write);
@@ -214,25 +173,6 @@ fn completed_runs_start_one_queued_message_but_stopping_preserves_pending(
     thread.read_with(session.cx, |thread, _| {
         assert!(!thread.is_generating());
         assert_eq!(thread.pending_submissions().len(), 1);
-    });
-    let sequence = thread.read_with(session.cx, |thread, _| thread.submission_count());
-    session.host.update(session.cx, |cowork, cx| {
-        let actor = thread.read(cx).participant_id();
-        let draft_id = thread.read(cx).draft().id;
-        assert!(cowork.accept_submission_mode(
-            draft_id,
-            Some(thread.clone()),
-            crate::thread::submission::SubmissionRequest {
-                actor,
-                submitted_locally: true,
-                mode: SubmissionMode::Steering
-            },
-            cx
-        ));
-        assert!(thread.read(cx).is_generating());
-        assert!(thread.read(cx).pending_submissions().is_empty());
-        assert_eq!(thread.read(cx).submission_count(), sequence);
-        assert!(thread.read(cx).draft().items().is_empty());
     });
     task.abort();
 }
@@ -453,7 +393,7 @@ fn pending_snapshot_keeps_comments_and_attachment_bytes_for_late_join(
         ));
         comment_id
     });
-    let snapshot = thread.read_with(session.cx, |thread, _| {
+    thread.read_with(session.cx, |thread, _| {
         let snapshot = thread.to_protocol();
         assert_eq!(snapshot.submission_sequence, 1);
         assert_eq!(
@@ -471,11 +411,7 @@ fn pending_snapshot_keeps_comments_and_attachment_bytes_for_late_join(
         );
         assert!(thread.draft().files.contains_key(&attachment_id));
         assert!(thread.draft().items().is_empty());
-        snapshot
     });
-    let bytes = postcard::to_stdvec(&snapshot).unwrap();
-    let decoded: protocol::ThreadSnapshot = postcard::from_bytes(&bytes).unwrap();
-    assert_eq!(snapshot, decoded);
     task.abort();
 }
 

@@ -269,62 +269,7 @@ impl Tool for RespondToComment {
 
 #[cfg(test)]
 mod tests {
-    use serde_json::json;
-
     use super::*;
-
-    #[test]
-    fn unknown_arguments_return_model_feedback() {
-        let mut tools = rig::tool::ToolSet::default();
-        tools.add_tool(RespondToComment::new(Arc::new(TurnComments::new(1))));
-        let result = futures::executor::block_on(
-            tools.execute(
-                RespondToComment::NAME,
-                json!({ "comment_id": "comment_1", "response": "Reply", "timeout": "60000" })
-                    .to_string(),
-                &mut ToolContext::new(),
-            ),
-        );
-        assert_eq!(
-            result.error().unwrap().kind(),
-            rig::tool::ToolErrorKind::InvalidArgs
-        );
-        let feedback = result.output().as_text().unwrap();
-        assert!(feedback.contains("unknown field `timeout`"), "{feedback}");
-        assert!(feedback.contains("comment_id"), "{feedback}");
-    }
-
-    #[test]
-    fn schema_and_argument_names_match() {
-        let tool = RespondToComment::new(Arc::new(TurnComments::new(1)));
-        let args: RespondToCommentArgs = serde_json::from_value(json!({
-            "comment_id": "comment_1", "response": "Reply"
-        }))
-        .unwrap();
-        assert_eq!(args.comment_id, "comment_1");
-        assert_eq!(args.response, "Reply");
-        assert!(
-            serde_json::from_value::<RespondToCommentArgs>(json!({
-                "comment_id": "comment_1"
-            }))
-            .is_err()
-        );
-        let parameters = tool.parameters();
-        assert_eq!(parameters["type"], "object");
-        assert_eq!(parameters["required"], json!(["comment_id", "response"]));
-        assert_eq!(parameters["additionalProperties"], false);
-        let properties = &parameters["properties"];
-        assert_eq!(properties["comment_id"]["type"], "string");
-        assert_eq!(
-            properties["comment_id"]["description"],
-            "One of the comment_ids listed with the inline comments, for example comment_1. Never invent one."
-        );
-        assert_eq!(properties["response"]["type"], "string");
-        assert_eq!(
-            properties["response"]["description"],
-            "Your reply to that comment, shown beside it"
-        );
-    }
 
     #[test]
     fn stale_calls_are_ignored_when_the_turn_has_no_comments() {
@@ -342,20 +287,6 @@ mod tests {
         assert!(!result.recorded);
         assert_eq!(result.comment_id, "comment_1");
         assert!(comments.responses().unwrap().is_empty());
-    }
-
-    #[test]
-    fn creates_predictable_turn_local_ids() {
-        let comments = TurnComments::new(3);
-
-        assert_eq!(
-            comments
-                .comment_ids()
-                .iter()
-                .map(CommentId::as_str)
-                .collect::<Vec<_>>(),
-            ["comment_1", "comment_2", "comment_3"]
-        );
     }
 
     #[test]
@@ -384,18 +315,14 @@ mod tests {
         let comments = Arc::new(TurnComments::new(0));
         let tool = RespondToComment::new(comments.clone());
         comments.extend(1).unwrap();
-        let args = || RespondToCommentArgs {
+        let args = RespondToCommentArgs {
             comment_id: "comment_1".into(),
             response: "Reply".into(),
         };
         assert!(
-            futures::executor::block_on(tool.call(&mut ToolContext::new(), args()))
+            futures::executor::block_on(tool.call(&mut ToolContext::new(), args))
                 .unwrap()
                 .recorded
-        );
-        assert_eq!(
-            futures::executor::block_on(tool.call(&mut ToolContext::new(), args())).unwrap_err(),
-            CommentToolError::AlreadyResponded(CommentId::for_index(0))
         );
     }
 

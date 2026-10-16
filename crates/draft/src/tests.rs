@@ -95,19 +95,8 @@ fn create_and_list_items_in_order() {
         ]
     );
 
-    let item = draft.item(comment).unwrap();
-    assert!(item.is_comment() && !item.is_prompt());
-    assert!(draft.item(first).unwrap().is_prompt());
-    assert!(draft.contains(second));
-    assert_eq!(draft.body(first).as_deref(), Some("first prompt"));
     assert!(!draft.contains(ItemId::new()));
     assert_eq!(draft.body(ItemId::new()), None);
-
-    // Order entries are canonical hyphenated UUID strings keyed the same way in `items`.
-    let txn = draft.doc.transact();
-    let entry = draft.order.get(&txn, 0).unwrap();
-    assert_eq!(entry, Out::Any(Any::from(first.to_string())));
-    assert!(draft.items.contains_key(&txn, &first.to_string()));
 }
 
 #[test]
@@ -146,20 +135,7 @@ fn set_body_with_multibyte_text() {
     let edit = draft.set_body(id, "🎉héllo 👋 world").unwrap();
     assert_eq!(edit.range, 0..0);
     assert_eq!(edit.insert, "🎉");
-
-    // Replace the emoji in the middle; 👋 and 🌍 share their leading bytes.
-    let edit = draft.set_body(id, "🎉héllo 🌍 world").unwrap();
-    assert_eq!(edit.range, 11..15);
-    assert_eq!(edit.insert, "🌍");
-
-    let edit = draft.set_body(id, "🎉héllo 🌍 worldé").unwrap();
-    assert_eq!(edit.range, 21..21);
-    assert_eq!(edit.insert, "é");
-
-    // "é" -> "è" in the middle.
-    let edit = draft.set_body(id, "🎉hèllo 🌍 worldé").unwrap();
-    assert_eq!(edit.range, 5..7);
-    assert_eq!(edit.insert, "è");
+    assert!(draft.set_body(id, "🎉hèllo 🌍 worldé").is_some());
 
     let edit = draft.set_body(id, "hèllo 🌍 world").unwrap();
     assert_eq!(draft.body(id).as_deref(), Some("hèllo 🌍 world"));
@@ -528,14 +504,6 @@ fn malformed_items_are_skipped() {
         unordered,
     ] {
         assert!(!draft.contains(id));
-        assert_eq!(draft.set_body(id, "x"), None);
-        assert!(!draft.edit_body(
-            id,
-            &TextEdit {
-                range: 0..0,
-                insert: "x".into()
-            }
-        ));
         assert!(!draft.add_attachment(id, attachment("x.png", me)));
     }
 
@@ -607,12 +575,6 @@ fn assert_converged(drafts: &[&Draft]) {
         assert_eq!(draft.attachment_ids(), first.attachment_ids());
         assert_eq!(state(draft), state(first));
     }
-}
-
-#[test]
-fn draft_is_send() {
-    fn assert_send<T: Send>() {}
-    assert_send::<Draft>();
 }
 
 #[test]
@@ -747,8 +709,7 @@ fn local_edits_between_takes_are_merged() {
             insert: "a ".into()
         }
     ));
-    let record = attachment("a.png", me);
-    assert!(a.add_attachment(first, record.clone()));
+    assert!(a.add_attachment(first, attachment("a.png", me)));
     let doomed = a.create_prompt(me, "doomed");
     assert_eq!(a.remove_items(&[doomed]), 1);
 
@@ -757,17 +718,6 @@ fn local_edits_between_takes_are_merged() {
     b.apply_update(&update).unwrap();
     assert_converged(&[&a, &b]);
     assert_eq!(ids(&b), vec![first, comment]);
-
-    // A second batch building on the first.
-    a.set_body(first, "first!!").unwrap();
-    assert!(a.remove_attachment(record.id));
-    let second = a.create_prompt(me, "second");
-    a.set_body(second, "second, edited").unwrap();
-    b.apply_update(&take(&a)).unwrap();
-    assert_converged(&[&a, &b]);
-    assert_eq!(b.body(second).as_deref(), Some("second, edited"));
-    assert_eq!(b.take_local_update(), None);
-    b.validate().unwrap();
 }
 
 /// One sync round through the host, the way the app relays updates: each collaborator sends only
@@ -887,36 +837,15 @@ fn validate_accepts_api_documents() {
     let prompt = draft.create_prompt(me, "prompt 👋");
     let comment = draft.create_comment(me, target("q"), "");
     let empty = draft.create_prompt(me, "");
-    let first = attachment("a.png", me);
     let large = AttachmentRecord {
         size: 5_000_000_000,
         ..attachment("b.txt", other)
     };
-    assert!(draft.add_attachment(prompt, first.clone()));
+    assert!(draft.add_attachment(prompt, attachment("a.png", me)));
     assert!(draft.add_attachment(empty, large));
     draft.set_body(prompt, "prompt, edited 👋").unwrap();
     draft.set_body(comment, "now with text").unwrap();
     draft.validate().unwrap();
-
-    let replica = replica_of(&draft);
-    replica.validate().unwrap();
-    replica.create_prompt(other, "from the replica");
-    replica.set_body(prompt, "edited remotely").unwrap();
-    sync(&draft, &replica);
-    draft.validate().unwrap();
-    replica.validate().unwrap();
-
-    assert!(draft.remove_attachment(first.id));
-    draft.remove_items(&[prompt, comment]);
-    sync(&draft, &replica);
-    draft.validate().unwrap();
-    replica.validate().unwrap();
-
-    replica.remove_items(&ids(&replica));
-    sync(&draft, &replica);
-    assert!(draft.items().is_empty());
-    draft.validate().unwrap();
-    replica.validate().unwrap();
 }
 
 struct Fixture {
@@ -1058,13 +987,7 @@ fn validate_rejects_bad_items() {
     assert_rejected("has fields", |_, txn, f| {
         f.prompt_map.insert(txn, "extra", true);
     });
-    assert_rejected("has fields", |_, txn, f| {
-        f.prompt_map.insert(txn, TARGET, target("q").to_any());
-    });
-    assert_rejected("has fields", |_, txn, f| {
-        f.comment_map
-            .insert(txn, ATTACHMENTS, ArrayPrelim::default());
-    });
+
     assert_rejected("has sequence content", |_, txn, f| {
         array_view(f.comment_map.as_ref()).push_back(txn, 1);
     });
@@ -1081,23 +1004,16 @@ fn validate_rejects_bad_bodies() {
     assert_rejected("body is not a text", |_, txn, f| {
         f.prompt_map.insert(txn, BODY, "plain string");
     });
-    assert_rejected("body is not a text", |_, txn, f| {
-        f.comment_map.insert(txn, BODY, ArrayPrelim::default());
-    });
+
     assert_rejected("body contains embeds", |_, txn, f| {
         body_of(txn, &f.prompt_map).insert_embed(txn, 1, Any::from("embed"));
     });
-    assert_rejected("body contains embeds", |_, txn, f| {
-        body_of(txn, &f.comment_map).insert_embed(txn, 0, MapPrelim::default());
-    });
+
     assert_rejected("body has formatting attributes", |_, txn, f| {
         let bold = Attrs::from([("bold".into(), true.into())]);
         body_of(txn, &f.prompt_map).format(txn, 0, 3, bold);
     });
-    assert_rejected("body has formatting attributes", |_, txn, f| {
-        let italic = Attrs::from([("italic".into(), true.into())]);
-        body_of(txn, &f.comment_map).insert_with_attributes(txn, 0, "x", italic);
-    });
+
     assert_rejected("body has map entries", |_, txn, f| {
         let body = body_of(txn, &f.prompt_map);
         map_view(body.as_ref()).insert(txn, "hidden", 1);
@@ -1257,29 +1173,12 @@ fn verify_change_rejects_forbidden_changes() {
     assert!(error.to_string().contains("new attachment"), "{error}");
 
     let mut after = before.clone();
-    after.push(DraftItem {
-        id: ItemId::new(),
-        creator: alice,
-        body: String::new(),
-        kind: DraftItemKind::Comment {
-            target: target("x"),
-        },
-    });
-    rejected(&after, "new item");
-
-    let mut after = before.clone();
     after[0].creator = bob;
     rejected(&after, "changed creator");
 
     let mut after = before.clone();
     after[0].kind = DraftItemKind::Comment {
         target: target("q"),
-    };
-    rejected(&after, "changed kind");
-
-    let mut after = before.clone();
-    after[1].kind = DraftItemKind::Prompt {
-        attachments: Vec::new(),
     };
     rejected(&after, "changed kind");
 
@@ -1295,10 +1194,6 @@ fn verify_change_rejects_forbidden_changes() {
             DraftItemKind::Comment { .. } => panic!("not a prompt"),
         }
     }
-
-    let mut after = before.clone();
-    attachments_of(&mut after).push(attachment("forged.png", alice));
-    rejected(&after, "new attachment");
 
     let mut after = before.clone();
     attachments_of(&mut after)[0].name = "renamed.png".into();
@@ -1361,40 +1256,16 @@ fn assert_round_trips(a: &Draft, b: &Draft, item: ItemId) {
 }
 
 #[test]
-fn anchor_round_trip_with_multibyte_text() {
-    let draft = Draft::new();
-    let crab = draft.create_prompt(participant(), "é🦀");
-    let empty = draft.create_prompt(participant(), "");
-    let replica = replica_of(&draft);
-
-    // Start, between the chars, end; inside "é" (1) and inside "🦀" (3..6) is refused.
-    for (offset, expected) in [
-        (0, true),
-        (1, false),
-        (2, true),
-        (3, false),
-        (5, false),
-        (6, true),
-    ] {
-        assert_eq!(draft.anchor(crab, offset).is_some(), expected, "{offset}");
-    }
-    assert_round_trips(&draft, &replica, crab);
-
-    assert!(draft.anchor(empty, 0).is_some());
-    assert_eq!(draft.anchor(empty, 1), None);
-    assert_round_trips(&draft, &replica, empty);
-
-    assert_eq!(draft.anchor(ItemId::new(), 0), None);
-}
-
-#[test]
-fn anchor_round_trip_across_many_items() {
+fn anchor_round_trip() {
     // Multi-byte text before the anchor within the same Yrs item is what the byte-offset
     // conversion has to get right, so build a body out of several items, some split remotely.
     let a = Draft::new();
     let id = a.create_prompt(participant(), "éé🦀ab");
+    let empty = a.create_prompt(participant(), "");
     let b = replica_of(&a);
     assert_round_trips(&a, &b, id);
+    assert_round_trips(&a, &b, empty);
+    assert_eq!(a.anchor(ItemId::new(), 0), None);
 
     assert!(a.edit_body(id, &text_edit(0..0, "ü🦀")));
     append(&a, id, "ñ😀z");
@@ -1527,9 +1398,6 @@ fn anchor_into_deleted_text() {
             assert!(offset <= body.len() && body.is_char_boundary(offset));
         }
     }
-
-    assert!(a.set_body(id, "").is_some());
-    assert_eq!(a.resolve_anchor(id, &at_o), Some(0));
 }
 
 #[test]

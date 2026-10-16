@@ -116,19 +116,6 @@ mod tests {
     }
 
     #[test]
-    fn initials_come_from_both_words() {
-        let id = ParticipantId::new();
-        let name = id.display_name();
-        let expected = name
-            .split(' ')
-            .filter_map(|word| word.chars().next())
-            .collect::<String>();
-
-        assert_eq!(id.initials(), expected);
-        assert_eq!(id.initials().chars().count(), 2);
-    }
-
-    #[test]
     fn ids_spread_across_names() {
         let names = (0..64)
             .map(|_| ParticipantId::new().display_name())

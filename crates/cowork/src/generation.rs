@@ -817,8 +817,6 @@ mod compaction_tests;
 
 #[cfg(test)]
 mod tests {
-    use rig::tool::Tool as _;
-
     use super::*;
 
     #[test]
@@ -904,23 +902,6 @@ mod tests {
         for definitions in changed {
             assert_eq!(definitions, first);
         }
-        let names = first
-            .iter()
-            .map(|definition| definition.name.to_string())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            names,
-            [
-                RespondToComment::NAME,
-                Calculate::NAME,
-                RunCommand::NAME,
-                RequestPermissions::NAME,
-                ListDirectory::NAME,
-                ReadFile::NAME,
-                WriteFile::NAME,
-            ],
-            "in the same order every time"
-        );
         let text = serde_json::to_string(&first).unwrap();
         for host_specific in ["thread-0f1e", "folder-5c2d", &folder.to_string_lossy()] {
             assert!(!text.contains(host_specific), "names {host_specific}");

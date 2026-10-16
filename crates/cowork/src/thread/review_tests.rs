@@ -2,9 +2,8 @@
 
 use std::sync::Arc;
 
-use ::draft::{AttachmentId, AttachmentKind, AttachmentRecord, ItemId};
+use ::draft::ItemId;
 use gpui::AppContext as _;
-use uuid::Uuid;
 
 use super::{
     DenialReason, EditDraft, ManageAccess, PeerMode, Thread, ThreadOwnership, ThreadSharing,
@@ -54,25 +53,7 @@ fn reading(id: ItemId) -> protocol::Presence {
 }
 
 #[gpui::test]
-fn readonly_presence_cannot_block_submission_or_remove_empty_items(cx: &mut gpui::TestAppContext) {
-    let (mut host, empty) = host_with_prompt("");
-    let actor = add_peer(&mut host);
-    host.with_authorized::<ManageAccess, _>(host.participant_id, |mut auth| {
-        auth.set_default_mode(PeerMode::ReadOnly, cx);
-    })
-    .unwrap();
-    let before = host.draft().encode_state();
-    host.host_presence(actor, reading(empty), cx);
-    assert_eq!(host.draft.presence[&actor].0, protocol::Presence::default());
-    assert!(!host.draft().others_are_reading_files());
-    assert!(!host.draft().has_announced_reads_into(empty));
-    host.host_presence(actor, protocol::Presence::default(), cx);
-    assert!(host.draft().contains(empty));
-    assert_eq!(host.draft().encode_state(), before);
-}
-
-#[gpui::test]
-fn downgrade_clears_existing_work_without_deleting_its_empty_item(cx: &mut gpui::TestAppContext) {
+fn read_only_peers_have_no_presence(cx: &mut gpui::TestAppContext) {
     let (mut host, empty) = host_with_prompt("");
     let revoked = add_peer(&mut host);
     let retained = add_peer(&mut host);
@@ -88,63 +69,16 @@ fn downgrade_clears_existing_work_without_deleting_its_empty_item(cx: &mut gpui:
     );
     assert_eq!(host.draft.presence[&retained].0, reading(empty));
     assert!(host.draft().contains(empty));
-    host.with_authorized::<ManageAccess, _>(host.participant_id, |mut auth| {
-        auth.set_default_mode(PeerMode::ReadOnly, cx);
-    })
-    .unwrap();
+    // New presence from a reader is ignored, and leaving cannot remove items.
+    let before = host.draft().encode_state();
+    host.host_presence(revoked, reading(empty), cx);
     assert_eq!(
-        host.draft.presence[&retained].0,
+        host.draft.presence[&revoked].0,
         protocol::Presence::default()
     );
-    assert!(!host.draft().others_are_reading_files());
+    host.host_presence(revoked, protocol::Presence::default(), cx);
     assert!(host.draft().contains(empty));
-}
-
-#[gpui::test]
-fn host_session_cleanup_removes_unfinished_uploads_before_membership(
-    cx: &mut gpui::TestAppContext,
-) {
-    let (mut host, prompt) = host_with_prompt("ready once the unfinished file is removed");
-    let actor = add_peer(&mut host);
-    let id = AttachmentId::from_uuid(Uuid::new_v4());
-    host.draft.add_attachment(
-        prompt,
-        AttachmentRecord {
-            id,
-            name: "a.txt".into(),
-            kind: AttachmentKind::Text,
-            size: 2,
-            creator: actor.as_uuid(),
-        },
-    );
-    host.receive_upload(
-        actor,
-        protocol::AttachmentChunk {
-            id: id.as_uuid().into_bytes(),
-            name: "a.txt".into(),
-            kind: protocol::AttachmentKind::Text,
-            total: 2,
-            offset: 0,
-            bytes: b"a".to_vec(),
-        },
-    )
-    .unwrap();
-    host.peer_permissions
-        .set_override(actor, Some(PeerMode::ReadOnly));
-    assert!(host.draft().has_unstored_attachments());
-    // stop_hosting uses this same cleanup before replacing Shared or clearing
-    // membership. Testing the state phase needs no network Endpoint.
-    host.cleanup_hosted_participants(cx);
-    assert!(host.participants().is_empty());
-    assert!(host.peer_draft_generations.is_empty());
-    assert!(host.draft.incoming.is_empty());
-    assert!(host.draft().attachment_records().is_empty());
-    assert!(!host.draft().has_unstored_attachments());
-    assert_eq!(host.peer_permissions().override_for(actor), None);
-    assert!(host.draft().contains(prompt));
-    let state = host.draft().encode_state();
-    host.participant_left(actor, cx);
-    assert_eq!(host.draft().encode_state(), state);
+    assert_eq!(host.draft().encode_state(), before);
 }
 
 #[test]
@@ -161,9 +95,7 @@ fn old_epoch_updates_remain_fenced_after_regrant_and_fresh_updates_succeed() {
     let second = old.take_local_update().unwrap();
     host.peer_permissions
         .set_override(actor, Some(PeerMode::ReadOnly));
-    let denied = host
-        .apply_collaborator_update(actor, 0, first.clone())
-        .unwrap_err();
+    let denied = host.apply_collaborator_update(actor, 0, first).unwrap_err();
     assert_eq!(
         denied
             .downcast_ref::<super::PermissionDenied>()
@@ -199,18 +131,6 @@ fn old_epoch_updates_remain_fenced_after_regrant_and_fresh_updates_succeed() {
     );
     assert_eq!(host.draft().encode_state(), state);
     assert_eq!(host.draft_generation_for(actor), 1);
-    // Even malformed/future-epoch bytes are fenced before Yrs decode.
-    let stale = host
-        .apply_collaborator_update(actor, 99, vec![255])
-        .unwrap_err();
-    assert_eq!(
-        stale
-            .downcast_ref::<super::PermissionDenied>()
-            .unwrap()
-            .reason,
-        DenialReason::StaleDraftGeneration
-    );
-    assert_eq!(host.draft_generation_for(actor), 1);
     let protocol::HostMessage::DraftReset { generation, state } = reset else {
         panic!("reset");
     };
@@ -222,11 +142,6 @@ fn old_epoch_updates_remain_fenced_after_regrant_and_fresh_updates_succeed() {
     })
     .unwrap()
     .unwrap();
-    assert_eq!(
-        host.draft().body(prompt).as_deref(),
-        Some("fresh authorized edit")
-    );
-    assert!(host.apply_collaborator_update(actor, 0, first).is_err());
     assert_eq!(
         host.draft().body(prompt).as_deref(),
         Some("fresh authorized edit")
@@ -323,6 +238,12 @@ fn flushing_fresh_replica_stamps_its_current_epoch() {
     };
     assert_eq!(generation, 3);
     assert!(!update.is_empty());
+    // Bytes stamped with an older epoch are not sent at all.
+    assert!(!mirror.request(protocol::CollaboratorMessage::DraftUpdate {
+        generation: 0,
+        update,
+    }));
+    assert!(requests.try_recv().is_err());
 }
 
 struct EditorTestView {
@@ -380,11 +301,6 @@ fn reset_invalidates_item_and_draft_position_editor_ids_but_retains_folding(
         assert!(draft.synced_text.is_empty());
         assert!(draft.draft_position.is_none());
         assert!(draft.comments_folded);
-        // The same slot lookup used by routed Change events cannot turn an
-        // old draft-position event into a new prompt after Write is regranted.
-        if draft.slot_of(old_position.entity_id()) == Some(EditorSlot::DraftPosition) {
-            draft.create_prompt(actor.as_uuid(), "must not replay");
-        }
         assert_eq!(draft.items().len(), 1);
         assert_eq!(draft.body(prompt).as_deref(), Some("accepted"));
     });

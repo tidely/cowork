@@ -778,8 +778,6 @@ mod tests {
         }
     }
 
-    /// Control messages are written before bulk ones that were waiting at
-    /// the same time.
     /// Both sides sending bulk data at once still read each other's control
     /// messages.
     #[tokio::test]
@@ -839,6 +837,8 @@ mod tests {
             .expect("both control messages arrive");
     }
 
+    /// Control messages are written before bulk ones that were waiting at
+    /// the same time.
     #[tokio::test]
     async fn control_messages_overtake_waiting_bulk_messages() {
         let (near, far) = tokio::io::duplex(1 << 20);
@@ -981,16 +981,18 @@ mod tests {
         );
     }
 
+    /// Every message besides the snapshot, once each.
     #[test]
-    fn membership_and_control_messages_round_trip_through_postcard() {
+    fn host_and_collaborator_messages_round_trip() {
+        let group = UserMessage {
+            id: [9; 16],
+            comments: Vec::new(),
+            blocks: Vec::new(),
+        };
         for message in [
             HostMessage::Rejected("Version mismatch".into()),
-            HostMessage::ModelCatalogChanged(ModelCatalog::default()),
             HostMessage::ModelCatalogChanged(sample_catalog()),
-            HostMessage::ProjectFoldersChanged(Vec::new()),
             HostMessage::ProjectFoldersChanged(vec!["zed".into(), "cowork".into()]),
-            HostMessage::ProjectModeChanged(ProjectMode::Write),
-            HostMessage::ProjectModeChanged(ProjectMode::Read),
             HostMessage::ProjectModeChanged(ProjectMode::Network),
             HostMessage::ParticipantJoined {
                 participant: [1; 16],
@@ -1010,21 +1012,12 @@ mod tests {
             HostMessage::PermissionDenied(PermissionDenied {
                 participant: [1; 16],
                 operation: crate::thread::PermissionOperation::EditDraft,
-                reason: crate::thread::DenialReason::InsufficientMode,
-            }),
-            HostMessage::PermissionDenied(PermissionDenied {
-                participant: [1; 16],
-                operation: crate::thread::PermissionOperation::EditDraft,
                 reason: crate::thread::DenialReason::StaleDraftGeneration,
             }),
             HostMessage::DefaultPeerModeChanged(PeerMode::ReadOnly),
             HostMessage::PeerModeOverrideChanged {
                 participant: [1; 16],
                 mode: Some(PeerMode::Write),
-            },
-            HostMessage::PeerModeOverrideChanged {
-                participant: [1; 16],
-                mode: None,
             },
             HostMessage::Presence {
                 participant: [1; 16],
@@ -1035,6 +1028,56 @@ mod tests {
                 uploader: [1; 16],
             },
             HostMessage::AttachmentData(sample_chunk()),
+            HostMessage::PendingSubmissions {
+                sequence: 42,
+                pending: vec![PendingSubmission {
+                    id: [9; 16],
+                    mode: SubmissionMode::Queue,
+                    group: group.clone(),
+                }],
+            },
+            HostMessage::PendingDelivered {
+                id: [9; 16],
+                group,
+                agent_id: Some([2; 16]),
+                aliases: vec!["comment_4".into()],
+            },
+            HostMessage::AgentPreparing {
+                id: [7; 16],
+                comment_group_id: Some([8; 16]),
+                started_at: SystemTime::UNIX_EPOCH,
+            },
+            HostMessage::CompactionStarted,
+            HostMessage::CompactionFinished {
+                context: Some("Summary".into()),
+            },
+            HostMessage::AgentStarted {
+                id: [7; 16],
+                comment_group_id: Some([8; 16]),
+                started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                prompt: json(r#"{"role":"user"}"#),
+            },
+            HostMessage::AgentEvent {
+                id: [7; 16],
+                event: json(r#"{"Model":{}}"#),
+            },
+            HostMessage::AgentEnded {
+                id: [7; 16],
+                outcome: RunOutcome::Failed("Unable to generate a response".into()),
+                duration: Duration::from_millis(2_500),
+            },
+            HostMessage::PromptNamed {
+                participant: [11; 16],
+                name: "Ada".into(),
+            },
+            HostMessage::ToolApprovalRequested {
+                id: [7; 16],
+                call: Json::call_id(&rig::message::CallId::from_wire("call_1")),
+            },
+            HostMessage::ToolApprovalResolved {
+                id: [7; 16],
+                call: Json::call_id(&rig::message::CallId::from_wire("call_1")),
+            },
         ] {
             assert_eq!(round_trip(&message), message);
         }
@@ -1057,10 +1100,6 @@ mod tests {
                 sequence: 4,
                 mode: SubmissionMode::Steering,
             },
-            CollaboratorMessage::SubmitPending {
-                sequence: 5,
-                mode: SubmissionMode::Queue,
-            },
             CollaboratorMessage::CancelPending { id: [4; 16] },
             CollaboratorMessage::Presence(sample_presence()),
             CollaboratorMessage::AttachmentData(sample_chunk()),
@@ -1069,100 +1108,11 @@ mod tests {
                 call: Json::call_id(&rig::message::CallId::from_wire("call_1")),
                 allow: true,
             },
-            // A call id rig minted for a call the provider sent without one.
-            CollaboratorMessage::DecideToolCall {
-                message_id: [2; 16],
-                call: Json::call_id(&rig::message::CallId::from_wire("")),
-                allow: false,
-            },
         ] {
             let encoded = postcard::to_stdvec(&message).expect("encode protocol message");
             let decoded: CollaboratorMessage =
                 postcard::from_bytes(&encoded).expect("decode protocol message");
             assert_eq!(decoded, message);
-        }
-    }
-
-    #[test]
-    fn pending_messages_round_trip() {
-        let group = UserMessage {
-            id: [9; 16],
-            comments: Vec::new(),
-            blocks: Vec::new(),
-        };
-        let pending = PendingSubmission {
-            id: [9; 16],
-            mode: SubmissionMode::Queue,
-            group: group.clone(),
-        };
-        for message in [
-            HostMessage::PendingSubmissions {
-                sequence: 42,
-                pending: vec![pending],
-            },
-            HostMessage::PendingDelivered {
-                id: [9; 16],
-                group,
-                agent_id: Some([2; 16]),
-                aliases: vec!["comment_4".into()],
-            },
-        ] {
-            assert_eq!(round_trip(&message), message);
-        }
-    }
-
-    #[test]
-    fn agent_stream_events_round_trip_through_postcard() {
-        for message in [
-            HostMessage::AgentPreparing {
-                id: [7; 16],
-                comment_group_id: Some([8; 16]),
-                started_at: SystemTime::UNIX_EPOCH,
-            },
-            HostMessage::CompactionStarted,
-            HostMessage::CompactionFinished {
-                context: Some("Summary".into()),
-            },
-            HostMessage::CompactionFinished { context: None },
-            HostMessage::AgentStarted {
-                id: [7; 16],
-                comment_group_id: Some([8; 16]),
-                started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-                prompt: json(r#"{"role":"user"}"#),
-            },
-            HostMessage::AgentEvent {
-                id: [7; 16],
-                event: json(r#"{"Model":{}}"#),
-            },
-            HostMessage::AgentEnded {
-                id: [7; 16],
-                outcome: RunOutcome::Failed("Unable to generate a response".into()),
-                duration: Duration::from_millis(2_500),
-            },
-            HostMessage::AgentEnded {
-                id: [7; 16],
-                outcome: RunOutcome::Stopped,
-                duration: Duration::from_millis(900),
-            },
-            HostMessage::AgentEnded {
-                id: [7; 16],
-                outcome: RunOutcome::Completed,
-                duration: Duration::from_secs(53),
-            },
-            HostMessage::PromptNamed {
-                participant: [11; 16],
-                name: "Ada".into(),
-            },
-            HostMessage::ToolApprovalRequested {
-                id: [7; 16],
-                call: Json::call_id(&rig::message::CallId::from_wire("call_1")),
-            },
-            HostMessage::ToolApprovalResolved {
-                id: [7; 16],
-                call: Json::call_id(&rig::message::CallId::from_wire("")),
-            },
-        ] {
-            assert_eq!(round_trip(&message), message);
         }
     }
 

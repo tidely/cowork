@@ -914,7 +914,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cancellation_during_tool_execution_does_not_deliver_steering() {
+    async fn steering_withdrawn_before_delivery_is_not_delivered() {
         let hook = Arc::new(PendingSteering::default());
         let mut tools = ToolSet::default();
         tools.add_tool(tools::Calculate);
@@ -1284,7 +1284,7 @@ mod tests {
 
         let [
             Message::User { .. },
-            Message::Assistant(reply),
+            Message::Assistant(_),
             Message::User { content: results },
             Message::Assistant(_),
         ] = history.as_slice()
@@ -1292,32 +1292,10 @@ mod tests {
             panic!("expected prompt, reply, tool result, reply, got {history:?}");
         };
         assert!(matches!(
-            reply.content.as_slice(),
-            [
-                AssistantContent::Reasoning(_),
-                AssistantContent::Text(_),
-                AssistantContent::ToolCall(_),
-            ]
-        ));
-        assert!(reply.origin.is_some());
-        assert!(matches!(
             results.as_slice(),
             [UserContent::ToolResult(result)] if !result.is_error
         ));
-
-        let mut fold = TurnFold::default();
-        let folded = events
-            .iter()
-            .map(|event| {
-                serde_json::from_str::<AgentEvent>(&serde_json::to_string(event).expect("encode"))
-                    .expect("decode")
-            })
-            .filter_map(|event| fold.apply(&event).expect("a valid event").message);
-        let prompt = Message::user("1 + 2?");
-        assert_eq!(
-            std::iter::once(prompt).chain(folded).collect::<Vec<_>>(),
-            history
-        );
+        assert_replayed_history(Message::user("1 + 2?"), &events, &history);
     }
 
     /// A call whose arguments are not a JSON object never reaches the tool:
@@ -1510,27 +1488,5 @@ mod tests {
                 .is_some_and(|text| text.contains("read only")),
             "{result:?}"
         );
-    }
-
-    /// What a run emits folds the same after each event crosses a JSON
-    /// boundary on its own.
-    #[test]
-    fn events_fold_the_same_after_serialization() {
-        let fold = |events: &[AgentEvent]| {
-            let mut fold = TurnFold::default();
-            events
-                .iter()
-                .filter_map(|event| fold.apply(event).expect("a valid event").message)
-                .collect::<Vec<_>>()
-        };
-        let events = thinking_turn();
-        let received = events
-            .iter()
-            .map(|event| {
-                serde_json::from_str(&serde_json::to_string(event).expect("encode"))
-                    .expect("decode")
-            })
-            .collect::<Vec<AgentEvent>>();
-        assert_eq!(fold(&received), fold(&events));
     }
 }

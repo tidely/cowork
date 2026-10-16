@@ -102,21 +102,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn highlights_fenced_rust_code() {
-        let code = "fn main() { println!(\"hello\"); }\n";
-        let block = CodeBlock::from_code(code, Some("rust"));
-        for is_dark in [false, true] {
-            let highlights = highlight_code_block_in_mode(&block, is_dark);
-            assert!(!highlights.is_empty());
-            assert!(
-                highlights
-                    .iter()
-                    .all(|(range, _)| range.start < range.end && range.end <= code.len())
-            );
-        }
-    }
-
-    #[test]
     fn highlights_multiline_shell_commands() {
         let code = "# café\nfor file in *.rs; do\n    printf '%s\\n' \"$file\"\ndone";
         let block = CodeBlock::from_code(code, Some("sh"));

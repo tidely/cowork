@@ -194,9 +194,7 @@ fn selection_survives_crossing_the_deferred_history_threshold(cx: &mut gpui::Tes
 }
 
 #[gpui::test]
-fn settled_history_culls_middle_rows_and_bottom_keeps_the_full_extent(
-    cx: &mut gpui::TestAppContext,
-) {
+fn settled_history_culls_rows_and_keeps_its_geometry(cx: &mut gpui::TestAppContext) {
     let (fixture, _runtime, cx) = Fixture::new(cx, timeline_bench::SHORT);
     fixture.assert_culled(cx);
     assert!(cx.debug_bounds(fixture.users[0].1).is_some());
@@ -213,14 +211,8 @@ fn settled_history_culls_middle_rows_and_bottom_keeps_the_full_extent(
 
     fixture.top(cx);
     assert_same_geometry(fixture.geometry(cx), (px(0.), max));
-}
 
-#[gpui::test]
-fn stable_redraws_leave_an_interior_scroll_offset_and_extent_unchanged(
-    cx: &mut gpui::TestAppContext,
-) {
-    let (fixture, _runtime, cx) = Fixture::new(cx, timeline_bench::SHORT);
-    let (_, max) = fixture.geometry(cx);
+    // Stable redraws leave an interior offset and the extent unchanged.
     fixture.cowork.update(cx, |cowork, cx| {
         cowork
             .timeline_scroll_handle

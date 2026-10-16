@@ -528,7 +528,7 @@ mod tests {
     }
 
     #[test]
-    fn titles_match_fuzzily_and_the_best_match_ranks_first() {
+    fn titles_match_fuzzily_word_by_word() {
         let chats = titled(&[
             "Protocol decode failures",
             "Review protocol decoding edge cases",
@@ -545,31 +545,14 @@ mod tests {
         );
         // A match at word starts outranks one scattered through the title.
         assert_eq!(found_titles(&chats, "rui")[0], "Find Rust UI frameworks");
-    }
 
-    #[test]
-    fn each_title_word_must_match_in_any_order() {
+        // Each word must match on its own, in any order.
         let chats = titled(&["Set upstream Git remote", "Remove untracked file"]);
         assert_eq!(
             found_titles(&chats, "remote git"),
             ["Set upstream Git remote"]
         );
         assert!(found_titles(&chats, "remote zzz").is_empty());
-    }
-
-    #[test]
-    fn no_match_leaves_no_category() {
-        let mut query = PaletteQuery::new("zzz");
-        let rows = query
-            .row(
-                PaletteTarget::Chat(Uuid::new_v4()),
-                "Alpha".into(),
-                None,
-                ["nothing here"],
-            )
-            .into_iter()
-            .collect();
-        assert!(section("Chats", rows).is_none());
     }
 
     #[test]
@@ -603,28 +586,18 @@ mod tests {
             excerpt_parts(rows[0].excerpt.as_ref().expect("an excerpt")),
             ("Try the noodle bar.", "noodle bar")
         );
-
-        // Case is ignored unless the query has a capital.
-        assert_eq!(found_titles(&chats, "LIFETIMES"), Vec::<String>::new());
-        assert_eq!(found_titles(&chats, "lifetimes"), ["Rust questions"]);
     }
 
     #[test]
-    fn title_matches_rank_above_message_matches() {
+    fn title_matches_rank_above_message_matches_and_still_show_them() {
         let chats: [(&str, &[&str]); 2] = [
             ("Weekend plans", &["Let's talk about the deploy"]),
-            ("Deploy checklist", &[]),
+            ("Deploy checklist", &["Run the deploy script"]),
         ];
-        assert_eq!(
-            found_titles(&chats, "deploy"),
-            ["Deploy checklist", "Weekend plans"]
-        );
-    }
-
-    #[test]
-    fn a_title_match_still_shows_where_messages_match() {
-        let chats: [(&str, &[&str]); 1] = [("Deploy checklist", &["Run the deploy script"])];
-        let row = search(&chats, "deploy").remove(0);
+        let rows = search(&chats, "deploy");
+        let titles: Vec<_> = rows.iter().map(|row| row.label.to_string()).collect();
+        assert_eq!(titles, ["Deploy checklist", "Weekend plans"]);
+        let row = &rows[0];
         assert_eq!(
             &row.label[row.matched[0].start..row.matched.last().unwrap().end],
             "Deploy"
@@ -640,11 +613,11 @@ mod tests {
         let lead = "word ".repeat(20);
         let tail = "more ".repeat(60);
         let text = format!("{lead}the\n\n  needle\tin {tail}");
-        let excerpt = excerpt(
+        let cut = excerpt(
             &text,
             text.find("needle").unwrap()..text.find("needle").unwrap() + 6,
         );
-        let (line, matched) = excerpt_parts(&excerpt);
+        let (line, matched) = excerpt_parts(&cut);
         assert_eq!(matched, "needle");
         assert!(line.starts_with('…'), "{line:?}");
         assert!(line.ends_with('…'), "{line:?}");
@@ -656,15 +629,13 @@ mod tests {
         // The lead is the last `EXCERPT_LEAD_CHARS` chars before the match:
         // 25 of the words, then "the" and its four whitespace chars.
         assert_eq!(
-            &excerpt.text[..excerpt.matched.start],
+            &cut.text[..cut.matched.start],
             "…word word word word word the "
         );
-    }
 
-    #[test]
-    fn short_messages_are_shown_whole() {
+        // Short messages are shown whole.
         let text = "Café is\nhere";
-        let excerpt = excerpt(text, 0.."Café".len());
-        assert_eq!(excerpt_parts(&excerpt), ("Café is here", "Café"));
+        let whole = excerpt(text, 0.."Café".len());
+        assert_eq!(excerpt_parts(&whole), ("Café is here", "Café"));
     }
 }

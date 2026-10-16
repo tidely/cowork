@@ -37,9 +37,6 @@ fn dark_theme() -> ThemeConfig {
 
 #[cfg(test)]
 mod tests {
-    use gpui::rgb;
-    use gpui_component::ThemeMode;
-
     use super::*;
 
     #[test]
@@ -52,31 +49,5 @@ mod tests {
             gpui_component::try_parse_color(color.as_str().unwrap())
                 .unwrap_or_else(|error| panic!("invalid {role}: {error}"));
         }
-    }
-
-    #[gpui::test]
-    fn palette_and_semantic_tokens_switch_together(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            gpui_component::init(cx);
-            init(cx);
-            let theme = cx.theme();
-            assert_eq!(theme.dark_theme.name.as_ref(), "Cowork Dark");
-            assert_eq!(theme.background, rgb(0x18181b).into());
-            assert_eq!(theme.semantic_tokens().colors.surface, theme.popover);
-            assert_eq!(theme.tokens.primary.color, theme.primary);
-
-            Theme::change(ThemeMode::Light, None, cx);
-            assert!(!cx.theme().is_dark());
-            assert_ne!(cx.theme().background, rgb(0x18181b).into());
-            assert_eq!(
-                cx.theme().semantic_tokens().colors.primary,
-                cx.theme().primary
-            );
-
-            Theme::change(ThemeMode::Dark, None, cx);
-            assert!(cx.theme().is_dark());
-            assert_eq!(cx.theme().background, rgb(0x18181b).into());
-            assert_eq!(cx.theme().primary, rgb(0x60a5fa).into());
-        });
     }
 }

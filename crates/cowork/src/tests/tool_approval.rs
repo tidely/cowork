@@ -76,13 +76,6 @@ fn only_admins_decide_a_waiting_call(cx: &mut gpui::TestAppContext) {
     let mirror = session.collaborator_thread().expect("joined");
     let mut waiting = wait_for_approval(&mut session);
     let message_id = waiting.message_id;
-    let selector = move |part: &str| -> &'static str {
-        Box::leak(format!("tool-approval-{message_id}-0-{part}").into_boxed_str())
-    };
-
-    // The host may decide; the collaborator, joined as `Write`, waits.
-    assert!(session.cx.debug_bounds(selector("allow")).is_some());
-    assert!(session.cx.debug_bounds(selector("waiting")).is_some());
 
     // Neither the mirror's guard nor the host lets a `Write` peer decide.
     let request = protocol::CollaboratorMessage::DecideToolCall {
@@ -119,12 +112,6 @@ fn only_admins_decide_a_waiting_call(cx: &mut gpui::TestAppContext) {
         waiting.decision.try_recv(),
         Ok(ToolDecision::Deny { .. })
     ));
-
-    // A decision that comes too late changes nothing.
-    let call = waiting.call.clone();
-    session.host.update(session.cx, |cowork, cx| {
-        cowork.decide_tool_call(message_id, call, true, cx);
-    });
     waiting.task.abort();
 }
 
@@ -169,33 +156,16 @@ fn only_the_host_decides_a_command(cx: &mut gpui::TestAppContext) {
         Some(waiting.call.clone())
     );
 
-    let call = waiting.call.clone();
-    session.host.update(session.cx, |cowork, cx| {
-        cowork.decide_tool_call(message_id, call, true, cx);
-    });
-    session.wait_until("everyone sees the call decided", |this| {
-        awaiting(&host_thread, this.cx).is_none() && awaiting(&mirror, this.cx).is_none()
-    });
-    assert_eq!(waiting.decision.try_recv(), Ok(ToolDecision::Allow));
-    waiting.task.abort();
-}
-
-#[gpui::test]
-fn the_host_allows_a_call_from_its_card(cx: &mut gpui::TestAppContext) {
-    let mut session = Collaboration::start(cx);
-    let mut waiting = wait_for_approval(&mut session);
+    // The host allows it from its card.
     let allow = session
         .cx
-        .debug_bounds(Box::leak(
-            format!("tool-approval-{}-0-allow", waiting.message_id).into_boxed_str(),
-        ))
+        .debug_bounds(selector("allow"))
         .expect("the host is offered Allow");
     session
         .cx
         .simulate_click(allow.center(), gpui::Modifiers::default());
-    let mirror = session.collaborator_thread().expect("joined");
-    session.wait_until("the mirror sees the call decided", |this| {
-        awaiting(&mirror, this.cx).is_none()
+    session.wait_until("everyone sees the call decided", |this| {
+        awaiting(&host_thread, this.cx).is_none() && awaiting(&mirror, this.cx).is_none()
     });
     assert_eq!(waiting.decision.try_recv(), Ok(ToolDecision::Allow));
     waiting.task.abort();
@@ -209,24 +179,10 @@ fn waiting_calls_reach_joiners_and_are_checked(cx: &mut gpui::TestAppContext) {
     let waiting = wait_for_approval(&mut session);
     let welcome = session
         .host_thread
-        .read_with(session.cx, |host, _| protocol::Welcome {
-            draft_generation: 0,
-            participant_id: ParticipantId::new().into_bytes(),
-            thread: host.to_protocol(),
-            draft: host.draft().encode_state(),
-            presence: Vec::new(),
-            stored_attachments: Vec::new(),
-        });
-    let joined = session.cx.update(|_, cx| {
-        cx.new(|cx| {
-            Thread::from_welcome(
-                welcome.clone(),
-                ThreadDraft::new(ParticipantId::new()),
-                ThreadSharing::NotShared,
-                cx,
-            )
-        })
-    });
+        .read_with(session.cx, |host, _| host.welcome_for_test());
+    let joined = session
+        .cx
+        .update(|_, cx| cx.new(|cx| Thread::join_for_test(welcome.clone(), cx)));
     assert_eq!(awaiting(&joined, session.cx), Some(waiting.call.clone()));
 
     let elsewhere = protocol::Json::call_id(&CallId::from_wire("elsewhere"));

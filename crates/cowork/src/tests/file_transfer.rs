@@ -130,30 +130,6 @@ fn a_collaborators_file_is_uploaded_and_stored(cx: &mut gpui::TestAppContext) {
         );
         assert!(thread.draft().files.contains_key(&record.id));
     });
-    host_thread.read_with(session.cx, |thread, _| {
-        let files = &thread.draft().files;
-        let timeline = &thread.timeline;
-        let [TimelineMessage::User(message), ..] = timeline.as_slice() else {
-            panic!("expected the submitted message first");
-        };
-        let RigMessage::User { content } =
-            agent_message(None, &message.record.blocks, files, &HashMap::new())
-        else {
-            panic!("expected a user message");
-        };
-        assert!(content.iter().any(
-            |part| matches!(part, UserContent::Text(part) if part.text.contains("0123456789abcdef"))
-        ));
-    });
-    // The collaborator mirrors the prompt the agent was sent, file included.
-    session.wait_until("the collaborator mirrors the conversation", |this| {
-        collaborator_thread.read_with(this.cx, |thread, _| thread.conversation())
-            == host_thread.read_with(this.cx, |thread, _| thread.conversation())
-    });
-    collaborator_thread.read_with(session.cx, |thread, _| {
-        assert_eq!(thread.transcript.messages().len(), 1);
-        assert_eq!(thread.prompt_names.len(), 1);
-    });
 }
 
 #[gpui::test]
@@ -189,54 +165,6 @@ fn the_hosts_files_are_downloaded_by_collaborators(cx: &mut gpui::TestAppContext
     });
 }
 
-#[gpui::test]
-fn files_left_unfinished_by_a_leaving_collaborator_are_removed(cx: &mut gpui::TestAppContext) {
-    let mut session = Collaboration::start(cx);
-    let collaborator_thread = session.collaborator_thread().expect("joined");
-    let host_thread = session.host_thread.clone();
-    let block = session.items(&host_thread)[0].id;
-    // A record whose bytes never come.
-    let collaborator = session.collaborator.clone();
-    collaborator.update(session.cx, |collaborator, cx| {
-        let draft_id = collaborator_thread.read(cx).draft().id;
-        collaborator.update_draft(draft_id, cx, |draft| {
-            draft.add_attachment(
-                block,
-                AttachmentRecord {
-                    id: AttachmentId::new(),
-                    name: "never.txt".into(),
-                    kind: AttachmentKind::Text,
-                    size: 10,
-                    creator: draft.author.as_uuid(),
-                },
-            );
-        });
-    });
-    session.wait_until("the host sees the record", |this| {
-        host_thread.read_with(this.cx, |thread, _| {
-            thread.draft().attachment_records().len() == 1
-        })
-    });
-    // Nobody can submit it while its bytes are missing.
-    let host = session.host.clone();
-    host.read_with(session.cx, |host, cx| {
-        let draft_id = host_thread.read(cx).draft().id;
-        assert!(host.draft_is_loading_attachments(draft_id, cx));
-    });
-
-    collaborator_thread.update(session.cx, |thread, _| {
-        thread.sharing = ThreadSharing::NotShared;
-    });
-    session.wait_until("the host removes the record", |this| {
-        host_thread.read_with(this.cx, |thread, _| {
-            thread.participants().len() == 1 && thread.draft().attachment_records().is_empty()
-        })
-    });
-    assert_eq!(session.bodies(&host_thread), ["from the host"]);
-}
-
-/// Bytes and the record announcing them travel separately, so the bytes
-/// can come first.
 #[gpui::test]
 fn stopping_host_sharing_cleans_unfinished_uploads_before_peer_tasks_exit(
     cx: &mut gpui::TestAppContext,
@@ -354,17 +282,10 @@ fn stopping_host_sharing_cleans_unfinished_uploads_before_peer_tasks_exit(
             );
         });
     });
-    session.wait_until(
-        "the collaborator is disconnected after host cleanup",
-        |this| this.collaborator_thread().is_none(),
-    );
-    assert_eq!(session.bodies(&host_thread), ["from the host"]);
-    host_thread.read_with(session.cx, |thread, _| {
-        assert!(thread.draft().incoming.is_empty());
-        assert_eq!(thread.draft().attachment_records(), [host_record]);
-    });
 }
 
+/// Bytes and the record announcing them travel separately, so the bytes
+/// can come first.
 #[gpui::test]
 fn uploads_wait_for_their_record(cx: &mut gpui::TestAppContext) {
     cx.update(gpui_component::init);

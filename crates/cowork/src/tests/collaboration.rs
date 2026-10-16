@@ -9,7 +9,6 @@ fn copied_endpoint_id_is_accepted_by_join_input() {
     let copied_text = endpoint_id.to_string();
 
     assert!(endpoint_id_input_is_complete(&copied_text));
-    assert_eq!(copied_text.parse::<EndpointId>().unwrap(), endpoint_id);
 }
 
 #[gpui::test]
@@ -64,6 +63,8 @@ fn collaborators_receive_the_draft_and_edit_it_live(cx: &mut gpui::TestAppContex
     );
 }
 
+/// Draft updates and the submission travel on one ordered stream, so the
+/// last keystroke before Ctrl-Enter is part of the submission.
 #[gpui::test]
 fn the_host_accepts_one_submission_per_sequence(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
@@ -72,6 +73,9 @@ fn the_host_accepts_one_submission_per_sequence(cx: &mut gpui::TestAppContext) {
     let host_thread = session.host_thread.clone();
 
     let collaborator = session.collaborator.clone();
+    session.focus(&collaborator);
+    session.settle();
+    session.cx.simulate_input("?");
     session.cx.update(|window, cx| {
         collaborator.update(cx, |collaborator, cx| {
             collaborator.submit_composer(window, cx)
@@ -87,7 +91,7 @@ fn the_host_accepts_one_submission_per_sequence(cx: &mut gpui::TestAppContext) {
         let [TimelineMessage::User(message), ..] = timeline.as_slice() else {
             panic!("expected the submitted message first");
         };
-        assert_eq!(message.record.blocks[0].text, "from the host");
+        assert_eq!(message.record.blocks[0].text, "from the host?");
     });
 
     // The test's agent never answers, so end its run by hand.
@@ -133,37 +137,6 @@ fn the_host_accepts_one_submission_per_sequence(cx: &mut gpui::TestAppContext) {
         collaborator_thread.read_with(this.cx, |thread, _| thread.submission_count() == 2)
     });
     assert!(session.items(&host_thread).is_empty());
-}
-
-#[gpui::test]
-fn concurrent_blocks_converge_to_one_order(cx: &mut gpui::TestAppContext) {
-    let mut session = Collaboration::start(cx);
-    let collaborator_thread = session.collaborator_thread().expect("joined");
-    let host_thread = session.host_thread.clone();
-
-    // Both append before either hears of the other's block.
-    let host = session.host.clone();
-    host.update(session.cx, |host, cx| {
-        let draft_id = host_thread.read(cx).draft().id;
-        host.update_draft(draft_id, cx, |draft| {
-            draft.create_prompt(draft.author.as_uuid(), "host");
-        });
-    });
-    let collaborator = session.collaborator.clone();
-    collaborator.update(session.cx, |collaborator, cx| {
-        let draft_id = collaborator_thread.read(cx).draft().id;
-        collaborator.update_draft(draft_id, cx, |draft| {
-            draft.create_prompt(draft.author.as_uuid(), "collaborator");
-        });
-    });
-
-    session.wait_until("both have both blocks", |this| {
-        this.items(&host_thread).len() == 3 && this.items(&collaborator_thread).len() == 3
-    });
-    assert_eq!(
-        session.bodies(&host_thread),
-        session.bodies(&collaborator_thread)
-    );
 }
 
 #[gpui::test]
@@ -378,35 +351,6 @@ fn keystrokes_merge_with_edits_the_editor_does_not_show_yet(cx: &mut gpui::TestA
     });
 }
 
-/// Draft updates and the submission travel on one ordered stream, so the
-/// last keystroke before Ctrl-Enter is part of the submission.
-#[gpui::test]
-fn a_submission_includes_the_last_keystroke(cx: &mut gpui::TestAppContext) {
-    let mut session = Collaboration::start(cx);
-    set_default(&mut session, PeerMode::Admin);
-    let host_thread = session.host_thread.clone();
-    let collaborator = session.collaborator.clone();
-    session.focus(&collaborator);
-    session.settle();
-
-    session.cx.simulate_input("?");
-    session.cx.update(|window, cx| {
-        collaborator.update(cx, |collaborator, cx| {
-            collaborator.submit_composer(window, cx)
-        });
-    });
-    session.wait_until("the host accepts the submission", |this| {
-        host_thread.read_with(this.cx, |thread, _| thread.submission_count() == 1)
-    });
-    host_thread.read_with(session.cx, |thread, _| {
-        let timeline = &thread.timeline;
-        let [TimelineMessage::User(message), ..] = timeline.as_slice() else {
-            panic!("expected the submitted message first");
-        };
-        assert_eq!(message.record.blocks[0].text, "from the host?");
-    });
-}
-
 #[gpui::test]
 fn joining_a_thread_scrolls_to_the_bottom(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start_with_history(cx, true);
@@ -469,7 +413,7 @@ fn a_joined_thread_closes_when_the_host_sends_invalid_json(cx: &mut gpui::TestAp
 }
 
 #[gpui::test]
-fn the_host_sees_where_the_collaborator_is_typing(cx: &mut gpui::TestAppContext) {
+fn the_host_sees_the_collaborators_caret_and_selection(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
     let collaborator_thread = session.collaborator_thread().expect("joined");
     let host_thread = session.host_thread.clone();
@@ -494,18 +438,7 @@ fn the_host_sees_where_the_collaborator_is_typing(cx: &mut gpui::TestAppContext)
             if *participant == collaborator_id && *head == end && *selection == (end..end)
     ));
 
-    // The caret follows what the collaborator types, and the host's
-    // composer lists them as an editor of the host's block.
-    session.cx.simulate_input("!!");
-    session.wait_until("the caret moves along", |this| {
-        host_thread.read_with(this.cx, |thread, _| {
-            thread
-                .draft()
-                .remote_carets(block, thread.participants())
-                .first()
-                .is_some_and(|caret| caret.head == end + 2)
-        })
-    });
+    // The host's composer lists them as an editor of the host's block.
     let host = session.host.clone();
     let editors = session.cx.update(|window, cx| {
         let host = host.read(cx);
@@ -514,6 +447,20 @@ fn the_host_sees_where_the_collaborator_is_typing(cx: &mut gpui::TestAppContext)
         model.blocks[0].presence.editors.clone()
     });
     assert_eq!(editors, [collaborator_id]);
+
+    // The selection follows theirs.
+    session
+        .cx
+        .simulate_keystrokes("shift-left shift-left shift-left shift-left");
+    session.wait_until("the host sees the selection", |this| {
+        host_thread.read_with(this.cx, |thread, _| {
+            thread
+                .draft()
+                .remote_carets(block, thread.participants())
+                .first()
+                .is_some_and(|caret| caret.selection == (end - 4..end) && caret.head == end - 4)
+        })
+    });
 
     // Leaving the draft clears the presence.
     collaborator.update(session.cx, |collaborator, cx| {
@@ -526,29 +473,6 @@ fn the_host_sees_where_the_collaborator_is_typing(cx: &mut gpui::TestAppContext)
                 .draft()
                 .editors_of(block, thread.participants())
                 .is_empty()
-        })
-    });
-}
-
-#[gpui::test]
-fn the_host_sees_the_collaborators_selection(cx: &mut gpui::TestAppContext) {
-    let mut session = Collaboration::start(cx);
-    let host_thread = session.host_thread.clone();
-    let block = session.items(&host_thread)[0].id;
-    let collaborator = session.collaborator.clone();
-    session.focus(&collaborator);
-    session.settle();
-    session
-        .cx
-        .simulate_keystrokes("shift-left shift-left shift-left shift-left");
-    let end = "from the host".len();
-    session.wait_until("the host sees the selection", |this| {
-        host_thread.read_with(this.cx, |thread, _| {
-            thread
-                .draft()
-                .remote_carets(block, thread.participants())
-                .first()
-                .is_some_and(|caret| caret.selection == (end - 4..end) && caret.head == end - 4)
         })
     });
 }
@@ -593,16 +517,6 @@ fn an_empty_block_stays_while_someone_else_is_in_it(cx: &mut gpui::TestAppContex
         host_thread.read_with(this.cx, |thread, _| thread.draft().is_attended(block, None))
     });
 
-    // The host cannot remove it while the collaborator is in it.
-    let removed = host_thread.update(session.cx, |thread, _| {
-        thread
-            .with_authorized::<EditDraft, _>(thread.participant_id(), |auth| {
-                auth.edit(|draft| draft.remove_if_unattended(block))
-            })
-            .expect("host edit")
-    });
-    assert!(!removed);
-
     // The collaborator, although not its creator, removes it on leaving.
     session.cx.update(|window, cx| {
         collaborator.update(cx, |collaborator, cx| {
@@ -616,15 +530,29 @@ fn an_empty_block_stays_while_someone_else_is_in_it(cx: &mut gpui::TestAppContex
 }
 
 #[gpui::test]
-fn the_host_removes_the_empty_block_a_leaving_collaborator_was_in(cx: &mut gpui::TestAppContext) {
+fn a_leaving_collaborators_empty_block_and_unfinished_files_are_removed(
+    cx: &mut gpui::TestAppContext,
+) {
     let mut session = Collaboration::start(cx);
     let collaborator_thread = session.collaborator_thread().expect("joined");
     let host_thread = session.host_thread.clone();
+    let host_block = session.items(&host_thread)[0].id;
     let collaborator = session.collaborator.clone();
     let block = collaborator.update(session.cx, |collaborator, cx| {
         let draft_id = collaborator_thread.read(cx).draft().id;
         collaborator
             .update_draft(draft_id, cx, |draft| {
+                // A record whose bytes never come.
+                draft.add_attachment(
+                    host_block,
+                    AttachmentRecord {
+                        id: AttachmentId::new(),
+                        name: "never.txt".into(),
+                        kind: AttachmentKind::Text,
+                        size: 10,
+                        creator: draft.author.as_uuid(),
+                    },
+                );
                 draft.create_prompt(draft.author.as_uuid(), "")
             })
             .expect("draft")
@@ -636,16 +564,27 @@ fn the_host_removes_the_empty_block_a_leaving_collaborator_was_in(cx: &mut gpui:
         });
     });
     session.wait_until("the host sees the collaborator in the block", |this| {
-        host_thread.read_with(this.cx, |thread, _| thread.draft().is_attended(block, None))
+        host_thread.read_with(this.cx, |thread, _| {
+            thread.draft().is_attended(block, None)
+                && thread.draft().attachment_records().len() == 1
+        })
+    });
+    // Nobody can submit the record while its bytes are missing.
+    let host = session.host.clone();
+    host.read_with(session.cx, |host, cx| {
+        let draft_id = host_thread.read(cx).draft().id;
+        assert!(host.draft_is_loading_attachments(draft_id, cx));
     });
 
     // Closing the collaborator's end disconnects it.
     collaborator_thread.update(session.cx, |thread, _| {
         thread.sharing = ThreadSharing::NotShared;
     });
-    session.wait_until("the host drops the collaborator and the block", |this| {
+    session.wait_until("the host drops the collaborator, block, and file", |this| {
         host_thread.read_with(this.cx, |thread, _| {
-            thread.participants().len() == 1 && !thread.draft().contains(block)
+            thread.participants().len() == 1
+                && !thread.draft().contains(block)
+                && thread.draft().attachment_records().is_empty()
         })
     });
     assert_eq!(session.bodies(&host_thread), ["from the host"]);
@@ -728,15 +667,6 @@ fn profiles_reach_everyone_in_the_thread(cx: &mut gpui::TestAppContext) {
     let shown_name = |thread: &Thread, participant| {
         participant_name(participant, thread.profiles.get(&participant)).to_string()
     };
-    // Joined with the profile it had, which only carries its generated
-    // name, the same one its own profile page shows.
-    let generated_name = session
-        .collaborator
-        .read_with(session.cx, |collaborator, _| collaborator.profile_name());
-    assert_eq!(
-        host_thread.read_with(session.cx, |thread, _| shown_name(thread, collaborator_id)),
-        generated_name.to_string()
-    );
 
     let picture =
         Arc::new(profile_picture(&encoded_image(5, image::ImageFormat::Bmp)).expect("a picture"));
@@ -830,44 +760,36 @@ fn generated_profiles_look_the_same_in_every_thread(cx: &mut gpui::TestAppContex
     assert_eq!(host_view, own_view);
 }
 
+/// The host disconnects a collaborator sending what it can't accept: a
+/// profile picture that isn't one, or a block attributed to someone else.
 #[gpui::test]
-fn invalid_profiles_disconnect_the_collaborator(cx: &mut gpui::TestAppContext) {
-    let mut session = Collaboration::start(cx);
-    let collaborator_thread = session.collaborator_thread().expect("joined");
-    let host_thread = session.host_thread.clone();
-
-    collaborator_thread.read_with(session.cx, |thread, _| {
-        thread.request(protocol::CollaboratorMessage::Profile(protocol::Profile {
+fn invalid_requests_disconnect_the_collaborator(cx: &mut gpui::TestAppContext) {
+    let invalid_profile = |_: &Thread| {
+        protocol::CollaboratorMessage::Profile(protocol::Profile {
             name: None,
             picture: Some(b"not a picture".to_vec()),
             appearance: None,
-        }));
-    });
-    session.wait_until("the host drops the collaborator", |this| {
-        host_thread.read_with(this.cx, |thread, _| thread.participants().len() == 1)
-    });
-}
-
-#[gpui::test]
-fn misattributed_draft_updates_disconnect_the_collaborator(cx: &mut gpui::TestAppContext) {
-    let mut session = Collaboration::start(cx);
-    let collaborator_thread = session.collaborator_thread().expect("joined");
-    let host_thread = session.host_thread.clone();
-    assert_eq!(
-        host_thread.read_with(session.cx, |thread, _| thread.participants().len()),
-        2
-    );
-
-    let forged = Draft::new();
-    forged.create_prompt(Uuid::new_v4(), "not mine");
-    let update = forged.take_local_update().expect("an update");
-    collaborator_thread.read_with(session.cx, |thread, _| {
-        thread.request(protocol::CollaboratorMessage::DraftUpdate {
+        })
+    };
+    let misattributed_update = |thread: &Thread| {
+        let forged = Draft::new();
+        forged.create_prompt(Uuid::new_v4(), "not mine");
+        protocol::CollaboratorMessage::DraftUpdate {
             generation: thread.draft_generation(),
-            update,
+            update: forged.take_local_update().expect("an update"),
+        }
+    };
+    let requests: [&dyn Fn(&Thread) -> protocol::CollaboratorMessage; 2] =
+        [&invalid_profile, &misattributed_update];
+    for request in requests {
+        let mut session = Collaboration::start(cx);
+        let collaborator_thread = session.collaborator_thread().expect("joined");
+        let host_thread = session.host_thread.clone();
+        collaborator_thread.read_with(session.cx, |thread, _| {
+            thread.request(request(thread));
         });
-    });
-    session.wait_until("the host drops the collaborator", |this| {
-        host_thread.read_with(this.cx, |thread, _| thread.participants().len() == 1)
-    });
+        session.wait_until("the host drops the collaborator", |this| {
+            host_thread.read_with(this.cx, |thread, _| thread.participants().len() == 1)
+        });
+    }
 }

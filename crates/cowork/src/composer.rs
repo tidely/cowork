@@ -376,11 +376,7 @@ impl Cowork {
                                             .when(unavailable, |this| this.opacity(0.5)),
                                     )
                                 })
-                                .child(
-                                    div()
-                                        .debug_selector(|| "model-picker-label".to_owned())
-                                        .child(title),
-                                )
+                                .child(div().child(title))
                                 .child(
                                     Icon::new(if trigger.is_open() {
                                         AssetIconName::ChevronUp

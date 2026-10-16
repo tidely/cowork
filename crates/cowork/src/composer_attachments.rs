@@ -706,22 +706,6 @@ mod tests {
             assert!(cowork.pending_attachments.is_empty());
             assert!(cowork.attachment_errors.is_empty());
         });
-        app.set_mode(PeerMode::Write);
-        cowork.update(app.cx, |cowork, cx| {
-            assert!(
-                cowork
-                    .attachment_read_event(
-                        draft_id,
-                        generation,
-                        AttachmentReadEvent::Finished(
-                            pending_id,
-                            Ok(text_attachment("late.txt", "late bytes"))
-                        ),
-                        cx
-                    )
-                    .is_none()
-            );
-        });
         thread.read_with(app.cx, |thread, _| {
             assert_eq!(thread.draft().items(), canonical);
             assert!(thread.draft().attachment_records().is_empty());

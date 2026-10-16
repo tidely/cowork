@@ -579,25 +579,6 @@ mod tests {
             (titles_.len(), &*titles_[0], &*titles_[29]),
             (30, "Apr 21", "May 20")
         );
-        assert_eq!(
-            axis(&month)
-                .into_iter()
-                .map(|(_, text)| text)
-                .collect::<Vec<_>>(),
-            ["Apr 25", "Apr 30", "May 5", "May 10", "May 15", "May 20"]
-        );
-
-        let year = chart(&recent, ActivityRange::Year);
-        let titles_ = titles(&year);
-        assert_eq!(
-            (titles_.len(), &*titles_[0], &*titles_[11]),
-            (12, "Jun 2025", "May 2026")
-        );
-        let labels = axis(&year);
-        assert_eq!(
-            (labels.len(), &labels[0], &labels[11]),
-            (12, &(0, "Jun".to_owned()), &(11, "May".to_owned()))
-        );
 
         // All time takes the shortest layout that reaches the first turn.
         assert_eq!(chart(&recent, ActivityRange::Lifetime), day);

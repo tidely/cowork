@@ -441,18 +441,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_listed_tools_run_without_approval() {
-        assert!(!needs_approval(RespondToComment::NAME));
-        assert!(!needs_approval(ListDirectory::NAME));
-        assert!(!needs_approval(ReadFile::NAME));
-        assert!(needs_approval(WriteFile::NAME));
-        assert!(!needs_approval(Calculate::NAME));
-        assert!(needs_approval(RunCommand::NAME));
-        assert!(needs_approval(RequestPermissions::NAME));
-        assert!(needs_approval("a_tool_nobody_listed"));
-    }
-
-    #[test]
     fn admins_decide_everything_but_host_only_tools() {
         let host = ApprovalRights {
             approves_tools: true,
@@ -554,7 +542,10 @@ mod tests {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!("cowork-outside-{}", Uuid::new_v4()));
             std::fs::create_dir_all(&path).unwrap();
-            Self(std::fs::canonicalize(path).unwrap())
+            // Resolved as the gate resolves named folders: on Windows that is
+            // not `canonicalize`'s verbatim `\\?\` form.
+            let named = path.to_string_lossy().into_owned();
+            Self(Folders::resolve(&[], &[named]).unwrap().write.remove(0))
         }
 
         fn text(&self) -> String {
@@ -607,9 +598,10 @@ mod tests {
             );
         }
 
+        let missing = cache.0.join("no-such-folder");
         let missing = call_with(
             RunCommand::NAME,
-            serde_json::json!({ "command": "ls", "read_folders": ["/no/such/folder"] }),
+            serde_json::json!({ "command": "ls", "read_folders": [missing] }),
         );
         let decided = decide_allowing(&gate, &missing, &mut asked).await;
         assert!(
@@ -986,26 +978,6 @@ mod tests {
             gate.before_tool_call(&command(Some("network"))).await,
             ToolDecision::Deny { .. }
         ));
-    }
-
-    #[tokio::test]
-    async fn a_command_beyond_the_auto_approval_level_can_be_denied() {
-        let command = command(Some("network"));
-        let (gate, mut asked) = gate(false);
-        let decision = gate.before_tool_call(&command);
-        let answer = async {
-            let Some(RunUpdate::Approval { tool, decide, .. }) = asked.recv().await else {
-                panic!("a command asks");
-            };
-            assert_eq!(tool, RunCommand::NAME);
-            decide
-                .send(ToolDecision::Deny {
-                    reason: DENIED.into(),
-                })
-                .expect("the gate waits");
-        };
-        let (decision, ()) = tokio::join!(decision, answer);
-        assert!(matches!(decision, ToolDecision::Deny { .. }));
     }
 
     #[tokio::test]

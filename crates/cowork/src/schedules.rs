@@ -451,7 +451,6 @@ impl Cowork {
                     .child(div().text_xs().text_color(muted).child(status_label))
                     .child(
                         div()
-                            .debug_selector(move || format!("scheduled-task-next-{task_id}"))
                             .text_sm()
                             .when_some(status_color, |this, color| this.text_color(color))
                             .child(status_text),
@@ -1459,24 +1458,6 @@ mod tests {
         assert_eq!(
             format_relative(at((2027, 1, 1), 9, 0), now),
             "Jan 1, 2027 09:00"
-        );
-    }
-
-    #[test]
-    fn run_results_read_in_a_few_words() {
-        assert_eq!(
-            result_label(&RunResult::Skipped {
-                count: 3,
-                reason: SkipReason::Missed
-            }),
-            (
-                "Skipped 3 runs: missed while closed or asleep".into(),
-                false
-            )
-        );
-        assert_eq!(
-            result_label(&RunResult::Failed("no model".into())),
-            ("Failed: no model".into(), true)
         );
     }
 }

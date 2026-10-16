@@ -521,7 +521,6 @@ impl Cowork {
 
         div()
             .id("sidebar-bottom-bar")
-            .debug_selector(|| "sidebar-bottom-bar".to_owned())
             .relative()
             .flex_1()
             .mx(FOOTER_INSET)
@@ -553,7 +552,6 @@ impl Cowork {
                     // left-aligned row.
                     .child(
                         div()
-                            .debug_selector(|| "identity-button-content".to_owned())
                             .flex_1()
                             .min_w_0()
                             .flex()

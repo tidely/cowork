@@ -609,45 +609,33 @@ mod tests {
                 extra,
                 "{arguments}"
             );
-            let call = command_call(arguments);
-            let (_, cx) = cx.add_window_view(|_, _| AccessView { call, project });
-            cx.run_until_parked();
-            // Cards within the thread's mode don't repeat it.
-            assert_eq!(cx.debug_bounds("card-access").is_some(), extra.is_some());
-            assert_eq!(
-                cx.debug_bounds("card-escalation").is_some(),
-                extra.is_some()
-            );
         }
-    }
-
-    /// The warning sits beside the decision, below the command, rather than
-    /// lengthening the line above it.
-    #[gpui::test]
-    fn escalation_warnings_sit_beside_the_decision(cx: &mut gpui::TestAppContext) {
-        cx.update(|cx| {
-            gpui_component::init(cx);
-            crate::theme::init(cx);
-        });
-        let call = command_call(json!({"command": "cargo fetch", "access": "network"}));
-        let (_, cx) = cx.add_window_view(|_, _| AccessView {
-            call,
-            project: Access::Read,
-        });
-        cx.run_until_parked();
-        let card = cx.debug_bounds("card").expect("the card is shown");
-        let command = cx.debug_bounds("card-command").expect("the command");
-        let warning = cx.debug_bounds("card-escalation").expect("the warning");
-        let waiting = cx.debug_bounds("card-waiting").expect("the waiting note");
-        assert!(warning.top() >= command.bottom());
-        assert!(warning.right() <= waiting.left());
-        assert!(waiting.right() <= card.right());
+        // Cards within the thread's mode don't repeat it.
+        for (arguments, extra) in [
+            (json!({"command": "ls"}), false),
+            (json!({"command": "cargo fetch", "access": "network"}), true),
+        ] {
+            let call = command_call(arguments);
+            let (_, cx) = cx.add_window_view(|_, _| AccessView {
+                call,
+                project: Access::Read,
+            });
+            cx.run_until_parked();
+            assert_eq!(cx.debug_bounds("card-access").is_some(), extra);
+            assert_eq!(cx.debug_bounds("card-escalation").is_some(), extra);
+        }
     }
 
     #[test]
     fn permission_badges_account_for_existing_folder_grants() {
-        let here = std::env::current_dir().unwrap().canonicalize().unwrap();
-        let parent = here.parent().unwrap().to_path_buf();
+        // Resolved as grants are: on Windows that is not `canonicalize`'s
+        // verbatim `\\?\` form, which no grant would cover.
+        let resolve = |path: &std::path::Path| {
+            let named = path.to_string_lossy().into_owned();
+            Folders::resolve(&[], &[named]).unwrap().write.remove(0)
+        };
+        let here = resolve(&std::env::current_dir().unwrap());
+        let parent = resolve(here.parent().unwrap());
         let arguments = json!({"command": "fetch", "access": "network", "write_folders": [here]});
         // A run grant for an external folder, or a writable project containing
         // the requested folder, both leave only network permission to approve.
@@ -687,27 +675,27 @@ mod tests {
         );
     }
 
-    #[test]
-    fn titles_name_what_calls_do() {
-        assert_eq!(title(RunCommand::NAME).1, "Terminal");
-        assert_eq!(title("search_files").1, "Search files");
-        assert_eq!(title("calculate").1, "Calculate");
-    }
-
-    /// A command naming folders outside the project lists them; one naming
-    /// none shows no list.
+    /// A command shows as a command rather than JSON, lists the folders
+    /// outside the project it names, and falls back to its raw arguments
+    /// when they aren't a command.
     #[gpui::test]
-    fn command_cards_list_the_folders_they_name(cx: &mut gpui::TestAppContext) {
+    fn command_cards_show_the_command_its_folders_or_raw_arguments(cx: &mut gpui::TestAppContext) {
         cx.update(|cx| {
             gpui_component::init(cx);
             crate::theme::init(cx);
         });
-        for (arguments, lists) in [
-            (json!({"command": "ls"}), false),
+        for (arguments, command, folders) in [
+            (
+                json!({"command": "printf '%s\\n' \"hello\"\npwd"}),
+                true,
+                false,
+            ),
             (
                 json!({"command": "cargo fetch", "write_folders": ["~/.cargo"]}),
                 true,
+                true,
             ),
+            (json!({"command": 42}), false, false),
         ] {
             let call = command_call(arguments);
             let (_, cx) = cx.add_window_view(|_, _| AccessView {
@@ -715,8 +703,9 @@ mod tests {
                 project: Access::Read,
             });
             cx.run_until_parked();
-            assert_eq!(cx.debug_bounds("card-folders").is_some(), lists);
-            assert!(cx.debug_bounds("card-command").is_some());
+            assert_eq!(cx.debug_bounds("card-command").is_some(), command);
+            assert_eq!(cx.debug_bounds("card-arguments").is_some(), !command);
+            assert_eq!(cx.debug_bounds("card-folders").is_some(), folders);
         }
     }
 
@@ -806,18 +795,30 @@ mod tests {
     }
 
     #[gpui::test]
-    fn deciders_get_allow_and_deny(cx: &mut gpui::TestAppContext) {
-        let (allowed, denied, cx) = render_card(true, cx);
-        assert!(cx.debug_bounds("card-waiting").is_none());
+    fn only_deciders_get_allow_and_deny(cx: &mut gpui::TestAppContext) {
+        let (allowed, denied, window) = render_card(true, cx);
+        assert!(window.debug_bounds("card-waiting").is_none());
 
-        let deny = cx.debug_bounds("card-deny").expect("Deny is offered");
-        cx.simulate_click(deny.center(), Modifiers::default());
+        let deny = window.debug_bounds("card-deny").expect("Deny is offered");
+        window.simulate_click(deny.center(), Modifiers::default());
         assert_eq!((allowed.get(), denied.get()), (0, 1));
 
-        let allow = cx.debug_bounds("card-allow").expect("Allow is offered");
-        assert!(deny.right() <= allow.left(), "Allow comes last");
-        cx.simulate_click(allow.center(), Modifiers::default());
+        let allow = window.debug_bounds("card-allow").expect("Allow is offered");
+        window.simulate_click(allow.center(), Modifiers::default());
         assert_eq!((allowed.get(), denied.get()), (1, 1));
+
+        // Everyone else sees that the call waits.
+        let unused = Rc::new(Cell::new(0));
+        let (_, window) = cx.add_window_view(|_, _| CardView {
+            call: call(),
+            offer: false,
+            allowed: unused.clone(),
+            denied: unused,
+        });
+        window.run_until_parked();
+        assert!(window.debug_bounds("card-waiting").is_some());
+        assert!(window.debug_bounds("card-allow").is_none());
+        assert!(window.debug_bounds("card-deny").is_none());
     }
 
     fn command_call(arguments: serde_json::Value) -> ToolCall {
@@ -825,20 +826,6 @@ mod tests {
             CallId::from_wire("command_1"),
             ToolFunction::new(ToolName::new(RunCommand::NAME).unwrap(), arguments),
         )
-    }
-
-    #[gpui::test]
-    fn terminal_calls_show_commands_instead_of_json(cx: &mut gpui::TestAppContext) {
-        let (_, _, cx) = render_call_card(
-            true,
-            command_call(json!({"command": "printf '%s\\n' \"hello\"\npwd"})),
-            cx,
-        );
-        assert!(cx.debug_bounds("card-command").is_some());
-        assert!(cx.debug_bounds("card-arguments").is_none());
-        assert!(cx.debug_bounds("card-command-continuation").is_none());
-        assert!(cx.debug_bounds("card-allow").is_some());
-        assert!(cx.debug_bounds("card-deny").is_some());
     }
 
     #[gpui::test]
@@ -858,27 +845,5 @@ mod tests {
         );
         let allow = cx.debug_bounds("card-allow").expect("Allow stays visible");
         assert!(allow.top() >= hint.bottom());
-    }
-
-    #[gpui::test]
-    fn malformed_terminal_arguments_remain_visible(cx: &mut gpui::TestAppContext) {
-        let (_, _, cx) = render_call_card(false, command_call(json!({"command": 42})), cx);
-        assert!(cx.debug_bounds("card-command").is_none());
-        assert!(cx.debug_bounds("card-arguments").is_some());
-    }
-
-    #[test]
-    fn host_only_cards_name_only_the_host() {
-        let card = ToolCallCard::new("card", call());
-        assert_eq!(card.waiting_for, DECIDERS);
-        assert_eq!(card.host_only().waiting_for, HOST);
-    }
-
-    #[gpui::test]
-    fn everyone_else_sees_that_the_call_waits(cx: &mut gpui::TestAppContext) {
-        let (_, _, cx) = render_card(false, cx);
-        assert!(cx.debug_bounds("card-waiting").is_some());
-        assert!(cx.debug_bounds("card-allow").is_none());
-        assert!(cx.debug_bounds("card-deny").is_none());
     }
 }

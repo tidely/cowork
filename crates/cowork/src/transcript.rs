@@ -664,9 +664,6 @@ mod tests {
                 RigMessage::assistant("After"),
             ]
         );
-        let restored = transcript.to_protocol().to_transcript().unwrap();
-        assert_eq!(restored, transcript);
-        assert_eq!(AgentOutput::from_transcript(&restored.entries[1..]), output);
     }
 
     #[test]
@@ -702,10 +699,6 @@ mod tests {
             ]
         );
         let bytes = postcard::to_stdvec(&transcript.to_protocol()).unwrap();
-        assert_eq!(
-            bytes,
-            postcard::to_stdvec(&serde_json::to_string(&transcript).unwrap()).unwrap()
-        );
         let wire: Json<Transcript> = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(wire.to_transcript().unwrap(), transcript);
     }

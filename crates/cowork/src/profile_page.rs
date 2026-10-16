@@ -44,7 +44,6 @@ impl Cowork {
 
         let picture = div()
             .id("profile-picture")
-            .debug_selector(|| "profile-picture".to_owned())
             .group("profile-picture")
             .relative()
             .size(PICTURE_SIZE)
@@ -189,7 +188,6 @@ impl Cowork {
         };
 
         div()
-            .debug_selector(|| "usage-stats".to_owned())
             .mt_5()
             .w_full()
             .max_w(px(444.))
@@ -273,7 +271,6 @@ impl Cowork {
         });
 
         div()
-            .debug_selector(|| "token-activity".to_owned())
             .mt_6()
             .w_full()
             .max_w(px(444.))
@@ -288,7 +285,6 @@ impl Cowork {
                     .justify_between()
                     .child(
                         div()
-                            .debug_selector(|| "token-activity-title".to_owned())
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(cx.theme().foreground)
                             .child("Token activity"),
@@ -314,7 +310,6 @@ impl Cowork {
                         )
                         .child(
                             div()
-                                .debug_selector(|| "token-activity-peak-label".to_owned())
                                 .absolute()
                                 .top_0()
                                 .map(|this| {
