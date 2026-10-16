@@ -3,8 +3,8 @@
 //!
 //! The transcript records ordinary agent runs exactly as sent, as Rig's own
 //! messages. Prompts carry their files' content like any other request does.
-//! Compaction's separate summary request is kept as request-context metadata;
-//! it never rewrites the transcript used to render those runs.
+//! Accepted compaction summaries are entries in the same ordered sequence;
+//! they replace request context without rewriting the original messages.
 //!
 //! The host forwards what its agent loop reports ([`AgentEvent`]s) as it
 //! happens, and every participant, the host included, folds them with the
@@ -14,7 +14,7 @@
 //! stream, so a host's events that Rig could not have produced are refused.
 //!
 //! What an agent message shows ([`AgentOutput`]) is never sent. It is a
-//! function of Rig messages alone: the ones its run added to the transcript,
+//! function of transcript entries: the ones its run added to the transcript,
 //! followed by the message it is folding, as far as it has come
 //! ([`TurnFold::partial`]: the parts Rig has finalized, and a preview of
 //! the ones still streaming). That message is the fold of the run's pending
@@ -50,103 +50,107 @@ use crate::{
     usage::usage_tokens,
 };
 
-/// An absolute position in the original sequence of completed Rig messages.
+/// An absolute position in the append-only sequence of transcript entries.
 /// Compaction never changes these positions, and UUIDs identify runs rather
 /// than individual messages in this sequence.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct TranscriptIndex(pub(crate) u64);
 
-/// A gap in the original transcript, distinct from the index of a message.
-/// Boundaries describe coverage and insertion; content identities name parts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct TranscriptBoundary(pub(crate) TranscriptIndex);
-
-/// A complete replacement for the original prefix `[0, resume_at)`.
-/// Summary requests themselves never join the original messages.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct Compaction {
-    pub(crate) resume_at: TranscriptIndex,
-    pub(crate) summary: String,
+/// A summary replaces everything before its position for future requests,
+/// while the original messages remain available for display and replay.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) enum TranscriptEntry {
+    Message(RigMessage),
+    Compaction(String),
 }
 
 /// LLM state only: original messages and successive summaries of their prefix.
 /// Run identities, unfinished events, and local views belong to the timeline.
 ///
 /// All messages remain resident today. Offloading could add a
-/// `start: TranscriptIndex`, the absolute position of `messages[0]`, keeping a
+/// `start: TranscriptIndex`, the absolute position of `entries[0]`, keeping a
 /// contiguous tail. An absolute position would then map to the resident vector
 /// at `index - start`; removing a persisted prefix would advance `start` without
-/// changing run references or compaction boundaries. Missing ranges would need
-/// loading before access, and the absolute end would be `start + messages.len()`.
+/// changing run references or summary positions. Missing ranges would need
+/// loading before access, and the absolute end would be `start + entries.len()`.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Transcript {
-    pub(crate) messages: Vec<RigMessage>,
-    compactions: Vec<Compaction>,
+    pub(crate) entries: Vec<TranscriptEntry>,
 }
 
 impl Transcript {
     pub(crate) fn end(&self) -> TranscriptIndex {
-        TranscriptIndex(self.messages.len() as u64)
+        TranscriptIndex(self.entries.len() as u64)
     }
 
-    pub(crate) fn append(&mut self, message: RigMessage) -> TranscriptIndex {
-        let index = self.end();
-        self.messages.push(message);
-        index
+    pub(crate) fn append(&mut self, message: RigMessage) {
+        self.entries.push(TranscriptEntry::Message(message));
     }
 
-    pub(crate) fn latest_compaction(&self) -> Option<&Compaction> {
-        self.compactions.last()
+    #[cfg(test)]
+    pub(crate) fn latest_compaction(&self) -> Option<&String> {
+        self.entries.iter().rev().find_map(|entry| match entry {
+            TranscriptEntry::Compaction(summary) => Some(summary),
+            TranscriptEntry::Message(_) => None,
+        })
     }
 
-    pub(crate) fn compactions(&self) -> &[Compaction] {
-        &self.compactions
+    /// A run's leading summaries precede its prompt and submitted user group.
+    pub(crate) fn leading_compactions(&self, start: TranscriptIndex) -> Range<usize> {
+        let start = start.0 as usize;
+        let count = self.entries[start..]
+            .iter()
+            .take_while(|entry| matches!(entry, TranscriptEntry::Compaction(_)))
+            .count();
+        start..start + count
     }
 
-    /// Accept only nonempty summaries within the original transcript, with
-    /// nondecreasing coverage. A replacement at the same boundary is valid.
-    pub(crate) fn install_compaction(&mut self, compaction: Compaction) -> anyhow::Result<()> {
-        compaction.validate(self.end(), self.latest_compaction())?;
-        self.compactions.push(compaction);
+    pub(crate) fn has_prompt(&self, start: TranscriptIndex) -> bool {
+        self.leading_compactions(start).end < self.entries.len()
+    }
+
+    /// Coverage follows from append order; summaries cannot name an older or
+    /// future prefix. Repeated summaries are distinct entries.
+    pub(crate) fn install_compaction(&mut self, summary: String) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            !self.entries.is_empty() && !summary.trim().is_empty(),
+            "invalid compacted context"
+        );
+        self.entries.push(TranscriptEntry::Compaction(summary));
         Ok(())
     }
 
     pub(crate) fn request_history(&self) -> Vec<RigMessage> {
-        match self.latest_compaction() {
-            Some(compaction) => std::iter::once(RigMessage::user(format!(
-                "Summary of the conversation so far:\n{}",
-                compaction.summary
-            )))
-            .chain(
-                self.messages[compaction.resume_at.0 as usize..]
-                    .iter()
-                    .cloned(),
-            )
-            .collect(),
-            None => self.messages.clone(),
-        }
+        let start = self
+            .entries
+            .iter()
+            .rposition(|entry| matches!(entry, TranscriptEntry::Compaction(_)))
+            .unwrap_or(0);
+        self.entries[start..]
+            .iter()
+            .map(|entry| match entry {
+                TranscriptEntry::Message(message) => message.clone(),
+                TranscriptEntry::Compaction(summary) => {
+                    RigMessage::user(format!("Summary of the conversation so far:\n{summary}"))
+                }
+            })
+            .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn messages(&self) -> Vec<RigMessage> {
+        self.entries
+            .iter()
+            .filter_map(|entry| match entry {
+                TranscriptEntry::Message(message) => Some(message.clone()),
+                TranscriptEntry::Compaction(_) => None,
+            })
+            .collect()
     }
 
     pub(crate) fn to_protocol(&self) -> Json<Self> {
         Json::from_value(self).expect("a transcript encodes as JSON")
-    }
-}
-
-impl Compaction {
-    pub(crate) fn boundary(&self) -> TranscriptBoundary {
-        TranscriptBoundary(self.resume_at)
-    }
-
-    fn validate(&self, end: TranscriptIndex, previous: Option<&Self>) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            self.resume_at.0 > 0
-                && self.resume_at <= end
-                && previous.is_none_or(|previous| self.resume_at >= previous.resume_at)
-                && !self.summary.trim().is_empty(),
-            "invalid compacted context"
-        );
-        Ok(())
     }
 }
 
@@ -155,10 +159,13 @@ impl Json<Transcript> {
     /// a snapshot is installed. JSON validity alone does not establish coverage.
     pub(crate) fn to_transcript(&self) -> anyhow::Result<Transcript> {
         let transcript = self.parse().context("invalid transcript from host")?;
-        let mut previous = None;
-        for compaction in &transcript.compactions {
-            compaction.validate(transcript.end(), previous)?;
-            previous = Some(compaction);
+        for (index, entry) in transcript.entries.iter().enumerate() {
+            if let TranscriptEntry::Compaction(summary) = entry {
+                anyhow::ensure!(
+                    index > 0 && !summary.trim().is_empty(),
+                    "invalid compacted context"
+                );
+            }
         }
         Ok(transcript)
     }
@@ -204,24 +211,28 @@ impl Json<CallId> {
     }
 }
 
-/// The transcript entries each run output, given where each run's prompt is,
-/// in timeline order: those after its prompt, up to the next run's. Prompts
-/// must be increasing and within the transcript; see [`validate_agent_runs`].
-fn run_outputs(prompts: &[usize], transcript_len: usize) -> Vec<Range<usize>> {
-    prompts
+/// Each run owns its entries up to the next run's start. Leading summaries
+/// belong above its user group; output starts after its first ordinary entry,
+/// the prompt. Only a preparing run can lack that prompt.
+fn run_output(transcript: &[TranscriptEntry], range: Range<usize>) -> Option<Range<usize>> {
+    transcript[range.clone()]
         .iter()
-        .enumerate()
-        .map(|(index, prompt)| {
-            let end = prompts.get(index + 1).copied().unwrap_or(transcript_len);
-            prompt + 1..end
-        })
-        .collect()
+        .position(|entry| matches!(entry, TranscriptEntry::Message(_)))
+        .map(|prompt| range.start + prompt + 1..range.end)
 }
 
 /// A fold resuming after a run's output that joined the transcript, `output`
-/// of [`run_outputs`]. With no output yet, that is after its prompt.
-fn fold_after(transcript: &[RigMessage], output: &Range<usize>) -> TurnFold {
-    TurnFold::after(&transcript[output.end - 1])
+/// of [`run_output`]. With no output yet, that is after its prompt.
+fn fold_after(transcript: &[TranscriptEntry], output: &Range<usize>) -> TurnFold {
+    let message = transcript[..output.end]
+        .iter()
+        .rev()
+        .find_map(|entry| match entry {
+            TranscriptEntry::Message(message) => Some(message),
+            TranscriptEntry::Compaction(_) => None,
+        })
+        .expect("a run has a recorded prompt");
+    TurnFold::after(message)
 }
 
 /// Checks that a snapshot's agent messages, in timeline order, describe runs
@@ -230,36 +241,51 @@ fn fold_after(transcript: &[RigMessage], output: &Range<usize>) -> TurnFold {
 /// continue its output without completing a message, which would have
 /// joined the transcript.
 pub(crate) fn validate_agent_runs(
-    transcript: &[RigMessage],
+    transcript: &[TranscriptEntry],
     messages: &[&protocol::AgentMessage],
     compacting: bool,
 ) -> anyhow::Result<()> {
-    let prompts = messages
+    let starts = messages
         .iter()
         .map(|message| {
-            usize::try_from(message.prompt.0).context("transcript index does not fit in memory")
+            usize::try_from(message.start.0).context("transcript index does not fit in memory")
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
-    for (index, prompt) in prompts.iter().enumerate() {
+    for (index, start) in starts.iter().enumerate() {
         anyhow::ensure!(
-            matches!(transcript.get(*prompt), Some(RigMessage::User { .. })),
-            "agent message {index}'s prompt is not a user message of the transcript"
-        );
-        anyhow::ensure!(
-            index == 0 || prompts[index - 1] < *prompt,
-            "agent message {index}'s prompt comes before the previous one's"
+            *start <= transcript.len() && (index == 0 || starts[index - 1] < *start),
+            "agent message {index}'s start is outside the transcript or out of order"
         );
     }
-    for (index, (message, output)) in messages
-        .iter()
-        .zip(run_outputs(&prompts, transcript.len()))
-        .enumerate()
-    {
+    for (index, message) in messages.iter().enumerate() {
+        let end = starts.get(index + 1).copied().unwrap_or(transcript.len());
+        let output = run_output(transcript, starts[index]..end);
         anyhow::ensure!(
             index + 1 == messages.len() || !message.run.is_generating(),
             "agent message {index} is generating, but is not the last"
         );
-        let mut fold = fold_after(transcript, &output);
+        let mut fold = if let Some(output) = output {
+            anyhow::ensure!(
+                matches!(
+                    transcript.get(output.start - 1),
+                    Some(TranscriptEntry::Message(RigMessage::User { .. }))
+                ),
+                "agent message {index}'s prompt is not a user message of the transcript"
+            );
+            fold_after(transcript, &output)
+        } else {
+            anyhow::ensure!(
+                message.run.is_generating(),
+                "only the active run can await its prompt"
+            );
+            anyhow::ensure!(
+                message.pending_events.is_empty()
+                    && message.awaiting_approval.is_none()
+                    && message.steering.is_empty(),
+                "an unstarted run has output"
+            );
+            TurnFold::default()
+        };
         for (event_index, event) in message.pending_events.iter().enumerate() {
             let invalid =
                 || format!("invalid pending event {event_index} of agent message {index}");
@@ -304,16 +330,26 @@ impl Thread {
         event: Json<AgentEvent>,
         cx: &mut impl AppContext,
     ) -> anyhow::Result<()> {
+        let start = self
+            .agent_message_mut(message_id.into_bytes())
+            .context("event has no run")?
+            .record
+            .start;
+        anyhow::ensure!(
+            self.transcript.has_prompt(start),
+            "run has no recorded prompt"
+        );
         let decoded = event.to_agent()?;
         let folded = self
             .active_turn(message_id)?
             .apply(&decoded)
             .context("the host sent an agent event out of order")?;
         let completed = folded.message.is_some();
-        self.transcript.messages.extend(folded.message);
+        if let Some(message) = folded.message {
+            self.transcript.append(message);
+        }
         self.measure_agent_event(&decoded);
         let partial = self.active_turn(message_id)?.partial();
-        let next = self.transcript.end();
         let Some(message) = agent_message(&mut self.timeline, message_id) else {
             return Ok(());
         };
@@ -328,16 +364,14 @@ impl Thread {
         {
             message.record.awaiting_approval = None;
         }
-        let completed = completed.then(|| {
-            (
-                TranscriptIndex(next.0 - 1),
-                self.transcript.messages.last().unwrap(),
-            )
+        let completed = completed.then(|| match self.transcript.entries.last().unwrap() {
+            TranscriptEntry::Message(message) => message,
+            _ => unreachable!(),
         });
         let generating = message.is_generating();
         message
             .ui
-            .advance(completed, partial.as_ref(), next, generating, cx);
+            .advance(completed, partial.as_ref(), generating, cx);
         if self.run_activity(message_id) == Some(crate::timeline::RunActivity::AwaitingApproval)
             && self
                 .agent_message_mut(message_id.into_bytes())
@@ -391,7 +425,6 @@ impl Thread {
             return;
         };
         let partial = turn.partial();
-        let next = self.transcript.end();
         // A request that was stopped or failed before it reported usage
         // never adds its partial output to the transcript.
         self.streamed_bytes = 0;
@@ -403,7 +436,7 @@ impl Thread {
         message.record.awaiting_approval = None;
         // The work collapses under its summary, leaving the response.
         message.ui.work_expanded = false;
-        message.ui.advance(None, partial.as_ref(), next, false, cx);
+        message.ui.advance(None, partial.as_ref(), false, cx);
     }
 
     /// Shows the output of every agent message of a timeline fresh from a
@@ -411,22 +444,27 @@ impl Thread {
     /// is rebuilt by folding its pending events, as it was where they were
     /// folded. The snapshot must have passed [`validate_agent_runs`].
     pub(crate) fn restore_agent_output(&mut self, compacting: bool, cx: &mut impl AppContext) {
-        let (indices, prompts): (Vec<_>, Vec<_>) = self
+        let mut runs = self
             .timeline
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| match entry {
-                TimelineMessage::Agent(message) => Some((index, message.record.prompt.0 as usize)),
+            .iter_mut()
+            .filter_map(|entry| match entry {
+                TimelineMessage::Agent(message) => Some(message),
                 TimelineMessage::User(_) => None,
             })
-            .unzip();
-        let outputs = run_outputs(&prompts, self.transcript.messages.len());
+            .peekable();
         let mut active = None;
-        for (index, output) in indices.into_iter().zip(outputs) {
-            let TimelineMessage::Agent(message) = &mut self.timeline[index] else {
-                unreachable!("an agent message's index");
-            };
-            let mut fold = fold_after(&self.transcript.messages, &output);
+        while let Some(message) = runs.next() {
+            let end = runs.peek().map_or(self.transcript.entries.len(), |next| {
+                next.record.start.0 as usize
+            });
+            let output = run_output(
+                &self.transcript.entries,
+                message.record.start.0 as usize..end,
+            );
+            let mut fold = output
+                .as_ref()
+                .map(|output| fold_after(&self.transcript.entries, output))
+                .unwrap_or_default();
             for event in &message.record.pending_events {
                 let event = event
                     .to_agent()
@@ -435,11 +473,11 @@ impl Thread {
                     .expect("pending events validated with the snapshot");
             }
             let generating = message.is_generating();
+            let output =
+                output.unwrap_or(self.transcript.entries.len()..self.transcript.entries.len());
             message.ui.restore(
-                &self.transcript.messages[output.clone()],
-                TranscriptIndex(output.start as u64),
+                &self.transcript.entries[output.clone()],
                 fold.partial().as_ref(),
-                TranscriptIndex(output.end as u64),
                 generating,
                 cx,
             );
@@ -447,9 +485,15 @@ impl Thread {
             if message.is_generating() {
                 active = Some((message_id, fold));
             }
-            self.show_comment_responses(message_id, cx);
         }
         self.restore_execution(active, compacting);
+        // Comment replies can refer to other timeline entries, so reconcile
+        // them after releasing the mutable run traversal.
+        for index in 0..self.timeline.len() {
+            if let TimelineMessage::Agent(message) = &self.timeline[index] {
+                self.show_comment_responses(message.record.id, cx);
+            }
+        }
     }
 
     /// Counts an event towards the context window estimate; see
@@ -591,104 +635,73 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn compaction_markers_follow_original_steps_and_keep_repeated_boundaries() {
-        let call_id = CallId::from_wire("lookup");
-        let tool = ToolName::new("read_file").unwrap();
+    fn compactions_fold_in_order_and_separate_adjacent_text() {
+        use crate::timeline::AgentStep;
         let mut transcript = Transcript::default();
-        transcript.append(RigMessage::user("Earlier prompt"));
-        transcript.append(RigMessage::assistant("Earlier reply"));
-        let prompt = transcript.append(RigMessage::user("Continue"));
-        transcript.append(RigMessage::Assistant(AssistantMessage::new(vec![
-            AssistantContent::Reasoning(Reasoning::new("Check")),
-            AssistantContent::Reasoning(Reasoning::new(" the file")),
-            AssistantContent::text("Looking"),
-            AssistantContent::text(" now"),
-            AssistantContent::ToolCall(ToolCall::new(
-                call_id.clone(),
-                ToolFunction::new(tool.clone(), json!({"path": "file"})),
-            )),
-        ])));
-        transcript.append(RigMessage::tool_result(call_id, tool, "Contents"));
-        transcript.append(RigMessage::user("Steering"));
-        transcript.append(RigMessage::assistant("Answer"));
-        for boundary in [2, 5, 5, 6, 7] {
-            transcript
-                .install_compaction(Compaction {
-                    resume_at: TranscriptIndex(boundary),
-                    summary: "Summary".into(),
-                })
-                .unwrap();
-        }
-        let markers = |transcript: &Transcript, next: Option<TranscriptIndex>| {
-            let output = AgentOutput::from_transcript(
-                &transcript.messages[prompt.0 as usize + 1..],
-                TranscriptIndex(prompt.0 + 1),
-            );
-            transcript
-                .compactions()
-                .iter()
-                .enumerate()
-                .filter(|(_, summary)| {
-                    summary.resume_at > prompt && next.is_none_or(|end| summary.resume_at < end)
-                })
-                .map(|(index, summary)| (index, output.step_at_boundary(summary.boundary())))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(
-            markers(&transcript, Some(TranscriptIndex(7))),
-            vec![(1, 3), (2, 3), (3, 4)]
-        );
-        assert_eq!(
-            markers(&transcript, None),
-            vec![(1, 3), (2, 3), (3, 4), (4, 5)]
-        );
-        let restored = transcript.to_protocol().to_transcript().unwrap();
-        assert_eq!(markers(&restored, None), markers(&transcript, None));
-    }
-
-    #[test]
-    fn compactions_keep_original_positions_and_round_trip_their_history() {
-        let mut transcript = Transcript::default();
-        let first = transcript.append(RigMessage::user("Original request"));
-        let second = transcript.append(RigMessage::assistant("Original answer"));
-        assert_eq!((first, second), (TranscriptIndex(0), TranscriptIndex(1)));
-
-        let boundary = transcript.end();
-        // A new conversation prompt may arrive before the summary finishes.
-        let third = transcript.append(RigMessage::user("Continue"));
+        transcript.append(RigMessage::user("Request"));
+        transcript.append(RigMessage::assistant("Before"));
         transcript
-            .install_compaction(Compaction {
-                resume_at: boundary,
-                summary: "Earlier conversation".into(),
-            })
+            .install_compaction("First summary".into())
             .unwrap();
-        assert_eq!(third, TranscriptIndex(2));
+        transcript
+            .install_compaction("Second summary".into())
+            .unwrap();
+        transcript.append(RigMessage::assistant("After"));
+        let output = AgentOutput::from_transcript(&transcript.entries[1..]);
+        assert_eq!(
+            output.steps(),
+            &[
+                AgentStep::Text("Before".into()),
+                AgentStep::Compaction,
+                AgentStep::Compaction,
+                AgentStep::Text("After".into()),
+            ]
+        );
         assert_eq!(
             transcript.request_history(),
             vec![
-                RigMessage::user("Summary of the conversation so far:\nEarlier conversation"),
-                RigMessage::user("Continue"),
+                RigMessage::user("Summary of the conversation so far:\nSecond summary"),
+                RigMessage::assistant("After"),
             ]
         );
+        let restored = transcript.to_protocol().to_transcript().unwrap();
+        assert_eq!(restored, transcript);
+        assert_eq!(AgentOutput::from_transcript(&restored.entries[1..]), output);
+    }
+
+    #[test]
+    fn summaries_precede_the_next_prompt_and_preserve_original_messages() {
+        let mut transcript = Transcript::default();
+        transcript.append(RigMessage::user("Original request"));
+        transcript.append(RigMessage::assistant("Original answer"));
         transcript
-            .install_compaction(Compaction {
-                resume_at: transcript.end(),
-                summary: "Everything so far".into(),
-            })
+            .install_compaction("Earlier conversation".into())
             .unwrap();
-        assert_eq!(transcript.compactions.len(), 2);
+        transcript
+            .install_compaction("Everything so far".into())
+            .unwrap();
+        let prompt = transcript.end();
+        transcript.append(RigMessage::user("Continue"));
+        assert_eq!(prompt, TranscriptIndex(4));
+        assert_eq!(transcript.leading_compactions(TranscriptIndex(2)), 2..4);
+        assert_eq!(run_output(&transcript.entries, 0..2), Some(1..2));
+        assert_eq!(run_output(&transcript.entries, 2..5), Some(5..5));
         assert_eq!(
-            transcript.messages,
+            transcript.messages(),
             vec![
                 RigMessage::user("Original request"),
                 RigMessage::assistant("Original answer"),
                 RigMessage::user("Continue"),
             ]
         );
-
+        assert_eq!(
+            transcript.request_history(),
+            vec![
+                RigMessage::user("Summary of the conversation so far:\nEverything so far"),
+                RigMessage::user("Continue"),
+            ]
+        );
         let bytes = postcard::to_stdvec(&transcript.to_protocol()).unwrap();
-        // The entire value travels as one JSON string, with no per-message
-        // wrappers or intermediate transcript representation.
         assert_eq!(
             bytes,
             postcard::to_stdvec(&serde_json::to_string(&transcript).unwrap()).unwrap()
@@ -698,33 +711,22 @@ mod tests {
     }
 
     #[test]
-    fn invalid_compactions_leave_context_unchanged_and_are_rejected_in_snapshots() {
+    fn empty_or_leading_summaries_are_rejected() {
         let mut transcript = Transcript::default();
+        assert!(transcript.install_compaction("No history".into()).is_err());
         transcript.append(RigMessage::user("Request"));
-        transcript.append(RigMessage::assistant("Answer"));
-        transcript
-            .install_compaction(Compaction {
-                resume_at: TranscriptIndex(2),
-                summary: "Summary".into(),
-            })
-            .unwrap();
         let original = transcript.clone();
-        for (boundary, summary) in [
-            (0, "Invalid"),
-            (1, "Backward"),
-            (3, "Beyond end"),
-            (2, "  "),
-            (u64::MAX, "Overflow"),
+        assert!(transcript.install_compaction("  ".into()).is_err());
+        assert_eq!(transcript, original);
+        for entries in [
+            vec![TranscriptEntry::Compaction("No history".into())],
+            vec![
+                TranscriptEntry::Message(RigMessage::user("Request")),
+                TranscriptEntry::Compaction("  ".into()),
+            ],
         ] {
-            let invalid = Compaction {
-                resume_at: TranscriptIndex(boundary),
-                summary: summary.into(),
-            };
-            assert!(transcript.install_compaction(invalid.clone()).is_err());
-            assert_eq!(transcript, original);
-            let mut invalid_transcript = transcript.clone();
-            invalid_transcript.compactions.push(invalid);
-            assert!(invalid_transcript.to_protocol().to_transcript().is_err());
+            let invalid = Transcript { entries };
+            assert!(invalid.to_protocol().to_transcript().is_err());
         }
     }
 

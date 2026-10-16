@@ -248,7 +248,7 @@ impl Fixture {
         );
         let thread = self.thread.read(cx);
         anyhow::ensure!(
-            thread.transcript.messages == expected,
+            thread.transcript.messages() == expected,
             "production transcript differs from Rig"
         );
         let timeline = &thread.timeline;
@@ -261,7 +261,7 @@ impl Fixture {
         );
         // Synthetic history has no transcript: validate only the real run.
         validate_agent_runs(
-            &thread.transcript.messages,
+            &thread.transcript.entries,
             &[&message.record.to_protocol()],
             false,
         )?;

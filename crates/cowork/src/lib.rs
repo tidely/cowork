@@ -336,11 +336,7 @@ impl Cowork {
             .and_then(|id| self.thread_store.read(cx).thread(id, cx))
             .map(|thread| {
                 let thread = thread.read(cx);
-                TimelineProjection::new(
-                    &messages,
-                    thread.transcript.compactions(),
-                    thread.pending_submissions(),
-                )
+                TimelineProjection::new(&messages, &thread.transcript)
             })
             .unwrap_or_default();
         let mut timeline_messages = Vec::new();
@@ -360,7 +356,7 @@ impl Cowork {
                             div()
                                 .w_full()
                                 .px(px(40.))
-                                .child(Self::render_compaction_marker(id.0, false, cx))
+                                .child(Self::render_compaction_marker(id.0 as usize, false, cx))
                                 .into_any_element(),
                         );
                         continue;
@@ -483,9 +479,7 @@ impl Cowork {
         let can_write = composer.is_some();
         let composer = composer.map(|composer| self.render_composer(composer, cx));
         let pending_rows = active_thread_id
-            .map(|thread_id| {
-                self.render_pending_messages(thread_id, messages.len(), projection.pending(), cx)
-            })
+            .map(|thread_id| self.render_pending_messages(thread_id, messages.len(), cx))
             .unwrap_or_default();
 
         div()

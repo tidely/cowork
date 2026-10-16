@@ -365,7 +365,7 @@ fn assert_backslash_selection_creates_comment(
                 },
                 comment_group_id: None,
                 started_at: SystemTime::UNIX_EPOCH,
-                prompt: crate::transcript::TranscriptIndex(0),
+                start: crate::transcript::TranscriptIndex(0),
                 pending_events: Vec::new(),
                 run: crate::protocol::AgentRun::Ended {
                     outcome: crate::protocol::RunOutcome::Completed,
@@ -688,7 +688,7 @@ fn commenting_on_a_long_response_keeps_the_timeline_scroll_position(cx: &mut gpu
                 id: message_id,
                 comment_group_id: None,
                 started_at: SystemTime::UNIX_EPOCH,
-                prompt: crate::transcript::TranscriptIndex(0),
+                start: crate::transcript::TranscriptIndex(0),
                 pending_events: Vec::new(),
                 run: crate::protocol::AgentRun::Ended {
                     outcome: crate::protocol::RunOutcome::Completed,

@@ -103,10 +103,8 @@ fn summary_reduces_history(
 }
 
 /// Uses the same summary path before a run and at its tool boundaries.
-/// Transcript positions count ordinary messages, never the smaller context.
 struct GenerationCompaction {
     threshold: Option<u64>,
-    transcript_base: u64,
     latest_context_tokens: Mutex<u64>,
     environment_note: String,
     updates: mpsc::UnboundedSender<RunUpdate>,
@@ -117,7 +115,6 @@ impl GenerationCompaction {
         &self,
         agent: &StreamingAgent,
         history: &[rig::completion::Message],
-        through: u64,
         retain_environment: bool,
     ) -> Option<Vec<rig::completion::Message>> {
         _ = self.updates.send(RunUpdate::CompactionStarted);
@@ -138,14 +135,7 @@ impl GenerationCompaction {
                 if summary_reduces_history(history, &replacement) {
                     *self.latest_context_tokens.lock().unwrap() =
                         (summary.len() as u64).div_ceil(4);
-                    (
-                        Some(crate::transcript::Compaction {
-                            resume_at: crate::transcript::TranscriptIndex(through),
-                            summary,
-                        }),
-                        Some(replacement),
-                        usage,
-                    )
+                    (Some(summary), Some(replacement), usage)
                 } else {
                     eprintln!("compaction skipped: summary did not reduce request history");
                     (None, None, usage)
@@ -184,13 +174,7 @@ impl agent::ContextHook for GenerationCompaction {
             if context_tokens < threshold {
                 return None;
             }
-            self.compact(
-                agent,
-                boundary.history,
-                self.transcript_base + boundary.added_messages as u64,
-                true,
-            )
-            .await
+            self.compact(agent, boundary.history, true).await
         })
     }
 }
@@ -339,10 +323,9 @@ impl Cowork {
             scheduled,
         } = plan;
         let thread = self.thread_store.read(cx).thread(thread_id, cx)?;
-        // Capture context and its original boundary together, before recording
-        // the new run's prompt. A summary must never cover that later prompt.
+        // Pre-run compaction uses the old context. Its accepted summary must
+        // join the transcript before the upcoming prompt.
         let mut history = thread.read(cx).request_history();
-        let compact_through = thread.read(cx).transcript.end().0;
         let context_tokens = thread.read(cx).live_context_tokens().unwrap_or(0);
         let threshold = self
             .context_settings
@@ -368,15 +351,22 @@ impl Cowork {
             if compact { &[] } else { &history },
             environment_note.clone(),
         );
+        let started_event = protocol::HostMessage::AgentStarted {
+            id: message_id.into_bytes(),
+            comment_group_id: comment_group_id.map(Uuid::into_bytes),
+            started_at,
+            prompt: protocol::Json::from_rig(&prompt),
+        };
         thread.update(cx, |thread, cx| {
-            // Recorded before the run starts, so a prompt stays in the
-            // transcript even when the run is stopped before sending it.
             thread.emit(
-                protocol::HostMessage::AgentStarted {
-                    id: message_id.into_bytes(),
-                    comment_group_id: comment_group_id.map(Uuid::into_bytes),
-                    started_at,
-                    prompt: protocol::Json::from_rig(&prompt),
+                if compact {
+                    protocol::HostMessage::AgentPreparing {
+                        id: message_id.into_bytes(),
+                        comment_group_id: comment_group_id.map(Uuid::into_bytes),
+                        started_at,
+                    }
+                } else {
+                    started_event.clone()
                 },
                 cx,
             );
@@ -384,7 +374,6 @@ impl Cowork {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let compaction = Arc::new(GenerationCompaction {
             threshold,
-            transcript_base: compact_through,
             latest_context_tokens: Mutex::new(context_tokens),
             environment_note,
             updates: sender.clone(),
@@ -453,10 +442,7 @@ impl Cowork {
                     "num_ctx": max_tokens,
                     "think": "medium"
                 }));
-            if compact
-                && let Some(replacement) = compaction
-                    .compact(&agent, &history, compact_through, false)
-                    .await
+            if compact && let Some(replacement) = compaction.compact(&agent, &history, false).await
             {
                 history = replacement;
             }
@@ -481,6 +467,7 @@ impl Cowork {
         );
 
         cx.spawn(async move |this, cx| {
+            let mut pending_start = compact.then_some(started_event);
             let mut stream_completed = true;
             let mut turn_usage = Usage::default();
             while let Some(update) = receiver.recv().await {
@@ -496,7 +483,10 @@ impl Cowork {
                     RunUpdate::CompactionFinished { context, usage } => {
                         turn_usage += usage;
                         thread.update(cx, |thread, cx| {
-                            thread.emit(protocol::HostMessage::CompactionFinished { context }, cx)
+                            thread.emit(protocol::HostMessage::CompactionFinished { context }, cx);
+                            if let Some(event) = pending_start.take() {
+                                thread.emit(event, cx);
+                            }
                         });
                         _ = this.update(cx, |this, cx| this.thread_updated(thread_id, cx));
                         continue;
@@ -567,6 +557,19 @@ impl Cowork {
                     }
                     Err(error) => failed(error.into()),
                 };
+                // Stop or provider setup failure may end pre-run compaction
+                // before it reports completion. Keep the submitted prompt.
+                if let Some(event) = pending_start {
+                    thread.update(cx, |thread, cx| {
+                        if thread.is_compacting() {
+                            thread.emit(
+                                protocol::HostMessage::CompactionFinished { context: None },
+                                cx,
+                            );
+                        }
+                        thread.emit(event, cx);
+                    });
+                }
                 let duration = started.elapsed();
                 let ended = this.update(cx, |this, cx| {
                     this.finish_generation(

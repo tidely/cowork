@@ -554,7 +554,7 @@ impl<'a> Collaboration<'a> {
                         id: Uuid::new_v4(),
                         comment_group_id: None,
                         started_at: SystemTime::UNIX_EPOCH,
-                        prompt: crate::transcript::TranscriptIndex(0),
+                        start: crate::transcript::TranscriptIndex(0),
                         pending_events: Vec::new(),
                         run: crate::protocol::AgentRun::Ended {
                             outcome: crate::protocol::RunOutcome::Completed,
@@ -589,8 +589,8 @@ impl<'a> Collaboration<'a> {
                 let reply = RigMessage::assistant(message.ui.output.text.clone());
                 thread
                     .transcript
-                    .messages
-                    .extend([RigMessage::user("Long history prompt"), reply]);
+                    .append(RigMessage::user("Long history prompt"));
+                thread.transcript.append(reply);
             }
             assert!(thread.set_model_catalog(test_catalog(), cx));
             thread

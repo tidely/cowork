@@ -539,14 +539,12 @@ fn compaction_replaces_request_prefix_but_keeps_complete_transcript() {
     let mut thread = local_thread();
     let first = rig::completion::Message::user("Original request");
     let later = rig::completion::Message::user("Next request");
-    thread.transcript.messages = vec![first.clone(), later.clone()];
+    thread.transcript.append(first.clone());
     thread
         .transcript
-        .install_compaction(crate::transcript::Compaction {
-            resume_at: crate::transcript::TranscriptIndex(1),
-            summary: "First summary".into(),
-        })
+        .install_compaction("First summary".into())
         .unwrap();
+    thread.transcript.append(later.clone());
     assert_eq!(
         thread.request_history(),
         vec![
@@ -556,10 +554,7 @@ fn compaction_replaces_request_prefix_but_keeps_complete_transcript() {
     );
     thread
         .transcript
-        .install_compaction(crate::transcript::Compaction {
-            resume_at: crate::transcript::TranscriptIndex(2),
-            summary: "Second summary".into(),
-        })
+        .install_compaction("Second summary".into())
         .unwrap();
     assert_eq!(
         thread.request_history(),
@@ -567,13 +562,13 @@ fn compaction_replaces_request_prefix_but_keeps_complete_transcript() {
             "Summary of the conversation so far:\nSecond summary"
         )]
     );
-    assert_eq!(thread.transcript.messages, vec![first, later]);
+    assert_eq!(thread.transcript.messages(), vec![first, later]);
     let snapshot = thread.to_protocol();
     let bytes = postcard::to_stdvec(&snapshot).unwrap();
     let decoded: protocol::ThreadSnapshot = postcard::from_bytes(&bytes).unwrap();
     assert_eq!(decoded.transcript, thread.transcript.to_protocol());
     assert_eq!(
-        decoded.transcript.to_transcript().unwrap().messages.len(),
+        decoded.transcript.to_transcript().unwrap().messages().len(),
         2
     );
 }
@@ -583,12 +578,8 @@ fn compaction_events_preserve_previous_context_on_failure_and_stop(cx: &mut gpui
     let mut thread = local_thread();
     thread
         .transcript
-        .messages
-        .push(rig::completion::Message::user("Earlier request"));
-    let previous = crate::transcript::Compaction {
-        resume_at: crate::transcript::TranscriptIndex(1),
-        summary: "Earlier summary".into(),
-    };
+        .append(rig::completion::Message::user("Earlier request"));
+    let previous: String = "Earlier summary".into();
     thread
         .transcript
         .install_compaction(previous.clone())
@@ -631,7 +622,7 @@ fn compaction_events_preserve_previous_context_on_failure_and_stop(cx: &mut gpui
         .unwrap();
     assert!(!thread.is_compacting());
     assert_eq!(thread.transcript.latest_compaction(), Some(&previous));
-    assert_eq!(thread.transcript.messages.len(), 2);
+    assert_eq!(thread.transcript.messages().len(), 2);
 }
 
 #[gpui::test]
@@ -639,8 +630,7 @@ fn compaction_snapshot_restores_summary_and_full_transcript(cx: &mut gpui::TestA
     let mut host = local_thread();
     let peer = add_peer(&mut host);
     host.transcript
-        .messages
-        .push(rig::completion::Message::user("Earlier request"));
+        .append(rig::completion::Message::user("Earlier request"));
     let id = Uuid::new_v4().into_bytes();
     host.try_apply_for_test(
         protocol::HostMessage::AgentStarted {
@@ -656,11 +646,7 @@ fn compaction_snapshot_restores_summary_and_full_transcript(cx: &mut gpui::TestA
         .unwrap();
     host.try_apply_for_test(
         protocol::HostMessage::CompactionFinished {
-            context: Some(crate::transcript::Compaction {
-                // A loop boundary can summarize every recorded message.
-                resume_at: crate::transcript::TranscriptIndex(2),
-                summary: "Summary".into(),
-            }),
+            context: Some("Summary".into()),
         },
         cx,
     )
@@ -716,10 +702,7 @@ fn compaction_retains_local_views_and_ui_changes_do_not_change_shared_records(
     thread
         .try_apply_for_test(
             protocol::HostMessage::CompactionFinished {
-                context: Some(crate::transcript::Compaction {
-                    resume_at: thread.transcript.end(),
-                    summary: "Summary".into(),
-                }),
+                context: Some("Summary".into()),
             },
             cx,
         )
@@ -728,7 +711,7 @@ fn compaction_retains_local_views_and_ui_changes_do_not_change_shared_records(
     assert_eq!(ui.text_view.entity_id(), view.entity_id());
     assert!(!ui.work_expanded);
     assert_eq!(thread.to_protocol().messages, records);
-    assert_eq!(thread.transcript.messages.len(), 1);
+    assert_eq!(thread.transcript.messages().len(), 1);
 
     let mut welcome = protocol::Welcome {
         participant_id: thread.participant_id.into_bytes(),
@@ -753,5 +736,255 @@ fn compaction_retains_local_views_and_ui_changes_do_not_change_shared_records(
         error
             .to_string()
             .contains("duplicate timeline message identity")
+    );
+}
+
+/// Joining during preparation must not manufacture the upcoming prompt or fold
+/// a summary as an ordinary Rig message.
+#[gpui::test]
+fn pre_run_summary_is_recorded_before_prompt_and_replays_at_every_phase(
+    cx: &mut gpui::TestAppContext,
+) {
+    use crate::transcript::TranscriptEntry;
+    for summary in [Some("Earlier conversation".to_owned()), None] {
+        let mut host = local_thread();
+        let peer = add_peer(&mut host);
+        use agent::test_support::{MockStreamEvent, mock_final_with_total_tokens, turn};
+        let earlier = Uuid::new_v4().into_bytes();
+        host.try_apply_for_test(
+            protocol::HostMessage::AgentStarted {
+                id: earlier,
+                comment_group_id: None,
+                started_at: std::time::SystemTime::now(),
+                prompt: protocol::Json::from_rig(&rig::completion::Message::user(
+                    "Earlier request",
+                )),
+            },
+            cx,
+        )
+        .unwrap();
+        for event in turn([
+            MockStreamEvent::Text("Earlier answer".into()),
+            MockStreamEvent::FinalResponse(mock_final_with_total_tokens(100)),
+        ]) {
+            host.apply_agent_event(Uuid::from_bytes(earlier), protocol::Json::shared(event), cx)
+                .unwrap();
+        }
+        host.try_apply_for_test(
+            protocol::HostMessage::AgentEnded {
+                id: earlier,
+                outcome: protocol::RunOutcome::Completed,
+                duration: std::time::Duration::ZERO,
+            },
+            cx,
+        )
+        .unwrap();
+        let id = Uuid::new_v4().into_bytes();
+        let started_at = std::time::SystemTime::now();
+        host.try_apply_for_test(
+            protocol::HostMessage::AgentPreparing {
+                id,
+                comment_group_id: None,
+                started_at,
+            },
+            cx,
+        )
+        .unwrap();
+        host.try_apply_for_test(protocol::HostMessage::CompactionStarted, cx)
+            .unwrap();
+        let snapshot = |thread: &Thread, cx: &mut gpui::TestAppContext| {
+            let welcome = protocol::Welcome {
+                participant_id: peer.into_bytes(),
+                thread: thread.to_protocol(),
+                draft: thread.draft.encode_state(),
+                draft_generation: 0,
+                presence: Vec::new(),
+                stored_attachments: Vec::new(),
+            };
+            Thread::from_prepared_welcome(
+                Thread::prepare_welcome(welcome).unwrap(),
+                ThreadDraft::new(peer),
+                ThreadSharing::NotShared,
+                cx,
+            )
+        };
+        let mut mirror = snapshot(&host, cx);
+        assert!(mirror.is_compacting());
+        assert_eq!(mirror.transcript.entries.len(), 2);
+        let start = mirror.agent_message_mut(id).unwrap().record.start;
+        assert!(!mirror.transcript.has_prompt(start));
+        let finish = protocol::HostMessage::CompactionFinished {
+            context: summary.clone(),
+        };
+        host.try_apply_for_test(finish.clone(), cx).unwrap();
+        mirror.try_apply_for_test(finish, cx).unwrap();
+        assert_eq!(mirror.transcript, host.transcript);
+        let mut joined = snapshot(&host, cx);
+        assert_eq!(joined.transcript, host.transcript);
+        assert_eq!(
+            joined.agent_message_mut(earlier).unwrap().ui.output,
+            host.agent_message_mut(earlier).unwrap().ui.output
+        );
+        let start = protocol::HostMessage::AgentStarted {
+            id,
+            comment_group_id: None,
+            started_at,
+            prompt: protocol::Json::from_rig(&rig::completion::Message::user("Next request")),
+        };
+        host.try_apply_for_test(start.clone(), cx).unwrap();
+        mirror.try_apply_for_test(start.clone(), cx).unwrap();
+        assert_eq!(mirror.transcript, host.transcript);
+        if summary.is_some() {
+            assert!(matches!(
+                host.transcript.entries.as_slice(),
+                [
+                    TranscriptEntry::Message(_),
+                    TranscriptEntry::Message(_),
+                    TranscriptEntry::Compaction(_),
+                    TranscriptEntry::Message(_)
+                ]
+            ));
+        } else {
+            assert_eq!(host.transcript.entries.len(), 3);
+        }
+        let recorded = host.transcript.clone();
+        assert!(host.try_apply_for_test(start, cx).is_err());
+        assert_eq!(host.transcript, recorded);
+        let mut restored = snapshot(&host, cx);
+        assert_eq!(
+            restored.agent_message_mut(id).unwrap().ui.output,
+            host.agent_message_mut(id).unwrap().ui.output
+        );
+    }
+}
+
+#[gpui::test]
+fn summary_steps_survive_streaming_and_stay_with_their_run(cx: &mut gpui::TestAppContext) {
+    use crate::timeline::AgentStep;
+    use agent::test_support::{MockStreamEvent, mock_final_with_total_tokens, turn};
+    let mut thread = local_thread();
+    let peer = add_peer(&mut thread);
+    let id = Uuid::new_v4().into_bytes();
+    thread
+        .try_apply_for_test(
+            protocol::HostMessage::AgentStarted {
+                id,
+                comment_group_id: None,
+                started_at: std::time::SystemTime::now(),
+                prompt: protocol::Json::from_rig(&rig::completion::Message::user("Request")),
+            },
+            cx,
+        )
+        .unwrap();
+    for event in turn([
+        MockStreamEvent::Reasoning {
+            id: "thinking".into(),
+            text: "Think first".into(),
+        },
+        MockStreamEvent::Text("Before".into()),
+        MockStreamEvent::FinalResponse(mock_final_with_total_tokens(100)),
+    ]) {
+        thread
+            .apply_agent_event(Uuid::from_bytes(id), protocol::Json::shared(event), cx)
+            .unwrap();
+    }
+    let thinking_view = {
+        let ui = &mut thread.agent_message_mut(id).unwrap().ui;
+        ui.step_view_mut(0).unwrap().set_expanded(true);
+        let crate::timeline::StepView::Thinking { view, .. } = ui.step_view(0).unwrap() else {
+            panic!("thinking view")
+        };
+        view.entity_id()
+    };
+    for summary in ["First", "Second"] {
+        thread
+            .try_apply_for_test(protocol::HostMessage::CompactionStarted, cx)
+            .unwrap();
+        thread
+            .try_apply_for_test(
+                protocol::HostMessage::CompactionFinished {
+                    context: Some(summary.into()),
+                },
+                cx,
+            )
+            .unwrap();
+    }
+    let events = turn([
+        MockStreamEvent::Text("Partial".into()),
+        MockStreamEvent::FinalResponse(mock_final_with_total_tokens(100)),
+    ]);
+    for event in events
+        .into_iter()
+        .take_while(|event| !matches!(event, agent::AgentEvent::TurnEnded { .. }))
+    {
+        thread
+            .apply_agent_event(Uuid::from_bytes(id), protocol::Json::shared(event), cx)
+            .unwrap();
+    }
+    thread
+        .try_apply_for_test(
+            protocol::HostMessage::AgentEnded {
+                id,
+                outcome: protocol::RunOutcome::Stopped,
+                duration: std::time::Duration::ZERO,
+            },
+            cx,
+        )
+        .unwrap();
+    assert_eq!(
+        thread.agent_message_mut(id).unwrap().ui.output.steps(),
+        &[
+            AgentStep::Thinking("Think first".into()),
+            AgentStep::Text("Before".into()),
+            AgentStep::Compaction,
+            AgentStep::Compaction,
+            AgentStep::Text("Partial".into()),
+        ]
+    );
+    thread
+        .try_apply_for_test(
+            protocol::HostMessage::AgentStarted {
+                id: Uuid::new_v4().into_bytes(),
+                comment_group_id: None,
+                started_at: std::time::SystemTime::now(),
+                prompt: protocol::Json::from_rig(&rig::completion::Message::user("Continue")),
+            },
+            cx,
+        )
+        .unwrap();
+    assert_eq!(
+        thread.agent_message_mut(id).unwrap().ui.output.steps(),
+        &[
+            AgentStep::Thinking("Think first".into()),
+            AgentStep::Text("Before".into()),
+            AgentStep::Compaction,
+            AgentStep::Compaction,
+            AgentStep::Text("Partial".into())
+        ]
+    );
+    let ui = &thread.agent_message_mut(id).unwrap().ui;
+    let crate::timeline::StepView::Thinking { view, expanded } = ui.step_view(0).unwrap() else {
+        panic!("thinking view")
+    };
+    assert_eq!(view.entity_id(), thinking_view);
+    assert!(*expanded);
+    assert_eq!(ui.views().count(), ui.output.steps().len());
+    let welcome = protocol::Welcome {
+        participant_id: peer.into_bytes(),
+        thread: thread.to_protocol(),
+        draft: thread.draft.encode_state(),
+        draft_generation: 0,
+        presence: Vec::new(),
+        stored_attachments: Vec::new(),
+    };
+    let mut restored = Thread::from_prepared_welcome(
+        Thread::prepare_welcome(welcome).unwrap(),
+        ThreadDraft::new(peer),
+        ThreadSharing::NotShared,
+        cx,
+    );
+    assert_eq!(
+        restored.agent_message_mut(id).unwrap().ui.output,
+        thread.agent_message_mut(id).unwrap().ui.output
     );
 }

@@ -37,7 +37,7 @@ fn reply(text: &str, cx: &mut App) -> TimelineMessage {
             id: Uuid::new_v4(),
             comment_group_id: None,
             started_at: SystemTime::UNIX_EPOCH,
-            prompt: crate::transcript::TranscriptIndex(0),
+            start: crate::transcript::TranscriptIndex(0),
             pending_events: Vec::new(),
             run: AgentRun::Ended {
                 outcome: RunOutcome::Completed,

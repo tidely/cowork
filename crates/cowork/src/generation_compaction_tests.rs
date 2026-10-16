@@ -23,13 +23,9 @@ fn text_turn(text: &str) -> Vec<MockStreamEvent> {
     ]
 }
 
-fn hook(
-    updates: mpsc::UnboundedSender<RunUpdate>,
-    transcript_base: u64,
-) -> Arc<GenerationCompaction> {
+fn hook(updates: mpsc::UnboundedSender<RunUpdate>) -> Arc<GenerationCompaction> {
     Arc::new(GenerationCompaction {
         threshold: Some(10),
-        transcript_base,
         latest_context_tokens: Mutex::new(0),
         environment_note: "<environment>project path</environment>".into(),
         updates,
@@ -67,7 +63,7 @@ async fn steering_is_delivered_after_loop_compaction() {
     let (updates, mut receiver) = mpsc::unbounded_channel();
     let steering = Arc::new(Steering::default());
     let mut history = Vec::new();
-    agent(&model, hook(updates.clone(), 0))
+    agent(&model, hook(updates.clone()))
         .steering_hook(steering.clone())
         .run(
             Message::user("Original task. ".repeat(100)),
@@ -86,7 +82,7 @@ async fn steering_is_delivered_after_loop_compaction() {
     while let Ok(update) = receiver.try_recv() {
         match update {
             RunUpdate::CompactionFinished { context, .. } => {
-                assert_eq!(context.unwrap().resume_at.0, 3);
+                assert!(context.unwrap().contains("Handoff"));
                 finished = true;
             }
             RunUpdate::Event(AgentEvent::Steered { .. }) => assert!(finished),
@@ -110,7 +106,7 @@ async fn compaction_runs_between_tool_turns_and_preserves_full_history() {
         text_turn("Finished"),
     ]);
     let (updates, mut receiver) = mpsc::unbounded_channel();
-    let agent = agent(&model, hook(updates.clone(), 7));
+    let agent = agent(&model, hook(updates.clone()));
     let prompt =
         Message::user("Keep this original task and its detailed constraints. ".repeat(100));
     let mut history = Vec::new();
@@ -130,18 +126,13 @@ async fn compaction_runs_between_tool_turns_and_preserves_full_history() {
             RunUpdate::CompactionStarted => assert!(fold.pending_calls().is_empty()),
             RunUpdate::CompactionFinished { context, .. } => {
                 let context = context.expect("smaller summary");
-                assert!(
-                    context
-                        .summary
-                        .contains("<environment>project path</environment>")
-                );
-                assert_eq!(context.resume_at.0, 7 + replayed.len() as u64);
-                boundaries.push(context.resume_at.0);
+                assert!(context.contains("<environment>project path</environment>"));
+                boundaries.push(replayed.len());
             }
             _ => panic!("unexpected update"),
         }
     }
-    assert_eq!(boundaries, [10, 12]);
+    assert_eq!(boundaries, [3, 5]);
     assert_eq!(replayed, history);
     let requests = model.requests();
     assert_eq!(requests.len(), 5);
@@ -207,7 +198,7 @@ async fn tool_call_during_loop_compaction_preserves_request_history() {
     ]);
     let (updates, mut receiver) = mpsc::unbounded_channel();
     let mut history = Vec::new();
-    agent(&model, hook(updates.clone(), 0))
+    agent(&model, hook(updates.clone()))
         .run(Message::user("Original task"), &mut history, |event| {
             _ = updates.send(RunUpdate::Event(event));
         })

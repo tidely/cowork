@@ -151,7 +151,7 @@ fn a_collaborators_file_is_uploaded_and_stored(cx: &mut gpui::TestAppContext) {
             == host_thread.read_with(this.cx, |thread, _| thread.conversation())
     });
     collaborator_thread.read_with(session.cx, |thread, _| {
-        assert_eq!(thread.transcript.messages.len(), 1);
+        assert_eq!(thread.transcript.messages().len(), 1);
         assert_eq!(thread.prompt_names.len(), 1);
     });
 }

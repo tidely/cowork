@@ -374,14 +374,14 @@ fn consumed_steering_cannot_be_cancelled_and_mirrors_keep_the_prompt_out_of_outp
             [AgentStep::Steering, AgentStep::Text(text)] if text == "updated answer"
         ));
         assert_eq!(agent.ui.output.text, "updated answer");
-        assert_eq!(state.transcript.messages.len(), 3);
+        assert_eq!(state.transcript.messages().len(), 3);
     });
     let mirror = session.collaborator_thread().unwrap();
     session.wait_until(
         "steering transcript and output reach the mirror",
         |session| {
             mirror.read_with(session.cx, |thread, _| {
-                thread.transcript.messages.len() == 3 && thread.pending_submissions().is_empty()
+                thread.transcript.messages().len() == 3 && thread.pending_submissions().is_empty()
             })
         },
     );

@@ -411,12 +411,13 @@ fn assert_joining_agent_timeline_converges(cx: &mut gpui::TestAppContext, join_a
         // The transcript, thinking and tool call included, is the host's,
         // though the collaborator missed the start of the turn.
         assert_eq!(collaborator.transcript, host.transcript);
+        let transcript_messages = collaborator.transcript.messages();
         let [
             RigMessage::User { .. },
             RigMessage::Assistant(reply),
             RigMessage::User { .. },
             RigMessage::Assistant(_),
-        ] = collaborator.transcript.messages.as_slice()
+        ] = transcript_messages.as_slice()
         else {
             panic!("expected prompt, reply, tool result, reply");
         };
@@ -845,7 +846,8 @@ fn a_restated_part_shows_as_rig_accumulates_it(cx: &mut gpui::TestAppContext) {
             message.ui.output.thinking().collect::<Vec<_>>(),
             ["Considered."]
         );
-        let [_, RigMessage::Assistant(reply)] = host.transcript.messages.as_slice() else {
+        let transcript_messages = host.transcript.messages();
+        let [_, RigMessage::Assistant(reply)] = transcript_messages.as_slice() else {
             panic!("expected the prompt and the reply");
         };
         assert!(matches!(
@@ -902,11 +904,11 @@ fn snapshots_with_agent_runs_the_transcript_cannot_hold_are_rejected(
 
         // The prompt must be a user message: here it is the agent's reply.
         assert!(
-            with_agent_message(&|message| message.prompt = crate::transcript::TranscriptIndex(1))
+            with_agent_message(&|message| message.start = crate::transcript::TranscriptIndex(1))
                 .is_err()
         );
         assert!(
-            with_agent_message(&|message| message.prompt = crate::transcript::TranscriptIndex(99))
+            with_agent_message(&|message| message.start = crate::transcript::TranscriptIndex(99))
                 .is_err()
         );
         // Events completing a turn would have joined the transcript.
@@ -932,13 +934,14 @@ fn snapshots_with_agent_runs_the_transcript_cannot_hold_are_rejected(
             .cloned()
             .expect("an agent message");
         let mut transcript = two_generating.thread.transcript.to_transcript().unwrap();
-        let second_prompt = transcript.append(RigMessage::user("Next"));
+        let second_prompt = transcript.end();
+        transcript.append(RigMessage::user("Next"));
         two_generating.thread.transcript = transcript.to_protocol();
         let protocol::TimelineMessage::Agent(mut second) = first.clone() else {
             unreachable!();
         };
         second.id = Uuid::new_v4().into_bytes();
-        second.prompt = second_prompt;
+        second.start = second_prompt;
         second.pending_events.clear();
         let protocol::TimelineMessage::Agent(mut first) = first else {
             unreachable!();
@@ -1505,8 +1508,8 @@ fn renaming_never_changes_what_the_agent_was_sent(cx: &mut gpui::TestAppContext)
     // The prompt is recorded before the run starts, and this test's run
     // never does.
     let first_prompt = thread.read_with(cx, |thread, _| {
-        assert_eq!(thread.transcript.messages.len(), 1);
-        thread.transcript.messages[0].clone()
+        assert_eq!(thread.transcript.messages().len(), 1);
+        thread.transcript.messages()[0].clone()
     });
     // The first prompt tells the agent where its commands run.
     let [note, first] = prompt_texts(&first_prompt).try_into().expect("two parts");
@@ -1538,14 +1541,14 @@ fn renaming_never_changes_what_the_agent_was_sent(cx: &mut gpui::TestAppContext)
     cx.run_until_parked();
 
     thread.read_with(cx, |thread, _| {
-        assert_eq!(thread.transcript.messages.len(), 2);
+        assert_eq!(thread.transcript.messages().len(), 2);
         assert_eq!(
-            prompt_texts(&thread.transcript.messages[0]),
+            prompt_texts(&thread.transcript.messages()[0]),
             prompt_texts(&first_prompt)
         );
         // The project did not change, so the note is not repeated.
         assert_eq!(
-            prompt_texts(&thread.transcript.messages[1]),
+            prompt_texts(&thread.transcript.messages()[1]),
             [format!("{derived_name}:\nsecond")]
         );
     });

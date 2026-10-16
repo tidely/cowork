@@ -83,13 +83,14 @@ impl Cowork {
     /// A quiet divider for accepted summaries, or an animated status while the
     /// host is summarizing. These are local views of mirrored transcript state.
     pub(crate) fn render_compaction_marker(
-        index: usize,
+        id: impl ToString,
         compacting: bool,
         cx: &App,
     ) -> gpui::AnyElement {
+        let id = id.to_string();
         let label = if compacting {
             ShimmerText::new("Compacting context…")
-                .id(("compacting-context", index))
+                .id(gpui::SharedString::from(format!("compacting-context-{id}")))
                 .text_color(cx.theme().muted_foreground)
                 .into_any_element()
         } else {
@@ -97,19 +98,19 @@ impl Cowork {
         };
         let line = || div().flex_1().h(px(1.)).bg(cx.theme().border);
         div()
-            .id((
+            .id(gpui::SharedString::from(format!(
+                "{}-{id}",
                 if compacting {
                     "compaction-status"
                 } else {
                     "compaction-marker"
-                },
-                index,
-            ))
+                }
+            )))
             .debug_selector(move || {
                 if compacting {
                     "compacting-context".into()
                 } else {
-                    format!("compaction-marker-{index}")
+                    format!("compaction-marker-{id}")
                 }
             })
             .w_full()
@@ -797,10 +798,7 @@ impl Cowork {
             .gap_2()
             .child(
                 div()
-                    .id(format!(
-                        "toggle-thinking-{message_id}-{}",
-                        message.ui.output.content_id(step_index)
-                    ))
+                    .id(format!("toggle-thinking-{message_id}-{}", step_index))
                     .debug_selector(move || format!("toggle-thinking-{message_id}-{step_index}"))
                     .h(px(24.))
                     .flex()
@@ -893,10 +891,7 @@ impl Cowork {
             .flex_col()
             .child(
                 div()
-                    .id(format!(
-                        "tool-call-{message_id}-{}",
-                        message.ui.output.content_id(step_index)
-                    ))
+                    .id(format!("tool-call-{message_id}-{}", step_index))
                     .debug_selector(move || format!("tool-call-{message_id}-{step_index}"))
                     .h(px(20.))
                     .w_full()
@@ -925,10 +920,7 @@ impl Cowork {
             .when(expanded, |this| {
                 this.child(
                     div()
-                        .id(format!(
-                            "tool-call-details-{message_id}-{}",
-                            message.ui.output.content_id(step_index)
-                        ))
+                        .id(format!("tool-call-details-{message_id}-{}", step_index))
                         .debug_selector(move || {
                             format!("tool-call-details-{message_id}-{step_index}")
                         })
@@ -1283,15 +1275,9 @@ impl Cowork {
             .thread(thread_id, cx)
             .map(|thread| {
                 let thread = thread.read(cx);
-                RunProjection::new(
-                    index,
-                    message,
-                    timeline,
-                    thread.transcript.compactions(),
-                    thread.run_activity(message.record.id),
-                )
+                RunProjection::new(message, timeline, thread.run_activity(message.record.id))
             })
-            .unwrap_or_else(|| RunProjection::new(index, message, timeline, &[], None));
+            .unwrap_or_else(|| RunProjection::new(message, timeline, None));
         let submitted_comments = submitted_comments
             .iter()
             .map(crate::timeline::SubmittedComment::to_view)
@@ -1428,7 +1414,6 @@ impl Cowork {
             }
         };
         let awaiting = message.awaiting_approval_step();
-        let mut response = Some(message_content);
         for item in projection.into_items() {
             match item {
                 RunItem::Content(step_index) => {
@@ -1485,8 +1470,12 @@ impl Cowork {
                                 cx,
                             ));
                         }
-                        RunItem::Compaction(id) => {
-                            content.push(Self::render_compaction_marker(id.0, false, cx))
+                        RunItem::Compaction(step_index) => {
+                            content.push(Self::render_compaction_marker(
+                                format!("{message_id}-{step_index}"),
+                                false,
+                                cx,
+                            ))
                         }
                         RunItem::Activity(crate::timeline::RunActivity::Compacting) => {
                             content.push(Self::render_compaction_marker(index, true, cx))
@@ -1497,12 +1486,13 @@ impl Cowork {
                                 .text_color(cx.theme().muted_foreground)
                                 .into_any_element(),
                         ),
-                        RunItem::Response => content.extend(response.take().unwrap()),
                         RunItem::Content(_) => unreachable!(),
                     }
                 }
             }
         }
+        flush(&mut calls, &mut content);
+        content.extend(message_content);
         content.extend(failure.map(IntoElement::into_any_element));
         if !content.is_empty() || rows.is_empty() {
             rows.push(agent_row(self, content, cx));

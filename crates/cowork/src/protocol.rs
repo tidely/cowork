@@ -15,7 +15,7 @@ use tokio_util::{
 use crate::models::{ModelCatalog, ModelRef};
 pub(crate) use crate::project_mode::ProjectMode;
 pub(crate) use crate::thread::{PeerMode, PeerPermissions, PermissionDenied};
-use crate::transcript::{Compaction, Transcript, TranscriptIndex};
+use crate::transcript::{Transcript, TranscriptIndex};
 
 /// Bounds how much memory a single frame from a peer can make us buffer.
 ///
@@ -40,7 +40,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 30;
+pub(crate) const PROTOCOL_VERSION: u32 = 31;
 
 /// A request from a collaborator to the host.
 ///
@@ -267,6 +267,13 @@ pub(crate) enum HostMessage {
         started_at: SystemTime,
         prompt: Json<rig::completion::Message>,
     },
+    /// Creates the response before pre-run compaction, without recording its
+    /// prompt yet. AgentStarted commits that prompt after the summary finishes.
+    AgentPreparing {
+        id: uuid::Bytes,
+        comment_group_id: Option<uuid::Bytes>,
+        started_at: SystemTime,
+    },
     /// Something the agent did while producing message `id`, exactly as the
     /// host's agent loop reported it. Every participant, the host included,
     /// folds these into the message and the transcript the same way; see
@@ -287,7 +294,7 @@ pub(crate) enum HostMessage {
     /// Only a validated, smaller summary replaces request history. None
     /// reports a failed attempt without changing the last successful summary.
     CompactionFinished {
-        context: Option<Compaction>,
+        context: Option<String>,
     },
     /// `participant` is called `name` in prompts from now on. Sent when their
     /// first item is submitted; a name never changes afterwards.
@@ -500,10 +507,10 @@ pub(crate) struct AgentMessage {
     pub(crate) comment_group_id: Option<uuid::Bytes>,
     /// See [`HostMessage::AgentStarted`].
     pub(crate) started_at: SystemTime,
-    /// Where the prompt this message answers is in the transcript. Each run
-    /// adds exactly its prompt there, with `AgentStarted`, so its output is
-    /// the entries after it, up to the next agent message's prompt.
-    pub(crate) prompt: TranscriptIndex,
+    /// Where this run starts in the ordered transcript, before any pre-run
+    /// summaries and its prompt. Its first ordinary entry is the user prompt.
+    /// Only the active run may still be preparing without that entry.
+    pub(crate) start: TranscriptIndex,
     /// The run's events since its output last joined the transcript, exactly
     /// as the host folded them. While generating, they are the turn in
     /// progress, which someone joining folds on from. Once a run is stopped
@@ -924,7 +931,7 @@ mod tests {
                     id: [4; 16],
                     comment_group_id: Some([2; 16]),
                     started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-                    prompt: TranscriptIndex(0),
+                    start: TranscriptIndex(0),
                     pending_events: vec![json("{}")],
                     run: AgentRun::Ended {
                         outcome: RunOutcome::Failed("Failed".into()),
@@ -1107,6 +1114,16 @@ mod tests {
     #[test]
     fn agent_stream_events_round_trip_through_postcard() {
         for message in [
+            HostMessage::AgentPreparing {
+                id: [7; 16],
+                comment_group_id: Some([8; 16]),
+                started_at: SystemTime::UNIX_EPOCH,
+            },
+            HostMessage::CompactionStarted,
+            HostMessage::CompactionFinished {
+                context: Some("Summary".into()),
+            },
+            HostMessage::CompactionFinished { context: None },
             HostMessage::AgentStarted {
                 id: [7; 16],
                 comment_group_id: Some([8; 16]),

@@ -6,21 +6,26 @@ Yrs document, and the protocol between host and collaborators.
 
 ## Status
 
-The LLM transcript is a separate value containing the original Rig messages and
-all accepted prefix compactions. Absolute message indices remain unchanged; the
-latest summary is used for requests. UUIDs and unfinished events belong to shared
-timeline run records. Each resident timeline entry holds its shared record and
+The LLM transcript is one append-only vector of entries: original Rig messages
+and accepted compaction summaries. A summary's position defines the prefix it
+replaces; requests use the latest summary and the messages after it. Indices count
+both variants and never change. UUIDs, run starts, and unfinished events belong to
+shared timeline run records. A run starts before its optional pre-run summaries;
+its first ordinary entry is its prompt. Each resident timeline entry holds its shared record and
 local presentation in separate fields; records and views share a lifetime while
 all history stays in memory. Only records cross the sharing boundary. Welcome
 snapshots carry the whole `Transcript` as one `Json<Transcript>` value, including
 original messages and compactions, plus the run records and their JSON-wrapped pending events. All history and local views remain
 in memory; there is no transcript offloading or history paging.
 
-The visible timeline is a local, pure projection of these records, summary
-boundaries, pending submissions, and active run activity. It owns placement and
-collapse behavior; synthetic rows never enter the agent transcript or the wire
-history. Folded content carries its original message/part position, and local
-step views are reconciled by those keys rather than display indices. A thread
+The visible timeline is a local, pure projection of these records, pending
+submissions, and active run activity. Compactions fold into output steps in the
+same traversal as messages; there is no separate boundary-to-step translation.
+The projection owns placement and collapse behavior; synthetic rows never enter the agent transcript or the wire
+history. Each folded step has one local view at the same index, including
+compaction steps. Streaming only rewinds the uncommitted suffix; collapsing or
+rendering a subset does not change those indices. In-run dividers use their run
+UUID and step index; no transcript positions flow through folded output. A thread
 owns at most one active execution, whose activity and event fold end together;
 stopped and failed run records still retain their unfinished replay events.
 
@@ -42,14 +47,15 @@ and the ordinary run continues with its old context. Stop cancels the whole run.
 A successful summary (including its wrapper) must also be smaller than the
 previous request history in encoded bytes. Only model request history replaces the earlier
 transcript prefix with a summary user message; the complete transcript and
-timeline stay intact. Host events and snapshots mirror the summary boundary and
+timeline stay intact. Host events and snapshots mirror accepted summaries and
 compacting indicator. Usage includes successful summary requests. The context
 indicator is also shown inline as “Compacting context…” while a summary runs.
-Every accepted summary leaves a “Context compacted” divider at its original
-transcript boundary: before the next prompt for pre-run compaction, or between
-work steps for mid-run compaction. Collapsed work keeps its dividers visible
-above the response. Failed, skipped, and canceled summaries leave no divider;
-snapshots restore all accepted dividers from the transcript's compaction history.
+Every accepted summary appends a compaction entry and leaves a “Context compacted”
+divider at that position: before the new prompt for pre-run compaction, or between
+work steps for mid-run compaction. Mid-run dividers remain with their original run
+when a later run starts. A summary separates text/reasoning steps on either side.
+Collapsed work keeps its dividers visible above the response. Failed, skipped, and canceled summaries leave no divider;
+snapshots restore all accepted dividers from the ordered transcript entries.
 The context estimate immediately after compaction counts summary bytes, excluding system,
 tools, wrapper, and the next prompt until normal provider usage arrives.
 Mid-run summaries carry the current environment note, so project access
@@ -565,8 +571,8 @@ A single-block submission looks like the current user message.
   reasoning, tool calls, and tool results. Between compactions each request
   extends the previous one exactly, keeping the provider's prompt cache
   valid. After compaction, requests use the summary followed by transcript
-  messages after its exclusive `resume_at` boundary; all accepted summaries
-  are retained, with nondecreasing prefix coverage. The full transcript remains available for
+  messages after that summary's entry. All accepted summaries are retained;
+  coverage follows from append order, without a separate boundary field. The full transcript remains available for
   display and sharing. A run that is stopped or fails keeps its prompt and
   every turn it completed.
 - Every participant mirrors the transcript and the prompt names. The
@@ -588,8 +594,8 @@ A single-block submission looks like the current user message.
 - What an agent message shows (its thinking, text, tool calls with their
   results, and replies to comments, in the order the agent produced them)
   is never sent. It is a function of Rig
-  messages alone: the transcript entries its run added (those after its
-  prompt, up to the next run's prompt), followed by the message the run is
+  messages and compaction entries: the transcript entries after its prompt,
+  up to the next run's start, followed by the message the run is
   folding, as far as it has come, as Rig's stream accumulator has it. That
   message is the fold of the run's **pending events**: those folded since
   its output last joined the transcript. A run that is stopped or fails
@@ -610,17 +616,21 @@ A single-block submission looks like the current user message.
   transcript with `AgentStarted`, including its files' content, images as
   base64, so attachment bytes also travel inline besides as
   `AttachmentData`. Summary instructions and summary responses never become
-  original transcript messages. A `Welcome` carries the whole `Json<Transcript>`
-  (original Rig messages and prefix compactions in one JSON value) and, for each agent
-  message, where its prompt is, its pending events, and whether its run
+  ordinary Rig messages; accepted summaries append as compaction entries.
+  For pre-run compaction, `AgentPreparing` creates the active response first,
+  without recording the upcoming prompt. `CompactionFinished` appends a successful
+  summary, then `AgentStarted` records the prompt. Failure or cancellation still
+  records the submitted prompt before ending the run. A `Welcome` carries the
+  whole `Json<Transcript>` (one ordered vector) and, for each agent
+  message, where its run starts, its pending events, and whether its run
   has ended. The joiner folds each run's pending events, which rebuilds the
   message it was folding exactly, and so shows what everyone else does. For
   the running message, it keeps that fold, so someone joining mid-turn
   folds the rest of it. Before that, the
   joiner checks that the snapshot fits its transcript: every prompt is a
-  user message there, in order, all timeline UUIDs are unique, every compaction
-  has a nonempty summary and valid nondecreasing boundary, only the last run can still be
-  generating, and no run's pending events complete a message the
+  user message there, run starts increase, all timeline UUIDs are unique,
+  every compaction has a nonempty summary and preceding history, only the last run can still be
+  generating (and only that run may still await its prompt, with no output), and no run's pending events complete a message the
   transcript lacks. A frame larger than 1 GiB cannot be sent; the
   collaborator is then disconnected.
 - Each block's attachments stay with that block, using today's encoding.
@@ -929,9 +939,10 @@ can still be reported. Runtime permission denials use the separate
 | `PendingDelivered`                           | Removes a pending ID, publishes its user group, and maps steering comment aliases to the ongoing agent run                                                                                                                                                                                                                     |
 | `UserMessage`                                | A delivered immediate submission with creators and attachment references instead of bytes; advances the submission sequence                                                                                                                                                                                                    |
 | `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and whether it completed, was stopped, or failed (with a message)                                                                                                                                                                                    |
+| `AgentPreparing` | Creates the active response before pre-run compaction; its prompt is recorded by `AgentStarted` after the attempt finishes |
 | `AgentEvent`                                 | What the host's agent loop reported during a run, which everyone folds into the agent message and transcript                                                                                                                                                                                                                   |
 | `CompactionStarted` | The active run is generating a summary; mirrored context indicator animates |
-| `CompactionFinished` | Ends summary generation; a successful summary and transcript boundary replace request context, while `None` preserves the previous context |
+| `CompactionFinished` | Ends summary generation; a successful summary appends to the transcript and replaces request context, while `None` preserves the previous context |
 | `PromptNamed`                                | A participant's prompt name, fixed on their first submitted item                                                                                                                                                                                                                                                               |
 | `ToolApprovalRequested`                      | A run waits for the named call of its last reply to be allowed or denied                                                                                                                                                                                                                                                       |
 | `ToolApprovalResolved`                       | The waiting call was decided; its result follows as an `AgentEvent`                                                                                                                                                                                                                                                            |

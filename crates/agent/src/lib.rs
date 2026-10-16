@@ -303,8 +303,6 @@ pub trait SteeringHook: Send + Sync {
 /// request context here never removes unresolved tool calls or user steering.
 pub struct RequestBoundary<'a> {
     pub history: &'a [Message],
-    /// Messages added to the complete transcript since this run began.
-    pub added_messages: usize,
     pub usage: Usage,
     /// Tool results were not included in the provider's last usage count.
     pub tool_result_tokens: u64,
@@ -466,7 +464,6 @@ impl Agent {
     ) -> Result<()> {
         let mut fold = TurnFold::default();
         let mut prompt_recorded = false;
-        let initial_history_len = history.len();
         // Request context may shrink; the caller's history always gains
         // exactly the messages described by the emitted ordinary-run events.
         let mut request_history = history.clone();
@@ -630,7 +627,6 @@ impl Agent {
                         self,
                         RequestBoundary {
                             history: &request_history,
-                            added_messages: history.len() - initial_history_len,
                             usage,
                             tool_result_tokens,
                         },

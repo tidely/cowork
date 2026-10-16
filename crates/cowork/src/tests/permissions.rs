@@ -407,7 +407,7 @@ fn stopping_sharing_from_the_menu_preserves_the_canonical_local_thread(
                 thread.draft().id,
                 thread.draft().encode_state(),
                 thread.model().cloned(),
-                serde_json::to_string(&thread.transcript.messages).expect("serialize transcript"),
+                serde_json::to_string(&thread.transcript.messages()).expect("serialize transcript"),
             )
         });
     assert!(session.cx.debug_bounds("toggle-sharing").is_none());
@@ -434,7 +434,7 @@ fn stopping_sharing_from_the_menu_preserves_the_canonical_local_thread(
         assert_eq!(thread.draft().encode_state(), draft_state);
         assert_eq!(thread.model().cloned(), model);
         assert_eq!(
-            serde_json::to_string(&thread.transcript.messages).unwrap(),
+            serde_json::to_string(&thread.transcript.messages()).unwrap(),
             transcript
         );
     });
@@ -678,7 +678,7 @@ fn readonly_and_write_cannot_submit_by_keyboard_or_direct_actions(cx: &mut gpui:
         session.host_thread.read_with(session.cx, |thread, _| {
             assert_eq!(thread.submission_count(), 0);
             assert!(!thread.is_generating());
-            assert!(thread.transcript.messages.is_empty());
+            assert!(thread.transcript.messages().is_empty());
             assert_eq!(thread.model().cloned(), Some(ollama_qwen()));
         });
         collaborator.read_with(session.cx, |cowork, _| {
@@ -788,7 +788,7 @@ fn readonly_peers_keep_receiving_drafts_models_and_agent_output(cx: &mut gpui::T
         this.bodies(&mirror) == ["still visible"]
             && mirror.read_with(this.cx, |thread, _| {
                 thread.model().cloned() == Some(recommended_qwen())
-                    && thread.transcript.messages.len() == 2
+                    && thread.transcript.messages().len() == 2
             })
     });
     mirror.read_with(session.cx, |thread, cx| {

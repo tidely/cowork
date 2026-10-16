@@ -667,7 +667,7 @@ impl Thread {
             })
             .collect::<Vec<_>>();
         validate_agent_runs(
-            &transcript.messages,
+            &transcript.entries,
             &agent_messages,
             welcome.thread.compacting,
         )
@@ -1646,39 +1646,78 @@ impl Thread {
                 anyhow::ensure!(self.is_compacting(), "compaction is not running");
                 if let Some(context) = context {
                     self.transcript.install_compaction(context.clone())?;
-                    self.context_tokens =
-                        Some((context.summary.len() as u64).div_ceil(BYTES_PER_TOKEN));
+                    let id = self.active_run.as_ref().unwrap().id;
+                    let start = self
+                        .agent_message_mut(id.into_bytes())
+                        .unwrap()
+                        .record
+                        .start;
+                    if self.transcript.has_prompt(start) {
+                        self.agent_message_mut(id.into_bytes())
+                            .unwrap()
+                            .ui
+                            .compact(cx);
+                    }
+                    self.context_tokens = Some((context.len() as u64).div_ceil(BYTES_PER_TOKEN));
                     self.streamed_bytes = 0;
                 }
                 self.active_run.as_mut().unwrap().activity = crate::timeline::RunActivity::Working;
             }
-            protocol::HostMessage::AgentStarted {
-                id,
-                comment_group_id,
-                started_at,
-                prompt,
-            } => {
-                anyhow::ensure!(
-                    !self.timeline.iter().any(|entry| matches!(entry, TimelineMessage::Agent(message) if message.record.id == Uuid::from_bytes(id))),
-                    "duplicate agent run identity"
-                );
-                anyhow::ensure!(!self.is_generating(), "a run is already active");
-                let prompt_index = self.transcript.append(prompt.to_rig()?);
-                let message = AgentMessage::new(
-                    Uuid::from_bytes(id),
-                    comment_group_id.map(Uuid::from_bytes),
-                    started_at,
-                    prompt_index,
-                    protocol::AgentRun::Generating,
-                    Vec::new(),
-                    cx,
-                );
-                self.timeline.push(TimelineMessage::Agent(message));
-                self.active_run = Some(ActiveRun {
-                    id: Uuid::from_bytes(id),
-                    activity: crate::timeline::RunActivity::Working,
-                    turn: TurnFold::default(),
+            event @ (protocol::HostMessage::AgentStarted { .. }
+            | protocol::HostMessage::AgentPreparing { .. }) => {
+                let (id, comment_group_id, started_at, prompt) = match event {
+                    protocol::HostMessage::AgentStarted {
+                        id,
+                        comment_group_id,
+                        started_at,
+                        prompt,
+                    } => (id, comment_group_id, started_at, Some(prompt.to_rig()?)),
+                    protocol::HostMessage::AgentPreparing {
+                        id,
+                        comment_group_id,
+                        started_at,
+                    } => (id, comment_group_id, started_at, None),
+                    _ => unreachable!(),
+                };
+                let previous = self.timeline.iter().find_map(|entry| match entry {
+                    TimelineMessage::Agent(message)
+                        if message.record.id == Uuid::from_bytes(id) =>
+                    {
+                        Some(&message.record)
+                    }
+                    _ => None,
                 });
+                if let Some(previous) = previous {
+                    anyhow::ensure!(
+                        prompt.is_some()
+                            && self.run_activity(Uuid::from_bytes(id))
+                                == Some(crate::timeline::RunActivity::Working)
+                            && !self.transcript.has_prompt(previous.start)
+                            && previous.comment_group_id == comment_group_id.map(Uuid::from_bytes)
+                            && previous.started_at == started_at,
+                        "duplicate agent run identity"
+                    );
+                } else {
+                    anyhow::ensure!(!self.is_generating(), "a run is already active");
+                    let message = AgentMessage::new(
+                        Uuid::from_bytes(id),
+                        comment_group_id.map(Uuid::from_bytes),
+                        started_at,
+                        self.transcript.end(),
+                        protocol::AgentRun::Generating,
+                        Vec::new(),
+                        cx,
+                    );
+                    self.timeline.push(TimelineMessage::Agent(message));
+                    self.active_run = Some(ActiveRun {
+                        id: Uuid::from_bytes(id),
+                        activity: crate::timeline::RunActivity::Working,
+                        turn: TurnFold::default(),
+                    });
+                }
+                if let Some(prompt) = prompt {
+                    self.transcript.append(prompt);
+                }
             }
             protocol::HostMessage::AgentEvent { id, event } => {
                 self.apply_agent_event(Uuid::from_bytes(id), event, cx)?;
