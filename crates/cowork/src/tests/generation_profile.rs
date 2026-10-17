@@ -40,9 +40,10 @@ use gpui::{
 };
 use gpui_component::Root;
 use rig::{
+    AgentBuilder,
+    agent::{AgentHook, HookContext, RunSettled},
     completion::{AssistantContent, Message},
     providers::ollama::Ollama,
-    tool::ToolSet,
 };
 use std::{
     cell::RefCell,
@@ -62,6 +63,16 @@ use uuid::Uuid;
 
 const PROMPT: &str = "Explain presentation batching in a short Markdown paragraph and three bullets. Do not call tools.";
 const EVENT_CAP: usize = 2048;
+
+/// Keeps the messages a run commits, the history its events must fold into.
+#[derive(Clone, Default)]
+struct Committed(Arc<std::sync::Mutex<Vec<Message>>>);
+
+impl AgentHook for Committed {
+    async fn on_run_settled(&self, _: &HookContext, event: RunSettled<'_>) {
+        *self.0.lock().unwrap() = event.messages.map(<[Message]>::to_vec).unwrap_or_default();
+    }
+}
 fn setting<T: std::str::FromStr>(key: &str, default: &str) -> T
 where
     T::Err: std::fmt::Debug,
@@ -390,16 +401,16 @@ fn generation_profile() {
                 let producer_max = queued_max.clone();
                 let task = runtime.spawn(async move {
                     let started = Instant::now();
-                    let mut history = Vec::new();
+                    let committed = Committed::default();
                     let result = async {
                         let model = Ollama::from_env()?.native_completion("qwen3.8:27b");
                         // rig-core 0.44 native Chat: think top-level, options merged.
-                        let agent = agent::Agent::new(model.erase(), ToolSet::default()).additional_params(serde_json::json!({
+                        let runner = AgentBuilder::new(model).additional_params(serde_json::json!({
                             "think": reasoning, "options": {"num_ctx": 4096, "num_predict": num_predict}
-                        }));
+                        })).build().prompt(Message::user(PROMPT)).add_hook(committed.clone());
                         let cap = tokio::sync::Notify::new();
                         let mut count = 0;
-                        let run = agent.run(Message::user(PROMPT), &mut history, |event| {
+                        let run = agent::run(runner, |event| {
                             if count >= EVENT_CAP { cap.notify_one(); return; }
                             count += 1;
                             let pending = producer_queued.fetch_add(1, Ordering::SeqCst) + 1;
@@ -414,6 +425,8 @@ fn generation_profile() {
                         }).await.map_err(|_| anyhow::anyhow!("producer timeout (60s)"))??;
                         Ok::<_, anyhow::Error>(())
                     }.await;
+                    // The prompt and every message the run added.
+                    let history = committed.0.lock().unwrap().clone();
                     let _ = sender.send(Update::Done(result.map(|()| history).map_err(|e| format!("{e:#}")), started.elapsed()));
                 });
                 control.borrow_mut().abort = Some(task.abort_handle());

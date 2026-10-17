@@ -1252,17 +1252,14 @@ impl Cowork {
         }
     }
 
-    /// An agent message, with the user messages steering it: each where it
-    /// joined the work while the work is open, and all between the summary
-    /// and the response while it is closed. The agent's parts around them
-    /// are rows of their own.
+    /// An agent message: the comments it was asked about, a summary of its
+    /// work and, while that is open, the work itself, then its response.
     #[allow(clippy::too_many_arguments)]
     fn render_agent_message(
         &mut self,
         thread_id: Uuid,
         index: usize,
         message: &AgentMessage,
-        timeline: &[TimelineMessage],
         comments: &[UserComment],
         submitted_comments: &[crate::timeline::SubmittedComment],
         wrap_width: gpui::Pixels,
@@ -1275,9 +1272,9 @@ impl Cowork {
             .thread(thread_id, cx)
             .map(|thread| {
                 let thread = thread.read(cx);
-                RunProjection::new(message, timeline, thread.run_activity(message.record.id))
+                RunProjection::new(message, thread.run_activity(message.record.id))
             })
-            .unwrap_or_else(|| RunProjection::new(message, timeline, None));
+            .unwrap_or_else(|| RunProjection::new(message, None));
         let submitted_comments = submitted_comments
             .iter()
             .map(crate::timeline::SubmittedComment::to_view)
@@ -1364,40 +1361,7 @@ impl Cowork {
             .map(|thread| ApprovalRights::of(thread.read(cx)))
             .unwrap_or_default();
         let failed = message.record.run.failure().is_some();
-        let agent_row = |this: &Self, content: Vec<gpui::AnyElement>, cx: &Context<Self>| {
-            div()
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, _| {
-                        this.selection_message_id = Some(message_id);
-                    }),
-                )
-                .w_full()
-                .flex()
-                .items_start()
-                .child(
-                    div()
-                        .w(px(40.))
-                        .flex_none()
-                        .flex()
-                        .justify_center()
-                        .child(this.render_avatar(MessageAuthor::Agent)),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .when(failed, |this| this.text_color(cx.theme().danger))
-                        .children(content),
-                )
-                .child(div().w(px(40.)).flex_none())
-                .into_any_element()
-        };
 
-        let mut rows = Vec::new();
         let mut content = submitted_comment_content;
         content.extend(summary);
         let mut calls = Vec::new();
@@ -1455,21 +1419,6 @@ impl Cowork {
                 item => {
                     flush(&mut calls, &mut content);
                     match item {
-                        RunItem::Steering(group_index) => {
-                            if !content.is_empty() {
-                                rows.push(agent_row(self, std::mem::take(&mut content), cx));
-                            }
-                            let TimelineMessage::User(group) = &timeline[group_index] else {
-                                unreachable!("projected submission");
-                            };
-                            let cards = self.user_group_cards(thread_id, group, cx);
-                            rows.push(self.render_user_message_group(
-                                group_index,
-                                group,
-                                cards,
-                                cx,
-                            ));
-                        }
                         RunItem::Compaction(step_index) => {
                             content.push(Self::render_compaction_marker(
                                 format!("{message_id}-{step_index}"),
@@ -1494,16 +1443,36 @@ impl Cowork {
         flush(&mut calls, &mut content);
         content.extend(message_content);
         content.extend(failure.map(IntoElement::into_any_element));
-        if !content.is_empty() || rows.is_empty() {
-            rows.push(agent_row(self, content, cx));
-        }
         div()
             .id(format!("timeline-run-{message_id}"))
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, _| {
+                    this.selection_message_id = Some(message_id);
+                }),
+            )
             .w_full()
             .flex()
-            .flex_col()
-            .gap_6()
-            .children(rows)
+            .items_start()
+            .child(
+                div()
+                    .w(px(40.))
+                    .flex_none()
+                    .flex()
+                    .justify_center()
+                    .child(self.render_avatar(MessageAuthor::Agent)),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .when(failed, |this| this.text_color(cx.theme().danger))
+                    .children(content),
+            )
+            .child(div().w(px(40.)).flex_none())
             .into_any_element()
     }
 
@@ -1535,8 +1504,7 @@ impl Cowork {
             .unwrap_or_default()
     }
 
-    /// Timeline entry `index`. Steering messages are entries of their own,
-    /// but are shown by the agent message they steer.
+    /// Timeline entry `index`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_timeline_message(
         &mut self,
@@ -1558,7 +1526,6 @@ impl Cowork {
                 thread_id,
                 index,
                 message,
-                timeline,
                 comments,
                 submitted_comments,
                 wrap_width,

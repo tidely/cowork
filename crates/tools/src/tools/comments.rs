@@ -41,7 +41,6 @@ pub struct CommentResponse {
 
 #[derive(Default)]
 struct TurnCommentsState {
-    added_ids: Vec<CommentId>,
     responses: Vec<CommentResponse>,
     responded_to: HashSet<CommentId>,
 }
@@ -66,24 +65,9 @@ impl TurnComments {
         }
     }
 
-    /// Returns the initial aliases in the order supplied by the app.
+    /// Returns aliases in the same order as the comments supplied by the app.
     pub fn comment_ids(&self) -> &[CommentId] {
         &self.comment_ids
-    }
-
-    /// Allocates aliases for comments delivered by steering in the same
-    /// run. Existing aliases keep their identity, including answered ones.
-    pub fn extend(&self, count: usize) -> Result<Vec<CommentId>, CommentToolError> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| CommentToolError::StoreUnavailable)?;
-        let start = self.comment_ids.len() + state.added_ids.len();
-        let ids = (start..start + count)
-            .map(CommentId::for_index)
-            .collect::<Vec<_>>();
-        state.added_ids.extend(ids.clone());
-        Ok(ids)
     }
 
     /// Returns a snapshot of responses in tool-call order.
@@ -105,7 +89,6 @@ impl TurnComments {
         Ok(self
             .comment_ids
             .iter()
-            .chain(state.added_ids.iter())
             .filter(|comment_id| !state.responded_to.contains(*comment_id))
             .cloned()
             .collect())
@@ -116,12 +99,8 @@ impl TurnComments {
         Ok(self.unanswered_comment_ids()?.is_empty())
     }
 
-    fn has_comments(&self) -> Result<bool, CommentToolError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| CommentToolError::StoreUnavailable)?;
-        Ok(!self.comment_ids.is_empty() || !state.added_ids.is_empty())
+    fn has_comments(&self) -> bool {
+        !self.comment_ids.is_empty()
     }
 
     fn record_response(
@@ -140,7 +119,6 @@ impl TurnComments {
         let comment_id = self
             .comment_ids
             .iter()
-            .chain(state.added_ids.iter())
             .find(|candidate| candidate.as_str() == comment_id)
             .cloned()
             .ok_or_else(|| CommentToolError::UnknownComment(comment_id.to_owned()))?;
@@ -250,7 +228,7 @@ impl Tool for RespondToComment {
         _context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        if !self.comments.has_comments()? {
+        if !self.comments.has_comments() {
             return Ok(CommentResponseRecorded {
                 comment_id: args.comment_id,
                 recorded: false,
@@ -287,43 +265,6 @@ mod tests {
         assert!(!result.recorded);
         assert_eq!(result.comment_id, "comment_1");
         assert!(comments.responses().unwrap().is_empty());
-    }
-
-    #[test]
-    fn steering_adds_aliases_without_reusing_answered_comment_ids() {
-        let comments = TurnComments::new(1);
-        comments
-            .record_response("comment_1", "Original reply".into())
-            .unwrap();
-        assert_eq!(
-            comments.extend(2).unwrap(),
-            vec![CommentId::for_index(1), CommentId::for_index(2)]
-        );
-        assert_eq!(comments.extend(1).unwrap(), vec![CommentId::for_index(3)]);
-        comments
-            .record_response("comment_3", "Steering reply".into())
-            .unwrap();
-        assert_eq!(
-            comments.unanswered_comment_ids().unwrap(),
-            vec![CommentId::for_index(1), CommentId::for_index(3)]
-        );
-        assert_eq!(comments.responses().unwrap().len(), 2);
-    }
-
-    #[test]
-    fn steering_comments_work_when_the_initial_prompt_had_none() {
-        let comments = Arc::new(TurnComments::new(0));
-        let tool = RespondToComment::new(comments.clone());
-        comments.extend(1).unwrap();
-        let args = RespondToCommentArgs {
-            comment_id: "comment_1".into(),
-            response: "Reply".into(),
-        };
-        assert!(
-            futures::executor::block_on(tool.call(&mut ToolContext::new(), args))
-                .unwrap()
-                .recorded
-        );
     }
 
     #[test]

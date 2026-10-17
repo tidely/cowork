@@ -229,7 +229,6 @@ fn rebasing_keeps_local_edits_the_host_has_not_seen(cx: &mut gpui::TestAppContex
         thread: protocol::ThreadSnapshot {
             submission_sequence: 0,
             pending: Vec::new(),
-            steered_comments: Vec::new(),
             id: [1; 16],
             title: "Shared".into(),
             participants: vec![[2; 16], [3; 16]],

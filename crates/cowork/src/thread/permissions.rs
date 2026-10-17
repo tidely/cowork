@@ -300,21 +300,11 @@ impl Authorized<'_, ControlGeneration> {
         Ok(result)
     }
 
-    #[cfg(test)]
     pub(crate) fn request_submit(self) -> bool {
         self.thread.flush_draft();
         self.thread.request(protocol::CollaboratorMessage::Submit {
             sequence: self.thread.submission_count(),
         })
-    }
-
-    pub(crate) fn request_submit_mode(self, mode: protocol::SubmissionMode) -> bool {
-        self.thread.flush_draft();
-        self.thread
-            .request(protocol::CollaboratorMessage::SubmitPending {
-                sequence: self.thread.submission_count(),
-                mode,
-            })
     }
 
     pub(crate) fn request_cancel_pending(self, id: Uuid) -> bool {

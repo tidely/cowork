@@ -2,8 +2,6 @@
 //! Items are references to facts, not agent events or another shared history.
 //! Projection chooses ordering and collapse behavior; renderers only draw it.
 
-use std::collections::HashSet;
-
 use crate::{
     timeline::{AgentMessage, RunActivity, TimelineMessage},
     transcript::{Transcript, TranscriptIndex},
@@ -24,20 +22,8 @@ impl TimelineProjection {
         &self.history
     }
     pub(crate) fn new(messages: &[TimelineMessage], transcript: &Transcript) -> Self {
-        let steering = messages
-            .iter()
-            .filter_map(|entry| match entry {
-                TimelineMessage::Agent(run) => Some(run.record.steering.iter().copied()),
-                TimelineMessage::User(_) => None,
-            })
-            .flatten()
-            .collect::<HashSet<_>>();
         let mut history = Vec::new();
         for (index, message) in messages.iter().enumerate() {
-            if matches!(message, TimelineMessage::User(group) if steering.contains(&group.record.id))
-            {
-                continue;
-            }
             let run = match message {
                 TimelineMessage::User(_) => messages.get(index + 1),
                 TimelineMessage::Agent(_)
@@ -62,7 +48,6 @@ impl TimelineProjection {
 
 pub(crate) enum RunItem {
     Content(usize),
-    Steering(usize),
     Compaction(usize),
     Activity(RunActivity),
 }
@@ -76,16 +61,7 @@ impl RunProjection {
         self.items.into_iter()
     }
 
-    pub(crate) fn new(
-        message: &AgentMessage,
-        timeline: &[TimelineMessage],
-        activity: Option<RunActivity>,
-    ) -> Self {
-        let mut steering = message.record.steering.iter().filter_map(|id| {
-            timeline.iter().position(
-                |entry| matches!(entry, TimelineMessage::User(group) if group.record.id == *id),
-            )
-        });
+    pub(crate) fn new(message: &AgentMessage, activity: Option<RunActivity>) -> Self {
         let mut items = Vec::new();
         if activity == Some(RunActivity::Working)
             && message.ui.output.steps().is_empty()
@@ -101,21 +77,9 @@ impl RunProjection {
             ) {
                 items.push(RunItem::Compaction(step));
             } else if expanded {
-                if matches!(
-                    message.ui.output.steps()[step],
-                    crate::timeline::AgentStep::Steering
-                ) {
-                    if let Some(index) = steering.next() {
-                        items.push(RunItem::Steering(index));
-                    }
-                } else {
-                    items.push(RunItem::Content(step));
-                }
+                items.push(RunItem::Content(step));
             }
         }
-        // Collapsed work and steering delivered before its prompt is folded
-        // still show submissions. All hidden boundaries remain above the reply.
-        items.extend(steering.map(RunItem::Steering));
         if activity == Some(RunActivity::Compacting) {
             items.push(RunItem::Activity(RunActivity::Compacting));
         }

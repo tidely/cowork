@@ -1,6 +1,5 @@
-//! Pending submissions use the same user-message rows as the timeline. Only
-//! separators distinguish delivery timing; steering shares one batch, while
-//! each queued submission has its own boundary and cancellation.
+//! Pending submissions use the same user-message rows as the timeline, oldest
+//! first. Each has a separator of its own with its cancellation.
 
 use gpui::{AnyElement, App, Context, IntoElement, canvas, div, prelude::*, px, size};
 use gpui_component::{
@@ -9,7 +8,7 @@ use gpui_component::{
 };
 use uuid::Uuid;
 
-use crate::{Cowork, composer_attachments::AttachmentCard, submission::SubmissionMode};
+use crate::{Cowork, composer_attachments::AttachmentCard};
 
 /// Paint at the measured width so resizing keeps the dash rhythm independent
 /// of font metrics. The solid draft boundary shares the work summary's color.
@@ -79,16 +78,8 @@ impl Cowork {
                                 .label("×")
                                 .debug_selector(move || format!("cancel-pending-{pending_id}"))
                                 .text_color(cx.theme().muted_foreground)
-                                .accessibility_label(if label == "Steering" {
-                                    "Cancel all steering messages"
-                                } else {
-                                    "Cancel queued message"
-                                })
-                                .tooltip(if label == "Steering" {
-                                    "Cancel all steering messages"
-                                } else {
-                                    "Cancel this queued message"
-                                })
+                                .accessibility_label("Cancel queued message")
+                                .tooltip("Cancel this queued message")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.cancel_pending_submission(thread_id, pending_id, cx);
                                 })),
@@ -114,19 +105,12 @@ impl Cowork {
             return Vec::new();
         }
         let can_cancel = state.can_control_generation();
-        let ordered = pending
-            .iter()
-            .filter(|pending| pending.mode == SubmissionMode::Steering)
-            .chain(
-                pending
-                    .iter()
-                    .filter(|pending| pending.mode == SubmissionMode::Queue),
-            );
         let draft_row = div()
             .mt_6()
             .child(self.pending_separator("Draft", false, None, cx))
             .into_any_element();
-        ordered
+        pending
+            .iter()
             .enumerate()
             .map(|(position, pending)| {
                 let cards = {
@@ -144,17 +128,13 @@ impl Cowork {
                         })
                         .collect()
                 };
-                let label = match pending.mode {
-                    SubmissionMode::Steering => "Steering",
-                    SubmissionMode::Queue => "Queued",
-                };
                 div()
                     .mt_6()
                     .flex()
                     .flex_col()
                     .gap_4()
                     .child(self.pending_separator(
-                        label,
+                        "Queued",
                         true,
                         can_cancel.then_some((thread_id, pending.id)),
                         cx,

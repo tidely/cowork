@@ -17,7 +17,7 @@ use tools::TurnComments;
 use uuid::Uuid;
 
 use crate::{
-    Cowork, QueueComposer, SubmitComposer,
+    Cowork, SubmitComposer,
     attachments::{MAX_MESSAGE_ATTACHMENT_BYTES, format_bytes},
     composer_attachments::AttachmentError,
     models::ModelRef,
@@ -33,19 +33,17 @@ use crate::{
     },
 };
 
-pub(crate) use crate::protocol::SubmissionMode;
-
-/// The requester's authority and one-shot delivery choice are checked together.
+/// Who asks for a submission, whose authority is checked as it is taken.
 pub(crate) struct SubmissionRequest {
     pub(crate) actor: ParticipantId,
     pub(crate) submitted_locally: bool,
-    pub(crate) mode: SubmissionMode,
 }
 
+/// A submission accepted while a run was going, waiting to start a later
+/// run; see [`protocol::PendingSubmission`].
 #[derive(Clone)]
 pub(crate) struct PendingSubmission {
     pub(crate) id: Uuid,
-    pub(crate) mode: SubmissionMode,
     pub(crate) group: UserMessageGroup,
 }
 
@@ -53,14 +51,12 @@ impl PendingSubmission {
     pub(crate) fn to_protocol(&self) -> protocol::PendingSubmission {
         protocol::PendingSubmission {
             id: self.id.into_bytes(),
-            mode: self.mode,
             group: self.group.to_protocol(),
         }
     }
     pub(crate) fn from_protocol(pending: protocol::PendingSubmission) -> Self {
         Self {
             id: Uuid::from_bytes(pending.id),
-            mode: pending.mode,
             group: pending.group.into_native(),
         }
     }
@@ -112,7 +108,7 @@ struct GenerationPlan {
 impl Cowork {
     pub(crate) fn composer_button_clicked(
         &mut self,
-        event: &gpui::ClickEvent,
+        _: &gpui::ClickEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -130,8 +126,6 @@ impl Cowork {
         });
         if generating && empty {
             self.stop_generation(cx);
-        } else if event.modifiers().shift {
-            self.queue_composer(window, cx);
         } else {
             self.submit_composer(window, cx);
         }
@@ -146,26 +140,10 @@ impl Cowork {
         self.submit_composer(window, cx);
     }
 
-    pub(crate) fn queue_composer_action(
-        &mut self,
-        _: &QueueComposer,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.queue_composer(window, cx);
-    }
-    pub(crate) fn queue_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.submit_composer_mode(SubmissionMode::Queue, window, cx);
-    }
+    /// Submits the active draft. While the thread's agent is running, the
+    /// submission waits for the runs before it; see
+    /// [`Cowork::start_next_pending`].
     pub(crate) fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.submit_composer_mode(SubmissionMode::Steering, window, cx);
-    }
-    fn submit_composer_mode(
-        &mut self,
-        mode: SubmissionMode,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
         let active_thread = self.active_thread(cx);
         if active_thread
             .as_ref()
@@ -197,7 +175,7 @@ impl Cowork {
                 }
                 thread
                     .with_authorized::<ControlGeneration, _>(thread.participant_id(), |auth| {
-                        auth.request_submit_mode(mode)
+                        auth.request_submit()
                     })
                     .unwrap_or(false)
             });
@@ -213,13 +191,12 @@ impl Cowork {
             .map_or(self.local_participant_id, |thread| {
                 thread.read(cx).participant_id()
             });
-        if self.accept_submission_mode(
+        if self.accept_submission(
             draft_id,
             active_thread,
             SubmissionRequest {
                 actor,
                 submitted_locally: true,
-                mode,
             },
             cx,
         ) {
@@ -235,10 +212,13 @@ impl Cowork {
     }
 
     /// Submits a local or hosted thread's draft: publishes its non-empty
-    /// items as one user message and starts the agent on it. Without a
-    /// thread, the draft starts a new one. Returns whether anything was
-    /// submitted. Rejections are shown when the local user submitted.
-    pub(crate) fn accept_submission_mode(
+    /// items as one user message and starts the agent on it, or, while the
+    /// agent is running, adds them to the pending submissions. Without a
+    /// thread, the draft starts a new one. An empty draft resumes pending
+    /// submissions a stop or failure paused. Returns whether anything was
+    /// submitted or resumed. Rejections are shown when the local user
+    /// submitted.
+    pub(crate) fn accept_submission(
         &mut self,
         draft_id: Uuid,
         active_thread: Option<Entity<Thread>>,
@@ -248,7 +228,6 @@ impl Cowork {
         let SubmissionRequest {
             actor,
             submitted_locally,
-            mode,
         } = request;
         // An actor is the requester, not the host's local viewer. In particular,
         // Write may edit the draft but cannot consume it on someone else's behalf.
@@ -260,7 +239,9 @@ impl Cowork {
         {
             return false;
         }
-        // Checked again here, as several participants' files add up.
+        // Checked again here, as several participants' files add up. Each
+        // pending submission becomes a message of its own, so only this
+        // one's files count.
         let attached = self
             .read_draft(draft_id, cx, |draft| {
                 draft
@@ -275,26 +256,7 @@ impl Cowork {
                     .sum::<u64>()
             })
             .unwrap_or(0);
-        let pending_bytes = if mode == SubmissionMode::Steering {
-            active_thread
-                .as_ref()
-                .and_then(|thread| self.active_generations.get(&thread.read(cx).instance_id))
-                .and_then(|generation| {
-                    generation.steering.lock().unwrap().as_ref().map(|payload| {
-                        payload
-                            .group
-                            .blocks
-                            .iter()
-                            .flat_map(|block| &block.attachments)
-                            .map(|record| record.size)
-                            .sum::<u64>()
-                    })
-                })
-                .unwrap_or(0)
-        } else {
-            0
-        };
-        if attached.saturating_add(pending_bytes) > MAX_MESSAGE_ATTACHMENT_BYTES {
+        if attached > MAX_MESSAGE_ATTACHMENT_BYTES {
             // TODO: tell a collaborator who submitted, too.
             if !submitted_locally {
                 return false;
@@ -374,7 +336,7 @@ impl Cowork {
                 blocks,
                 comments_folded,
             };
-            self.defer_submission(thread, mode, group, prompt_names, cx);
+            self.defer_submission(thread, group, prompt_names, cx);
             return true;
         }
         let turn_comments = Arc::new(TurnComments::new(comments.len()));
@@ -449,62 +411,20 @@ impl Cowork {
         true
     }
 
+    /// Adds `group` to the end of the thread's pending submissions.
     fn defer_submission(
         &mut self,
         thread: &Entity<Thread>,
-        mode: SubmissionMode,
-        mut group: UserMessageGroup,
+        group: UserMessageGroup,
         names: HashMap<ParticipantId, SharedString>,
         cx: &mut Context<Self>,
     ) {
         let thread_id = thread.read(cx).instance_id;
-        if mode == SubmissionMode::Steering {
-            let generation = self
-                .active_generations
-                .get_mut(&thread_id)
-                .expect("a generating host has a run");
-            let mut slot = generation.steering.lock().unwrap();
-            let aliases = generation
-                .turn_comments
-                .extend(group.comments.len())
-                .expect("comment state is available");
-            if let Some(payload) = slot.as_mut() {
-                payload.group.comments.extend(group.comments);
-                payload.group.blocks.extend(group.blocks);
-                payload.aliases.extend(aliases);
-                group = payload.group.clone();
-            } else {
-                *slot = Some(generation::SteeringPayload {
-                    group: group.clone(),
-                    aliases,
-                    prompt: RigMessage::user(""),
-                });
-            }
-            let state = thread.read(cx);
-            let payload = slot.as_mut().unwrap();
-            let preface =
-                Self::comments_preface(&group.comments, &payload.aliases, &state.timeline, &names);
-            payload.prompt = agent_message(
-                preface.as_deref(),
-                &group.blocks,
-                &state.draft().files,
-                &names,
-            );
-        }
         thread.update(cx, |thread, cx| {
-            if let Some(pending) = thread
-                .pending
-                .iter_mut()
-                .find(|pending| pending.id == group.id)
-            {
-                pending.group = group;
-            } else {
-                thread.pending.push(PendingSubmission {
-                    id: group.id,
-                    mode,
-                    group,
-                });
-            }
+            thread.pending.push(PendingSubmission {
+                id: group.id,
+                group,
+            });
             thread.submission_sequence += 1;
             thread.name_in_prompts(names, cx);
             thread.publish_pending(cx);
@@ -533,6 +453,9 @@ impl Cowork {
         }
     }
 
+    /// Removes the pending submission `id` for `actor`. One that already
+    /// started its run is gone from the list, so a late cancel changes
+    /// nothing.
     pub(crate) fn cancel_pending_for(
         &mut self,
         thread: &Entity<Thread>,
@@ -549,19 +472,13 @@ impl Cowork {
         if !allowed || !thread.read(cx).is_host() {
             return;
         }
-        if let Some(generation) = self.active_generations.get(&thread_id) {
-            let mut slot = generation.steering.lock().unwrap();
-            if thread
-                .read(cx)
-                .pending
-                .iter()
-                .any(|pending| pending.id == id && pending.mode == SubmissionMode::Steering)
-            {
-                if !slot.as_ref().is_some_and(|payload| payload.group.id == id) {
-                    return;
-                }
-                *slot = None;
-            }
+        if !thread
+            .read(cx)
+            .pending
+            .iter()
+            .any(|pending| pending.id == id)
+        {
+            return;
         }
         thread.update(cx, |thread, cx| {
             thread.pending.retain(|pending| pending.id != id);
@@ -570,7 +487,8 @@ impl Cowork {
         self.thread_updated(thread_id, cx);
     }
 
-    /// Only normally completed runs continue the FIFO. Stopping or failure
+    /// Starts a run on the oldest pending submission. Only normally
+    /// completed runs continue the queue on their own. Stopping or failure
     /// leaves accepted drafts visible and cancellable until the user resumes.
     pub(super) fn start_next_pending(&mut self, thread: &Entity<Thread>, cx: &mut Context<Self>) {
         let state = thread.read(cx);
@@ -584,13 +502,7 @@ impl Cowork {
         {
             return;
         }
-        let Some(pending) = state
-            .pending
-            .iter()
-            .find(|pending| pending.mode == SubmissionMode::Steering)
-            .or_else(|| state.pending.first())
-            .cloned()
-        else {
+        let Some(pending) = state.pending.first().cloned() else {
             return;
         };
         let group = pending.group;
@@ -619,8 +531,6 @@ impl Cowork {
                 protocol::HostMessage::PendingDelivered {
                     id: pending.id.into_bytes(),
                     group: group.to_protocol(),
-                    agent_id: None,
-                    aliases: Vec::new(),
                 },
                 cx,
             )

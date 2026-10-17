@@ -44,7 +44,6 @@ fn reply(text: &str, cx: &mut App) -> TimelineMessage {
                 duration: Duration::ZERO,
             },
             awaiting_approval: None,
-            steering: Vec::new(),
         },
         ui: crate::timeline::AgentMessageUi {
             output: AgentOutput::for_test(Vec::new(), text.into(), true),

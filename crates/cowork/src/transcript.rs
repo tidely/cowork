@@ -279,9 +279,7 @@ pub(crate) fn validate_agent_runs(
                 "only the active run can await its prompt"
             );
             anyhow::ensure!(
-                message.pending_events.is_empty()
-                    && message.awaiting_approval.is_none()
-                    && message.steering.is_empty(),
+                message.pending_events.is_empty() && message.awaiting_approval.is_none(),
                 "an unstarted run has output"
             );
             TurnFold::default()
@@ -359,8 +357,8 @@ impl Thread {
             message.record.pending_events.push(event);
         }
         // A call that returned no longer waits, however the host decided.
-        if let AgentEvent::ToolResult { call, .. } = &decoded
-            && message.record.awaiting_approval.as_ref() == Some(call)
+        if let AgentEvent::ToolResult(result) = &decoded
+            && message.record.awaiting_approval.as_ref() == Some(&result.call)
         {
             message.record.awaiting_approval = None;
         }
@@ -576,19 +574,12 @@ impl Thread {
                 _ => None,
             })
             .unwrap_or_else(Vec::new);
-        let initial_comment_id = TurnComments::new(comments.len())
+        let Some(comment_id) = TurnComments::new(comments.len())
             .comment_ids()
             .iter()
             .position(|alias| alias.as_str() == args.comment_id)
-            .and_then(|index| comments.get(index).copied());
-        let Some(comment_id) = initial_comment_id.or_else(|| {
-            self.steered_comments.get(&message_id).and_then(|aliases| {
-                aliases
-                    .iter()
-                    .find(|(alias, _)| alias == &args.comment_id)
-                    .map(|(_, id)| *id)
-            })
-        }) else {
+            .and_then(|index| comments.get(index).copied())
+        else {
             return;
         };
         let Some(message) = self.agent_message_mut(message_id.into_bytes()) else {

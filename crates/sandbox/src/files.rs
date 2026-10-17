@@ -17,7 +17,7 @@ use rig::tool::{ContextValue, Tool, ToolContext, ToolExecutionError};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Sandboxes,
+    CallApprovals, Sandboxes,
     paths::{FileError, Location, Places, Resolved, Root},
 };
 
@@ -459,7 +459,7 @@ impl Tool for WriteFile {
         context: &mut ToolContext,
         args: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let approved = context
+        let approved = CallApprovals::approved(context, Self::NAME)
             .get::<ApprovedWrite>()
             .ok()
             .flatten()

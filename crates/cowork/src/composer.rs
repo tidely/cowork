@@ -22,7 +22,7 @@ use gpui_kit_assets::IconName as AssetIconName;
 use uuid::Uuid;
 
 use crate::{
-    Cowork, QueueComposer, StopGeneration, SubmitComposer,
+    Cowork, StopGeneration, SubmitComposer,
     composer_attachments::{AttachmentCard, PendingAttachment},
     model_picker::{LanguageModel, UNAVAILABLE_MODEL_TOOLTIP},
     participant::ParticipantId,
@@ -113,7 +113,7 @@ impl Cowork {
                             .justify_between()
                             .gap_6()
                             .child(if generating {
-                                "Steer"
+                                "Queue message"
                             } else if resume_pending {
                                 "Resume messages"
                             } else {
@@ -125,22 +125,9 @@ impl Cowork {
                         content = content
                             .child(
                                 div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap_6()
-                                    .child("Queue")
-                                    .children(Kbd::binding_for_action(
-                                        &QueueComposer,
-                                        None,
-                                        window,
-                                    )),
-                            )
-                            .child(
-                                div()
                                     .text_xs()
                                     .text_color(cx.theme().muted_foreground)
-                                    .child("Click to steer · Shift-click to queue"),
+                                    .child("Sent when the agent finishes"),
                             )
                             .child(
                                 div()
@@ -164,7 +151,7 @@ impl Cowork {
                 Button::new("send-message")
                     .debug_selector(move || {
                         if generating {
-                            "steer-message"
+                            "queue-message"
                         } else if resume_pending {
                             "resume-messages"
                         } else {
@@ -172,9 +159,7 @@ impl Cowork {
                         }
                         .to_owned()
                     })
-                    .icon(Icon::new(if generating {
-                        AssetIconName::CornerDownLeft
-                    } else if resume_pending {
+                    .icon(Icon::new(if resume_pending {
                         AssetIconName::Play
                     } else {
                         AssetIconName::SendHorizontal
@@ -186,7 +171,7 @@ impl Cowork {
                         button.bg(cx.theme().accent).text_color(cx.theme().primary)
                     })
                     .accessibility_label(if generating {
-                        "Steer message; Shift-click to queue"
+                        "Queue message"
                     } else if resume_pending {
                         "Resume messages"
                     } else {

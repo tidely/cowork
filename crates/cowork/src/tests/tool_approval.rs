@@ -1,4 +1,4 @@
-use agent::ToolDecision;
+use crate::tool_approval::ToolDecision;
 use rig::message::CallId;
 use tokio::sync::oneshot;
 

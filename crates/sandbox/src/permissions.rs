@@ -12,7 +12,7 @@
 use rig::tool::{ContextValue, Tool, ToolContext, ToolExecutionError};
 use serde::{Deserialize, Serialize};
 
-use crate::{Access, Folders, Grant, RunCommand, grant::named_folders};
+use crate::{Access, CallApprovals, Folders, Grant, RunCommand, grant::named_folders};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -126,7 +126,11 @@ impl Tool for RequestPermissions {
         context: &mut ToolContext,
         _: Self::Args,
     ) -> Result<Self::Output, Self::Error> {
-        let Granted(granted) = context.get::<Granted>().ok().flatten().ok_or(NotGranted)?;
+        let Granted(granted) = CallApprovals::approved(context, Self::NAME)
+            .get::<Granted>()
+            .ok()
+            .flatten()
+            .ok_or(NotGranted)?;
         Ok(format!(
             "The user allowed it. For the rest of this turn, `run_command` calls run with these \
              permissions unless they ask for other access, and without asking the user when they \

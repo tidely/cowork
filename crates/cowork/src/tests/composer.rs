@@ -457,7 +457,7 @@ fn submitting_keeps_focus_on_an_item_that_stays(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
-fn generation_button_switches_between_stop_and_steer_for_the_whole_draft(
+fn generation_button_switches_between_stop_and_queue_for_the_whole_draft(
     cx: &mut gpui::TestAppContext,
 ) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
@@ -484,17 +484,17 @@ fn generation_button_switches_between_stop_and_steer_for_the_whole_draft(
     });
     cx.run_until_parked();
     assert!(cx.debug_bounds("stop-generation").is_some());
-    assert!(cx.debug_bounds("steer-message").is_none());
+    assert!(cx.debug_bounds("queue-message").is_none());
 
     cx.simulate_input("hello");
     cx.run_until_parked();
-    assert!(cx.debug_bounds("steer-message").is_some());
+    assert!(cx.debug_bounds("queue-message").is_some());
     assert!(cx.debug_bounds("stop-generation").is_none());
 
     cx.simulate_keystrokes("backspace backspace backspace backspace backspace");
     cx.run_until_parked();
     assert!(cx.debug_bounds("stop-generation").is_some());
-    assert!(cx.debug_bounds("steer-message").is_none());
+    assert!(cx.debug_bounds("queue-message").is_none());
 }
 
 #[gpui::test]
@@ -519,13 +519,12 @@ fn idle_pending_messages_show_resume_until_a_new_draft_is_written(cx: &mut gpui:
             .thread_store
             .update(cx, |store, _| store.threads.push_front(thread.clone()));
         cowork.active_thread_id = Some(id);
-        assert!(cowork.accept_submission_mode(
+        assert!(cowork.accept_submission(
             thread.read(cx).draft().id,
             Some(thread.clone()),
             crate::thread::submission::SubmissionRequest {
                 actor: cowork.local_participant_id,
                 submitted_locally: true,
-                mode: crate::thread::submission::SubmissionMode::Queue,
             },
             cx,
         ));

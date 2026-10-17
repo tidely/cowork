@@ -17,6 +17,7 @@
 //! The file tools ([`files`]) reach the same folders from the host process
 //! itself, with every path they accept mapped in [`paths`].
 
+mod approval;
 pub mod environment;
 pub mod files;
 pub mod grant;
@@ -46,6 +47,7 @@ use mxc_sdk::v1::{
     NetworkIngressPolicy, NetworkPolicy, StreamCloser,
 };
 
+pub use approval::CallApprovals;
 pub use environment::{EnvironmentSource, PRINT_ENV_FLAG, print_env};
 pub use files::{ListDirectory, ReadFile, WriteFile};
 pub use grant::{Folders, Grant};

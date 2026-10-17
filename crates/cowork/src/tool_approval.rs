@@ -9,17 +9,18 @@
 
 use std::sync::Arc;
 
-use agent::{AgentEvent, ToolDecision, ToolHook};
+use agent::AgentEvent;
 use futures::future::BoxFuture;
 use gpui::Context;
 use parking_lot::Mutex;
 use rig::{
-    message::{CallId, ToolCall},
-    tool::Tool as _,
+    agent::{AgentHook, DispatchAction, DispatchEvent, HookContext, OutcomeAction, OutcomeEvent},
+    message::{CallId, ToolCall, ToolFunction, ToolName},
+    tool::{Tool as _, ToolContext},
 };
 use sandbox::{
-    Access, Folders, Grant, ListDirectory, ReadFile, RequestPermissions, RunCommand, Sandboxes,
-    WriteFile,
+    Access, CallApprovals, Folders, Grant, ListDirectory, ReadFile, RequestPermissions, RunCommand,
+    Sandboxes, WriteFile,
 };
 use tokio::sync::{mpsc, oneshot};
 use tools::{Calculate, RespondToComment};
@@ -107,10 +108,7 @@ pub(crate) enum RunUpdate {
         context: Option<String>,
         usage: rig::completion::Usage,
     },
-    SteeringConsumed {
-        group: crate::timeline::UserMessageGroup,
-        aliases: Vec<String>,
-    },
+
     /// A call of the last reply waits for a decision, given through `decide`.
     Approval {
         call: CallId,
@@ -120,9 +118,26 @@ pub(crate) enum RunUpdate {
     },
 }
 
-/// The run's hook: lets calls that need no approval through, and asks the
-/// thread about the rest. It shares the run's channel with its events, so a
-/// request always arrives after the reply whose call it is.
+/// Whether a tool call may run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ToolDecision {
+    Allow,
+    /// The call runs with `context` as its tool's context, as when it is
+    /// allowed only on conditions the tool itself must keep.
+    AllowWith {
+        context: ToolContext,
+    },
+    /// The call is answered with `reason` instead of running, which the
+    /// model reads as the call's result.
+    Deny {
+        reason: String,
+    },
+}
+
+/// Decides each call of a run before its tool sees it: lets calls that need
+/// no approval through, and asks the thread about the rest. It shares the
+/// run's channel with its events, so a request always arrives after the
+/// reply whose call it is.
 pub(crate) struct ApprovalGate {
     updates: mpsc::UnboundedSender<RunUpdate>,
     /// Where the run's commands run, whose project decides whether they
@@ -202,8 +217,14 @@ enum Asked {
     Permissions(Grant),
 }
 
-impl ToolHook for ApprovalGate {
-    fn before_tool_call<'a>(&'a self, call: &'a ToolCall) -> BoxFuture<'a, ToolDecision> {
+impl ApprovalGate {
+    /// Decides `call`, waiting for someone to when it needs approval. Called
+    /// once per call, in the order the reply made them; dropping the run
+    /// drops the pending decision with it.
+    pub(crate) fn before_tool_call<'a>(
+        &'a self,
+        call: &'a ToolCall,
+    ) -> BoxFuture<'a, ToolDecision> {
         Box::pin(async move {
             let tool = call.function.name.as_str();
             if !needs_approval(tool) {
@@ -351,6 +372,50 @@ impl ApprovalGate {
                 .access
                 .max(granted.access)
         })
+    }
+}
+
+/// The [`ApprovalGate`] as the hook of a Rig run: each call dispatches only
+/// once the gate allows it, and a call allowed with a context gets it
+/// through `approvals`, which the run's tool context carries. The run must
+/// dispatch its calls one at a time; see [`CallApprovals`].
+pub(crate) struct GateHook {
+    gate: Arc<ApprovalGate>,
+    approvals: Arc<CallApprovals>,
+}
+
+impl GateHook {
+    pub(crate) fn new(gate: Arc<ApprovalGate>, approvals: Arc<CallApprovals>) -> Self {
+        Self { gate, approvals }
+    }
+}
+
+impl AgentHook for GateHook {
+    async fn on_dispatch(&self, _: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
+        let (Some(call), Some(name), Some(arguments)) =
+            (event.call_id, event.tool_name(), event.tool_args())
+        else {
+            return DispatchAction::proceed();
+        };
+        let Ok(tool) = ToolName::new(name) else {
+            return DispatchAction::skip(UNDECIDED);
+        };
+        let call = ToolCall::new(call.clone(), ToolFunction::parse(tool, arguments));
+        match self.gate.before_tool_call(&call).await {
+            ToolDecision::Allow => DispatchAction::proceed(),
+            ToolDecision::AllowWith { context } => {
+                self.approvals.approve(name, context);
+                DispatchAction::proceed()
+            }
+            ToolDecision::Deny { reason } => DispatchAction::skip(reason),
+        }
+    }
+
+    async fn on_outcome(&self, _: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
+        if event.call_id.is_some() {
+            self.approvals.clear();
+        }
+        OutcomeAction::proceed()
     }
 }
 
@@ -1012,49 +1077,36 @@ mod tests {
         assert_eq!(decision, ToolDecision::Allow);
     }
 
-    /// A reply making several calls, run by the agent loop with the gate:
-    /// each call is asked about on its own, so allowing the first decides
-    /// nothing for the rest. Also when the provider sends no call ids, as
-    /// Ollama may, since Rig gives each call its own.
+    /// A reply making several calls, run by Rig's agent with the gate: each
+    /// call is asked about on its own, so allowing the first decides nothing
+    /// for the rest, and the allowed one reaches its tool with what was
+    /// approved, here a write in a Read-mode project. Also when the provider
+    /// sends no call ids, as Ollama may, since Rig gives each call its own.
     #[tokio::test]
     async fn each_call_of_a_reply_is_asked_about_on_its_own() {
-        // Keep exercising per-call approvals with a tool outside the allowlist.
-        struct ApprovalTestCalculate;
-        impl rig::tool::Tool for ApprovalTestCalculate {
-            const NAME: &'static str = "approval_test_calculate";
-            type Error = <Calculate as rig::tool::Tool>::Error;
-            type Args = <Calculate as rig::tool::Tool>::Args;
-            type Output = <Calculate as rig::tool::Tool>::Output;
-
-            fn description(&self) -> String {
-                Calculate.description()
-            }
-
-            fn parameters(&self) -> serde_json::Value {
-                Calculate.parameters()
-            }
-
-            async fn call(
-                &self,
-                context: &mut rig::tool::ToolContext,
-                args: Self::Args,
-            ) -> Result<Self::Output, Self::Error> {
-                Calculate.call(context, args).await
-            }
-        }
+        use rig::test_utils::{MockCompletionModel, MockStreamEvent, mock_final_with_total_tokens};
 
         for ids in [["c1", "c2", "c3", "c4"], ["", "", "", ""]] {
-            use rig::test_utils::{
-                MockCompletionModel, MockStreamEvent, mock_final_with_total_tokens,
-            };
+            let project = Outside::new();
+            let (gate, mut asked, sandboxes) = gate_in(false, Access::Read);
+            sandboxes.set_project(
+                "thread",
+                sandbox::Project {
+                    folders: vec![sandbox::ProjectFolder {
+                        name: "project".into(),
+                        path: project.0.clone(),
+                    }],
+                    access: Access::Read,
+                },
+            );
             let mut first = ids
                 .iter()
                 .enumerate()
                 .map(|(index, id)| {
                     MockStreamEvent::tool_call(
                         *id,
-                        ApprovalTestCalculate::NAME,
-                        serde_json::json!({"operation": "add", "a": index, "b": 1}),
+                        WriteFile::NAME,
+                        serde_json::json!({"path": format!("project/{index}.txt"), "content": "approved"}),
                     )
                 })
                 .collect::<Vec<_>>();
@@ -1068,21 +1120,24 @@ mod tests {
                     MockStreamEvent::FinalResponse(mock_final_with_total_tokens(20)),
                 ],
             ]);
-            let mut tool_set = rig::tool::ToolSet::default();
-            tool_set.add_tool(ApprovalTestCalculate);
-            let (gate, mut asked) = gate(false);
+            let approvals = Arc::new(CallApprovals::default());
+            let runner = rig::AgentBuilder::new(model)
+                .tool(WriteFile::new(sandboxes.clone(), "thread"))
+                .build()
+                .prompt("go")
+                .max_turns(10)
+                .tool_concurrency(1)
+                .tool_context(CallApprovals::run_context(&approvals))
+                .add_hook(GateHook::new(gate, approvals));
             let run = tokio::spawn(async move {
-                let mut history = Vec::new();
                 let mut results = Vec::new();
-                agent::Agent::new(model.erase(), tool_set)
-                    .tool_hook(gate)
-                    .run(rig::message::Message::user("go"), &mut history, |event| {
-                        if let AgentEvent::ToolResult { call, result } = event {
-                            results.push((call, result.status_name()));
-                        }
-                    })
-                    .await
-                    .expect("the run");
+                agent::run(runner, |event| {
+                    if let AgentEvent::ToolResult(result) = event {
+                        results.push((result.call, result.is_error));
+                    }
+                })
+                .await
+                .expect("the run");
                 results
             });
             let mut approvals = Vec::new();
@@ -1111,13 +1166,15 @@ mod tests {
                 "asked one at a time, in order, each a call of its own"
             );
             assert_eq!(
-                results
-                    .iter()
-                    .map(|(_, status)| *status)
-                    .collect::<Vec<_>>(),
-                ["success", "skipped", "skipped", "skipped"],
+                results.iter().map(|(_, error)| *error).collect::<Vec<_>>(),
+                [false, true, true, true],
                 "only the allowed call ran"
             );
+            assert_eq!(
+                std::fs::read_to_string(project.0.join("0.txt")).unwrap(),
+                "approved"
+            );
+            assert!(!project.0.join("1.txt").exists());
         }
     }
 

@@ -130,7 +130,6 @@ impl ThreadOwnership {
 pub(crate) struct Thread {
     pub(crate) pending: Vec<submission::PendingSubmission>,
     pub(crate) submission_sequence: u64,
-    pub(crate) steered_comments: HashMap<Uuid, Vec<(String, Uuid)>>,
     /// Identifies this local view. Multiple views may mirror the same shared
     /// thread, so this must remain distinct from `summary.id`.
     pub(crate) instance_id: Uuid,
@@ -315,7 +314,6 @@ impl Thread {
                 .filter(|item| matches!(item, TimelineMessage::User(_)))
                 .count() as u64,
             pending: Vec::new(),
-            steered_comments: HashMap::new(),
             timeline,
             draft,
             peer_permissions: PeerPermissions::default(),
@@ -594,7 +592,6 @@ impl Thread {
             streamed_bytes: 0,
             pending: Vec::new(),
             submission_sequence: 0,
-            steered_comments: HashMap::new(),
             timeline: Vec::new(),
             draft,
             peer_permissions: PeerPermissions::default(),
@@ -757,18 +754,6 @@ impl Thread {
             .into_iter()
             .map(submission::PendingSubmission::from_protocol)
             .collect();
-        self.steered_comments = std::mem::take(&mut thread.steered_comments)
-            .into_iter()
-            .map(|(id, aliases)| {
-                (
-                    Uuid::from_bytes(id),
-                    aliases
-                        .into_iter()
-                        .map(|(alias, id)| (alias, Uuid::from_bytes(id)))
-                        .collect(),
-                )
-            })
-            .collect();
         let compacting = thread.compacting;
         let (summary, timeline) = thread.into_native(cx);
         self.summary = summary;
@@ -800,20 +785,6 @@ impl Thread {
                 .pending
                 .iter()
                 .map(submission::PendingSubmission::to_protocol)
-                .collect(),
-            steered_comments: self
-                .steered_comments
-                .iter()
-                .map(|(id, comments)| {
-                    (
-                        id.into_bytes(),
-                        comments
-                            .iter()
-                            .map(|(alias, id)| (alias.clone(), id.into_bytes()))
-                            .collect(),
-                    )
-                })
-                .sorted_by_key(|(id, _)| *id)
                 .collect(),
             id: self.summary.id.into_bytes(),
             title: self.summary.title.clone(),
@@ -1307,7 +1278,6 @@ impl Thread {
                 Some(PermissionOperation::EditDraft)
             }
             protocol::CollaboratorMessage::Submit { .. }
-            | protocol::CollaboratorMessage::SubmitPending { .. }
             | protocol::CollaboratorMessage::CancelPending { .. }
             | protocol::CollaboratorMessage::Stop { .. } => {
                 Some(PermissionOperation::ControlGeneration)
@@ -1601,31 +1571,10 @@ impl Thread {
                     .map(submission::PendingSubmission::from_protocol)
                     .collect();
             }
-            protocol::HostMessage::PendingDelivered {
-                id,
-                group,
-                agent_id,
-                aliases,
-            } => {
+            protocol::HostMessage::PendingDelivered { id, group } => {
                 self.pending
                     .retain(|pending| pending.id != Uuid::from_bytes(id));
-                let group = group.into_native();
-                if let Some(agent_id) = agent_id {
-                    self.steered_comments
-                        .entry(Uuid::from_bytes(agent_id))
-                        .or_default()
-                        .extend(
-                            aliases
-                                .into_iter()
-                                .zip(group.comments.iter().map(|comment| comment.id)),
-                        );
-                }
-                // Steering joins the timeline when it joins the run, after
-                // the agent message, which shows it where its prompt landed.
-                if let Some(message) = agent_id.and_then(|id| self.agent_message_mut(id)) {
-                    message.record.steering.push(group.id);
-                }
-                self.append_user_group(group);
+                self.append_user_group(group.into_native());
             }
             protocol::HostMessage::CompactionStarted => {
                 let run = self

@@ -452,10 +452,6 @@ impl Cowork {
         request: protocol::CollaboratorMessage,
         cx: &mut Context<Self>,
     ) -> anyhow::Result<()> {
-        let submission_mode = match &request {
-            protocol::CollaboratorMessage::SubmitPending { mode, .. } => *mode,
-            _ => protocol::SubmissionMode::Steering,
-        };
         match request {
             // Only valid as the first message, which `serve_peer` consumes.
             protocol::CollaboratorMessage::Join { .. } => {}
@@ -481,9 +477,7 @@ impl Cowork {
                     .with_context(|| format!("Invalid draft update from {participant:?}."))?;
                 cx.notify();
             }
-            protocol::CollaboratorMessage::Submit { sequence }
-            | protocol::CollaboratorMessage::SubmitPending { sequence, .. } => {
-                let mode = submission_mode;
+            protocol::CollaboratorMessage::Submit { sequence } => {
                 thread.update(cx, |thread, _| {
                     thread.with_authorized::<ControlGeneration, _>(participant, |_| ())
                 })?;
@@ -498,13 +492,12 @@ impl Cowork {
                 // everyone sees that one.
                 // TODO: tell the submitter why a submission was not accepted.
                 if !stale && !self.draft_is_loading_attachments(draft_id, cx) {
-                    self.accept_submission_mode(
+                    self.accept_submission(
                         draft_id,
                         Some(thread.clone()),
                         crate::thread::submission::SubmissionRequest {
                             actor: participant,
                             submitted_locally: false,
-                            mode,
                         },
                         cx,
                     );

@@ -1,71 +1,51 @@
 # agent
 
-A deliberately small multi-turn agent loop built on Rig's low-level
-completion operation stream.
+Rig's agent runs, reported as events that anyone can fold into the run's
+history, here or on another computer.
 
-The important distinction from Rig's standard multi-turn stream is that
-everything is observable as it streams, including a completed tool call:
+`agent::run` drives a Rig `AgentRunner` and reports what it does as
+`AgentEvent`s, as it happens:
 
 ```text
-provider closes a tool call
-  -> AgentEvent::Model(End) completes the call, while the turn streams on
-  -> the rest of the model turn is consumed
-  -> AgentEvent::TurnEnded: the reply joins the history
-  -> tools execute, each reporting AgentEvent::ToolResult
+provider streams the reply
+  -> AgentEvent::Model: each part starts, grows, and ends with its content;
+     a tool call's end completes the call, while the turn streams on
+  -> AgentEvent::TurnEnded: the reply joins the history, with its usage and
+     the origin and stop reason Rig gave it
+  -> tools run, each reporting AgentEvent::ToolResult as soon as it returns
   -> once all have returned, their results become the next prompt
 ```
 
-This preserves valid conversation history without hiding completed calls until
-the whole model turn commits.
-
-`Agent::steering_hook` accepts a `SteeringHook` shared with the caller.
-At a finalized reasoning, text, or tool-call part the loop checks
-`has_pending`. If steering is waiting, it drops the old stream, commits only
-its finalized parts, executes any finalized tool calls, then atomically
-consumes the current batch with `take_pending`. Steering submitted while
-those tools run joins the same batch; cancellation is possible until it is
-consumed. Open parts never join history, and tool results always precede
-the injected user message. The next request continues the same run, using
-the same tools and hook permissions.
-
-`AgentEvent::Steered` records the injected prompt, so event replay includes
-it exactly once. A truncated turn's `TurnEnded` has no provider origin or
-stop reason and default usage: token usage is unavailable when the provider
-stream is cancelled before its final response. Without pending steering,
-normal replies and usage keep their provider values.
-
-A `ContextHook` can summarize at request boundaries after all tools return
-and before pending steering is delivered. It replaces only the next requests'
-context; the caller's complete history and event replay remain intact. Summary
-requests retain the same tools and system prompt and never execute tools.
+Rig's stream carries the model's events, but not a turn's origin and stop
+reason, and its tool results only once every call of a turn has returned.
+`run` adds a hook to the runner that observes those as Rig settles them
+(`on_outcome`), and reports them in that order among the stream's events.
+Rig answers some calls without dispatching them, such as one whose arguments
+are not a JSON object; their results come from the stream instead.
 
 A run is fully described by its events. `TurnFold` folds them into the
-messages they add to the history, and the loop records its own history by
-folding them, so anyone folding the same events, in this process or after
-sending them elsewhere one at a time (each is serializable on its own), ends
-up with exactly the same history.
+messages they add to the history, and anyone folding the same events, in
+this process or after sending them elsewhere one at a time (each is
+serializable on its own), ends up with exactly the messages Rig's agent
+committed.
 
-That history is Rig's own. Each part of Rig's stream ends with the content
-Rig finalized, at the part's position in the reply. A reply is exactly that
-content, with the origin and stop reason Rig gave the turn, so it is the
-message Rig's response appends (the loop asserts this in debug builds).
-Nothing re-accumulates the stream. Fragments only feed `TurnFold::partial`,
-a preview of the message being folded: finished parts as Rig finalized them,
-and open ones as their fragments so far, each where the reply will have it.
-The preview never joins the history.
+Each part of Rig's stream ends with the content Rig finalized, at the part's
+position in the reply. A reply is exactly that content, with the origin and
+stop reason Rig gave the turn. Nothing re-accumulates the stream. Fragments
+only feed `TurnFold::partial`, a preview of the message being folded:
+finished parts as Rig finalized them, and open ones as their fragments so
+far, each where the reply will have it. The preview never joins the history.
+A tool result is the message Rig commits for the call
+(`AgentEvent::tool_result`).
 
 The fold checks each turn's events as Rig checks a relayed stream, with
 `Transcript::push`, and refuses one Rig's stream could not have produced,
 such as a fragment of a part that never started. Events from elsewhere are
 checked before they are folded.
 
-A `ToolHook` set with `Agent::tool_hook` decides whether each call may run
-before its tool sees it, and may take as long as it needs, such as while a
-user decides. A hook may allow a call with a `ToolContext` for its tool,
-when it allows the call only on conditions the tool must keep. A denied call is answered with Rig's skipped result carrying
-the hook's reason, so the history stays valid and the model learns why. The
-hook plays the part of Rig's own agent's `on_dispatch`, which this loop does
-not run.
+Everything else about a run is the runner's: its tools, hooks (such as one
+deciding in `on_dispatch` whether each call may run), turn budget, and tool
+concurrency.
 
 With the `test-support` feature, `agent::test_support::turn` scripts a turn
 through Rig's mock model, so its events are exactly what Rig emits.
@@ -73,37 +53,36 @@ through Rig's mock model, so its events are exactly what Rig emits.
 ## Sketch
 
 ```rust,no_run
-use agent::{Agent, AgentEvent, TurnFold};
-use rig::{completion::Message, providers::ollama::Ollama, tool::ToolSet};
-use tools::{Calculate, RespondToComment, TurnComments};
+use agent::{AgentEvent, TurnFold};
+use rig::{AgentBuilder, completion::Message, providers::ollama::Ollama};
+use tools::Calculate;
 
 # async fn example() -> anyhow::Result<()> {
-let client = Ollama::new();
-let model = client.completion("qwen3.8:27b");
-
-let comments = std::sync::Arc::new(TurnComments::new(2));
-let mut tools = ToolSet::default();
-tools.add_tool(RespondToComment::new(comments));
-tools.add_tool(Calculate);
-
-let mut history = Vec::new();
-let mut fold = TurnFold::default();
-Agent::new(model.erase(), tools)
+let model = Ollama::new().native_completion("qwen3.8:27b");
+let runner = AgentBuilder::new(model)
     .additional_params(serde_json::json!({
         "num_ctx": 131_072,
         "think": "medium"
     }))
-    .run(Message::user("Reply to comment_1 and comment_2."), &mut history, |event| {
-        let folded = fold.apply(&event).expect("Rig's events are in order");
-        if let Some(rig::completion::AssistantContent::ToolCall(call)) = folded.block {
-            // This occurs as soon as the provider closes this call.
-            println!("{}: {}", call.function.name, call.function.arguments_value());
-        }
-        if let AgentEvent::TurnEnded { usage, .. } = event {
-            println!("turn used {usage:?}");
-        }
-    })
-    .await?;
+    .tool(Calculate)
+    .build()
+    .prompt(Message::user("What is 1 + 2?"))
+    .max_turns(10);
+
+let mut history = vec![Message::user("What is 1 + 2?")];
+let mut fold = TurnFold::default();
+agent::run(runner, |event| {
+    let folded = fold.apply(&event).expect("Rig's events are in order");
+    if let Some(rig::completion::AssistantContent::ToolCall(call)) = folded.block {
+        // This occurs as soon as the provider closes this call.
+        println!("{}: {}", call.function.name, call.function.arguments_value());
+    }
+    if let AgentEvent::TurnEnded { usage, .. } = event {
+        println!("turn used {usage:?}");
+    }
+    history.extend(folded.message);
+})
+.await?;
 # Ok(())
 # }
 ```

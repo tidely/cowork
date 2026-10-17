@@ -15,9 +15,9 @@ anyhow.workspace = true
 futures.workspace = true
 rig.workspace = true
 serde.workspace = true
-serde_json.workspace = true
 
 [dev-dependencies]
 rig = { workspace = true, features = ["test-utils"] }
+serde_json.workspace = true
 tokio.workspace = true
 tools.workspace = true

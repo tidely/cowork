@@ -1,6 +1,6 @@
 //! Accepted drafts are fenced independently from delivery to the agent.
 use super::*;
-use crate::thread::submission::{RunTotals, SubmissionMode};
+use crate::thread::submission::RunTotals;
 
 fn generating(session: &mut Collaboration<'_>) -> (Uuid, tokio::task::JoinHandle<()>) {
     let message_id = Uuid::new_v4();
@@ -19,7 +19,7 @@ fn generating(session: &mut Collaboration<'_>) -> (Uuid, tokio::task::JoinHandle
     (message_id, task)
 }
 
-fn accept(session: &mut Collaboration<'_>, text: &str, mode: SubmissionMode) {
+fn accept(session: &mut Collaboration<'_>, text: &str) {
     let thread = session.host_thread.clone();
     session.host.update(session.cx, |cowork, cx| {
         let draft_id = thread.read(cx).draft().id;
@@ -29,13 +29,12 @@ fn accept(session: &mut Collaboration<'_>, text: &str, mode: SubmissionMode) {
             draft.create_prompt(draft.author.as_uuid(), text);
         });
         let actor = thread.read(cx).participant_id();
-        assert!(cowork.accept_submission_mode(
+        assert!(cowork.accept_submission(
             draft_id,
             Some(thread.clone()),
             crate::thread::submission::SubmissionRequest {
                 actor,
                 submitted_locally: true,
-                mode
             },
             cx
         ));
@@ -43,43 +42,36 @@ fn accept(session: &mut Collaboration<'_>, text: &str, mode: SubmissionMode) {
 }
 
 #[gpui::test]
-fn pending_steering_merges_while_queue_is_fifo_and_cancel_is_fenced(cx: &mut gpui::TestAppContext) {
+fn pending_submissions_queue_in_order_and_cancel_removes_only_one(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
     let (_message_id, task) = generating(&mut session);
-    accept(&mut session, "steer one", SubmissionMode::Steering);
-    accept(&mut session, "steer two", SubmissionMode::Steering);
-    accept(&mut session, "queue one", SubmissionMode::Queue);
-    accept(&mut session, "queue two", SubmissionMode::Queue);
+    accept(&mut session, "one");
+    accept(&mut session, "two");
+    accept(&mut session, "three");
     let thread = session.host_thread.clone();
+    let texts = |thread: &Thread| {
+        thread
+            .pending_submissions()
+            .iter()
+            .map(|pending| pending.group.blocks[0].text.clone())
+            .collect::<Vec<_>>()
+    };
     let (id, thread_id) = thread.read_with(session.cx, |thread, _| {
-        assert_eq!(thread.submission_count(), 4);
-        assert_eq!(thread.pending_submissions().len(), 3);
-        assert_eq!(thread.pending_submissions()[0].group.blocks.len(), 2);
-        assert_eq!(
-            thread.pending_submissions()[1].group.blocks[0].text,
-            "queue one"
-        );
-        assert_eq!(
-            thread.pending_submissions()[2].group.blocks[0].text,
-            "queue two"
-        );
+        assert_eq!(thread.submission_count(), 3);
+        assert_eq!(texts(thread), ["one", "two", "three"]);
         assert!(thread.draft().items().is_empty());
-        (thread.pending_submissions()[0].id, thread.instance_id)
+        (thread.pending_submissions()[1].id, thread.instance_id)
     });
     session.host.update(session.cx, |cowork, cx| {
         cowork.cancel_pending_submission(thread_id, id, cx)
     });
-    accept(&mut session, "new steering", SubmissionMode::Steering);
+    accept(&mut session, "four");
+    // A repeated cancel finds nothing left to remove.
     session.host.update(session.cx, |cowork, cx| {
         cowork.cancel_pending_submission(thread_id, id, cx)
     });
     thread.read_with(session.cx, |thread, _| {
-        assert_eq!(thread.pending_submissions().len(), 3);
-        assert_eq!(
-            thread.pending_submissions()[2].group.blocks[0].text,
-            "new steering"
-        );
-        assert_ne!(thread.pending_submissions()[2].id, id);
+        assert_eq!(texts(thread), ["one", "three", "four"]);
     });
     task.abort();
 }
@@ -97,10 +89,7 @@ fn write_peers_cannot_cancel_pending_submissions(cx: &mut gpui::TestAppContext) 
             .collaborator_request(
                 &thread,
                 peer,
-                protocol::CollaboratorMessage::SubmitPending {
-                    sequence: 0,
-                    mode: SubmissionMode::Queue,
-                },
+                protocol::CollaboratorMessage::Submit { sequence: 0 },
                 cx,
             )
             .unwrap();
@@ -131,8 +120,8 @@ fn completed_runs_start_one_queued_message_but_stopping_preserves_pending(
 ) {
     let mut session = Collaboration::start(cx);
     let (message_id, task) = generating(&mut session);
-    accept(&mut session, "first queued", SubmissionMode::Queue);
-    accept(&mut session, "second queued", SubmissionMode::Queue);
+    accept(&mut session, "first queued");
+    accept(&mut session, "second queued");
     let thread = session.host_thread.clone();
     session.host.update(session.cx, |cowork, cx| {
         cowork.finish_generation(
@@ -178,14 +167,12 @@ fn completed_runs_start_one_queued_message_but_stopping_preserves_pending(
 }
 
 #[gpui::test]
-fn stop_wins_late_completion_and_resume_delivers_steering_before_the_queue(
-    cx: &mut gpui::TestAppContext,
-) {
+fn stop_wins_late_completion_and_resume_delivers_the_queue_in_order(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
     let (message_id, task) = generating(&mut session);
-    accept(&mut session, "queue one", SubmissionMode::Queue);
-    accept(&mut session, "queue two", SubmissionMode::Queue);
-    accept(&mut session, "steer first", SubmissionMode::Steering);
+    accept(&mut session, "queue one");
+    accept(&mut session, "queue two");
+    accept(&mut session, "queue three");
     let thread = session.host_thread.clone();
     session.host.update(session.cx, |cowork, cx| {
         let actor = thread.read(cx).participant_id();
@@ -218,13 +205,12 @@ fn stop_wins_late_completion_and_resume_delivers_steering_before_the_queue(
     session.host.update(session.cx, |cowork, cx| {
         let actor = thread.read(cx).participant_id();
         let draft_id = thread.read(cx).draft().id;
-        assert!(cowork.accept_submission_mode(
+        assert!(cowork.accept_submission(
             draft_id,
             Some(thread.clone()),
             crate::thread::submission::SubmissionRequest {
                 actor,
                 submitted_locally: true,
-                mode: SubmissionMode::Steering,
             },
             cx,
         ));
@@ -232,9 +218,9 @@ fn stop_wins_late_completion_and_resume_delivers_steering_before_the_queue(
         assert_eq!(thread.read(cx).pending_submissions().len(), 2);
         assert_eq!(thread.read(cx).submission_count(), 3);
         assert!(thread.read(cx).timeline.iter().any(|entry| matches!(
-            entry, TimelineMessage::User(group) if group.record.blocks[0].text == "steer first"
+            entry, TimelineMessage::User(group) if group.record.blocks[0].text == "queue one"
         )));
-        for (expected, remaining) in [("queue one", 1), ("queue two", 0)] {
+        for (expected, remaining) in [("queue two", 1), ("queue three", 0)] {
             let id = thread.read(cx).running_agent_message_id().unwrap();
             cowork.finish_generation(
                 &thread,
@@ -258,84 +244,6 @@ fn stop_wins_late_completion_and_resume_delivers_steering_before_the_queue(
             assert_eq!(latest, Some(expected));
             assert_eq!(state.submission_count(), 3);
         }
-    });
-    task.abort();
-}
-
-#[gpui::test]
-fn consumed_steering_cannot_be_cancelled_and_mirrors_keep_the_prompt_out_of_output(
-    cx: &mut gpui::TestAppContext,
-) {
-    let mut session = Collaboration::start(cx);
-    let (message_id, task) = generating(&mut session);
-    accept(&mut session, "new instructions", SubmissionMode::Steering);
-    let thread = session.host_thread.clone();
-    let thread_id = thread.read_with(session.cx, |thread, _| thread.instance_id);
-    session.host.update(session.cx, |cowork, cx| {
-        let (group, aliases, prompt) =
-            cowork.active_generations[&thread_id].take_steering_for_test();
-        let id = group.id;
-        // The agent thread has consumed it but its ordered metadata is still
-        // queued. A click from the old display must not retract delivered input.
-        cowork.cancel_pending_submission(thread_id, id, cx);
-        assert_eq!(thread.read(cx).pending_submissions().len(), 1);
-        thread.update(cx, |thread, cx| {
-            thread.emit_for_test(
-                protocol::HostMessage::PendingDelivered {
-                    id: id.into_bytes(),
-                    group: group.to_protocol(),
-                    agent_id: Some(message_id.into_bytes()),
-                    aliases,
-                },
-                cx,
-            );
-            thread.emit_for_test(
-                agent_event(message_id, agent::AgentEvent::Steered { prompt }),
-                cx,
-            );
-            for event in model_turn([streamed_text("t", "updated answer", false)], 10) {
-                thread.emit_for_test(agent_event(message_id, event), cx);
-            }
-        });
-        assert!(thread.read(cx).pending_submissions().is_empty());
-        let state = thread.read(cx);
-        // Steering joins the timeline when it was delivered, after the
-        // message it steers, which shows it where it joined the run.
-        let TimelineMessage::Agent(agent) = &state.timeline[0] else {
-            panic!("the steered reply comes first");
-        };
-        let TimelineMessage::User(steering) = &state.timeline[1] else {
-            panic!("steering follows the message it was delivered into");
-        };
-        assert_eq!(steering.record.id, id);
-        assert_eq!(agent.record.steering, vec![id]);
-        assert!(matches!(
-            agent.ui.output.steps(),
-            [AgentStep::Steering, AgentStep::Text(text)] if text == "updated answer"
-        ));
-        assert_eq!(agent.ui.output.text, "updated answer");
-        assert_eq!(state.transcript.messages().len(), 3);
-    });
-    let mirror = session.collaborator_thread().unwrap();
-    session.wait_until(
-        "steering transcript and output reach the mirror",
-        |session| {
-            mirror.read_with(session.cx, |thread, _| {
-                thread.transcript.messages().len() == 3 && thread.pending_submissions().is_empty()
-            })
-        },
-    );
-    assert_eq!(
-        thread.read_with(session.cx, |thread, _| thread.conversation()),
-        mirror.read_with(session.cx, |thread, _| thread.conversation())
-    );
-    mirror.read_with(session.cx, |thread, _| {
-        let TimelineMessage::Agent(agent) = &thread.timeline[0] else {
-            panic!("the mirror orders the timeline alike");
-        };
-        assert_eq!(agent.record.steering.len(), 1);
-        assert!(matches!(thread.timeline[1], TimelineMessage::User(_)));
-        assert!(matches!(agent.ui.output.steps()[0], AgentStep::Steering));
     });
     task.abort();
 }
@@ -381,13 +289,12 @@ fn pending_snapshot_keeps_comments_and_attachment_bytes_for_late_join(
             })
             .unwrap()
             .as_uuid();
-        assert!(cowork.accept_submission_mode(
+        assert!(cowork.accept_submission(
             draft_id,
             Some(thread.clone()),
             crate::thread::submission::SubmissionRequest {
                 actor,
                 submitted_locally: true,
-                mode: SubmissionMode::Steering,
             },
             cx
         ));
@@ -421,7 +328,7 @@ fn empty_draft_resume_rejects_write_only_peer_before_starting_any_run(
 ) {
     let mut session = Collaboration::start(cx);
     let (message_id, task) = generating(&mut session);
-    accept(&mut session, "pending", SubmissionMode::Queue);
+    accept(&mut session, "pending");
     let thread = session.host_thread.clone();
     let peer = session
         .collaborator_thread()
@@ -440,13 +347,12 @@ fn empty_draft_resume_rejects_write_only_peer_before_starting_any_run(
             cx,
         );
         let draft_id = thread.read(cx).draft().id;
-        assert!(!cowork.accept_submission_mode(
+        assert!(!cowork.accept_submission(
             draft_id,
             Some(thread.clone()),
             crate::thread::submission::SubmissionRequest {
                 actor: peer,
                 submitted_locally: false,
-                mode: SubmissionMode::Steering
             },
             cx
         ));

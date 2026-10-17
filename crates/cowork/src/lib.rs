@@ -100,13 +100,7 @@ static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 actions!(
     cowork,
-    [
-        Quit,
-        SubmitComposer,
-        QueueComposer,
-        StopGeneration,
-        OpenSearchPalette
-    ]
+    [Quit, SubmitComposer, StopGeneration, OpenSearchPalette]
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -383,14 +377,6 @@ impl Cowork {
                     TimelineMessage::User(group) => user_stable(group),
                     TimelineMessage::Agent(message) => {
                         !message.is_generating()
-                            && messages.iter().all(|entry| match entry {
-                                TimelineMessage::User(group)
-                                    if message.record.steering.contains(&group.record.id) =>
-                                {
-                                    user_stable(group)
-                                }
-                                _ => true,
-                            })
                             && !message.ui.work_expanded
                             && message.record.awaiting_approval.is_none()
                             && message.record.comment_group_id.is_none()
@@ -606,7 +592,6 @@ impl Render for Cowork {
             .bg(cx.theme().sidebar)
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(Self::submit_composer_action))
-            .on_action(cx.listener(Self::queue_composer_action))
             .on_action(cx.listener(|this, _: &StopGeneration, _, cx| this.stop_generation(cx)))
             .on_action(cx.listener(|this, _: &OpenSearchPalette, window, cx| {
                 this.open_search_palette(window, cx);
@@ -691,16 +676,13 @@ impl Render for Cowork {
 fn bind_app_keys(cx: &mut App) {
     // Keep both existing submit bindings, registering the native one last so
     // shortcut tooltips show Command on macOS and Control elsewhere.
-    let (alternate, native) = if cfg!(target_os = "macos") {
-        ("ctrl", "cmd")
-    } else {
-        ("cmd", "ctrl")
+    let (alternate, native) = cfg_select! {
+        target_os = "macos" => ("ctrl", "cmd"),
+        _ => ("cmd", "ctrl"),
     };
     cx.bind_keys([
         KeyBinding::new(&format!("{alternate}-enter"), SubmitComposer, None),
         KeyBinding::new(&format!("{native}-enter"), SubmitComposer, None),
-        KeyBinding::new(&format!("{alternate}-shift-enter"), QueueComposer, None),
-        KeyBinding::new(&format!("{native}-shift-enter"), QueueComposer, None),
         KeyBinding::new(
             cfg_select! {
                 target_os = "macos" => "cmd-.",

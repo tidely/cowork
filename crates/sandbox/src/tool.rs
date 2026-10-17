@@ -10,7 +10,7 @@ use std::{num::NonZeroU64, sync::Arc, time::Duration};
 use rig::tool::{ContextValue, Tool, ToolContext, ToolExecutionError};
 use serde::{Deserialize, Serialize};
 
-use crate::{Access, CommandOutput, Folders, Grant, SandboxError, Sandboxes};
+use crate::{Access, CallApprovals, CommandOutput, Folders, Grant, SandboxError, Sandboxes};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -157,7 +157,8 @@ impl Tool for RunCommand {
         // A call that reaches the tool without being granted anything, as
         // from an agent without a hook, runs with what it asked for, or the
         // project's mode.
-        let grant = match context.get::<Granted>().ok().flatten() {
+        let approved = CallApprovals::approved(context, Self::NAME);
+        let grant = match approved.get::<Granted>().ok().flatten() {
             Some(Granted(grant)) => Some(grant),
             None if args.access.is_none()
                 && args.read_folders.is_empty()

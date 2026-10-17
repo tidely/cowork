@@ -328,8 +328,8 @@ fn streamed_text(id: &str, text: &str, thinking: bool) -> agent::test_support::M
     }
 }
 
-/// The results of every tool the turn in `events` called, as the agent
-/// loop would report them.
+/// The results of every tool the turn in `events` called, as a run would
+/// report them.
 fn tool_results(events: &[agent::AgentEvent], output: &str) -> Vec<agent::AgentEvent> {
     let mut fold = agent::TurnFold::default();
     for event in events {
@@ -337,9 +337,12 @@ fn tool_results(events: &[agent::AgentEvent], output: &str) -> Vec<agent::AgentE
     }
     fold.pending_calls()
         .iter()
-        .map(|call| agent::AgentEvent::ToolResult {
-            call: call.id.clone(),
-            result: rig::tool::ToolResult::success(rig::tool::ToolOutput::text(output)),
+        .map(|call| {
+            agent::AgentEvent::tool_result(
+                call.id.clone(),
+                call.function.name.clone(),
+                &rig::tool::ToolResult::success(rig::tool::ToolOutput::text(output)),
+            )
         })
         .collect()
 }
@@ -581,7 +584,6 @@ impl<'a> Collaboration<'a> {
                             duration: std::time::Duration::ZERO,
                         },
                         awaiting_approval: None,
-                        steering: Vec::new(),
                     },
                     ui: crate::timeline::AgentMessageUi {
                         output: crate::timeline::AgentOutput::for_test(

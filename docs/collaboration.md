@@ -29,8 +29,7 @@ UUID and step index; no transcript positions flow through folded output. A threa
 owns at most one active execution, whose activity and event fold end together;
 stopped and failed run records still retain their unfinished replay events.
 
-Ollama context compaction runs before a new agent run and between model
-requests within a run, after all tool results and before queued steering.
+Ollama context compaction runs before a new agent run, never within one.
 This includes queued and scheduled runs. The host triggers it when the last measured
 context (plus unmeasured tool-result or streamed-output estimates) reaches the
 configured percentage of the context window (default: 80%), with no minimum-used-token
@@ -44,7 +43,7 @@ the next run. Settings are local to the host for this session.
 A single summary request appends a user instruction to the current request
 history, preserving the ordinary system prompt, tools, and model options; it
 never executes tool calls. Empty, failed, or tool-bearing summaries are rejected,
-and the ordinary run continues with its old context. Stop cancels the whole run.
+and the run starts with its old context. Stop cancels the whole run.
 A successful summary (including its wrapper) must also be smaller than the
 previous request history in encoded bytes. Only model request history replaces the earlier
 transcript prefix with a summary user message; the complete transcript and
@@ -52,19 +51,14 @@ timeline stay intact. Host events and snapshots mirror accepted summaries and
 compacting indicator. Usage includes successful summary requests. The context
 indicator is also shown inline as “Compacting context…” while a summary runs.
 Every accepted summary appends a compaction entry and leaves a “Context compacted”
-divider at that position: before the new prompt for pre-run compaction, or between
-work steps for mid-run compaction. Mid-run dividers remain with their original run
-when a later run starts. A summary separates text/reasoning steps on either side.
-Collapsed work keeps its dividers visible above the response. Failed, skipped, and canceled summaries leave no divider;
+divider at that position, before the new prompt. Collapsed work keeps its dividers
+visible above the response. Failed, skipped, and canceled summaries leave no divider;
 snapshots restore all accepted dividers from the ordered transcript entries.
 The context estimate immediately after compaction counts summary bytes, excluding system,
 tools, wrapper, and the next prompt until normal provider usage arrives.
-Mid-run summaries carry the current environment note, so project access
-information remains available. The loop keeps the complete event transcript
-separate from its shrinking request context; steering arriving during a summary
-joins the next request after compaction. Compaction never interrupts a model
-response while it streams, so a single long response can still exhaust the
-context window before reaching a safe boundary.
+The prompt after a summary always carries the environment note, so project access
+information remains available. As compaction waits for the next run, a single long
+run can still exhaust the context window.
 Completed summary requests log token and timing diagnostics without message
 content: total input, cached input, output, time to first output, model loading,
 prompt evaluation, and generation. Input tokens include cache hits; a large
@@ -76,9 +70,9 @@ from the host's catalog (grouped by provider), shared stopping,
 Yrs drafts with prompt blocks, comments as items, per-block attachments,
 navigation, and empty-item removal, the draft
 synced through the host with host-coordinated submission, presence, and
-attachment transfer. Multiple queued submissions and a cancellable steering batch are host-owned,
-mirrored in snapshots and delivered at safe agent boundaries; queued runs continue
-one at a time after normal completion. Stop pauses pending delivery, including
+attachment transfer. Submissions made while a run is going are queued: the
+queue is host-owned, mirrored in snapshots, and individually cancellable; queued
+submissions start runs one at a time, oldest first, after normal completion. Stop pauses pending delivery, including
 when completion races Stop; an idle composer with an empty draft offers an
 explicit Resume messages button. Peer permissions are also implemented: `ReadOnly`, `Write`,
 and `Admin`, defaulting to `Write`.
@@ -182,8 +176,8 @@ Implementation notes on attachment transfer:
 - **Draft position**: the empty spot below the last prompt block. Typing
   there creates a new prompt block.
 - **Submission**: an ordered immutable snapshot of the draft's non-empty items.
-  It is delivered immediately, queued for a later run, or merged into the
-  steering batch for the ongoing run.
+  It starts a run immediately, or, while a run is going, is queued for a
+  later run.
 
 ## Participants and identity
 
@@ -479,7 +473,7 @@ Send is available only to the host and `Admin` peers, and requires:
 
 The host accepts a submission as follows:
 
-1. The submitter sends `SubmitPending` with its delivery mode and the submission sequence it has seen. It
+1. The submitter sends `Submit` with the submission sequence it has seen. It
    sends all its pending draft updates first, on the same ordered stream, so
    its own accepted edits are included. The host checks `ControlGeneration`
    before considering the submission.
@@ -493,9 +487,8 @@ The host accepts a submission as follows:
    typing yet.
 5. The host broadcasts that draft update and advances the explicit submission
    sequence. While idle it publishes the user message and starts the agent.
-   While generating it accepts a pending submission without adding it to the
-   transcript yet. Steering is the default; Shift-Ctrl-Enter (Shift-Cmd-Enter
-   on macOS), or Shift-click on the send control, queues instead.
+   While generating it queues the submission as a pending one, without adding
+   it to the timeline or transcript yet.
 6. Edits that arrive for removed items are discarded. Participants whose
    focused item was submitted move to the draft position.
 
@@ -508,47 +501,34 @@ size limit) still lack collaborator feedback, as noted in Status.
 **Pending delivery**: each accepted draft is immutable and receives an ID.
 Queued drafts remain separate and start one run each in FIFO order, using the
 selected model and project settings when each run starts. Accepted user queues
-take precedence over the scheduler trying to reuse that thread. Steering
-submissions merge into one pending batch and are consumed together after the
-current finalized model part and its tool calls finish. A tool's result always
-precedes the injected user prompt. Partial provider fragments never enter the
-transcript. The agent emits `Steered` with the injected Rig user prompt so the
-host and collaborators fold exactly the same history.
+take precedence over the scheduler trying to reuse that thread. Nothing reaches
+a running agent: each queued draft is the prompt of a run of its own.
 
-Cancellation requires current `ControlGeneration` permission. The batch ID
-fences cancellation: once consumed, an old cancel cannot remove newer steering.
-The whole steering batch is cancelled together; each queued draft is cancelled
-individually. Consumption and cancellation synchronize with the run's hook.
-`PendingDelivered` removes the accepted batch and appends its user group to
-the timeline, so the timeline keeps the order messages joined the
-conversation. For steering it also names the running agent message, whose
-`steering` list records the group; snapshots carry that list. The agent
-message shows its steering groups inline: each steering prompt in the run's
-transcript output is a step of its own, and the n-th shows the n-th group.
-With the work open, a group sits between the steps before and after it
-joined; with the work closed, every group sits between the "Worked for"
-line and the response. Text before a steering prompt is work, like text
-before a tool call. Pending comments get unique
-run-local aliases, mirrored with their original comment UUIDs, so tool replies
-keep targeting the right comment. Pending attachment bytes stay stored and are
-included in late-join transfers. The 32 MB message attachment limit also applies
-to the combined steering batch.
+Cancellation (`CancelPending`) requires current `ControlGeneration` permission
+and removes one queued draft by its ID. A draft that already started its run
+has left the queue, so a late cancel changes nothing. `PendingDelivered`
+removes the oldest queued draft as its run starts and appends its user group to
+the timeline, followed by the run's `AgentStarted`. Queued comments are named
+in that run's prompt like any submission's. Queued attachment bytes stay stored
+and are included in late-join transfers. The 32 MB message attachment limit
+applies to each submission, as each becomes a message of its own.
 
-Normally completed runs automatically start one pending run. Stopping or failure
-keeps pending submissions visible and cancellable. Stop also wins over a
+Normally completed runs automatically start the next queued run. Stopping or
+failure keeps queued submissions visible and cancellable. Stop also wins over a
 completion already on its way to the UI, preventing automatic queue advancement.
 An idle composer with an empty draft shows a labelled **Resume messages** button
-with a play icon. Clicking it (or pressing the submit shortcut) resumes pending
-steering first, then queued messages in FIFO order, without creating a new submission.
-Steering already delivered remains in the conversation.
-Sending a new draft resumes the agent and any pending steering. Archived threads do not start queued
-runs. Queues are session state, like threads, and are not saved across app restarts.
+with a play icon. Clicking it (or pressing the submit shortcut) resumes the
+queue in FIFO order, without creating a new submission. Sending a new draft
+while idle starts its run at once; the queue continues after it completes.
+Archived threads do not start queued runs. Queues are session state, like
+threads, and are not saved across app restarts.
 
 The composer shows the red Stop control while generating with an empty draft.
-With any non-empty block, comment, or attachment it shows the blue steering
-control. Idle Send uses the same blue enabled accent. Pending blocks have muted
-centered Steering or Queued labels in dashed dividers, cancellation at the right,
-and a solid Draft divider before the editable draft.
+With any non-empty block, comment, or attachment it shows the blue Queue
+control, whose tooltip also names the Stop shortcut. Idle Send uses the same
+blue enabled accent. Queued blocks have muted centered Queued labels in dashed
+dividers, cancellation at the right, and a solid Draft divider before the
+editable draft.
 
 **Published user message**: one timeline entry, rendered like today:
 
@@ -577,14 +557,14 @@ A single-block submission looks like the current user message.
   display and sharing. A run that is stopped or fails keeps its prompt and
   every turn it completed.
 - Every participant mirrors the transcript and the prompt names. The
-  host forwards what its agent loop reports, as it happens, in
+  host runs Rig's agent and forwards what it reports, as it happens, in
   `AgentEvent`: Rig's stream events (each part of the reply starting,
   growing by fragments, and ending with its content), the end of each model
   turn with its usage and the origin and stop reason Rig gave it, and each
-  tool's result. Every event travels on its own as it happens. Everyone,
-  the host included, folds them the same way (the agent crate's
-  `TurnFold`) into the transcript, which comes out exactly as the agent
-  loop recorded it. Each reply is the content Rig finalized, which every
+  tool's result as soon as that tool returns. Every event travels on its own
+  as it happens. Everyone, the host included, folds them the same way (the
+  agent crate's `TurnFold`) into the transcript, which comes out exactly as
+  Rig's agent committed the run. Each reply is the content Rig finalized, which every
   part's end carries, in the parts' positions, so no participant
   accumulates the stream itself; fragments only feed a preview of the parts
   still streaming. The fold checks each turn's events as Rig checks a
@@ -604,7 +584,7 @@ A single-block submission looks like the current user message.
   transcript. Comment replies
   come from `respond_to_comment` calls, with ids derived from the message
   and call, so every participant names them alike. Only the **response**,
-  the text after the agent's last tool call or steering prompt, can be
+  the text after the agent's last tool call, can be
   commented on; comment
   ranges are offsets into it. Everything before it is the agent's work,
   shown under a "Working for" line while the run goes and collapsed under
@@ -903,50 +883,51 @@ can still be reported. Runtime permission denials use the separate
 
 **Collaborator to host**
 
-| Message                    | Purpose                                                                                                |
-| -------------------------- | ------------------------------------------------------------------------------------------------------ |
-| `Join`                     | First message; carries the protocol version                                                            |
-| `Profile`                  | Second message, and again whenever the profile changes                                                 |
-| `DraftUpdate`              | `{ generation, update }`: encoded Yrs update; requires the peer's current epoch and `Write` or `Admin` |
-| `Presence`                 | Replaces this participant's presence; host sanitizes readers to empty                                  |
-| `AttachmentData`           | Upload chunks; requires draft-write access or an already accepted record                               |
-| `AttachmentCancelled`      | Cancels this peer's upload, including after revocation                                                 |
-| `Submit` / `SubmitPending` | Requests a submission at the given sequence, with one-shot steering or queue mode; requires `Admin`    |
-| `Stop`                     | Stops the named agent run; same permission as `Submit`                                                 |
-| `SelectModel`              | Selects a model by provider and model ID; requires `Admin`                                             |
-| `DecideToolCall`           | Allows or denies the named run's waiting tool call; requires `Admin`; ignored once decided             |
+| Message               | Purpose                                                                                                |
+| --------------------- | ------------------------------------------------------------------------------------------------------ |
+| `Join`                | First message; carries the protocol version                                                            |
+| `Profile`             | Second message, and again whenever the profile changes                                                 |
+| `DraftUpdate`         | `{ generation, update }`: encoded Yrs update; requires the peer's current epoch and `Write` or `Admin` |
+| `Presence`            | Replaces this participant's presence; host sanitizes readers to empty                                  |
+| `AttachmentData`      | Upload chunks; requires draft-write access or an already accepted record                               |
+| `AttachmentCancelled` | Cancels this peer's upload, including after revocation                                                 |
+| `Submit`              | Requests a submission at the given sequence, queued while a run is going; requires `Admin`             |
+| `CancelPending`       | Cancels the named queued submission; same permission as `Submit`                                       |
+| `Stop`                | Stops the named agent run; same permission as `Submit`                                                 |
+| `SelectModel`         | Selects a model by provider and model ID; requires `Admin`                                             |
+| `DecideToolCall`      | Allows or denies the named run's waiting tool call; requires `Admin`; ignored once decided             |
 
 **Host to collaborators**
 
-| Message                                      | Purpose                                                                                                                                                                                                                                                                                                                        |
-| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Message                                      | Purpose                                                                                                                                                                                                                                                                                                                                                      |
+| -------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `Welcome`                                    | Participant UUID, timeline and transcript snapshot (models, run state, compacted context and status, prompt names, project folder names and mode), draft and receiving peer's `draft_generation`, participants, profiles, presence, stored attachment IDs, and peer permissions; explicit submission sequence and pending groups are included; peer-specific |
-| `Rejected`                                   | Join refused (e.g. protocol version); stable handshake encoding, then disconnect; peer-specific                                                                                                                                                                                                                                |
-| `PermissionDenied`                           | Runtime denial with participant UUID, operation, and reason (`NotParticipant`, `InsufficientMode`, `HostOnly`, or `StaleDraftGeneration`); peer-specific, connection stays open                                                                                                                                                |
-| `DraftReset`                                 | `{ generation, state }`: peer-specific authoritative draft; matching epoch merges, newer epoch replaces, older epoch is ignored                                                                                                                                                                                                |
-| `DefaultPeerModeChanged`                     | Host-owned live default changed; inheriting peers immediately follow it                                                                                                                                                                                                                                                        |
-| `PeerModeOverrideChanged`                    | Host-owned per-connection override changed; `None` resumes inheritance                                                                                                                                                                                                                                                         |
-| `DraftUpdate`                                | Untagged Yrs update from another participant or the host; per-peer generations tag only collaborator requests                                                                                                                                                                                                                  |
-| `ParticipantJoined` / `ParticipantLeft`      | Membership changes; joining carries the participant's profile                                                                                                                                                                                                                                                                  |
-| `ProfileChanged`                             | A participant's new profile                                                                                                                                                                                                                                                                                                    |
-| `Presence`                                   | A participant's latest presence                                                                                                                                                                                                                                                                                                |
-| `AttachmentData`                             | Relayed attachment bytes                                                                                                                                                                                                                                                                                                       |
-| `AttachmentStored`                           | The host holds every byte of an attachment                                                                                                                                                                                                                                                                                     |
-| `ModelSelected`                              | The thread's model changed                                                                                                                                                                                                                                                                                                     |
-| `ModelCatalogChanged`                        | Replaces the thread's model catalog (including with an empty one)                                                                                                                                                                                                                                                              |
-| `ProjectFoldersChanged`                      | Replaces the names of the project's folders, in order; paths are never sent                                                                                                                                                                                                                                                    |
-| `ProjectModeChanged`                         | The project's mode is now `Read`, `Write`, or `Write + Network`                                                                                                                                                                                                                                                                |
-| `PendingSubmissions`                         | Full accepted pending groups and current submission sequence; IDs fence cancellation                                                                                                                                                                                                                                           |
-| `PendingDelivered`                           | Removes a pending ID, publishes its user group, and maps steering comment aliases to the ongoing agent run                                                                                                                                                                                                                     |
-| `UserMessage`                                | A delivered immediate submission with creators and attachment references instead of bytes; advances the submission sequence                                                                                                                                                                                                    |
-| `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and whether it completed, was stopped, or failed (with a message)                                                                                                                                                                                    |
-| `AgentPreparing` | Creates the active response before pre-run compaction; its prompt is recorded by `AgentStarted` after the attempt finishes |
-| `AgentEvent`                                 | What the host's agent loop reported during a run, which everyone folds into the agent message and transcript                                                                                                                                                                                                                   |
-| `CompactionStarted` | The active run is generating a summary; mirrored context indicator animates |
-| `CompactionFinished` | Ends summary generation; a successful summary appends to the transcript and replaces request context, while `None` preserves the previous context |
-| `PromptNamed`                                | A participant's prompt name, fixed on their first submitted item                                                                                                                                                                                                                                                               |
-| `ToolApprovalRequested`                      | A run waits for the named call of its last reply to be allowed or denied                                                                                                                                                                                                                                                       |
-| `ToolApprovalResolved`                       | The waiting call was decided; its result follows as an `AgentEvent`                                                                                                                                                                                                                                                            |
+| `Rejected`                                   | Join refused (e.g. protocol version); stable handshake encoding, then disconnect; peer-specific                                                                                                                                                                                                                                                              |
+| `PermissionDenied`                           | Runtime denial with participant UUID, operation, and reason (`NotParticipant`, `InsufficientMode`, `HostOnly`, or `StaleDraftGeneration`); peer-specific, connection stays open                                                                                                                                                                              |
+| `DraftReset`                                 | `{ generation, state }`: peer-specific authoritative draft; matching epoch merges, newer epoch replaces, older epoch is ignored                                                                                                                                                                                                                              |
+| `DefaultPeerModeChanged`                     | Host-owned live default changed; inheriting peers immediately follow it                                                                                                                                                                                                                                                                                      |
+| `PeerModeOverrideChanged`                    | Host-owned per-connection override changed; `None` resumes inheritance                                                                                                                                                                                                                                                                                       |
+| `DraftUpdate`                                | Untagged Yrs update from another participant or the host; per-peer generations tag only collaborator requests                                                                                                                                                                                                                                                |
+| `ParticipantJoined` / `ParticipantLeft`      | Membership changes; joining carries the participant's profile                                                                                                                                                                                                                                                                                                |
+| `ProfileChanged`                             | A participant's new profile                                                                                                                                                                                                                                                                                                                                  |
+| `Presence`                                   | A participant's latest presence                                                                                                                                                                                                                                                                                                                              |
+| `AttachmentData`                             | Relayed attachment bytes                                                                                                                                                                                                                                                                                                                                     |
+| `AttachmentStored`                           | The host holds every byte of an attachment                                                                                                                                                                                                                                                                                                                   |
+| `ModelSelected`                              | The thread's model changed                                                                                                                                                                                                                                                                                                                                   |
+| `ModelCatalogChanged`                        | Replaces the thread's model catalog (including with an empty one)                                                                                                                                                                                                                                                                                            |
+| `ProjectFoldersChanged`                      | Replaces the names of the project's folders, in order; paths are never sent                                                                                                                                                                                                                                                                                  |
+| `ProjectModeChanged`                         | The project's mode is now `Read`, `Write`, or `Write + Network`                                                                                                                                                                                                                                                                                              |
+| `PendingSubmissions`                         | Full accepted pending groups and current submission sequence; IDs fence cancellation                                                                                                                                                                                                                                                                         |
+| `PendingDelivered`                           | Removes the oldest pending ID as its run starts and publishes its user group; `AgentStarted` follows                                                                                                                                                                                                                                                         |
+| `UserMessage`                                | A delivered immediate submission with creators and attachment references instead of bytes; advances the submission sequence                                                                                                                                                                                                                                  |
+| `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and whether it completed, was stopped, or failed (with a message)                                                                                                                                                                                                                  |
+| `AgentPreparing`                             | Creates the active response before pre-run compaction; its prompt is recorded by `AgentStarted` after the attempt finishes                                                                                                                                                                                                                                   |
+| `AgentEvent`                                 | What the host's agent reported during a run, which everyone folds into the agent message and transcript                                                                                                                                                                                                                                                      |
+| `CompactionStarted`                          | The active run is generating a summary; mirrored context indicator animates                                                                                                                                                                                                                                                                                  |
+| `CompactionFinished`                         | Ends summary generation; a successful summary appends to the transcript and replaces request context, while `None` preserves the previous context                                                                                                                                                                                                            |
+| `PromptNamed`                                | A participant's prompt name, fixed on their first submitted item                                                                                                                                                                                                                                                                                             |
+| `ToolApprovalRequested`                      | A run waits for the named call of its last reply to be allowed or denied                                                                                                                                                                                                                                                                                     |
+| `ToolApprovalResolved`                       | The waiting call was decided; its result follows as an `AgentEvent`                                                                                                                                                                                                                                                                                          |
 
 The host is itself a participant. Its local edits, submissions, stops, and
 model changes go through the same authorization paths as a collaborator's,
