@@ -9,6 +9,7 @@
 //! starts once the agent run of the last one ends.
 
 use std::{
+    borrow::Cow,
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
@@ -40,9 +41,9 @@ const MODEL_RETRY: Duration = Duration::from_secs(60);
 const FILE_VERSION: u32 = 1;
 
 #[derive(Serialize, Deserialize)]
-struct ScheduleFile {
+struct ScheduleFile<'a> {
     version: u32,
-    tasks: Vec<ScheduledTask>,
+    tasks: Cow<'a, [ScheduledTask]>,
 }
 
 /// The run going on now.
@@ -126,7 +127,7 @@ impl Scheduler {
         };
         let file = ScheduleFile {
             version: FILE_VERSION,
-            tasks: self.tasks.clone(),
+            tasks: Cow::Borrowed(&self.tasks),
         };
         if let Err(error) = save_tasks(path, &file) {
             eprintln!(
@@ -170,9 +171,12 @@ pub(crate) fn load_tasks(path: &Path) -> Vec<ScheduledTask> {
         }
     };
     match serde_json::from_slice::<ScheduleFile>(&bytes) {
-        Ok(file) if file.version == FILE_VERSION => {
-            file.tasks.into_iter().map(ScheduledTask::loaded).collect()
-        }
+        Ok(file) if file.version == FILE_VERSION => file
+            .tasks
+            .into_owned()
+            .into_iter()
+            .map(ScheduledTask::loaded)
+            .collect(),
         result => {
             let aside = path.with_extension("json.unreadable");
             match result {
