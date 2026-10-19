@@ -6,7 +6,9 @@ use schemars::JsonSchema;
 use serde::{Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
-use crate::{ToolCallContext, ToolError, ToolErrorKind, ToolOutput, TypedToolOutput};
+use crate::{
+    ToolCallContext, ToolCapabilities, ToolError, ToolErrorKind, ToolOutput, TypedToolOutput,
+};
 
 /// One typed tool. The host invokes `execute`; simple tools implement `run`,
 /// while streaming tools override `execute` to return progress and a final result.
@@ -17,6 +19,12 @@ pub trait Tool: Send + Sync {
 
     fn name(&self) -> &str;
     fn description(&self) -> String;
+
+    /// Execution declarations retained by the registry at registration time.
+    /// These are host metadata and are not part of the model's definition.
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities::default()
+    }
 
     fn definition(&self) -> ToolDefinition {
         let schema: Value = schemars::schema_for!(Self::Args).into();
@@ -126,6 +134,13 @@ pub async fn collect_output<T>(mut stream: ToolStream<T>) -> Result<T, ToolError
 /// this adapter automatically; input decoding failures are final tool errors.
 pub trait ToolDyn: Send + Sync {
     fn definition(&self) -> ToolDefinition;
+
+    /// Manual dynamic implementations can declare capabilities too. The
+    /// blanket adapter forwards the concrete Tool implementation's metadata.
+    fn capabilities(&self) -> ToolCapabilities {
+        ToolCapabilities::default()
+    }
+
     fn execute(
         &self,
         context: ToolCallContext,
@@ -136,6 +151,10 @@ pub trait ToolDyn: Send + Sync {
 impl<T: Tool> ToolDyn for T {
     fn definition(&self) -> ToolDefinition {
         Tool::definition(self)
+    }
+
+    fn capabilities(&self) -> ToolCapabilities {
+        Tool::capabilities(self)
     }
 
     fn execute(
