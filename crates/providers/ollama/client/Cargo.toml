@@ -1,0 +1,20 @@
+[package]
+name = "ollama"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+futures.workspace = true
+httpdate.workspace = true
+language-model.workspace = true
+ollama-types.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tokio-util = { workspace = true, features = ["io"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["net", "io-util", "time"] }
+

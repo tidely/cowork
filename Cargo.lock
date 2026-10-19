@@ -6390,6 +6390,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "language-model"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "uuid",
+]
+
+[[package]]
+name = "language-models"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "language-model",
+ "ollama",
+ "openai-compatible",
+ "reqwest 0.13.5",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8135,6 +8159,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "ollama"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "httpdate",
+ "language-model",
+ "ollama-types",
+ "reqwest 0.13.5",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+]
+
+[[package]]
+name = "ollama-types"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "language-model",
+ "mime",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8211,6 +8260,31 @@ checksum = "aa576c76302b7b808eecc68061e67336c47833ef9d22caa74dda10fa9675eebc"
 dependencies = [
  "is-wsl",
  "libc",
+]
+
+[[package]]
+name = "openai-compatible"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "httpdate",
+ "language-model",
+ "openai-compatible-types",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "openai-compatible-types"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "language-model",
+ "mime",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
