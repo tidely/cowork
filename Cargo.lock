@@ -11786,6 +11786,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "06bdbd8cfc056b8d2e2e85f29b56a3bdbecb527cef81eb39e3e7b98af4652770"
 
 [[package]]
+name = "tool-runtime"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "language-model",
+ "schemars 1.2.3",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "tools"
 version = "0.1.0"
 dependencies = [

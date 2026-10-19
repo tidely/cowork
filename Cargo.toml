@@ -8,6 +8,7 @@ members = [
     "crates/provider-sse",
     "crates/sandbox",
     "crates/tools",
+    "crates/tool-runtime",
     "crates/providers/*/types",
     "crates/providers/*/client",
 ]
@@ -27,6 +28,7 @@ agent = { path = "crates/agent" }
 draft = { path = "crates/draft" }
 sandbox = { path = "crates/sandbox" }
 tools = { path = "crates/tools" }
+tool-runtime = { path = "crates/tool-runtime" }
 language-model = { path = "crates/language-model" }
 language-models = { path = "crates/language-models" }
 ollama-types = { path = "crates/providers/ollama/types" }
