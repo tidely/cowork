@@ -236,6 +236,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "940b3a0ca603d1eade50a4846a2afffd5ef57a9feac2c0e2ec2e14f9ead76000"
 
 [[package]]
+name = "anthropic"
+version = "0.1.0"
+dependencies = [
+ "anthropic-types",
+ "futures",
+ "httpdate",
+ "language-model",
+ "provider-sse",
+ "reqwest 0.13.5",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "anthropic-types"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "language-model",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "anyhow"
 version = "1.0.104"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6404,6 +6429,7 @@ dependencies = [
 name = "language-models"
 version = "0.1.0"
 dependencies = [
+ "anthropic",
  "futures",
  "language-model",
  "ollama",
@@ -8270,6 +8296,7 @@ dependencies = [
  "httpdate",
  "language-model",
  "openai-compatible-types",
+ "provider-sse",
  "reqwest 0.13.5",
  "serde",
  "serde_json",
@@ -8986,6 +9013,10 @@ checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
 dependencies = [
  "prost",
 ]
+
+[[package]]
+name = "provider-sse"
+version = "0.1.0"
 
 [[package]]
 name = "ptr_meta"

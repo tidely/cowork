@@ -1,0 +1,13 @@
+[package]
+name = "anthropic-types"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+language-model.workspace = true
+base64.workspace = true

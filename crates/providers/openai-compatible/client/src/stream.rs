@@ -5,54 +5,9 @@ use language_model::{
     Reasoning, Role, StreamEvent, ToolArguments, ToolCall, ToolCallId,
 };
 use openai_compatible_types as wire;
+use provider_sse::Decoder;
 use serde_json::{Map, Value};
 use std::collections::{BTreeMap, VecDeque};
-
-/// Frame bytes before UTF-8 decoding: HTTP chunks need not end at a character
-/// boundary. CR, LF and CRLF are line endings, including across chunks.
-#[derive(Default)]
-struct Decoder {
-    line: Vec<u8>,
-    data: Vec<u8>,
-    skip_lf: bool,
-    frames: VecDeque<Vec<u8>>,
-    first_line: bool,
-}
-
-impl Decoder {
-    fn feed(&mut self, bytes: &[u8]) {
-        for &byte in bytes {
-            if self.skip_lf {
-                self.skip_lf = false;
-                if byte == b'\n' {
-                    continue;
-                }
-            }
-            if byte == b'\r' || byte == b'\n' {
-                self.skip_lf = byte == b'\r';
-                let mut line = std::mem::take(&mut self.line);
-                if !self.first_line {
-                    self.first_line = true;
-                    if line.starts_with(&[0xef, 0xbb, 0xbf]) {
-                        line.drain(..3);
-                    }
-                }
-                if line.is_empty() {
-                    if !self.data.is_empty() {
-                        self.data.pop();
-                        self.frames.push_back(std::mem::take(&mut self.data));
-                    }
-                } else if line.starts_with(b"data:") {
-                    let value = line[5..].strip_prefix(b" ").unwrap_or(&line[5..]);
-                    self.data.extend_from_slice(value);
-                    self.data.push(b'\n');
-                }
-            } else {
-                self.line.push(byte);
-            }
-        }
-    }
-}
 
 struct PendingCall {
     id: ToolCallId,
@@ -329,7 +284,7 @@ impl State {
             if let Some(event) = self.events.pop_front() {
                 return Ok(event);
             }
-            if let Some(frame) = self.decoder.frames.pop_front() {
+            if let Some(frame) = self.decoder.next_frame() {
                 if frame == b"[DONE]" {
                     self.ended = true;
                     return Ok(StreamEvent::Finished(Box::new(
@@ -379,23 +334,4 @@ pub(crate) fn completion_stream(client: Client, response: reqwest::Response) -> 
         Some((event, state))
     })
     .boxed()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn decoder_handles_every_byte_boundary_and_line_ending() {
-        let input = "\u{feff}:ignore\r\nevent: message\rdata: {\"value\":\r\ndata: \"考\"}\n\ndata: [DONE]\r\r";
-        let mut decoder = Decoder::default();
-        for byte in input.as_bytes() {
-            decoder.feed(&[*byte]);
-        }
-        assert_eq!(
-            decoder.frames.pop_front().unwrap(),
-            "{\"value\":\n\"考\"}".as_bytes()
-        );
-        assert_eq!(decoder.frames.pop_front().unwrap(), b"[DONE]");
-        assert!(decoder.frames.is_empty());
-    }
 }

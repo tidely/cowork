@@ -5,6 +5,7 @@ members = [
     "crates/draft",
     "crates/language-model",
     "crates/language-models",
+    "crates/provider-sse",
     "crates/sandbox",
     "crates/tools",
     "crates/providers/*/types",
@@ -21,6 +22,7 @@ edition = "2024"
 [workspace.lints.clippy]
 
 [workspace.dependencies]
+provider-sse = { path = "crates/provider-sse" }
 agent = { path = "crates/agent" }
 draft = { path = "crates/draft" }
 sandbox = { path = "crates/sandbox" }
@@ -31,6 +33,8 @@ ollama-types = { path = "crates/providers/ollama/types" }
 ollama = { path = "crates/providers/ollama/client" }
 openai-compatible-types = { path = "crates/providers/openai-compatible/types" }
 openai-compatible = { path = "crates/providers/openai-compatible/client" }
+anthropic-types = { path = "crates/providers/anthropic/types" }
+anthropic = { path = "crates/providers/anthropic/client" }
 
 anyhow = "1"
 base64 = "0.22"

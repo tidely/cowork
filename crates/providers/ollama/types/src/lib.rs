@@ -60,7 +60,7 @@ pub enum ResponseFormat {
 }
 
 /// Native messages also serve as streamed deltas. Empty content is meaningful
-/// for thinking-only, tool-only, and terminal chunks. Images are base64 strings,
+/// for thinking-only, tool-only, and final chunks. Images are base64 strings,
 /// not URLs; conversion from shared messages validates their encoded bytes.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Message {
@@ -275,7 +275,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn streamed_thinking_tools_and_terminal_usage_are_independent() {
+    fn streamed_thinking_tools_and_final_usage_are_independent() {
         let ndjson = r#"{"model":"qwen3","message":{"role":"assistant","thinking":"Consider"},"done":false}
 {"message":{"role":"assistant","tool_calls":[{"function":{"index":0,"name":"weather","arguments":{"city":"Helsinki"}}}]},"done":false}
 {"done":true,"done_reason":"stop","prompt_eval_count":100,"prompt_eval_cached_count":80,"eval_count":12,"eval_duration":1000000,"remote_model":"qwen3"}"#;

@@ -44,7 +44,7 @@ async fn check_stream(native: bool) {
         let mut deltas = 0;
         let mut completion = None;
         while let Some(event) = stream.next().await {
-            assert!(completion.is_none(), "event after terminal completion");
+            assert!(completion.is_none(), "event after final completion");
             match event.unwrap() {
                 StreamEvent::Delta { .. } => deltas += 1,
                 StreamEvent::Finished(value) => completion = Some(value),

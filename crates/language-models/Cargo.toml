@@ -9,6 +9,7 @@ workspace = true
 [dependencies]
 language-model.workspace = true
 ollama.workspace = true
+anthropic.workspace = true
 openai-compatible.workspace = true
 reqwest.workspace = true
 

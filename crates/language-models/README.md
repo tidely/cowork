@@ -22,6 +22,9 @@ Both use `http://localhost:11434`; the compatible example uses its `/v1` API.
 
 | Crate | Responsibility |
 | --- | --- |
+| `provider-sse` | Byte-level SSE framing shared by the HTTP providers. |
+| `anthropic-types` | Native Messages wire types, request conversion, and signed thinking replay. |
+| `anthropic` | Anthropic model discovery and streamed Messages HTTP provider. |
 | `language-model` | Owned conversation types, versioned message encoding, and the provider-independent completion contract. |
 | `ollama-types` | Native Ollama request and response data, with Serde and no HTTP dependencies. |
 | `ollama` | Native Ollama HTTP communication and conversion to the shared contract. |
@@ -85,7 +88,7 @@ portable capabilities. Reverse conversions are separate operations and cannot
 promise a lossless round trip through a provider's more limited format.
 
 Use `CompletionRequest.thinking` and the typed controls (`max_output_tokens`,
-`temperature`, `top_p`, `stop`, `seed`) for what every provider supports,
+`temperature`, `top_p`, `stop`, `seed`) where the provider supports them,
 leaving `options` for provider-specific settings. Effort values remain model-defined strings.
 `LanguageModel.thinking` can advertise value/label choices and explicit defaults;
 unknown metadata stays absent. `None` preserves server defaults, and adapters
@@ -120,3 +123,15 @@ cargo test -p language-models --test live_ollama -- --ignored --nocapture --test
 
 They default to `qwen3.8:27b` with medium thinking. `OLLAMA_URL` and `OLLAMA_MODEL`
 can select another server/model; the model must support the chosen controls.
+
+
+## Anthropic
+
+`Anthropic::new("https://api.anthropic.com/v1")?.with_api_key(key)?` supplies
+another implementation of the same provider trait. Set `max_output_tokens`
+explicitly. Run `cargo run -p language-models --example anthropic` with
+`ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` set. Shared thinking uses adaptive mode; legacy budgets and native cache
+controls are available through `anthropic-types::MessagesRequest`. Signed
+thinking replay survives the shared message envelope. See
+[the client documentation](../providers/anthropic/client/README.md) for the
+supported subset and transport behavior.

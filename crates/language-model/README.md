@@ -90,7 +90,7 @@ belong in provider options. Specifying both shared thinking and its raw wire
 option is an error, including when that raw option is null.
 
 `stream` returns an owned stream with provisional indexed deltas and exactly
-one final authoritative `Finished(Box<Completion>)` event. A terminal length stop
+one final authoritative `Finished(Box<Completion>)` event. A length stop
 still finishes a request; agent policy decides whether tools may execute.
 Providers must yield `IncompleteStream` on unexpected EOF, even after text
 was observed. Raw streams cannot enforce this just through a type alias;

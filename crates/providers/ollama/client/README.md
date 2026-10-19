@@ -138,7 +138,7 @@ counts stay unknown; a total is retained only if the server reports one.
 NDJSON framing operates on bytes and supports split UTF-8, CRLF, blank lines,
 and a final complete JSON object without a newline. Each line is bounded at 8 MiB;
 oversized lines and malformed UTF-8 fail as invalid responses. Deltas are provisional;
-only one terminal `done: true` response produces authoritative `Finished`.
+only one final `done: true` response produces authoritative `Finished`.
 Unexpected EOF produces `IncompleteStream`, including after visible text.
 HTTP failures, malformed JSON, in-band errors, and invalid assistant roles
 never become successful empty completions.

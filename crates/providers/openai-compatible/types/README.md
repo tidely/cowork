@@ -14,7 +14,7 @@ raw strings, preserving fragments and malformed model output. Reasoning and
 reasoning_content are separate optional fields because servers can emit both.
 
 Stream payloads preserve choice indexes and tool indexes independently. IDs,
-function names, arguments, and terminal deltas can be absent/null. Empty choices
+function names, arguments, and final deltas can be absent/null. Empty choices
 with usage are valid. These types do not frame SSE, recognize `[DONE]`, assemble
 fragments, or decide when an incomplete call is usable. Those are client concerns.
 Known optional null fields normalize to omission on serialization; unknown JSON

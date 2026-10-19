@@ -1,0 +1,7 @@
+[package]
+name = "provider-sse"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true

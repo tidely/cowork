@@ -305,7 +305,7 @@ impl LanguageModel {
 ///
 /// Implementations validate requests and fail unsupported conversions rather
 /// than drop content. A successful stream emits exactly one `Finished`, last.
-/// Missing terminal protocol data must produce `IncompleteStream`, including
+/// A missing completion signal must produce `IncompleteStream`, including
 /// when some text was already observed. Dropping the returned future/stream
 /// cancels local I/O; this does not promise server-side cancellation.
 /// `stream().await` performs request startup and rejects initial transport or
@@ -324,8 +324,8 @@ pub trait LanguageModelProvider: Send + Sync {
 }
 
 /// Drains an existing stream when previews are not needed; no separate request
-/// is made. Also validates terminal ordering for scripted or third-party adapters. This
-/// helper cannot make a raw stream's EOF turn into an error for other consumers;
+/// is made. Also validates completion event ordering for scripted or third-party
+/// adapters. This helper cannot make a raw stream's EOF turn into an error for other consumers;
 /// implementations must enforce that contract in their stream itself.
 pub async fn collect_completion(mut stream: CompletionStream) -> Result<Completion, Error> {
     let mut completion = None;
@@ -377,7 +377,7 @@ pub enum Error {
     Provider(String),
     #[error("invalid provider response: {0}")]
     InvalidResponse(String),
-    #[error("stream ended without a terminal completion")]
+    #[error("stream ended without a completion signal")]
     IncompleteStream,
     #[error("request timed out")]
     Timeout,

@@ -248,7 +248,7 @@ impl LanguageModelProvider for Scripted {
 }
 
 #[test]
-fn object_safe_completion_requires_terminal_content_and_rejects_late_events() {
+fn object_safe_completion_requires_final_content_and_rejects_late_events() {
     async fn collect(provider: &dyn LanguageModelProvider) -> Result<Completion, Error> {
         let model = LanguageModel::new("scripted");
         collect_completion(

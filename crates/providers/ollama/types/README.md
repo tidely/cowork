@@ -22,7 +22,7 @@ and is rejected rather than silently regrouped.
 
 `ChatResponse` is one JSON response/chunk. `ChatStreamItem` distinguishes a
 chunk from an in-band error. Framing NDJSON, accumulating fragments, requiring
-a terminal chunk, validating completed tool arguments, and interpreting model
+a final chunk, validating completed tool arguments, and interpreting model
 capabilities are the communication adapter's responsibilities. A streamed
 function may lack its name/arguments until completed; native calls may have no
 ID. Missing/null optional fields do not imply zero usage. Durations are

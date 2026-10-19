@@ -25,3 +25,6 @@ pub use ollama::Client as Ollama;
 /// A chat-completions API root, including `/v1` where required.
 pub use openai_compatible::Client as OpenAiCompatible;
 pub use reqwest;
+
+/// An Anthropic Messages API root, including `/v1`.
+pub use anthropic::Client as Anthropic;

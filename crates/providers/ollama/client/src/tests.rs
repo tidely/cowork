@@ -237,7 +237,7 @@ async fn native_stream_projects_history_tools_controls_and_auth_once() {
 }
 
 #[tokio::test]
-async fn stream_handles_byte_boundaries_tools_thinking_and_terminal_usage() {
+async fn stream_handles_byte_boundaries_tools_thinking_and_final_usage() {
     let ndjson = concat!(
         " \t\r\n\n",
         "{\"model\":\"resolved\",\"message\":{\"role\":\"assistant\",\"thinking\":\"考え\"},\"done\":false}\r\n",
@@ -266,7 +266,7 @@ async fn stream_handles_byte_boundaries_tools_thinking_and_terminal_usage() {
         matches!(&events[0], StreamEvent::Delta { index:0, delta: ContentDelta::Reasoning(text) } if text == "考え")
     );
     let StreamEvent::Finished(completion) = events.last().unwrap() else {
-        panic!("missing terminal completion")
+        panic!("missing final completion")
     };
     let message = &completion.message;
     let Content::ToolCall(call) = &message.content[2] else {
