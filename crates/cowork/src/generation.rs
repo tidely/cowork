@@ -115,7 +115,7 @@ fn summary_reduces_history(history: &[Message], replacement: &[Message]) -> bool
 /// the same, so the provider's prompt cache serves both.
 struct RequestPrefix {
     model: DynModel<Completion>,
-    tools: Vec<ToolDefinition>,
+    tools: Vec<Arc<ToolDefinition>>,
     params: serde_json::Value,
 }
 
@@ -862,9 +862,10 @@ mod tests {
             requests[1].system_instructions()
         );
         // Rig combines adjacent user messages while retaining content order.
-        let [Message::System { .. }, Message::User { content }] =
-            requests[0].chat_history.as_slice()
-        else {
+        let [system, user] = requests[0].chat_history.as_slice() else {
+            panic!("unexpected summary request");
+        };
+        let (Message::System { .. }, Message::User { content }) = (&**system, &**user) else {
             panic!("unexpected summary request");
         };
         assert_eq!(

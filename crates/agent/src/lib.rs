@@ -16,7 +16,7 @@
 //! positions, with the origin and stop Rig gave the turn; each tool result is
 //! the message Rig commits for the call.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 
 use futures::{StreamExt as _, channel::mpsc};
 use rig::{
@@ -24,9 +24,10 @@ use rig::{
     agent::{AgentHook, HookContext, MultiTurnStreamItem, OutcomeAction, OutcomeEvent},
     completion::{AssistantContent, Message, Usage},
     message::{self, AssistantMessage, CallId, Origin, StopReason, ToolCall, UserContent},
-    streaming::{Item, SequenceError, StreamEvent, Transcript},
+    streaming::{Item, SequenceError, StreamEvent, StreamRecord},
     tool::ToolResult,
 };
+use rig_core::tool::feedback;
 use serde::{Deserialize, Serialize};
 
 #[cfg(any(test, feature = "test-support"))]
@@ -62,7 +63,7 @@ impl AgentEvent {
     /// The report that `call`, of the tool `name`, returned `result`, which
     /// the model reads as Rig commits it.
     pub fn tool_result(call: CallId, name: message::ToolName, result: &ToolResult) -> Self {
-        match rig::transcript::tool_result_output(call, name, result) {
+        match feedback::tool_result_output(call, name, result) {
             UserContent::ToolResult(result) => Self::ToolResult(result),
             _ => unreachable!("a tool's output is a tool result"),
         }
@@ -80,12 +81,12 @@ impl AgentEvent {
 /// streams, which never joins the history.
 ///
 /// Model events are checked as Rig checks a relayed stream (see
-/// [`Transcript::push`]), so events from elsewhere that Rig's stream could
+/// [`StreamRecord::push`]), so events from elsewhere that Rig's stream could
 /// not have produced are refused rather than folded.
 #[derive(Default)]
 pub struct TurnFold {
     /// The reply's events so far, in the order Rig's stream yields them.
-    transcript: Transcript,
+    record: StreamRecord,
     /// The parts of the reply that ended, by position: what the reply is.
     ended: BTreeMap<usize, AssistantContent>,
     /// The text and reasoning of parts still streaming, by position: shown
@@ -149,7 +150,7 @@ impl TurnFold {
     pub fn apply(&mut self, event: &AgentEvent) -> Result<Folded, SequenceError> {
         match event {
             AgentEvent::Model(event) => {
-                self.transcript.push(Item::Event(event.clone()))?;
+                self.record.push(Item::Event(event.clone()))?;
                 Ok(Folded {
                     message: None,
                     block: self.show(event),
@@ -159,7 +160,7 @@ impl TurnFold {
                 let content = std::mem::take(&mut self.ended)
                     .into_values()
                     .collect::<Vec<_>>();
-                self.transcript = Transcript::default();
+                self.record = StreamRecord::default();
                 self.streaming.clear();
                 self.calls = pending_calls(&content, stop.as_ref());
                 self.results.clear();
@@ -264,6 +265,12 @@ fn pending_calls(content: &[AssistantContent], stop: Option<&StopReason>) -> Vec
 /// reason, and tool results only once every call of a turn has returned. A
 /// hook added to `runner` observes those as they happen instead, in the
 /// order Rig settles them.
+///
+/// Rig reports the outcome of every turn whose answer arrived, including one
+/// the run then refuses (a hook stopping the run at the turn's end, or a
+/// reply the run fails), whose reply it never commits. A turn's end is
+/// therefore reported once the run goes on with it, and not at all when the
+/// run fails first.
 pub async fn run(runner: AgentRunner, mut emit: impl FnMut(AgentEvent)) -> anyhow::Result<()> {
     let (observed, mut observations) = mpsc::unbounded();
     let mut stream = runner.add_hook(Observer(observed)).stream().fuse();
@@ -281,7 +288,10 @@ pub async fn run(runner: AgentRunner, mut emit: impl FnMut(AgentEvent)) -> anyho
             relay.observed(event, &mut emit);
         }
         match item {
-            None | Some(Ok(MultiTurnStreamItem::FinalResponse(_))) => return Ok(()),
+            None | Some(Ok(MultiTurnStreamItem::FinalResponse(_))) => {
+                relay.go_on(&mut emit);
+                return Ok(());
+            }
             Some(Ok(item)) => relay.item(item, &mut emit),
             Some(Err(error)) => return Err(error.into()),
         }
@@ -320,18 +330,21 @@ impl AgentHook for Observer {
 /// once.
 #[derive(Default)]
 struct Relay {
-    /// The calls of the turn routed to execution, by id.
-    calls: HashMap<CallId, ToolCall>,
-    /// The calls whose results were reported.
+    /// The end of the last turn, until the run goes on with that turn.
+    ending: Option<AgentEvent>,
+    /// The calls of the last turn whose results were reported.
     answered: HashSet<CallId>,
 }
 
 impl Relay {
     fn observed(&mut self, event: AgentEvent, emit: &mut impl FnMut(AgentEvent)) {
+        // Rig observes nothing more of a turn it refuses.
+        self.go_on(emit);
         match &event {
             AgentEvent::TurnEnded { .. } => {
-                self.calls.clear();
                 self.answered.clear();
+                self.ending = Some(event);
+                return;
             }
             AgentEvent::ToolResult(result) => {
                 self.answered.insert(result.call.clone());
@@ -342,22 +355,28 @@ impl Relay {
     }
 
     fn item(&mut self, item: MultiTurnStreamItem, emit: &mut impl FnMut(AgentEvent)) {
+        // Rig yields nothing more after a turn it refuses but the error.
+        self.go_on(emit);
         match item {
             MultiTurnStreamItem::StreamAssistantItem(Item::Event(event)) => {
                 emit(AgentEvent::Model(event));
             }
-            MultiTurnStreamItem::ToolCall { tool_call } => {
-                self.calls.insert(tool_call.id.clone(), tool_call);
-            }
-            // Rig answers some calls without dispatching them, as one whose
-            // arguments are not a JSON object; no hook sees those results.
+            // Rig's tool items are its committed history, so every call has
+            // one, including those answered without dispatching them (as one
+            // whose arguments are not a JSON object), which no hook sees.
             MultiTurnStreamItem::ToolResult { tool_result }
-                if self.calls.contains_key(&tool_result.call)
-                    && self.answered.insert(tool_result.call.clone()) =>
+                if self.answered.insert(tool_result.call.clone()) =>
             {
                 emit(AgentEvent::ToolResult(tool_result));
             }
             _ => {}
+        }
+    }
+
+    /// Reports the end of the last turn, now that the run goes on with it.
+    fn go_on(&mut self, emit: &mut impl FnMut(AgentEvent)) {
+        if let Some(ending) = self.ending.take() {
+            emit(ending);
         }
     }
 }

@@ -21,7 +21,10 @@ reason, and its tool results only once every call of a turn has returned.
 `run` adds a hook to the runner that observes those as Rig settles them
 (`on_outcome`), and reports them in that order among the stream's events.
 Rig answers some calls without dispatching them, such as one whose arguments
-are not a JSON object; their results come from the stream instead.
+are not a JSON object; their results come from the stream instead, whose tool
+items are Rig's committed history. Rig reports an outcome for every turn
+whose answer arrived, including one the run then refuses, so a turn's end is
+reported only once the run goes on with it.
 
 A run is fully described by its events. `TurnFold` folds them into the
 messages they add to the history, and anyone folding the same events, in
@@ -39,7 +42,7 @@ A tool result is the message Rig commits for the call
 (`AgentEvent::tool_result`).
 
 The fold checks each turn's events as Rig checks a relayed stream, with
-`Transcript::push`, and refuses one Rig's stream could not have produced,
+`StreamRecord::push`, and refuses one Rig's stream could not have produced,
 such as a fragment of a part that never started. Events from elsewhere are
 checked before they are folded.
 

@@ -568,7 +568,7 @@ A single-block submission looks like the current user message.
   part's end carries, in the parts' positions, so no participant
   accumulates the stream itself; fragments only feed a preview of the parts
   still streaming. The fold checks each turn's events as Rig checks a
-  relayed stream (`Transcript::push`): an event Rig's stream could not have
+  relayed stream (`StreamRecord::push`): an event Rig's stream could not have
   produced after the turn's events so far, such as a fragment of a part
   that never started, is invalid host data. Provider payloads Rig does not
   model are not forwarded.

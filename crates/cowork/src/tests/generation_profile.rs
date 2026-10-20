@@ -70,7 +70,10 @@ struct Committed(Arc<std::sync::Mutex<Vec<Message>>>);
 
 impl AgentHook for Committed {
     async fn on_run_settled(&self, _: &HookContext, event: RunSettled<'_>) {
-        *self.0.lock().unwrap() = event.messages.map(<[Message]>::to_vec).unwrap_or_default();
+        *self.0.lock().unwrap() = event
+            .messages
+            .map(|messages| messages.iter().map(|message| (**message).clone()).collect())
+            .unwrap_or_default();
     }
 }
 fn setting<T: std::str::FromStr>(key: &str, default: &str) -> T
@@ -404,7 +407,7 @@ fn generation_profile() {
                     let committed = Committed::default();
                     let result = async {
                         let model = Ollama::from_env()?.native_completion("qwen3.8:27b");
-                        // rig-core 0.44 native Chat: think top-level, options merged.
+                        // rig-core 0.45 native Chat: think top-level, options merged.
                         let runner = AgentBuilder::new(model).additional_params(serde_json::json!({
                             "think": reasoning, "options": {"num_ctx": 4096, "num_predict": num_predict}
                         })).build().prompt(Message::user(PROMPT)).add_hook(committed.clone());

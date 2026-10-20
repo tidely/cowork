@@ -273,7 +273,9 @@ impl AgentHook for Recorder {
     }
 
     async fn on_run_settled(&self, _: &HookContext, event: RunSettled<'_>) {
-        *self.0.lock().unwrap() = event.messages.map(<[Message]>::to_vec);
+        *self.0.lock().unwrap() = event
+            .messages
+            .map(|messages| messages.iter().map(|message| (**message).clone()).collect());
     }
 }
 
@@ -353,4 +355,61 @@ async fn folding_a_runs_events_rebuilds_what_rig_commits() {
         .map(|result| matches!(result, UserContent::ToolResult(result) if result.is_error))
         .collect::<Vec<_>>();
     assert_eq!(errors, [true, false, true]);
+}
+
+/// Stops the run at the end of its first model turn, and keeps the
+/// messages it commits.
+#[derive(Clone, Default)]
+struct Stopper(Recorder);
+
+impl AgentHook for Stopper {
+    async fn on_model_turn_finished(
+        &self,
+        _: &HookContext,
+        _: rig::agent::ModelTurnFinished<'_>,
+    ) -> rig::agent::ModelTurnAction {
+        rig::agent::ModelTurnAction::stop("Enough.")
+    }
+
+    async fn on_run_settled(&self, context: &HookContext, event: RunSettled<'_>) {
+        self.0.on_run_settled(context, event).await;
+    }
+}
+
+/// Rig reports the outcome of a turn whose answer arrived even when the run
+/// then refuses it; such a turn's end is not reported, as Rig never commits
+/// its reply.
+#[tokio::test]
+async fn a_refused_turn_does_not_end() {
+    let model = MockCompletionModel::from_stream_turns([vec![
+        MockStreamEvent::Text("Done.".into()),
+        MockStreamEvent::FinalResponse(mock_final_with_total_tokens(10)),
+    ]]);
+    let stopper = Stopper::default();
+    let agent = AgentBuilder::new(model).build();
+    let prompt = Message::user("Hi");
+    let mut events = Vec::new();
+    run(
+        agent.prompt(prompt.clone()).add_hook(stopper.clone()),
+        |event| events.push(event),
+    )
+    .await
+    .expect_err("the hook stops the run");
+
+    let mut fold = TurnFold::default();
+    let replayed = std::iter::once(prompt)
+        .chain(
+            fold_all(&mut fold, &events)
+                .into_iter()
+                .filter_map(|folded| folded.message),
+        )
+        .collect::<Vec<_>>();
+    let committed = stopper
+        .0
+        .0
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("the run settled");
+    assert_eq!(replayed, committed);
 }
