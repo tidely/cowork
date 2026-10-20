@@ -1,8 +1,8 @@
 # Language models
 
 The new provider stack lives alongside Cowork's Rig integration. Cowork does not
-use these crates yet; they introduce no agent loop, database, or sharing protocol
-changes.
+use these crates yet; its agent loop, database, and sharing protocol are unchanged.
+The examples exercise both individual providers and the new session runtime.
 
 ## Examples
 
@@ -135,3 +135,42 @@ controls are available through `anthropic-types::MessagesRequest`. Signed
 thinking replay survives the shared message envelope. See
 [the client documentation](../providers/anthropic/client/README.md) for the
 supported subset and transport behavior.
+
+## Minimal agent loop
+
+The new [agent-runtime](../agent-runtime/README.md) also provides a session driver
+with input queues, steering, run cancellation, host approval policy, conversation
+commitment, and ordered events. Its [session example](examples/agent_session.rs)
+uses the same providers and tool primitives:
+
+```text
+cargo run -p language-models --example agent_session
+```
+
+The session example uses the managed `Agent::builder`, `prompt`, `compact`, and
+`close` API, with a reusable `AgentDefinition` for its prompt, tool selection,
+permissions, and thinking settings. It hardcodes Ollama at `http://localhost:11434`, `qwen3.8:27b` with
+thinking disabled, and saved-session reuse at `/tmp/cowork-agent-session`; it
+reads no environment variables. It explicitly allows its `add` tool, saves JSONL
+transcript events, requests manual compaction, and asks a follow-up question.
+Compaction preserves the full transcript. Agent operations enqueue writes without
+waiting for a durable commit. Cowork still uses Rig; app integration remains
+separate work.
+
+[The agent loop example](examples/agent_loop.rs) registers an `add` tool, sends
+its definition with a request, dispatches completed tool calls through
+`ToolDispatch`, and sends correlated results back on the next model turn.
+The loop takes provider and dispatcher trait objects, so the same code can use
+another provider or a dispatcher wrapped with host permissions.
+
+```text
+OLLAMA_MODEL=<installed-model> cargo run -p language-models --example agent_loop
+```
+
+`OLLAMA_URL` optionally changes the default `http://localhost:11434`. The selected
+model needs tool-calling support. Calls run sequentially; errors become model
+feedback with `is_error: true`. Complete assistant messages are retained,
+including native thinking replay. The example stops before dispatch on malformed
+arguments or incomplete, truncated, refused, or unrecognized completion outcomes,
+and limits the conversation to eight model turns. It collects model and tool
+streams instead of displaying their progress.

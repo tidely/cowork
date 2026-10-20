@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "crates/agent",
+    "crates/agent-input",
+    "crates/agent-runtime",
     "crates/cowork",
     "crates/draft",
     "crates/language-model",
@@ -25,6 +27,8 @@ edition = "2024"
 [workspace.dependencies]
 provider-sse = { path = "crates/provider-sse" }
 agent = { path = "crates/agent" }
+agent-input = { path = "crates/agent-input" }
+agent-runtime = { path = "crates/agent-runtime" }
 draft = { path = "crates/draft" }
 sandbox = { path = "crates/sandbox" }
 tools = { path = "crates/tools" }
