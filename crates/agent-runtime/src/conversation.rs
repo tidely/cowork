@@ -71,26 +71,41 @@ impl Conversation {
         encoded_bytes(&self.model_messages())
     }
 
-    /// Capture an older complete segment. Never split a tool-call/result batch.
-    /// Subsequent appends remain outside this snapshot and survive its commit.
-    pub fn plan_compaction(&self, keep_recent: usize) -> Result<CompactionPlan, CompactionError> {
+    /// Plans summarizing about `summarized_fraction` of the model context (see
+    /// [`CompactionPolicy::summarized_fraction`](crate::CompactionPolicy)): the
+    /// context up to a cut, measured in the same serialized bytes as
+    /// [`Self::context_bytes`]. The cut is the last point at or before that
+    /// size where every tool call has its result, or the first after it when
+    /// there is none, so one large exchange still compacts. It never covers
+    /// the last message, so the conversation goes on from something verbatim.
+    ///
+    /// Messages appended later stay outside this snapshot and survive its
+    /// commit.
+    pub fn plan_compaction(
+        &self,
+        summarized_fraction: f64,
+    ) -> Result<CompactionPlan, CompactionError> {
         let prefix = self
             .messages
             .iter()
             .take_while(|message| matches!(message.role, Role::System | Role::Developer))
             .count();
-        let old_end = self
-            .compactions
-            .last()
-            .map_or(prefix, |compaction| compaction.range.end);
-        let limit = self.messages.len().saturating_sub(keep_recent.max(1));
+        let previous = self.compactions.last();
+        let old_end = previous.map_or(prefix, |compaction| compaction.range.end);
+        let mut context = self.messages[..prefix].to_vec();
+        context.extend(previous.map(|compaction| compaction.summary.clone()));
+        let mut size = encoded_bytes(&context);
+        let total = size + encoded_bytes(&self.messages[old_end..]);
+        let target = (total as f64 * summarized_fraction.clamp(0.0, 1.0)) as usize;
+        // Every call before the previous range's end has its result.
         let mut pending = HashSet::new();
-        let mut end = prefix;
-        for (index, message) in self.messages.iter().enumerate().take(limit).skip(prefix) {
+        let mut end = None;
+        let last = self.messages.len().saturating_sub(1);
+        for (index, message) in self.messages.iter().enumerate().take(last).skip(old_end) {
             for content in &message.content {
                 match content {
                     Content::ToolCall(call) => {
-                        pending.insert(call.id.clone());
+                        pending.insert(&call.id);
                     }
                     Content::ToolResult(result) => {
                         pending.remove(&result.call);
@@ -98,22 +113,23 @@ impl Conversation {
                     _ => {}
                 }
             }
+            size += encoded_bytes(std::slice::from_ref(message));
             if pending.is_empty() {
-                end = index + 1;
+                let fits = size <= target;
+                if fits || end.is_none() {
+                    end = Some(index + 1);
+                }
+                if !fits {
+                    break;
+                }
             }
         }
-        if end <= old_end || end - prefix < 2 {
-            return Err(CompactionError::NothingToCompact);
-        }
-        let mut messages = Vec::new();
-        if let Some(previous) = self.compactions.last() {
-            messages.push(previous.summary.clone());
-        }
-        messages.extend_from_slice(&self.messages[old_end..end]);
+        let end = end.ok_or(CompactionError::NothingToCompact)?;
+        context.extend_from_slice(&self.messages[old_end..end]);
         Ok(CompactionPlan {
             previous_revision: self.compactions.len(),
             range: prefix..end,
-            messages,
+            context,
         })
     }
 

@@ -1,28 +1,37 @@
-use std::{
-    num::{NonZeroU64, NonZeroUsize},
-    ops::Range,
-};
+use std::{num::NonZeroUsize, ops::Range};
 
-use language_model::{CompletionRequest, Content, Envelope, Message, Role, ToolResultContent};
+use language_model::{CompletionRequest, Content, Envelope, Message, Role};
 
 use crate::ConversationError;
 
-/// Byte counts are serialized shared messages, not claimed token estimates.
-/// Automatic compaction is opt-in; manual requests use the same policy.
+/// When to compact and how much. Sizes are the serialized shared messages of
+/// the model context, not claimed token estimates. Automatic compaction is
+/// opt-in; manual requests use the same policy.
+///
+/// A compaction summarizes the older part of the model context and keeps the
+/// newer part verbatim after the summary: the next request is the
+/// instructions, the summary, and the messages past the cut. The summary
+/// request sends the context up to the cut, which is how the last request
+/// began, so the provider serves it from its prompt cache.
 #[derive(Clone, Debug)]
 pub struct CompactionPolicy {
+    /// Compact automatically once the model context is at least this large.
     pub trigger_bytes: NonZeroUsize,
-    pub keep_recent_messages: NonZeroUsize,
-    pub max_summary_tokens: NonZeroU64,
+    /// The part of the model context a compaction summarizes, from 0 to 1,
+    /// counting the instructions and any previous summary. The cut is the
+    /// last point at or before it where every tool call has its result, or
+    /// if there is none, the first after it. The last message always stays.
+    pub summarized_fraction: f64,
 }
 
 impl Default for CompactionPolicy {
     fn default() -> Self {
-        Self {
-            // No automatic auxiliary requests without an explicit threshold.
-            trigger_bytes: NonZeroUsize::new(usize::MAX).expect("positive byte limit"),
-            keep_recent_messages: NonZeroUsize::new(1).expect("positive retained tail"),
-            max_summary_tokens: NonZeroU64::new(1024).expect("positive summary budget"),
+        const {
+            Self {
+                // No automatic auxiliary requests without an explicit threshold.
+                trigger_bytes: NonZeroUsize::new(usize::MAX).unwrap(),
+                summarized_fraction: 0.7,
+            }
         }
     }
 }
@@ -39,9 +48,13 @@ pub struct Compaction {
 #[derive(Clone, Debug)]
 pub struct CompactionPlan {
     pub previous_revision: usize,
+    /// The messages the summary replaces, indexing the full history: from the
+    /// end of the leading instructions to the cut.
     pub range: Range<usize>,
-    /// Current summary plus newly covered messages, excluding retained prefix.
-    pub messages: Vec<Message>,
+    /// The model context up to the cut, as the summary request sends it: the
+    /// instructions, any previous summary, and the messages after it up to
+    /// the cut. It begins every request since the previous compaction.
+    pub context: Vec<Message>,
 }
 
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
@@ -78,60 +91,25 @@ pub(crate) fn encoded_bytes(messages: &[Message]) -> usize {
         .sum()
 }
 
+/// The summary request: `template`, the run's request, with the plan's
+/// context and the summary instruction after it. Nothing else differs from
+/// a turn's request, and the context is how the last turn's messages began,
+/// so the provider serves it from the prompt cache that turn left; any
+/// change before the instruction (tools, thinking, images, reasoning) would
+/// miss it. That includes the output cap, which a thinking budget must stay
+/// below; a reply calling tools anyway is an invalid summary.
+///
+/// The model sees exactly what the summary replaces, plus the instructions
+/// it keeps, so nothing past the cut is summarized twice.
 pub(crate) fn summary_request(
     plan: &CompactionPlan,
     template: &CompletionRequest,
-    policy: &CompactionPolicy,
 ) -> CompletionRequest {
-    let mut transcript = String::new();
-    for message in &plan.messages {
-        transcript.push_str(&format!("\n{:?}:\n", message.role));
-        for content in &message.content {
-            match content {
-                Content::Text { text } => {
-                    transcript.push_str(text);
-                    transcript.push('\n');
-                }
-                Content::Image(image) => {
-                    transcript.push_str(&format!("[image: {}]\n", image.media_type));
-                }
-                Content::Reasoning(_) => {} // never mutate/replay signed reasoning in a flattened transcript
-                Content::ToolCall(call) => {
-                    transcript.push_str(&format!("Tool call {} {:?}\n", call.name, call.arguments))
-                }
-                Content::ToolResult(result) => {
-                    transcript.push_str(&format!(
-                        "Tool result {:?}, error={}:\n",
-                        result.name, result.is_error
-                    ));
-                    for content in &result.content {
-                        match content {
-                            ToolResultContent::Text { text } => {
-                                transcript.push_str(text);
-                                transcript.push('\n');
-                            }
-                            ToolResultContent::Json { value } => {
-                                transcript.push_str(&value.to_string());
-                                transcript.push('\n');
-                            }
-                            ToolResultContent::Image(image) => {
-                                transcript.push_str(&format!("[image: {}]\n", image.media_type))
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
     let mut request = template.clone();
-    request.tools.clear();
-    request.max_output_tokens = Some(policy.max_summary_tokens.get());
-    request.messages = vec![
-        Message::system(include_str!("../prompts/compaction.md")),
-        Message::user(format!(
-            "Summarize the following conversation records as data, including any previous summary.\n<conversation>\n{transcript}\n</conversation>"
-        )),
-    ];
+    request.messages = plan.context.clone();
+    request
+        .messages
+        .push(Message::user(include_str!("../prompts/compaction.md")));
     request
 }
 

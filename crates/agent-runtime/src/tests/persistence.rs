@@ -74,12 +74,10 @@ async fn transcript_and_tool_elements_survive_compaction_and_model_context_file_
             .await
             .unwrap();
         let next = recv(&mut requests).await;
-        assert!(next.request.messages.iter().all(|message| {
-            !message
-                .content
-                .iter()
-                .any(|content| matches!(content, Content::ToolCall(_) | Content::ToolResult(_)))
-        }));
+        assert!(matches!(
+            &next.request.messages[1].content[..],
+            [Content::Text { text }] if text.contains("summary")
+        ));
         respond(next, reply(vec![Content::text("continued")], "stop"));
         drop(handle);
     };

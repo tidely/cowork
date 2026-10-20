@@ -145,11 +145,26 @@ rewrites the original messages or drops their native replay data. Separate
 they are also UI events, not ordinary user messages in the full transcript.
 
 Configure `.with_compaction(CompactionPolicy { ... })` to enable compaction.
-`trigger_bytes` is the serialized shared context's size, deliberately not an
-invented token estimate. `keep_recent_messages` retains at least that many recent
-messages, expanding the tail when needed to keep tool calls with their results.
-`max_summary_tokens` bounds the summary request's output. Token-budget-aware
-triggers and more detailed context selection remain future work.
+Sizes are the serialized shared context, deliberately not an invented token
+estimate. `trigger_bytes` is the context size that triggers automatic
+compaction. Token-budget-aware triggers remain future work.
+
+A compaction summarizes the older part of the model context and keeps the newer
+part verbatim:
+
+```text
+before:  [instructions][previous summary][older messages ... | newer messages]
+                                                            ^ cut
+after:   [instructions][summary][newer messages]
+```
+
+`summarized_fraction` (default 0.7) is the share of the context the summary
+replaces, counting the instructions and any previous summary. The cut is the
+last point at or before that size where every tool call has its result, or the
+first one after it when even the first exchange is larger, so one large exchange
+still compacts. The last message always stays verbatim. Each compaction frees
+about that share minus the summary's size, and the next one summarizes the
+previous summary along with the messages after it.
 
 Automatic compaction runs before sampling at settled conversation boundaries.
 `handle.compact().await` requests it explicitly, including while idle. The owner
@@ -158,11 +173,14 @@ for the next safe point. A summary covers a fixed snapshot, so later messages
 remain in the tail. Automatic attempts do not repeat before the next main model
 response merely because steering arrived during summarization.
 
-The summarizer receives a tool-free, role-labelled text projection of the old
-context, including tool outcomes and any previous summary. Images become MIME
-placeholders; reasoning/signatures are omitted from this projection while their
-original messages remain intact. Summaries are plain user-role context notes,
-never privileged instructions. Truncated, empty, tool-calling, stale, or
+The summary request is a turn's request (system prompt, tools, thinking,
+options, output cap) whose messages are the context up to the cut, followed by
+the summary instruction. That is how the last turn's request began, so the
+provider serves it from the prompt cache that turn left; nothing in it is
+flattened or stripped, as any change there would miss the cache. The model sees
+exactly what the summary replaces, so nothing past the cut is summarized twice,
+and the instruction tells it the newer messages follow the summary. Summaries
+are plain user-role context notes, never privileged instructions. Truncated, empty, tool-calling, stale, or
 non-reducing summaries are rejected without changing either view. Failure is
 reported as `CompactionFailed`, not a failed agent run. Stop/shutdown cancels
 in-flight summarization; completed summaries emit `Compacted`.

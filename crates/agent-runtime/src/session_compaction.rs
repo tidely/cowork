@@ -46,7 +46,7 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
         self.last_compaction_attempt = Some(stamp);
         let plan = match self
             .conversation
-            .plan_compaction(policy.keep_recent_messages.get())
+            .plan_compaction(policy.summarized_fraction)
         {
             Ok(plan) => plan,
             Err(error) => {
@@ -56,7 +56,7 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
                 return false;
             }
         };
-        let request = summary_request(&plan, &self.request, policy);
+        let request = summary_request(&plan, &self.request);
         if let Some(active) = &mut self.active {
             active.compaction_attempted = true;
         }
