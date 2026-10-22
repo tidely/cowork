@@ -3,17 +3,18 @@
 //! through `call_tool`. Instructions are explicit because small local models
 //! need them to be.
 //!
-//! cargo test -p language-models --test live_agent -- --ignored --nocapture
+//! cargo test -p agent --test live_agent -- --ignored --nocapture
 
 use std::sync::{Arc, Mutex};
 
-use agent_runtime::{
-    Agent, AgentDefinition, DynamicToolChange, EventKind, RequestKind, ToolPermissions,
+use agent::tool::{Tool, ToolCall, ToolError};
+use agent::{Agent, AgentDefinition, DynamicToolChange, EventKind, RequestKind, ToolPermissions};
+use agent::{
+    Ollama,
+    model::{LanguageModel, Thinking},
 };
-use language_models::{LanguageModel, Ollama, Thinking};
 use schemars::JsonSchema;
 use serde::Deserialize;
-use tool_runtime::{Tool, ToolCall, ToolError};
 
 #[derive(Deserialize, JsonSchema)]
 struct Numbers {

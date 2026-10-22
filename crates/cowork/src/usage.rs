@@ -3,16 +3,16 @@
 
 use std::time::{Duration, SystemTime};
 
+use agent::model::Usage;
 use chrono::{DateTime, Datelike as _, Days, Local, Months, NaiveTime, TimeDelta, Timelike as _};
 use gpui::{Hsla, SharedString};
 use gpui_component::Theme;
-use rig::completion::Usage;
 
 use crate::Thread;
 
 /// The tokens `usage` counts: the provider's total, or the sum of its input
 /// and output counts when it reports no total.
-pub(crate) fn usage_tokens(usage: Usage) -> u64 {
+pub(crate) fn usage_tokens(usage: &Usage) -> u64 {
     match usage.total_tokens {
         Some(tokens) => tokens,
         None => usage.input_tokens.unwrap_or(0) + usage.output_tokens.unwrap_or(0),
@@ -699,15 +699,15 @@ mod tests {
 
     #[test]
     fn usage_tokens_falls_back_to_input_and_output() {
-        let usage = |input: Option<u64>, output: Option<u64>, total: Option<u64>| {
-            Usage::new()
-                .input_tokens(input)
-                .output_tokens(output)
-                .total_tokens(total)
+        let usage = |input: Option<u64>, output: Option<u64>, total: Option<u64>| Usage {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: total,
+            ..Usage::default()
         };
-        assert_eq!(usage_tokens(usage(Some(10), Some(5), Some(20))), 20);
-        assert_eq!(usage_tokens(usage(Some(10), Some(5), None)), 15);
-        assert_eq!(usage_tokens(usage(Some(10), None, None)), 10);
-        assert_eq!(usage_tokens(Usage::default()), 0);
+        assert_eq!(usage_tokens(&usage(Some(10), Some(5), Some(20))), 20);
+        assert_eq!(usage_tokens(&usage(Some(10), Some(5), None)), 15);
+        assert_eq!(usage_tokens(&usage(Some(10), None, None)), 10);
+        assert_eq!(usage_tokens(&Usage::default()), 0);
     }
 }

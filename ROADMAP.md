@@ -24,8 +24,9 @@ owner's own feature notes.
 
 ## Provider-independent agent runtime
 
-Build the replacement for the Rig integration around the new `language-model`,
-`language-models`, provider, and `tool-runtime` crates. These are responsibility
+The agent stack replaced the Rig integration: `language-model`, the provider
+crates, `tool-runtime`, `agent-input`, and `agent-runtime`, re-exported by the
+`agent` crate. These are responsibility
 boundaries, not a requirement to create a separate crate for every item. Existing
 Cowork behavior should inform the implementation; some of these mechanisms
 already exist in the app but have not moved into the new stack.
@@ -33,8 +34,8 @@ already exist in the app but have not moved into the new stack.
 The [agent-input layer](crates/agent-input/README.md) covers source-independent
 queueing, steering, interjection, and interrupt follow-ups. It is integrated into
 the new [agent-runtime](crates/agent-runtime/README.md) session driver. The runtime
-is exercised by `language-models/examples/agent_session.rs`; Cowork still uses
-the Rig integration. Input queues own pending delivery; the runtime owns running
+is exercised by `crates/agent/examples`, and Cowork runs one session per
+thread on it. Input queues own pending delivery; the runtime owns running
 work, conversation history, and execution-policy coordination.
 
 The managed `Agent` API now owns driver/log tasks and input-bound completion

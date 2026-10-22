@@ -283,10 +283,12 @@ impl Cowork {
     /// called for a thread that left the sidebar and when a run of such a
     /// thread ends, which adds that run's time. An archived thread keeps its
     /// scratch folder, so restoring it continues where it was; its commands
-    /// end with its run.
+    /// end with its run, as does its agent session.
     pub(crate) fn settle_retired_thread(&mut self, thread: &Entity<Thread>, cx: &App) {
         let thread = thread.read(cx);
         let thread_id = thread.instance_id;
+        // Its session ends with it; restoring the thread starts another.
+        self.retire_agent(thread_id);
         if self
             .thread_store
             .read(cx)

@@ -6,16 +6,18 @@ Yrs document, and the protocol between host and collaborators.
 
 ## Status
 
-The LLM transcript is one append-only vector of entries: original Rig messages
-and accepted compaction summaries. A summary's position defines the prefix it
-replaces; requests use the latest summary and the messages after it. Indices count
-both variants and never change. UUIDs, run starts, and unfinished events belong to
-shared timeline run records. A run starts before its optional pre-run summaries;
-its first ordinary entry is its prompt. Each resident timeline entry holds its shared record and
+The LLM transcript is the host's agent session's conversation: an append-only
+vector of entries (inputs, context notes, replies, and tool results) and a
+ledger of accepted compactions, each replacing the entries before its end for
+later requests, and kept with the number of entries it was accepted at.
+Indices never change. UUIDs, run starts, and unfinished previews belong to
+shared timeline run records. A run's first input entry is its prompt, possibly
+after a context note. Each resident timeline entry holds its shared record and
 local presentation in separate fields; records and views share a lifetime while
 all history stays in memory. Only records cross the sharing boundary. Welcome
-snapshots carry the whole `Transcript` as one `Json<Transcript>` value, including
-original messages and compactions, plus the run records and their JSON-wrapped pending events. All history and local views remain
+snapshots carry the whole transcript as one `Json<TranscriptRecord>` value, its
+entries and compactions in the agent's versioned records, plus the run records
+and their pending previews. All history and local views remain
 in memory; there is no transcript offloading or history paging.
 
 The visible timeline is a local, pure projection of these records, pending
@@ -84,8 +86,8 @@ including after regrant; snapshots and resets merge only at a matching epoch.
 The host sanitizes read-only presence and clears stale announcements on
 downgrade. Stopping sharing cleans peers and unfinished uploads before
 clearing membership. Denial feedback is routed to the originating thread.
-Agent events are checked on arrival in the order Rig's stream could produce
-them.
+Committed entries are checked on arrival as the session's own conversation
+checked them.
 Tool calls outside a short always-allowed list wait for the host or an
 `Admin` peer to allow or deny them, and `run_command`, `write_file`, and `request_permissions` for the
 host alone; commands within the project auto-approval level run without asking, as does
@@ -551,37 +553,34 @@ A single-block submission looks like the current user message.
 - The host keeps a **transcript** of ordinary agent runs, including prompts,
   reasoning, tool calls, and tool results. Between compactions each request
   extends the previous one exactly, keeping the provider's prompt cache
-  valid. After compaction, requests use the summary followed by transcript
-  messages after that summary's entry. All accepted summaries are retained;
-  coverage follows from append order, without a separate boundary field. The full transcript remains available for
-  display and sharing. A run that is stopped or fails keeps its prompt and
+  valid. After compaction, requests use the latest summary followed by the
+  entries after the point it covers; the session's context notes and
+  steering never change an earlier request. All accepted summaries are
+  retained, and no entry is removed. The full transcript remains available
+  for display and sharing. A run that is stopped or fails keeps its prompt and
   every turn it completed.
 - Every participant mirrors the transcript and the prompt names. The
-  host runs Rig's agent and forwards what it reports, as it happens, in
-  `AgentEvent`: Rig's stream events (each part of the reply starting,
-  growing by fragments, and ending with its content), the end of each model
-  turn with its usage and the origin and stop reason Rig gave it, and each
-  tool's result as soon as that tool returns. Every event travels on its own
-  as it happens. Everyone, the host included, folds them the same way (the
-  agent crate's `TurnFold`) into the transcript, which comes out exactly as
-  Rig's agent committed the run. Each reply is the content Rig finalized, which every
-  part's end carries, in the parts' positions, so no participant
-  accumulates the stream itself; fragments only feed a preview of the parts
-  still streaming. The fold checks each turn's events as Rig checks a
-  relayed stream (`StreamRecord::push`): an event Rig's stream could not have
-  produced after the turn's events so far, such as a fragment of a part
-  that never started, is invalid host data. Provider payloads Rig does not
-  model are not forwarded.
+  host runs one agent session per thread (the `agent` crate's
+  `AgentSession`) and forwards what it reports for a run, as it happens, in
+  `AgentEvent`s carrying a `RunEvent`: previews of the reply's text and
+  reasoning, each entry the session commits with its index (the run's
+  input and context notes, each complete reply, each tool's result as soon
+  as the tool returns), the tokens each request used, and compactions
+  starting, being accepted, or failing. Everyone, the host included, folds
+  them the same way into a replica of the session's conversation, which
+  refuses an entry the session's conversation could not have committed at
+  that index, such as a result no call waits for. A reply joins the
+  transcript whole, as the provider completed it; previews only show it
+  while it streams, and tool calls show once it is complete.
 - What an agent message shows (its thinking, text, tool calls with their
   results, and replies to comments, in the order the agent produced them)
-  is never sent. It is a function of Rig
-  messages and compaction entries: the transcript entries after its prompt,
-  up to the next run's start, followed by the message the run is
-  folding, as far as it has come, as Rig's stream accumulator has it. That
-  message is the fold of the run's **pending events**: those folded since
-  its output last joined the transcript. A run that is stopped or fails
-  mid-turn keeps its pending events, since that output never joins the
-  transcript. Comment replies
+  is never sent. It is a function of transcript entries and compactions:
+  the entries after its prompt, up to the next run's start, with the
+  compactions accepted among them, followed by the reply being previewed,
+  as far as it has come. That reply is the fold of the run's **pending
+  events**: the previews since its last reply joined the transcript. A run
+  that is stopped or fails mid-reply keeps its pending events, since that
+  output never joins the transcript. Comment replies
   come from `respond_to_comment` calls, with ids derived from the message
   and call, so every participant names them alike. Only the **response**,
   the text after the agent's last tool call, can be
@@ -591,28 +590,29 @@ A single-block submission looks like the current user message.
   "Worked for" once it ends, with whether it was stopped or failed. That
   line and whether it is open are local. A failure message is kept apart
   from the agent's output, and shown only when there is none.
-- The transcript contains Rig messages and compactions, sent together as one
-  JSON value; individual live messages and agent events also travel as JSON, which postcard cannot represent directly. Their encoding is
-  Rig's, so upgrading Rig bumps the protocol version. A prompt joins the
-  transcript with `AgentStarted`, including its files' content, images as
-  base64, so attachment bytes also travel inline besides as
-  `AttachmentData`. Summary instructions and summary responses never become
-  ordinary Rig messages; accepted summaries append as compaction entries.
-  For pre-run compaction, `AgentPreparing` creates the active response first,
-  without recording the upcoming prompt. `CompactionFinished` appends a successful
-  summary, then `AgentStarted` records the prompt. Failure or cancellation still
-  records the submitted prompt before ending the run. A `Welcome` carries the
-  whole `Json<Transcript>` (one ordered vector) and, for each agent
+- The transcript's entries and compactions are sent in the agent's
+  versioned records (message envelopes), together as one JSON value;
+  individual committed entries and compactions also travel as JSON, which
+  postcard cannot represent directly. `AgentStarted` creates the run's
+  message; its prompt joins the transcript as the run's first input entry,
+  including its files' content, images as base64, so attachment bytes also
+  travel inline besides as `AttachmentData`. Summary requests and their
+  replies never become entries; an accepted summary joins the compaction
+  ledger, at a point where every call has its result. The session compacts
+  when a request reports the context past the user's threshold, or before
+  a run's first request when the run starts on a full context. A `Welcome`
+  carries the whole `Json<TranscriptRecord>` and, for each agent
   message, where its run starts, its pending events, and whether its run
   has ended. The joiner folds each run's pending events, which rebuilds the
   message it was folding exactly, and so shows what everyone else does. For
   the running message, it keeps that fold, so someone joining mid-turn
   folds the rest of it. Before that, the
-  joiner checks that the snapshot fits its transcript: every prompt is a
-  user message there, run starts increase, all timeline UUIDs are unique,
-  every compaction has a nonempty summary and preceding history, only the last run can still be
-  generating (and only that run may still await its prompt, with no output), and no run's pending events complete a message the
-  transcript lacks. A frame larger than 1 GiB cannot be sent; the
+  joiner rebuilds the transcript, checking every entry and compaction as
+  they were checked when first applied, and checks that the snapshot fits
+  it: run starts increase within it, all timeline UUIDs are unique, only the
+  last run can still be generating (and only that run may still await its
+  prompt, with no output), and the running run's previews, waiting call,
+  and compaction are ones its conversation allows. A frame larger than 1 GiB cannot be sent; the
   collaborator is then disconnected.
 - Each block's attachments stay with that block, using today's encoding.
 - Mentions (once supported) render as `@Name`.
@@ -660,8 +660,8 @@ The host emits `ToolApprovalRequested` for a waiting call. Only the host
 may decide commands, file writes, and permission grants; Admin peers may
 decide other tools. Local clicks and `DecideToolCall` use the same checked
 path. The first decision wins and emits `ToolApprovalResolved`; stale
-requests change nothing. A denial returns a skipped tool result and the
-run continues. Ending a run drops outstanding requests. Snapshots include
+requests change nothing. A denial commits a refused tool result and the
+run continues. Ending a run settles outstanding calls as not run. Snapshots include
 the waiting call; participants reject requests for calls the reply did not
 make or that already returned.
 
@@ -780,7 +780,7 @@ This is independent of the draft document and is the first feature to build.
 - **Host disconnects**: the session ends and collaborators' copies of the
   thread are removed, as today. Host migration is out of scope.
 - **Invalid host data**: invalid draft snapshots, inconsistent transcript/run
-  snapshots, or invalid Rig JSON in transcript messages or agent events are
+  snapshots, or invalid agent records in transcript entries or run events are
   protocol errors. The collaborator removes its mirrored thread; the
   application stays open. `Welcome` validates draft and transcript/run state
   before installation.
@@ -920,11 +920,8 @@ can still be reported. Runtime permission denials use the separate
 | `PendingSubmissions`                         | Full accepted pending groups and current submission sequence; IDs fence cancellation                                                                                                                                                                                                                                                                         |
 | `PendingDelivered`                           | Removes the oldest pending ID as its run starts and publishes its user group; `AgentStarted` follows                                                                                                                                                                                                                                                         |
 | `UserMessage`                                | A delivered immediate submission with creators and attachment references instead of bytes; advances the submission sequence                                                                                                                                                                                                                                  |
-| `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, with its prompt; and ending, with its duration and whether it completed, was stopped, or failed (with a message)                                                                                                                                                                                                                  |
-| `AgentPreparing`                             | Creates the active response before pre-run compaction; its prompt is recorded by `AgentStarted` after the attempt finishes                                                                                                                                                                                                                                   |
-| `AgentEvent`                                 | What the host's agent reported during a run, which everyone folds into the agent message and transcript                                                                                                                                                                                                                                                      |
-| `CompactionStarted`                          | The active run is generating a summary; mirrored context indicator animates                                                                                                                                                                                                                                                                                  |
-| `CompactionFinished`                         | Ends summary generation; a successful summary appends to the transcript and replaces request context, while `None` preserves the previous context                                                                                                                                                                                                            |
+| `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, whose prompt follows as its first committed input; and ending, with its duration and whether it completed, was stopped, or failed (with a message)                                                                                                                                                                                                                  |
+| `AgentEvent`                                 | A `RunEvent` of the host's session during a run (a preview, a committed entry, usage, or a compaction starting, accepted, or failing), which everyone folds into the agent message and transcript |
 | `PromptNamed`                                | A participant's prompt name, fixed on their first submitted item                                                                                                                                                                                                                                                                                             |
 | `ToolApprovalRequested`                      | A run waits for the named call of its last reply to be allowed or denied                                                                                                                                                                                                                                                                                     |
 | `ToolApprovalResolved`                       | The waiting call was decided; its result follows as an `AgentEvent`                                                                                                                                                                                                                                                                                          |

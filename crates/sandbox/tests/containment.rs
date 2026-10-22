@@ -316,25 +316,19 @@ async fn a_timeout_returns_output_and_stops_child_processes() {
     }
     let root = Root::new("timeout");
     let sandboxes = sandboxes(&root);
-    let mut tools = rig::tool::ToolSet::default();
-    tools.add_tool(sandbox::RunCommand::new(sandboxes, "thread"));
     let started = Instant::now();
-    let result = tools
-        .execute(
-            "run_command",
-            serde_json::json!({
-                "command": "(while true; do echo tick >> \"$TMPDIR/ticks\"; sleep 0.05; done) & echo started; echo diagnostic >&2; wait",
-                "timeout_ms": 300,
-            })
-            .to_string(),
-            &mut rig::tool::ToolContext::new(),
+    let error = sandboxes
+        .run_with(
+            "thread",
+            "(while true; do echo tick >> \"$TMPDIR/ticks\"; sleep 0.05; done) & echo started; echo diagnostic >&2; wait",
+            None,
+            Some(Duration::from_millis(300)),
         )
-        .await;
-    assert_eq!(
-        result.error().unwrap().kind(),
-        rig::tool::ToolErrorKind::Timeout
-    );
-    let feedback = result.output().as_text().unwrap();
+        .await
+        .expect_err("the command times out");
+    let error = agent::tool::ToolError::from(error);
+    assert_eq!(error.kind, agent::tool::ToolErrorKind::Timeout);
+    let feedback = error.message;
     assert!(feedback.contains("timed out after 300 ms"), "{feedback}");
     assert!(feedback.contains("stdout:\nstarted\n"), "{feedback}");
     assert!(feedback.contains("stderr:\ndiagnostic\n"), "{feedback}");

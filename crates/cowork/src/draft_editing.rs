@@ -940,6 +940,7 @@ pub(crate) mod tests {
                         tokio_handle,
                         sandboxes: crate::test_support::unused_sandboxes(),
                         active_generations: HashMap::new(),
+                        agents: HashMap::new(),
                         tokens_used: 0,
                         token_activity: Vec::new(),
                         deleted_chats: 0,

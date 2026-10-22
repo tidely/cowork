@@ -1,10 +1,13 @@
 //! The simplest use of the agent runtime: define an agent, prompt it, and
 //! read its replies. Needs a local Ollama server with `gemma4:e4b`.
 //!
-//! cargo run -p language-models --example prompt
+//! cargo run -p agent --example prompt
 
-use agent_runtime::{Agent, AgentDefinition};
-use language_models::{LanguageModel, Ollama, Thinking};
+use agent::{Agent, AgentDefinition};
+use agent::{
+    Ollama,
+    model::{LanguageModel, Thinking},
+};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {

@@ -22,6 +22,9 @@ impl CommandOutput {
     }
 }
 
+/// The model reads the output as its JSON.
+impl agent::tool::ToolOutput for CommandOutput {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

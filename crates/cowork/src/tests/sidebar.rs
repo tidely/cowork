@@ -17,7 +17,10 @@ fn add_thread(cowork: &Entity<Cowork>, seconds: u64, cx: &mut gpui::VisualTestCo
         let thread = cx.new(|_| test_thread(thread_id, Vec::new(), draft));
         let id = Uuid::new_v4().into_bytes();
         thread.update(cx, |thread, cx| {
-            thread.apply_for_test(agent_started(Uuid::from_bytes(id), None, "prompt"), cx);
+            thread.apply_for_test(
+                ScriptedHost::default().started(Uuid::from_bytes(id), None),
+                cx,
+            );
             thread.apply_for_test(
                 protocol::HostMessage::AgentEnded {
                     id,
@@ -87,7 +90,10 @@ fn usage_statistics_outlast_the_threads_of_an_earlier_session(cx: &mut gpui::Tes
     let used = add_thread(&cowork, 90, cx);
     cowork.update(cx, |cowork, cx| {
         let thread = cowork.thread_store.read(cx).thread(used, cx).unwrap();
-        let usage = Usage::new().total_tokens(100);
+        let usage = Usage {
+            total_tokens: Some(100),
+            ..Usage::default()
+        };
         cowork.record_turn_usage(&thread, usage, SystemTime::now(), Duration::ZERO, cx);
         cowork.save_statistics(cx);
     });
@@ -232,7 +238,10 @@ fn archived_threads_are_restored_or_deleted_from_the_archive(cx: &mut gpui::Test
     cx.update(|window, cx| {
         cowork.update(cx, |cowork, cx| {
             let thread = cowork.thread_store.read(cx).thread(deleted, cx).unwrap();
-            let usage = Usage::new().total_tokens(100);
+            let usage = Usage {
+                total_tokens: Some(100),
+                ..Usage::default()
+            };
             cowork.record_turn_usage(&thread, usage, SystemTime::now(), Duration::ZERO, cx);
             cowork.open_thread(deleted, window, cx);
         })

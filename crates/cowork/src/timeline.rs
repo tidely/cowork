@@ -3,17 +3,12 @@
 
 use std::{ops::Range, time::SystemTime};
 
-use agent::AgentEvent;
+use agent::model::{
+    Content, Message, Reasoning, Role, ToolArguments, ToolCall, ToolCallId, ToolResultContent,
+};
 use draft::AttachmentRecord;
 use gpui::{AppContext, Entity, SharedString};
 use gpui_base::{TextViewState, input::TextareaState};
-use rig::{
-    completion::{
-        AssistantContent, Message as RigMessage,
-        message::{ToolResultContent, UserContent},
-    },
-    message::{CallId, ToolCall},
-};
 use uuid::Uuid;
 
 use crate::{
@@ -21,7 +16,7 @@ use crate::{
     participant::ParticipantId,
     protocol::{self, AgentRun},
     thread_draft::ItemPresence,
-    transcript::TranscriptEntry,
+    transcript::Transcript,
 };
 
 #[derive(Clone, Copy)]
@@ -73,23 +68,23 @@ pub(crate) struct AgentRunRecord {
     /// See [`protocol::AgentMessage::start`].
     pub(crate) start: crate::transcript::TranscriptIndex,
     /// See [`protocol::AgentMessage::pending_events`].
-    pub(crate) pending_events: Vec<protocol::Json<AgentEvent>>,
+    pub(crate) pending_events: Vec<protocol::Preview>,
     pub(crate) run: AgentRun,
 
     /// The tool call the run is waiting for someone to allow or deny. Kept
     /// beside `output` rather than in it, since the output is refolded on
     /// every event. One at most, as the agent runs calls one at a time.
-    pub(crate) awaiting_approval: Option<CallId>,
+    pub(crate) awaiting_approval: Option<ToolCallId>,
 }
 
 /// Local presentation and interaction state, owned beside the shared run record.
 #[derive(Clone)]
 pub(crate) struct AgentMessageUi {
-    /// What the message shows, derived from its run's output as Rig has it;
-    /// see `transcript.rs`.
+    /// What the message shows, derived from its run's output; see
+    /// `transcript.rs`.
     pub(crate) output: AgentOutput,
     /// How much of `output` comes from the run's transcript entries, which
-    /// never change; the rest comes from the message the run is folding.
+    /// never change; the rest comes from the reply being previewed.
     pub(crate) committed: OutputMark,
     /// One local view per folded step, in the same order. Compaction is a
     /// step too, so rendering and collapse never change these indices.
@@ -166,8 +161,8 @@ impl TimelineMessage {
 }
 
 /// What an agent message shows: a function of its run's output alone, the
-/// transcript entries it added followed by the Rig message it is
-/// folding, as far as it has come. Every copy of the thread derives the same
+/// transcript entries it added followed by the reply being previewed, as far
+/// as it has come. Every copy of the thread derives the same
 /// from the same messages; see `AgentOutput::from_transcript`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct AgentOutput {
@@ -238,7 +233,7 @@ pub(crate) struct AgentCommentResponse {
     pub(crate) response_view: Entity<TextViewState>,
 }
 
-/// A tool call the agent made, and what the tool returned, as Rig has them.
+/// A tool call the agent made, and what the tool returned.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AgentToolCall {
     pub(crate) call: ToolCall,
@@ -246,16 +241,40 @@ pub(crate) struct AgentToolCall {
     pub(crate) result: Option<Vec<ToolResultContent>>,
 }
 
+/// A call's arguments as JSON: the object, or the text of arguments that
+/// were not one.
+pub(crate) fn arguments_value(call: &ToolCall) -> serde_json::Value {
+    match &call.arguments {
+        ToolArguments::Object { value } => serde_json::Value::Object(value.clone()),
+        ToolArguments::Invalid { raw } => serde_json::Value::String(raw.clone()),
+    }
+}
+
+/// A call of `name` with `arguments`, under `id`, for previews and tests.
+pub(crate) fn tool_call(id: &str, name: &str, arguments: serde_json::Value) -> ToolCall {
+    ToolCall {
+        id: ToolCallId(id.into()),
+        provider_id: None,
+        name: name.into(),
+        arguments: match arguments {
+            serde_json::Value::Object(value) => ToolArguments::Object { value },
+            other => ToolArguments::Invalid {
+                raw: other.to_string(),
+            },
+        },
+    }
+}
+
 impl AgentToolCall {
     pub(crate) fn arguments_text(&self) -> String {
-        pretty_json(&self.call.function.arguments_value())
+        pretty_json(&arguments_value(&self.call))
     }
 
     /// A quiet description for the collapsed row; raw arguments stay in the details.
     pub(crate) fn description(&self) -> String {
-        match self.call.function.name.as_str() {
+        match self.call.name.as_str() {
             "calculate" => {
-                let arguments = self.call.function.arguments_value();
+                let arguments = arguments_value(&self.call);
                 let calculation = (|| {
                     let a = arguments.get("a")?.as_f64()?;
                     let b = arguments.get("b")?.as_f64()?;
@@ -286,10 +305,10 @@ impl AgentToolCall {
     /// Preview only the first nonempty shell line, never flattening a script
     /// into something that looks like a different command.
     pub(crate) fn command_preview(&self) -> Option<String> {
-        if self.call.function.name.as_str() != "run_command" {
+        if self.call.name != "run_command" {
             return None;
         }
-        let arguments = self.call.function.arguments_value();
+        let arguments = arguments_value(&self.call);
         let command = arguments.get("command")?.as_str()?;
         let mut lines = command
             .lines()
@@ -309,7 +328,7 @@ impl AgentToolCall {
             content
                 .iter()
                 .map(|item| match item {
-                    ToolResultContent::Text(text) => text.text.clone(),
+                    ToolResultContent::Text { text } => text.clone(),
                     ToolResultContent::Json { value } => pretty_json(value),
                     ToolResultContent::Image(_) => "[image]".to_owned(),
                 })
@@ -322,15 +341,11 @@ impl AgentToolCall {
 #[cfg(test)]
 mod tool_call_tests {
     use super::AgentToolCall;
-    use rig::message::{ToolCall, ToolFunction, ToolName};
     use serde_json::{Value, json};
 
     fn tool_call(name: &str, arguments: Value) -> AgentToolCall {
         AgentToolCall {
-            call: ToolCall::from_wire(
-                "test",
-                ToolFunction::new(ToolName::new(name).unwrap(), arguments),
-            ),
+            call: super::tool_call("test", name, arguments),
             result: Some(Vec::new()),
         }
     }
@@ -385,14 +400,6 @@ mod tool_call_tests {
 }
 
 impl AgentOutput {
-    pub(crate) fn from_transcript(messages: &[TranscriptEntry]) -> Self {
-        let mut output = Self::default();
-        for message in messages {
-            output.push_entry(message);
-        }
-        output
-    }
-
     pub(crate) fn steps(&self) -> &[AgentStep] {
         &self.steps
     }
@@ -714,7 +721,7 @@ impl AgentMessage {
         started_at: SystemTime,
         start: crate::transcript::TranscriptIndex,
         run: AgentRun,
-        pending_events: Vec<protocol::Json<AgentEvent>>,
+        pending_events: Vec<protocol::Preview>,
         cx: &mut impl AppContext,
     ) -> Self {
         let work_expanded = run.is_generating();
@@ -761,8 +768,7 @@ impl AgentMessage {
         self.record.run.is_generating()
     }
 
-    /// Where the call awaiting approval is among `output`'s steps. Rig may
-    /// mint the same id for id-less calls of different replies, and only the
+    /// Where the call awaiting approval is among `output`'s steps; only the
     /// last reply's calls can be waiting, so it is the latest with that id.
     pub(crate) fn awaiting_approval_step(&self) -> Option<usize> {
         let awaiting = self.record.awaiting_approval.as_ref()?;
@@ -781,7 +787,7 @@ impl AgentRunRecord {
             start: self.start,
             pending_events: self.pending_events.clone(),
             run: self.run.clone(),
-            awaiting_approval: self.awaiting_approval.as_ref().map(protocol::Json::call_id),
+            awaiting_approval: self.awaiting_approval.clone(),
         }
     }
 }
@@ -800,9 +806,7 @@ impl protocol::AgentMessage {
             self.pending_events,
             cx,
         );
-        message.record.awaiting_approval = self
-            .awaiting_approval
-            .map(|call| call.to_call_id().expect("validated with the snapshot"));
+        message.record.awaiting_approval = self.awaiting_approval;
         message
     }
 }
@@ -817,42 +821,39 @@ impl protocol::TimelineMessage {
 }
 
 impl AgentOutput {
-    fn push_entry(&mut self, entry: &TranscriptEntry) {
-        match entry {
-            TranscriptEntry::Message(message) => self.push(message),
-            TranscriptEntry::Compaction(_) => self.steps.push(AgentStep::Compaction),
-        }
+    pub(crate) fn push_compaction(&mut self) {
+        self.steps.push(AgentStep::Compaction);
     }
 
     /// Adds what `message`, the next message of a run's output, shows.
-    fn push(&mut self, message: &RigMessage) {
-        match message {
-            RigMessage::Assistant(reply) => {
-                for part in &reply.content {
+    /// Context notes and inputs show nothing; the run's user group does.
+    pub(crate) fn push(&mut self, message: &Message) {
+        match message.role {
+            Role::Assistant => {
+                for part in &message.content {
                     match part {
-                        AssistantContent::Reasoning(reasoning) => {
-                            self.push_thinking(&reasoning.text);
-                        }
-                        AssistantContent::Text(text) => self.push_text(&text.text),
-                        AssistantContent::ToolCall(call) => {
+                        Content::Reasoning(Reasoning::Text { text }) => self.push_thinking(text),
+                        Content::Text { text } => self.push_text(text),
+                        Content::ToolCall(call) => {
                             self.steps.push(AgentStep::ToolCall(AgentToolCall {
                                 call: call.clone(),
                                 result: None,
                             }));
                         }
-                        _ => {}
+                        Content::Reasoning(Reasoning::Redacted { .. })
+                        | Content::Image(_)
+                        | Content::ToolResult(_) => {}
                     }
                 }
             }
-            RigMessage::User { content } => {
-                // A run's own user messages carry its tool results.
-                for item in content {
-                    if let UserContent::ToolResult(result) = item {
+            Role::Tool => {
+                for part in &message.content {
+                    if let Content::ToolResult(result) = part {
                         self.record_tool_result(&result.call, &result.content);
                     }
                 }
             }
-            RigMessage::System { .. } => {}
+            Role::User | Role::System | Role::Developer => {}
         }
     }
 
@@ -879,7 +880,7 @@ impl AgentOutput {
         }
     }
 
-    fn extend(&mut self, message: Option<&RigMessage>) {
+    fn extend(&mut self, message: Option<&Message>) {
         if let Some(message) = message {
             self.push(message);
         }
@@ -892,10 +893,8 @@ impl AgentOutput {
         })
     }
 
-    /// Records what the tool returned for `call`. Results answer the latest
-    /// reply, and Rig may mint the same id for id-less calls of different
-    /// replies, so the latest call with that id is the one answered.
-    fn record_tool_result(&mut self, call: &CallId, content: &[ToolResultContent]) {
+    /// Records what the tool returned for `call`.
+    fn record_tool_result(&mut self, call: &ToolCallId, content: &[ToolResultContent]) {
         if let Some(tool_call) = self
             .tool_calls_mut()
             .rfind(|tool_call| tool_call.call.id == *call)
@@ -941,16 +940,13 @@ impl AgentOutput {
     /// Whether `partial`, the message a run is folding, shows the model
     /// still reasoning: it is the reply streaming, ending in reasoning that
     /// has some text, which is then the output's last step.
-    fn still_reasoning(partial: Option<&RigMessage>) -> bool {
-        matches!(
-            partial,
-            Some(RigMessage::Assistant(reply))
-                if matches!(
-                    reply.content.last(),
-                    Some(AssistantContent::Reasoning(reasoning))
-                        if !reasoning.text.is_empty()
-                )
-        )
+    fn still_reasoning(partial: Option<&Message>) -> bool {
+        partial.is_some_and(|reply| {
+            matches!(
+                reply.content.last(),
+                Some(Content::Reasoning(Reasoning::Text { text })) if !text.is_empty()
+            )
+        })
     }
 }
 
@@ -958,7 +954,7 @@ impl AgentMessageUi {
     /// Summary entries commit at a safe boundary, just like completed messages.
     pub(crate) fn compact(&mut self, cx: &mut impl AppContext) {
         let first = self.output.steps.len();
-        self.output.steps.push(AgentStep::Compaction);
+        self.output.push_compaction();
         self.committed = self.output.mark();
         self.show_steps(first, &[], cx);
     }
@@ -969,8 +965,8 @@ impl AgentMessageUi {
     /// redone, and the text views only get what that part added.
     pub(crate) fn advance(
         &mut self,
-        completed: Option<&RigMessage>,
-        partial: Option<&RigMessage>,
+        completed: Option<&Message>,
+        partial: Option<&Message>,
         generating: bool,
         cx: &mut impl AppContext,
     ) {
@@ -1017,17 +1013,19 @@ impl AgentMessageUi {
         }
     }
 
-    /// Shows `output`, a run's transcript entries, followed by `partial`, the
-    /// message it is folding, in a message fresh from a snapshot. The text
-    /// views are shown whole, as history rather than as a stream.
+    /// Shows a run's `output` entries of `transcript`, followed by
+    /// `partial`, the reply being previewed, in a message fresh from a
+    /// snapshot. The text views are shown whole, as history rather than as a
+    /// stream.
     pub(crate) fn restore(
         &mut self,
-        output: &[TranscriptEntry],
-        partial: Option<&RigMessage>,
+        transcript: &Transcript,
+        output: std::ops::Range<usize>,
+        partial: Option<&Message>,
         generating: bool,
         cx: &mut impl AppContext,
     ) {
-        self.output = AgentOutput::from_transcript(output);
+        self.output = AgentOutput::from_transcript(transcript, output);
         self.committed = self.output.mark();
         self.output.extend(partial);
         self.set_thinking_complete(partial, generating);
@@ -1043,7 +1041,7 @@ impl AgentMessageUi {
 
     /// Thinking is complete unless the model is still reasoning. Thinking in
     /// progress cannot be expanded by hand, so it completes collapsed.
-    fn set_thinking_complete(&mut self, partial: Option<&RigMessage>, generating: bool) {
+    fn set_thinking_complete(&mut self, partial: Option<&Message>, generating: bool) {
         self.output.thinking_complete = !(generating && AgentOutput::still_reasoning(partial));
     }
 }

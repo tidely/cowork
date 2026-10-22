@@ -2,9 +2,13 @@
 
 use std::time::Duration;
 
-use language_models::{
-    CompletionRequest, Content, Envelope, FinishReason, LanguageModel, LanguageModelProvider,
-    Message, Ollama, OpenAiCompatible, Role, Thinking, collect_completion, reqwest,
+use agent::{
+    Ollama, OpenAiCompatible,
+    model::{
+        CompletionRequest, Content, Envelope, FinishReason, LanguageModel, LanguageModelProvider,
+        Message, Role, Thinking, collect_completion,
+    },
+    reqwest,
 };
 use serde_json::{Value, json};
 use tokio::{

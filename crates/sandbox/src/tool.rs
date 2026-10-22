@@ -7,10 +7,10 @@
 
 use std::{num::NonZeroU64, sync::Arc, time::Duration};
 
-use rig::tool::{ContextValue, Tool, ToolContext, ToolExecutionError};
-use serde::{Deserialize, Serialize};
+use agent::tool::{Tool, ToolCall, ToolError, ToolErrorKind};
+use serde::Deserialize;
 
-use crate::{Access, CallApprovals, CommandOutput, Folders, Grant, SandboxError, Sandboxes};
+use crate::{Access, CommandOutput, Folders, Needs, SandboxError, ThreadSandbox};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -44,18 +44,10 @@ pub struct RunCommandArgs {
 
 /// Runs a shell command, contained, on the host's computer for the thread
 /// the run belongs to.
-pub struct RunCommand {
-    sandboxes: Arc<Sandboxes>,
-    thread: String,
-}
+pub struct RunCommand;
 
 impl RunCommand {
-    pub fn new(sandboxes: Arc<Sandboxes>, thread: impl Into<String>) -> Self {
-        Self {
-            sandboxes,
-            thread: thread.into(),
-        }
-    }
+    pub const NAME: &'static str = "run_command";
 
     /// The access a call with `arguments` asks for of its own, if it names
     /// one it may have.
@@ -68,31 +60,18 @@ impl RunCommand {
     pub fn named_folders(arguments: &serde_json::Value) -> (Vec<String>, Vec<String>) {
         crate::grant::named_folders(arguments)
     }
-
-    /// The folders outside the project a call with `arguments` asks for,
-    /// resolved on this computer, or why they can't be granted.
-    pub fn requested_folders(arguments: &serde_json::Value) -> Result<Folders, String> {
-        let (read, write) = Self::named_folders(arguments);
-        Folders::resolve(&read, &write)
-    }
-
-    /// The context for a call allowed with `grant`: the command runs with
-    /// exactly that, whatever the project's mode by the time it starts.
-    pub fn context(grant: Grant) -> ToolContext {
-        let mut context = ToolContext::new();
-        context
-            .insert(Granted(grant))
-            .expect("a grant always encodes");
-        context
-    }
 }
 
-/// What a call was allowed with; see [`RunCommand::context`].
-#[derive(Serialize, Deserialize)]
-struct Granted(Grant);
-
-impl ContextValue for Granted {
-    const KEY: &'static str = "sandbox.run_command.access";
+impl From<SandboxError> for ToolError {
+    fn from(error: SandboxError) -> Self {
+        let kind = match error {
+            SandboxError::InvalidCommand(_) => ToolErrorKind::InvalidArguments,
+            SandboxError::Unsupported(_) => ToolErrorKind::NotFound,
+            SandboxError::Timeout { .. } => ToolErrorKind::Timeout,
+            SandboxError::Setup(_) | SandboxError::Failed(_) => ToolErrorKind::Execution,
+        };
+        ToolError::new(kind, error.to_string())
+    }
 }
 
 const DESCRIPTION: &str = concat!(
@@ -125,86 +104,73 @@ const DESCRIPTION: &str = concat!(
 );
 
 impl Tool for RunCommand {
-    const NAME: &'static str = "run_command";
-    type Error = SandboxError;
     type Args = RunCommandArgs;
     type Output = CommandOutput;
+    type Context = ThreadSandbox;
+    type Access = Needs;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
 
     fn description(&self) -> String {
         DESCRIPTION.to_owned()
     }
 
-    fn parameters(&self) -> serde_json::Value {
-        schemars::schema_for!(RunCommandArgs).into()
-    }
-
-    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
-        match error {
-            SandboxError::InvalidCommand(_) => ToolExecutionError::invalid_args(error.to_string()),
-            SandboxError::Unsupported(_) => ToolExecutionError::not_found(error.to_string()),
-            SandboxError::Timeout { .. } => ToolExecutionError::timeout(error.to_string()),
-            SandboxError::Setup(_) | SandboxError::Failed(_) => {
-                ToolExecutionError::other(error.to_string())
-            }
+    /// The access the command asks for of its own, and the folders outside
+    /// the project it names, resolved on this computer.
+    fn access(&self, args: &RunCommandArgs, _: &ThreadSandbox) -> Needs {
+        match Folders::resolve(&args.read_folders, &args.write_folders) {
+            Ok(folders) => Needs::Command {
+                access: args.access,
+                folders,
+            },
+            Err(reason) => Needs::Refused(reason),
         }
     }
 
-    async fn call(
+    /// Runs with what the call was allowed, and the project's mode or the
+    /// run's grant as they are when it starts; see
+    /// [`ThreadSandbox::command_grant`].
+    async fn run(
         &self,
-        context: &mut ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
-        // A call that reaches the tool without being granted anything, as
-        // from an agent without a hook, runs with what it asked for, or the
-        // project's mode.
-        let approved = CallApprovals::approved(context, Self::NAME);
-        let grant = match approved.get::<Granted>().ok().flatten() {
-            Some(Granted(grant)) => Some(grant),
-            None if args.access.is_none()
-                && args.read_folders.is_empty()
-                && args.write_folders.is_empty() =>
-            {
-                None
-            }
-            None => Some(Grant {
-                access: args
-                    .access
-                    .unwrap_or_else(|| self.sandboxes.project(&self.thread).access),
-                folders: Folders::resolve(&args.read_folders, &args.write_folders)
-                    .map_err(SandboxError::InvalidCommand)?,
-            }),
+        call: ToolCall<Needs>,
+        sandbox: Arc<ThreadSandbox>,
+        args: RunCommandArgs,
+    ) -> Result<CommandOutput, ToolError> {
+        let Needs::Command { access, folders } = call.access else {
+            return Err(ToolError::new(
+                ToolErrorKind::PermissionDenied,
+                "the command was not allowed",
+            ));
         };
-        self.sandboxes
+        let grant = sandbox.command_grant(access, &folders);
+        Ok(sandbox
+            .sandboxes()
             .run_with(
-                &self.thread,
+                sandbox.thread(),
                 &args.command,
-                grant,
+                Some(grant),
                 args.timeout_ms.map(|ms| Duration::from_millis(ms.get())),
             )
-            .await
+            .await?)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use rig::tool::ToolSet;
+    use agent::tool::ToolErrorKind;
     use serde_json::json;
 
     use super::*;
-    use crate::{Project, ProjectFolder, TestRoot, test_sandboxes};
+    use crate::{Grant, Project, ProjectFolder, TestRoot, call, prepare, test_sandboxes};
 
     /// Invented arguments reach the model as actionable errors, before any
     /// command, file operation, or permission request can run.
     #[tokio::test]
     async fn unknown_arguments_return_model_feedback() {
         let (sandboxes, _scratch) = test_sandboxes();
-        let mut tools = ToolSet::default();
-        tools.add_tool(RunCommand::new(sandboxes.clone(), "thread"));
-        tools.add_tool(crate::ListDirectory::new(sandboxes.clone(), "thread"));
-        tools.add_tool(crate::ReadFile::new(sandboxes.clone(), "thread"));
-        tools.add_tool(crate::WriteFile::new(sandboxes.clone(), "thread"));
-        tools.add_tool(crate::RequestPermissions);
-
+        let sandbox = Arc::new(ThreadSandbox::new(sandboxes.clone(), "thread"));
         for (name, mut arguments) in [
             (RunCommand::NAME, json!({ "command": "echo hello" })),
             (crate::ListDirectory::NAME, json!({ "path": "." })),
@@ -219,17 +185,19 @@ mod tests {
             (crate::RequestPermissions::NAME, json!({ "reason": "Test" })),
         ] {
             arguments["timeout"] = json!("60000");
-            let result = tools
-                .execute(name, arguments.to_string(), &mut ToolContext::new())
-                .await;
-            assert_eq!(
-                result.error().unwrap().kind(),
-                rig::tool::ToolErrorKind::InvalidArgs,
-                "{name}"
-            );
-            let feedback = result.output().as_text().unwrap();
-            assert!(feedback.contains("unknown field `timeout`"), "{feedback}");
-            assert!(feedback.contains("expected"), "{feedback}");
+            let prepared = match name {
+                RunCommand::NAME => prepare(RunCommand, &sandbox, arguments),
+                crate::ListDirectory::NAME => prepare(crate::ListDirectory, &sandbox, arguments),
+                crate::ReadFile::NAME => prepare(crate::ReadFile, &sandbox, arguments),
+                crate::WriteFile::NAME => prepare(crate::WriteFile, &sandbox, arguments),
+                _ => prepare(crate::RequestPermissions, &sandbox, arguments),
+            };
+            let Err(error) = prepared else {
+                panic!("{name} accepted an unknown argument");
+            };
+            assert_eq!(error.kind, ToolErrorKind::InvalidArguments, "{name}");
+            assert!(error.message.contains("unknown field `timeout`"), "{error}");
+            assert!(error.message.contains("expected"), "{error}");
         }
         sandboxes.shutdown();
     }
@@ -237,34 +205,70 @@ mod tests {
     #[tokio::test]
     async fn invalid_timeouts_return_model_feedback_before_running() {
         let (sandboxes, _scratch) = test_sandboxes();
-        let mut tools = ToolSet::default();
-        tools.add_tool(RunCommand::new(sandboxes.clone(), "thread"));
+        let sandbox = Arc::new(ThreadSandbox::new(sandboxes.clone(), "thread"));
         for timeout in [json!(0), json!(-1), json!(1.5), json!("60000")] {
-            let result = tools
-                .execute(
-                    RunCommand::NAME,
-                    json!({ "command": "echo hello", "timeout_ms": timeout }).to_string(),
-                    &mut ToolContext::new(),
-                )
-                .await;
-            assert_eq!(
-                result.error().unwrap().kind(),
-                rig::tool::ToolErrorKind::InvalidArgs,
-                "{timeout}"
-            );
+            let Err(error) = prepare(
+                RunCommand,
+                &sandbox,
+                json!({ "command": "echo hello", "timeout_ms": timeout }),
+            ) else {
+                panic!("{timeout} was accepted");
+            };
+            assert_eq!(error.kind, ToolErrorKind::InvalidArguments, "{timeout}");
             assert!(
-                result.output().as_text().unwrap().contains("invalid value")
-                    || result.output().as_text().unwrap().contains("invalid type")
+                error.message.contains("invalid value") || error.message.contains("invalid type")
             );
         }
         sandboxes.shutdown();
     }
 
-    /// A call runs with the access it was granted, whatever the project's
-    /// mode when it starts: read-only in a writable project, and writing in a
-    /// read-only one.
+    /// A call needs what it asks for of its own and the folders it names;
+    /// one naming a folder that can't be granted is refused before anyone
+    /// is asked.
+    #[test]
+    fn calls_need_the_access_and_folders_they_ask_for() {
+        let (sandboxes, _scratch) = test_sandboxes();
+        let sandbox = Arc::new(ThreadSandbox::new(sandboxes, "thread"));
+        let cache = TestRoot::new();
+        let needs = |arguments| {
+            prepare(RunCommand, &sandbox, arguments)
+                .unwrap()
+                .access()
+                .clone()
+        };
+        assert_eq!(
+            needs(json!({"command": "ls"})),
+            Needs::Command {
+                access: None,
+                folders: Folders::default()
+            }
+        );
+        assert_eq!(
+            needs(json!({
+                "command": "cargo fetch",
+                "access": "network",
+                "write_folders": [cache.0.to_string_lossy()],
+            })),
+            Needs::Command {
+                access: Some(Access::Network),
+                folders: Folders {
+                    read: Vec::new(),
+                    write: vec![crate::resolved(&cache.0).unwrap()],
+                },
+            }
+        );
+        let missing = cache.0.join("no-such-folder");
+        assert!(matches!(
+            needs(json!({"command": "ls", "read_folders": [missing]})),
+            Needs::Refused(reason) if reason.contains("does not exist")
+        ));
+    }
+
+    /// A call runs with the access it asked for, whatever the project's
+    /// mode: read-only in a writable project, and writing in a read-only
+    /// one once allowed; without asking, it runs with the mode.
     #[tokio::test(flavor = "multi_thread")]
-    async fn calls_run_with_the_access_they_were_granted() {
+    async fn calls_run_with_the_access_they_ask_for() {
         if !mxc_sdk::v1::platform_support().is_supported {
             return;
         }
@@ -284,105 +288,83 @@ mod tests {
                 },
             )
         };
-        let mut tools = ToolSet::default();
-        tools.add_tool(RunCommand::new(sandboxes.clone(), "thread"));
-        let write = |file: &str| {
+        let sandbox = Arc::new(ThreadSandbox::new(sandboxes.clone(), "thread"));
+        let write = |file: &str, access: Option<&str>| {
             let command = if cfg!(windows) {
                 format!("cmd /c echo agent> {file}")
             } else {
                 format!("echo agent > {file}")
             };
-            json!({ "command": command }).to_string()
+            let mut arguments = json!({ "command": command });
+            if let Some(access) = access {
+                arguments["access"] = access.into();
+            }
+            arguments
         };
 
-        let access = |access| {
-            RunCommand::context(Grant {
-                access,
-                ..Grant::default()
-            })
-        };
         set_mode(Access::Write);
-        tools
-            .execute(
-                RunCommand::NAME,
-                write("held.txt"),
-                &mut access(Access::Read),
-            )
-            .await;
+        _ = call(RunCommand, &sandbox, write("held.txt", Some("read"))).await;
         assert!(!folder.join("held.txt").exists(), "held read-only");
-        tools
-            .execute(RunCommand::NAME, write("mode.txt"), &mut ToolContext::new())
-            .await;
+        _ = call(RunCommand, &sandbox, write("mode.txt", None)).await;
         assert!(folder.join("mode.txt").exists(), "the mode's access");
 
         set_mode(Access::Read);
-        tools
-            .execute(
-                RunCommand::NAME,
-                write("granted.txt"),
-                &mut access(Access::Write),
-            )
-            .await;
+        _ = call(RunCommand, &sandbox, write("granted.txt", Some("write"))).await;
         assert!(folder.join("granted.txt").exists(), "granted write access");
         sandboxes.shutdown();
     }
 
-    /// A folder outside the project is writable only for a command granted
-    /// it, and only while the rest stays as the grant says.
+    /// A folder outside the project is writable only for a command naming
+    /// it to write, or once the run was granted it.
     #[tokio::test(flavor = "multi_thread")]
     async fn granted_folders_outside_the_project_are_writable() {
         if !mxc_sdk::v1::platform_support().is_supported {
             return;
         }
         let (sandboxes, _scratch) = test_sandboxes();
+        let sandbox = Arc::new(ThreadSandbox::new(sandboxes.clone(), "thread"));
         let outside = TestRoot::new();
         let cache = crate::resolved(&outside.0).unwrap();
-        let mut tools = ToolSet::default();
-        tools.add_tool(RunCommand::new(sandboxes.clone(), "thread"));
         let file = cache.join("cached.txt");
         let command = if cfg!(windows) {
             format!("cmd /c echo agent> \"{}\"", file.display())
         } else {
             format!("echo agent > '{}'", file.display())
         };
-        let arguments = json!({ "command": command }).to_string();
+        let cache_text = cache.to_string_lossy().into_owned();
 
-        tools
-            .execute(RunCommand::NAME, arguments.clone(), &mut ToolContext::new())
-            .await;
+        _ = call(RunCommand, &sandbox, json!({ "command": command })).await;
         assert!(!file.exists(), "not granted");
 
-        let read_only = Grant {
-            folders: Folders {
-                read: vec![cache.clone()],
-                write: Vec::new(),
-            },
-            ..Grant::default()
-        };
-        tools
-            .execute(
-                RunCommand::NAME,
-                arguments.clone(),
-                &mut RunCommand::context(read_only),
-            )
-            .await;
+        _ = call(
+            RunCommand,
+            &sandbox,
+            json!({ "command": command, "read_folders": [cache_text] }),
+        )
+        .await;
         assert!(!file.exists(), "granted only reading");
 
-        let writable = Grant {
-            folders: Folders {
-                read: Vec::new(),
-                write: vec![cache.clone()],
-            },
-            ..Grant::default()
-        };
-        tools
-            .execute(
-                RunCommand::NAME,
-                arguments,
-                &mut RunCommand::context(writable),
-            )
-            .await;
+        _ = call(
+            RunCommand,
+            &sandbox,
+            json!({ "command": command, "write_folders": [cache_text] }),
+        )
+        .await;
         assert!(file.exists(), "granted writing");
+        std::fs::remove_file(&file).unwrap();
+
+        sandboxes.grant_for_run(
+            "thread",
+            &Grant {
+                folders: Folders {
+                    read: Vec::new(),
+                    write: vec![cache.clone()],
+                },
+                ..Grant::default()
+            },
+        );
+        _ = call(RunCommand, &sandbox, json!({ "command": command })).await;
+        assert!(file.exists(), "granted for the run");
         sandboxes.shutdown();
     }
 

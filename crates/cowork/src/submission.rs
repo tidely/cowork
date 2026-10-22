@@ -3,16 +3,16 @@
 
 #[path = "generation.rs"]
 mod generation;
-pub(crate) use generation::ActiveGeneration;
 #[cfg(test)]
 pub(crate) use generation::RunTotals;
+pub(crate) use generation::{ActiveGeneration, ThreadAgent, provider};
 
 use std::{collections::HashMap, sync::Arc};
 
+use agent::model::Content;
 use draft::{DraftItem, DraftItemKind};
 use gpui::{Context, Entity, SharedString, Window};
 use itertools::Itertools;
-use rig::completion::Message as RigMessage;
 use tools::TurnComments;
 use uuid::Uuid;
 
@@ -31,6 +31,7 @@ use crate::{
         CommentReference, PromptBlock, TimelineMessage, UserComment, UserCommentBody,
         UserMessageGroup,
     },
+    transcript::RunSource,
 };
 
 /// Who asks for a submission, whose authority is checked as it is taken.
@@ -97,12 +98,12 @@ impl Thread {
 /// before spawning any work. This is not a reusable authorization token.
 struct GenerationPlan {
     thread_id: Uuid,
-    prompt: RigMessage,
+    prompt: Vec<Content>,
     comment_group_id: Option<Uuid>,
     turn_comments: Arc<TurnComments>,
-    /// Whether a scheduled task started the run, which nobody may be
-    /// watching; see `tool_approval.rs`.
-    scheduled: bool,
+    /// Who started the run: a scheduled task's run may be unattended; see
+    /// `tool_approval.rs`.
+    source: RunSource,
 }
 
 impl Cowork {
@@ -404,7 +405,7 @@ impl Cowork {
                 prompt,
                 comment_group_id,
                 turn_comments,
-                scheduled: false,
+                source: RunSource::Participant(actor.into_bytes()),
             },
             cx,
         );
@@ -524,7 +525,7 @@ impl Cowork {
             prompt,
             comment_group_id: (!group.comments.is_empty()).then_some(group.id),
             turn_comments,
-            scheduled: false,
+            source: RunSource::Participant(state.participant_id().into_bytes()),
         };
         thread.update(cx, |thread, cx| {
             thread.emit(
@@ -605,7 +606,7 @@ impl Cowork {
                     prompt,
                     comment_group_id: None,
                     turn_comments: Arc::new(TurnComments::new(0)),
-                    scheduled: true,
+                    source: RunSource::Schedule,
                 },
                 cx,
             )

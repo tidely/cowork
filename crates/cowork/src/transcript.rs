@@ -1,247 +1,284 @@
 //! The transcript and the agent's events: on the wire, and folded into a
 //! thread.
 //!
-//! The transcript records ordinary agent runs exactly as sent, as Rig's own
-//! messages. Prompts carry their files' content like any other request does.
-//! Accepted compaction summaries are entries in the same ordered sequence;
-//! they replace request context without rewriting the original messages.
-//!
-//! The host forwards what its agent loop reports ([`AgentEvent`]s) as it
-//! happens, and every participant, the host included, folds them with the
-//! agent crate's [`TurnFold`] into the transcript, which ends up exactly as
-//! the loop recorded it: each reply is the content Rig finalized, which the
-//! part ends carry. The fold checks the events' order as Rig checks a relayed
-//! stream, so a host's events that Rig could not have produced are refused.
+//! Only the host runs the agent, as an agent session per thread (see
+//! `generation.rs`). The transcript is that session's conversation, kept by
+//! every participant: the host forwards what the session reports as
+//! [`RunEvent`]s, and everyone, the host included, folds them into a replica
+//! of the conversation, which checks each committed entry as the session's
+//! own conversation did. Accepted summaries replace the older part of the
+//! context for later requests; they never remove entries.
 //!
 //! What an agent message shows ([`AgentOutput`]) is never sent. It is a
-//! function of transcript entries: the ones its run added to the transcript,
-//! followed by the message it is folding, as far as it has come
-//! ([`TurnFold::partial`]: the parts Rig has finalized, and a preview of
-//! the ones still streaming). That message is the fold of the run's pending
-//! events, the events since its output last joined the transcript, which a
-//! snapshot carries raw. So someone joining rebuilds it exactly, and every
-//! copy shows the same.
+//! function of transcript entries: the ones its run added after its prompt,
+//! followed by the reply being sampled, as far as its previews have come.
+//! Those previews are the run's pending events, which a snapshot carries raw,
+//! so someone joining rebuilds the message exactly, and every copy shows the
+//! same.
 //!
 //! Live, the transcript part never changes, so only the rest is redone per
 //! event: a message rewinds its output to where the committed part ends,
-//! adds a message that has just joined the transcript, if any, and then the
-//! partial one. An event costs as much as the turn in progress, not the run.
+//! adds an entry that has just joined the transcript, if any, and then the
+//! preview.
 
-use std::ops::Range;
+use std::{collections::BTreeMap, ops::Range};
 
-use agent::{AgentEvent, TurnFold};
+use agent::{
+    Compaction, Conversation, Entry, Origin,
+    model::{Content, Message, Reasoning, Role, ToolArguments, ToolCall, ToolCallId},
+    persistence::record::{StoredCompaction, StoredEntry},
+};
 use anyhow::Context as _;
 use gpui::AppContext;
 use gpui_base::TextViewState;
-use rig::{
-    completion::Message as RigMessage,
-    message::{CallId, ToolCall},
-    streaming::StreamEvent,
-    tool::Tool as _,
-};
 use serde::{Deserialize, Serialize};
 use tools::{RespondToComment, RespondToCommentArgs, TurnComments};
 use uuid::Uuid;
 
 use crate::{
-    protocol::{self, AgentRun, Json, RunOutcome},
+    protocol::{self, AgentRun, Json, Preview, PreviewDelta, RunEvent, RunOutcome},
     thread::Thread,
-    timeline::{AgentCommentResponse, AgentMessage, TimelineMessage},
-    usage::usage_tokens,
+    timeline::{AgentCommentResponse, AgentMessage, RunActivity, TimelineMessage},
 };
+
+/// A rough average for estimating the tokens in text before the provider
+/// reports the exact count.
+pub(crate) const BYTES_PER_TOKEN: u64 = 4;
+
+/// Who started a run, recorded with its input. Only provenance: the host
+/// checked authority when it accepted the submission.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum RunSource {
+    /// A participant's submission.
+    Participant(uuid::Bytes),
+    /// A scheduled task, which nobody may be watching.
+    Schedule,
+    /// The host app itself, for requests nobody made, such as compacting a
+    /// full context.
+    Host,
+}
 
 /// An absolute position in the append-only sequence of transcript entries.
 /// Compaction never changes these positions, and UUIDs identify runs rather
-/// than individual messages in this sequence.
+/// than individual entries.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub(crate) struct TranscriptIndex(pub(crate) u64);
 
-/// A summary replaces everything before its position for future requests,
-/// while the original messages remain available for display and replay.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) enum TranscriptEntry {
-    Message(RigMessage),
-    Compaction(String),
+/// The conversation of a thread's agent session, and where each of its
+/// compactions was accepted, so a run's output can show it in place.
+///
+/// All entries remain resident today; nothing is persisted.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Transcript {
+    conversation: Conversation<RunSource>,
+    /// The number of entries when each compaction was accepted, in order.
+    compacted_at: Vec<usize>,
 }
 
-/// LLM state only: original messages and successive summaries of their prefix.
-/// Run identities, unfinished events, and local views belong to the timeline.
-///
-/// All messages remain resident today. Offloading could add a
-/// `start: TranscriptIndex`, the absolute position of `entries[0]`, keeping a
-/// contiguous tail. An absolute position would then map to the resident vector
-/// at `index - start`; removing a persisted prefix would advance `start` without
-/// changing run references or summary positions. Missing ranges would need
-/// loading before access, and the absolute end would be `start + entries.len()`.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Transcript {
-    pub(crate) entries: Vec<TranscriptEntry>,
+impl PartialEq for Transcript {
+    fn eq(&self, other: &Self) -> bool {
+        self.conversation.entries() == other.conversation.entries()
+            && self.conversation.compactions() == other.conversation.compactions()
+            && self.compacted_at == other.compacted_at
+    }
+}
+
+/// A transcript as it is sent: entries and compactions in the agent's
+/// versioned records.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub(crate) struct TranscriptRecord {
+    entries: Vec<StoredEntry>,
+    /// Each compaction, after the number of entries it was accepted at.
+    compactions: Vec<(u64, StoredCompaction)>,
 }
 
 impl Transcript {
+    pub(crate) fn conversation(&self) -> &Conversation<RunSource> {
+        &self.conversation
+    }
+
+    pub(crate) fn entries(&self) -> &[Entry<RunSource>] {
+        self.conversation.entries()
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.entries().len()
+    }
+
     pub(crate) fn end(&self) -> TranscriptIndex {
-        TranscriptIndex(self.entries.len() as u64)
+        TranscriptIndex(self.len() as u64)
     }
 
-    pub(crate) fn append(&mut self, message: RigMessage) {
-        self.entries.push(TranscriptEntry::Message(message));
+    /// Adds `entry` at `index`, refusing one the host's conversation could
+    /// not have committed there.
+    pub(crate) fn commit(&mut self, index: u64, entry: Entry<RunSource>) -> anyhow::Result<()> {
+        let index = usize::try_from(index).context("entry index does not fit in memory")?;
+        self.conversation
+            .apply(index, entry)
+            .context("the host committed an entry its conversation could not hold")
     }
 
-    #[cfg(test)]
-    pub(crate) fn latest_compaction(&self) -> Option<&String> {
-        self.entries.iter().rev().find_map(|entry| match entry {
-            TranscriptEntry::Compaction(summary) => Some(summary),
-            TranscriptEntry::Message(_) => None,
-        })
-    }
-
-    /// A run's leading summaries precede its prompt and submitted user group.
-    pub(crate) fn leading_compactions(&self, start: TranscriptIndex) -> Range<usize> {
-        let start = start.0 as usize;
-        let count = self.entries[start..]
-            .iter()
-            .take_while(|entry| matches!(entry, TranscriptEntry::Compaction(_)))
-            .count();
-        start..start + count
-    }
-
-    pub(crate) fn has_prompt(&self, start: TranscriptIndex) -> bool {
-        self.leading_compactions(start).end < self.entries.len()
-    }
-
-    /// Coverage follows from append order; summaries cannot name an older or
-    /// future prefix. Repeated summaries are distinct entries.
-    pub(crate) fn install_compaction(&mut self, summary: String) -> anyhow::Result<()> {
-        anyhow::ensure!(
-            !self.entries.is_empty() && !summary.trim().is_empty(),
-            "invalid compacted context"
-        );
-        self.entries.push(TranscriptEntry::Compaction(summary));
+    pub(crate) fn compact(&mut self, compaction: Compaction) -> anyhow::Result<()> {
+        self.conversation
+            .apply_compaction(compaction)
+            .context("the host accepted a compaction its conversation could not hold")?;
+        self.compacted_at.push(self.len());
         Ok(())
     }
 
-    pub(crate) fn request_history(&self) -> Vec<RigMessage> {
-        let start = self
-            .entries
-            .iter()
-            .rposition(|entry| matches!(entry, TranscriptEntry::Compaction(_)))
-            .unwrap_or(0);
-        self.entries[start..]
-            .iter()
-            .map(|entry| match entry {
-                TranscriptEntry::Message(message) => message.clone(),
-                TranscriptEntry::Compaction(summary) => {
-                    RigMessage::user(format!("Summary of the conversation so far:\n{summary}"))
-                }
-            })
-            .collect()
+    /// Whether every tool call has its result.
+    pub(crate) fn is_settled(&self) -> bool {
+        self.conversation.is_settled()
     }
 
-    #[cfg(test)]
-    pub(crate) fn messages(&self) -> Vec<RigMessage> {
-        self.entries
+    /// Whether `call` waits for its result.
+    pub(crate) fn is_pending(&self, call: &ToolCallId) -> bool {
+        self.conversation
+            .pending_calls()
             .iter()
-            .filter_map(|entry| match entry {
-                TranscriptEntry::Message(message) => Some(message.clone()),
-                TranscriptEntry::Compaction(_) => None,
-            })
-            .collect()
+            .any(|pending| pending.id == *call)
     }
 
-    pub(crate) fn to_protocol(&self) -> Json<Self> {
-        Json::from_value(self).expect("a transcript encodes as JSON")
+    /// The tokens the context holds, estimated from its size, until the
+    /// provider measures it again.
+    pub(crate) fn estimated_tokens(&self) -> u64 {
+        (self.conversation.context_bytes() as u64).div_ceil(BYTES_PER_TOKEN)
+    }
+
+    /// The compactions accepted with `range.start..=range.end` entries.
+    fn compactions_in(&self, range: &Range<usize>) -> impl Iterator<Item = usize> + '_ {
+        let range = range.clone();
+        self.compacted_at
+            .iter()
+            .copied()
+            .filter(move |at| range.contains(at) || *at == range.end)
+    }
+
+    pub(crate) fn to_protocol(&self) -> Json<TranscriptRecord> {
+        let mut at = self.compacted_at.iter();
+        let record = TranscriptRecord {
+            entries: self
+                .entries()
+                .iter()
+                .map(|entry| StoredEntry::encode(entry).expect("committed entries encode"))
+                .collect(),
+            compactions: self
+                .conversation
+                .compactions()
+                .iter()
+                .map(|compaction| {
+                    (
+                        *at.next().expect("every compaction has a position") as u64,
+                        StoredCompaction::encode(compaction).expect("accepted summaries encode"),
+                    )
+                })
+                .collect(),
+        };
+        Json::from_value(&record).expect("a transcript encodes as JSON")
     }
 }
 
-impl Json<Transcript> {
-    /// Decode the whole LLM state once and validate all prefix summaries before
-    /// a snapshot is installed. JSON validity alone does not establish coverage.
+impl Json<TranscriptRecord> {
+    /// Rebuilds a transcript from the host, checking every entry and
+    /// compaction as they were checked when they were first applied.
     pub(crate) fn to_transcript(&self) -> anyhow::Result<Transcript> {
-        let transcript = self.parse().context("invalid transcript from host")?;
-        for (index, entry) in transcript.entries.iter().enumerate() {
-            if let TranscriptEntry::Compaction(summary) = entry {
-                anyhow::ensure!(
-                    index > 0 && !summary.trim().is_empty(),
-                    "invalid compacted context"
-                );
+        let record = self.parse().context("invalid transcript from host")?;
+        let mut transcript = Transcript::default();
+        let mut entries = record.entries.iter();
+        for (at, compaction) in &record.compactions {
+            while (transcript.len() as u64) < *at {
+                let entry = entries.next().context("compaction past the transcript")?;
+                transcript.commit(transcript.len() as u64, entry.decode()?)?;
             }
+            transcript.compact(compaction.decode()?)?;
+        }
+        for entry in entries {
+            transcript.commit(transcript.len() as u64, entry.decode()?)?;
         }
         Ok(transcript)
     }
 }
 
-impl Json<RigMessage> {
-    pub(crate) fn from_rig(message: &RigMessage) -> Self {
-        // Rig's messages are plain data, which always encodes.
-        Self::from_value(message).expect("a Rig message encodes as JSON")
+/// An entry as it is sent.
+pub(crate) fn shared_entry(entry: &Entry<RunSource>) -> Json<StoredEntry> {
+    Json::from_value(&StoredEntry::encode(entry).expect("committed entries encode"))
+        .expect("a stored entry encodes as JSON")
+}
+
+/// A compaction as it is sent.
+pub(crate) fn shared_compaction(compaction: &Compaction) -> Json<StoredCompaction> {
+    Json::from_value(&StoredCompaction::encode(compaction).expect("accepted summaries encode"))
+        .expect("a stored compaction encodes as JSON")
+}
+
+/// The reply being sampled, as far as its previews have come: each part's
+/// text or reasoning, by its position in the reply.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ReplyPreview {
+    parts: BTreeMap<u32, Content>,
+}
+
+impl ReplyPreview {
+    pub(crate) fn apply(&mut self, preview: &Preview) {
+        let part = self
+            .parts
+            .entry(preview.index)
+            .or_insert_with(|| match &preview.delta {
+                PreviewDelta::Text(_) => Content::text(""),
+                PreviewDelta::Reasoning(_) => Content::Reasoning(Reasoning::Text {
+                    text: String::new(),
+                }),
+            });
+        match (part, &preview.delta) {
+            (Content::Text { text }, PreviewDelta::Text(delta))
+            | (Content::Reasoning(Reasoning::Text { text }), PreviewDelta::Reasoning(delta)) => {
+                text.push_str(delta)
+            }
+            (part, PreviewDelta::Text(delta)) => *part = Content::text(delta.clone()),
+            (part, PreviewDelta::Reasoning(delta)) => {
+                *part = Content::Reasoning(Reasoning::Text {
+                    text: delta.clone(),
+                })
+            }
+        }
     }
 
-    pub(crate) fn to_rig(&self) -> anyhow::Result<RigMessage> {
-        self.parse()
-            .context("failed to decode a transcript message")
+    pub(crate) fn is_empty(&self) -> bool {
+        self.parts.is_empty()
+    }
+
+    /// The reply as far as it has come, or `None` before its first preview.
+    pub(crate) fn partial(&self) -> Option<Message> {
+        (!self.is_empty())
+            .then(|| Message::new(Role::Assistant, self.parts.values().cloned().collect()))
+    }
+
+    fn of(previews: &[Preview]) -> Self {
+        let mut preview = Self::default();
+        for delta in previews {
+            preview.apply(delta);
+        }
+        preview
     }
 }
 
-impl Json<AgentEvent> {
-    /// The event as it is sent. A part's end keeps the content Rig
-    /// finalized, which is what the reply is made of, even though its
-    /// fragments already streamed: rebuilding it from them would be a second
-    /// accumulation that could disagree.
-    pub(crate) fn shared(event: AgentEvent) -> Self {
-        // Rig's events are plain data, which always encodes.
-        Self::from_value(&event).expect("an agent event encodes as JSON")
-    }
-
-    pub(crate) fn to_agent(&self) -> anyhow::Result<AgentEvent> {
-        self.parse().context("failed to decode an agent event")
-    }
-}
-
-impl Json<CallId> {
-    /// A call id as it is sent. Through JSON rather than its text, since an
-    /// id rig minted cannot be rebuilt from its text.
-    pub(crate) fn call_id(call: &CallId) -> Self {
-        // A call id is plain data, which always encodes.
-        Self::from_value(call).expect("a call id encodes as JSON")
-    }
-
-    pub(crate) fn to_call_id(&self) -> anyhow::Result<CallId> {
-        self.parse().context("failed to decode a tool call id")
-    }
-}
-
-/// Each run owns its entries up to the next run's start. Leading summaries
-/// belong above its user group; output starts after its first ordinary entry,
-/// the prompt. Only a preparing run can lack that prompt.
-fn run_output(transcript: &[TranscriptEntry], range: Range<usize>) -> Option<Range<usize>> {
-    transcript[range.clone()]
+/// Each run owns its entries up to the next run's start. Its output starts
+/// after its first input, the prompt, which may follow context notes. Only
+/// a run still starting can lack it.
+fn run_output(transcript: &Transcript, range: Range<usize>) -> Option<Range<usize>> {
+    transcript.entries()[range.clone()]
         .iter()
-        .position(|entry| matches!(entry, TranscriptEntry::Message(_)))
+        .position(|entry| matches!(entry.origin, Origin::Input { .. }))
         .map(|prompt| range.start + prompt + 1..range.end)
 }
 
-/// A fold resuming after a run's output that joined the transcript, `output`
-/// of [`run_output`]. With no output yet, that is after its prompt.
-fn fold_after(transcript: &[TranscriptEntry], output: &Range<usize>) -> TurnFold {
-    let message = transcript[..output.end]
-        .iter()
-        .rev()
-        .find_map(|entry| match entry {
-            TranscriptEntry::Message(message) => Some(message),
-            TranscriptEntry::Compaction(_) => None,
-        })
-        .expect("a run has a recorded prompt");
-    TurnFold::after(message)
-}
-
 /// Checks that a snapshot's agent messages, in timeline order, describe runs
-/// `transcript` can hold: each prompt is a user message there, in order;
-/// only the last run can still be generating; and each run's pending events
-/// continue its output without completing a message, which would have
-/// joined the transcript.
+/// `transcript` can hold: each starts within it, in order; only the last
+/// run can still be generating; a run still starting has no output; and
+/// the active run's live state is one its conversation allows.
 pub(crate) fn validate_agent_runs(
-    transcript: &[TranscriptEntry],
+    transcript: &Transcript,
     messages: &[&protocol::AgentMessage],
     compacting: bool,
 ) -> anyhow::Result<()> {
@@ -259,64 +296,41 @@ pub(crate) fn validate_agent_runs(
     }
     for (index, message) in messages.iter().enumerate() {
         let end = starts.get(index + 1).copied().unwrap_or(transcript.len());
-        let output = run_output(transcript, starts[index]..end);
+        let generating = message.run.is_generating();
         anyhow::ensure!(
-            index + 1 == messages.len() || !message.run.is_generating(),
+            index + 1 == messages.len() || !generating,
             "agent message {index} is generating, but is not the last"
         );
-        let mut fold = if let Some(output) = output {
-            anyhow::ensure!(
-                matches!(
-                    transcript.get(output.start - 1),
-                    Some(TranscriptEntry::Message(RigMessage::User { .. }))
-                ),
-                "agent message {index}'s prompt is not a user message of the transcript"
-            );
-            fold_after(transcript, &output)
-        } else {
-            anyhow::ensure!(
-                message.run.is_generating(),
-                "only the active run can await its prompt"
-            );
+        if run_output(transcript, starts[index]..end).is_none() {
+            anyhow::ensure!(generating, "only the active run can await its prompt");
             anyhow::ensure!(
                 message.pending_events.is_empty() && message.awaiting_approval.is_none(),
                 "an unstarted run has output"
             );
-            TurnFold::default()
-        };
-        for (event_index, event) in message.pending_events.iter().enumerate() {
-            let invalid =
-                || format!("invalid pending event {event_index} of agent message {index}");
-            let event = event.to_agent().with_context(invalid)?;
-            anyhow::ensure!(
-                fold.apply(&event).with_context(invalid)?.message.is_none(),
-                "agent message {index}'s pending events complete a message the transcript lacks"
-            );
         }
+        if !generating {
+            continue;
+        }
+        anyhow::ensure!(
+            message.pending_events.is_empty() || transcript.is_settled(),
+            "agent message {index} previews a reply while calls wait for results"
+        );
         if let Some(call) = &message.awaiting_approval {
-            let call = call.to_call_id()?;
             anyhow::ensure!(
-                message.run.is_generating() && is_pending(&fold, &call),
+                transcript.is_pending(call),
                 "agent message {index} awaits approval of a call that is not waiting"
             );
         }
-        if compacting && message.run.is_generating() {
+        if compacting {
             anyhow::ensure!(
                 message.awaiting_approval.is_none()
-                    && fold.pending_calls().is_empty()
-                    && fold.partial().is_none(),
+                    && transcript.is_settled()
+                    && message.pending_events.is_empty(),
                 "compaction is not at a request boundary"
             );
         }
     }
     Ok(())
-}
-
-/// Whether `call` is one of the calls `fold` is waiting for the results of.
-fn is_pending(fold: &TurnFold, call: &CallId) -> bool {
-    fold.pending_calls()
-        .iter()
-        .any(|pending| pending.id == *call)
 }
 
 impl Thread {
@@ -325,58 +339,111 @@ impl Thread {
     pub(crate) fn apply_agent_event(
         &mut self,
         message_id: Uuid,
-        event: Json<AgentEvent>,
+        event: RunEvent,
         cx: &mut impl AppContext,
     ) -> anyhow::Result<()> {
-        let start = self
-            .agent_message_mut(message_id.into_bytes())
-            .context("event has no run")?
-            .record
-            .start;
-        anyhow::ensure!(
-            self.transcript.has_prompt(start),
-            "run has no recorded prompt"
-        );
-        let decoded = event.to_agent()?;
-        let folded = self
-            .active_turn(message_id)?
-            .apply(&decoded)
-            .context("the host sent an agent event out of order")?;
-        let completed = folded.message.is_some();
-        if let Some(message) = folded.message {
-            self.transcript.append(message);
+        let activity = self
+            .run_activity(message_id)
+            .context("event is not for the active run")?;
+        let mut completed = None;
+        match event {
+            RunEvent::Preview(preview) => {
+                anyhow::ensure!(
+                    activity != RunActivity::Compacting && self.transcript.is_settled(),
+                    "a reply previews while calls wait or the context is compacting"
+                );
+                let (PreviewDelta::Text(text) | PreviewDelta::Reasoning(text)) = &preview.delta;
+                self.streamed_bytes += text.len() as u64;
+                self.active_preview(message_id)?.apply(&preview);
+                if let Some(message) = agent_message(&mut self.timeline, message_id) {
+                    message.record.pending_events.push(preview);
+                }
+            }
+            RunEvent::Committed { index, entry } => {
+                anyhow::ensure!(
+                    activity != RunActivity::Compacting,
+                    "an entry was committed while compacting"
+                );
+                let entry = entry
+                    .parse()
+                    .context("invalid entry from host")?
+                    .decode::<RunSource>()
+                    .context("invalid entry from host")?;
+                self.transcript.commit(index, entry.clone())?;
+                if entry.message.role == Role::Assistant {
+                    *self.active_preview(message_id)? = ReplyPreview::default();
+                    if let Some(message) = agent_message(&mut self.timeline, message_id) {
+                        message.record.pending_events.clear();
+                    }
+                }
+                // A call that returned no longer waits, however the host
+                // decided.
+                if let Some(message) = agent_message(&mut self.timeline, message_id)
+                    && message
+                        .record
+                        .awaiting_approval
+                        .as_ref()
+                        .is_some_and(|call| !self.transcript.is_pending(call))
+                {
+                    message.record.awaiting_approval = None;
+                    self.approval_activity(message_id, None)?;
+                }
+                completed = Some(entry.message);
+            }
+            RunEvent::Usage { tokens } => {
+                // A summary's usage measures the context it summarized.
+                if activity != RunActivity::Compacting {
+                    self.context_tokens = Some(tokens);
+                    self.streamed_bytes = 0;
+                }
+                return Ok(());
+            }
+            RunEvent::CompactionStarted => {
+                anyhow::ensure!(
+                    activity == RunActivity::Working,
+                    "compaction requires a working run"
+                );
+                anyhow::ensure!(
+                    self.transcript.is_settled() && self.active_preview(message_id)?.is_empty(),
+                    "compaction requires a request boundary"
+                );
+                self.set_run_activity(message_id, RunActivity::Compacting);
+                return Ok(());
+            }
+            RunEvent::Compacted(compaction) => {
+                anyhow::ensure!(
+                    activity == RunActivity::Compacting,
+                    "compaction is not running"
+                );
+                let compaction = compaction
+                    .parse()
+                    .context("invalid compaction from host")?
+                    .decode()
+                    .context("invalid compaction from host")?;
+                self.transcript.compact(compaction)?;
+                self.context_tokens = Some(self.transcript.estimated_tokens());
+                self.streamed_bytes = 0;
+                self.set_run_activity(message_id, RunActivity::Working);
+                if let Some(message) = agent_message(&mut self.timeline, message_id) {
+                    message.ui.compact(cx);
+                }
+                return Ok(());
+            }
+            RunEvent::CompactionFailed => {
+                if activity == RunActivity::Compacting {
+                    self.set_run_activity(message_id, RunActivity::Working);
+                }
+                return Ok(());
+            }
         }
-        self.measure_agent_event(&decoded);
-        let partial = self.active_turn(message_id)?.partial();
+        let partial = self.active_preview(message_id)?.partial();
         let Some(message) = agent_message(&mut self.timeline, message_id) else {
             return Ok(());
         };
-        if completed {
-            message.record.pending_events.clear();
-        } else {
-            message.record.pending_events.push(event);
-        }
-        // A call that returned no longer waits, however the host decided.
-        if let AgentEvent::ToolResult(result) = &decoded
-            && message.record.awaiting_approval.as_ref() == Some(&result.call)
-        {
-            message.record.awaiting_approval = None;
-        }
-        let completed = completed.then(|| match self.transcript.entries.last().unwrap() {
-            TranscriptEntry::Message(message) => message,
-            _ => unreachable!(),
-        });
         let generating = message.is_generating();
         message
             .ui
-            .advance(completed, partial.as_ref(), generating, cx);
-        if self.run_activity(message_id) == Some(crate::timeline::RunActivity::AwaitingApproval)
-            && self
-                .agent_message_mut(message_id.into_bytes())
-                .is_some_and(|run| run.record.awaiting_approval.is_none())
-        {
-            self.approval_activity(message_id, None)?;
-        }
+            .advance(completed.as_ref(), partial.as_ref(), generating, cx);
         self.show_comment_responses(message_id, cx);
         Ok(())
     }
@@ -386,10 +453,10 @@ impl Thread {
     pub(crate) fn await_tool_approval(
         &mut self,
         message_id: Uuid,
-        call: CallId,
+        call: ToolCallId,
     ) -> anyhow::Result<()> {
         anyhow::ensure!(
-            is_pending(self.active_turn(message_id)?, &call),
+            self.transcript.is_pending(&call),
             "the host asked to approve a call that is not waiting for its result"
         );
         self.approval_activity(message_id, Some(&call))?;
@@ -401,7 +468,7 @@ impl Thread {
     }
 
     /// Stops showing `call` as waiting for approval; its result follows.
-    pub(crate) fn resolve_tool_approval(&mut self, message_id: Uuid, call: &CallId) {
+    pub(crate) fn resolve_tool_approval(&mut self, message_id: Uuid, call: &ToolCallId) {
         if let Some(message) = agent_message(&mut self.timeline, message_id)
             && message.record.awaiting_approval.as_ref() == Some(call)
         {
@@ -410,7 +477,7 @@ impl Thread {
         }
     }
 
-    /// Ends the run producing message `id`. What it streamed that never
+    /// Ends the run producing message `id`. What it previewed that never
     /// joined the transcript stays in the message's pending events.
     pub(crate) fn end_agent_run(
         &mut self,
@@ -419,12 +486,12 @@ impl Thread {
         duration: std::time::Duration,
         cx: &mut impl AppContext,
     ) {
-        let Some(turn) = self.take_active_turn(Uuid::from_bytes(id)) else {
+        let Some(preview) = self.take_active_preview(Uuid::from_bytes(id)) else {
             return;
         };
-        let partial = turn.partial();
-        // A request that was stopped or failed before it reported usage
-        // never adds its partial output to the transcript.
+        let partial = preview.partial();
+        // A reply that was stopped or failed before it completed never
+        // joins the transcript.
         self.streamed_bytes = 0;
         let Some(message) = self.agent_message_mut(id) else {
             return;
@@ -438,50 +505,41 @@ impl Thread {
     }
 
     /// Shows the output of every agent message of a timeline fresh from a
-    /// snapshot, and resumes folding the running one. A run's partial message
-    /// is rebuilt by folding its pending events, as it was where they were
-    /// folded. The snapshot must have passed [`validate_agent_runs`].
+    /// snapshot, and resumes previewing the running one. The snapshot must
+    /// have passed [`validate_agent_runs`].
     pub(crate) fn restore_agent_output(&mut self, compacting: bool, cx: &mut impl AppContext) {
-        let mut runs = self
+        let starts = self
             .timeline
-            .iter_mut()
+            .iter()
             .filter_map(|entry| match entry {
-                TimelineMessage::Agent(message) => Some(message),
+                TimelineMessage::Agent(message) => Some(message.record.start.0 as usize),
                 TimelineMessage::User(_) => None,
             })
-            .peekable();
+            .collect::<Vec<_>>();
         let mut active = None;
-        while let Some(message) = runs.next() {
-            let end = runs.peek().map_or(self.transcript.entries.len(), |next| {
-                next.record.start.0 as usize
-            });
-            let output = run_output(
-                &self.transcript.entries,
-                message.record.start.0 as usize..end,
-            );
-            let mut fold = output
-                .as_ref()
-                .map(|output| fold_after(&self.transcript.entries, output))
-                .unwrap_or_default();
-            for event in &message.record.pending_events {
-                let event = event
-                    .to_agent()
-                    .expect("pending events validated with the snapshot");
-                fold.apply(&event)
-                    .expect("pending events validated with the snapshot");
-            }
+        let mut runs = 0;
+        for entry in &mut self.timeline {
+            let TimelineMessage::Agent(message) = entry else {
+                continue;
+            };
+            let end = starts
+                .get(runs + 1)
+                .copied()
+                .unwrap_or(self.transcript.len());
+            let output = run_output(&self.transcript, starts[runs]..end)
+                .unwrap_or(self.transcript.len()..self.transcript.len());
+            runs += 1;
+            let preview = ReplyPreview::of(&message.record.pending_events);
             let generating = message.is_generating();
-            let output =
-                output.unwrap_or(self.transcript.entries.len()..self.transcript.entries.len());
             message.ui.restore(
-                &self.transcript.entries[output.clone()],
-                fold.partial().as_ref(),
+                &self.transcript,
+                output,
+                preview.partial().as_ref(),
                 generating,
                 cx,
             );
-            let message_id = message.record.id;
-            if message.is_generating() {
-                active = Some((message_id, fold));
+            if generating {
+                active = Some((message.record.id, preview));
             }
         }
         self.restore_execution(active, compacting);
@@ -491,24 +549,6 @@ impl Thread {
             if let TimelineMessage::Agent(message) = &self.timeline[index] {
                 self.show_comment_responses(message.record.id, cx);
             }
-        }
-    }
-
-    /// Counts an event towards the context window estimate; see
-    /// [`Thread::live_context_tokens`]. Only live events count: a snapshot
-    /// carries the counts.
-    fn measure_agent_event(&mut self, event: &AgentEvent) {
-        match event {
-            AgentEvent::Model(
-                StreamEvent::Text { text, .. } | StreamEvent::Reasoning { text, .. },
-            ) => self.streamed_bytes += text.len() as u64,
-            // Each request sends the current request context (possibly a
-            // summary plus newer messages), so its usage measures fullness.
-            AgentEvent::TurnEnded { usage, .. } if usage.is_reported() => {
-                self.context_tokens = Some(usage_tokens(*usage));
-                self.streamed_bytes = 0;
-            }
-            _ => {}
         }
     }
 
@@ -539,14 +579,15 @@ impl Thread {
         cx: &mut impl AppContext,
     ) {
         // A call whose arguments are not a JSON object never ran.
-        if call.function.name.as_str() != RespondToComment::NAME
-            || call.function.invalid_arguments.is_some()
-        {
+        let ToolArguments::Object { value } = &call.arguments else {
+            return;
+        };
+        if call.name != RespondToComment::NAME {
             return;
         }
-        let Ok(args) =
-            serde_json::from_value::<RespondToCommentArgs>(call.function.arguments_value())
-        else {
+        let Ok(args) = serde_json::from_value::<RespondToCommentArgs>(serde_json::Value::Object(
+            value.clone(),
+        )) else {
             return;
         };
         if args.response.trim().is_empty() {
@@ -596,7 +637,7 @@ impl Thread {
         message.ui.comment_responses.push(AgentCommentResponse {
             // Derived rather than random, so every participant names the
             // reply alike and comments on it reach the same one.
-            id: Uuid::new_v5(&message_id, call.id.to_string().as_bytes()),
+            id: Uuid::new_v5(&message_id, call.id.0.as_bytes()),
             comment_id,
             response_view: cx.new(|cx| TextViewState::markdown(&args.response, cx)),
             response: args.response,
@@ -613,142 +654,143 @@ fn agent_message(timeline: &mut [TimelineMessage], id: Uuid) -> Option<&mut Agen
     })
 }
 
+impl crate::timeline::AgentOutput {
+    /// What a run's `output` entries of `transcript` show, with the
+    /// compactions accepted among them in place.
+    pub(crate) fn from_transcript(transcript: &Transcript, output: Range<usize>) -> Self {
+        let mut shown = Self::default();
+        let mut compactions = transcript.compactions_in(&output).peekable();
+        for index in output.clone() {
+            while compactions.next_if(|at| *at == index).is_some() {
+                shown.push_compaction();
+            }
+            shown.push(&transcript.entries()[index].message);
+        }
+        for _ in compactions {
+            shown.push_compaction();
+        }
+        shown
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    use crate::timeline::AgentOutput;
-    use rig::completion::AssistantContent;
-    use rig::message::{
-        AssistantMessage, ImageMediaType, Origin, Reasoning, StopReason, ToolCall, ToolFunction,
-        ToolName, UserContent,
-    };
-    use serde_json::json;
+    use crate::timeline::{AgentOutput, AgentStep};
+    use agent::model::{FinishReason, GenerationMetadata, ToolResult, ToolResultContent};
+    use agent::{DefinitionRevision, InputId};
 
+    fn input(text: &str) -> Entry<RunSource> {
+        Entry {
+            message: Message::user(text),
+            origin: Origin::Input {
+                id: InputId::new(),
+                source: RunSource::Schedule,
+            },
+        }
+    }
+
+    fn reply(content: Vec<Content>) -> Entry<RunSource> {
+        let mut message = Message::new(Role::Assistant, content);
+        message.generation = Some(GenerationMetadata {
+            provider: "test".into(),
+            model: None,
+            finish_reason: Some(FinishReason::Stop),
+            usage: None,
+            extra: Default::default(),
+        });
+        Entry {
+            message,
+            origin: Origin::Model {
+                revision: DefinitionRevision::default(),
+            },
+        }
+    }
+
+    fn commit(transcript: &mut Transcript, entry: Entry<RunSource>) {
+        transcript.commit(transcript.len() as u64, entry).unwrap();
+    }
+
+    fn summary(end: usize, previous_revision: usize) -> Compaction {
+        Compaction {
+            previous_revision,
+            end,
+            summary: Message::user("Summary"),
+        }
+    }
+
+    /// Accepted summaries show where they were accepted, and survive the
+    /// wire with every entry, exactly.
     #[test]
-    fn compactions_fold_in_order_and_separate_adjacent_text() {
-        use crate::timeline::AgentStep;
+    fn compactions_show_in_place_and_round_trip() {
         let mut transcript = Transcript::default();
-        transcript.append(RigMessage::user("Request"));
-        transcript.append(RigMessage::assistant("Before"));
-        transcript
-            .install_compaction("First summary".into())
-            .unwrap();
-        transcript
-            .install_compaction("Second summary".into())
-            .unwrap();
-        transcript.append(RigMessage::assistant("After"));
-        let output = AgentOutput::from_transcript(&transcript.entries[1..]);
+        commit(&mut transcript, input("Request"));
+        commit(
+            &mut transcript,
+            reply(vec![Content::text("Before ".repeat(50))]),
+        );
+        commit(&mut transcript, input("More"));
+        transcript.compact(summary(2, 0)).unwrap();
+        commit(&mut transcript, reply(vec![Content::text("After")]));
+        let output = AgentOutput::from_transcript(&transcript, 1..4);
         assert_eq!(
             output.steps(),
             &[
-                AgentStep::Text("Before".into()),
-                AgentStep::Compaction,
+                AgentStep::Text("Before ".repeat(50)),
                 AgentStep::Compaction,
                 AgentStep::Text("After".into()),
             ]
         );
-        assert_eq!(
-            transcript.request_history(),
-            vec![
-                RigMessage::user("Summary of the conversation so far:\nSecond summary"),
-                RigMessage::assistant("After"),
-            ]
-        );
-    }
-
-    #[test]
-    fn summaries_precede_the_next_prompt_and_preserve_original_messages() {
-        let mut transcript = Transcript::default();
-        transcript.append(RigMessage::user("Original request"));
-        transcript.append(RigMessage::assistant("Original answer"));
-        transcript
-            .install_compaction("Earlier conversation".into())
-            .unwrap();
-        transcript
-            .install_compaction("Everything so far".into())
-            .unwrap();
-        let prompt = transcript.end();
-        transcript.append(RigMessage::user("Continue"));
-        assert_eq!(prompt, TranscriptIndex(4));
-        assert_eq!(transcript.leading_compactions(TranscriptIndex(2)), 2..4);
-        assert_eq!(run_output(&transcript.entries, 0..2), Some(1..2));
-        assert_eq!(run_output(&transcript.entries, 2..5), Some(5..5));
-        assert_eq!(
-            transcript.messages(),
-            vec![
-                RigMessage::user("Original request"),
-                RigMessage::assistant("Original answer"),
-                RigMessage::user("Continue"),
-            ]
-        );
-        assert_eq!(
-            transcript.request_history(),
-            vec![
-                RigMessage::user("Summary of the conversation so far:\nEverything so far"),
-                RigMessage::user("Continue"),
-            ]
-        );
         let bytes = postcard::to_stdvec(&transcript.to_protocol()).unwrap();
-        let wire: Json<Transcript> = postcard::from_bytes(&bytes).unwrap();
+        let wire: Json<TranscriptRecord> = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(wire.to_transcript().unwrap(), transcript);
     }
 
+    /// Entries the host's conversation could not have committed are
+    /// refused: out of order, or a result no call waits for.
     #[test]
-    fn empty_or_leading_summaries_are_rejected() {
+    fn invalid_entries_are_refused() {
         let mut transcript = Transcript::default();
-        assert!(transcript.install_compaction("No history".into()).is_err());
-        transcript.append(RigMessage::user("Request"));
-        let original = transcript.clone();
-        assert!(transcript.install_compaction("  ".into()).is_err());
-        assert_eq!(transcript, original);
-        for entries in [
-            vec![TranscriptEntry::Compaction("No history".into())],
-            vec![
-                TranscriptEntry::Message(RigMessage::user("Request")),
-                TranscriptEntry::Compaction("  ".into()),
-            ],
-        ] {
-            let invalid = Transcript { entries };
-            assert!(invalid.to_protocol().to_transcript().is_err());
-        }
+        assert!(transcript.commit(1, input("Gap")).is_err());
+        commit(&mut transcript, input("Request"));
+        let stray = Entry {
+            message: Message::new(
+                Role::Tool,
+                vec![Content::ToolResult(ToolResult {
+                    call: ToolCallId::new(),
+                    provider_id: None,
+                    name: None,
+                    content: vec![ToolResultContent::Text { text: "x".into() }],
+                    is_error: false,
+                })],
+            ),
+            origin: Origin::Tool,
+        };
+        assert!(transcript.commit(1, stray).is_err());
+        assert_eq!(transcript.len(), 1);
     }
 
-    /// A prompt with an image, a reply with reasoning and a tool call, and
-    /// the tool's result come back from the wire exactly as they were
-    /// recorded.
     #[test]
-    fn messages_round_trip_exactly() {
-        let call_id = CallId::from_wire("call_1");
-        let tool = ToolName::new("respond_to_comment").expect("a valid name");
-        let messages = [
-            RigMessage::User {
-                content: vec![
-                    UserContent::text("Ada:\nWhat is this?"),
-                    UserContent::image_base64("AQID", Some(ImageMediaType::PNG), None),
-                ],
-            },
-            RigMessage::Assistant(
-                AssistantMessage::new(vec![
-                    AssistantContent::Reasoning(Reasoning::new("Look it up first.")),
-                    AssistantContent::text("Checking."),
-                    AssistantContent::ToolCall(ToolCall::new(
-                        call_id.clone(),
-                        ToolFunction::new(
-                            tool.clone(),
-                            json!({"comment_id": "comment_1", "response": "Yes", "n": 1.5}),
-                        ),
-                    )),
-                ])
-                .with_origin(Origin::new("ollama.chat", "ollama", "qwen"))
-                .with_stop(StopReason::ToolUse),
-            ),
-            RigMessage::tool_result(call_id, tool, "Recorded"),
-        ];
-        for message in messages {
-            let wire = postcard::to_stdvec(&Json::from_rig(&message)).expect("encode");
-            let received: Json<RigMessage> = postcard::from_bytes(&wire).expect("decode");
-            assert_eq!(received.to_rig().expect("a message"), message);
+    fn previews_follow_their_parts() {
+        let mut preview = ReplyPreview::default();
+        for (index, delta) in [
+            (0, PreviewDelta::Reasoning("Think".into())),
+            (1, PreviewDelta::Text("Hel".into())),
+            (0, PreviewDelta::Reasoning("ing.".into())),
+            (1, PreviewDelta::Text("lo".into())),
+        ] {
+            preview.apply(&Preview { index, delta });
         }
+        let partial = preview.partial().unwrap();
+        assert_eq!(
+            partial.content,
+            [
+                Content::Reasoning(Reasoning::Text {
+                    text: "Thinking.".into()
+                }),
+                Content::text("Hello"),
+            ]
+        );
     }
 }

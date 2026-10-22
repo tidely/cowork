@@ -12,7 +12,6 @@ use gpui_component::{
     searchable_list::{SearchableGroup, SearchableListItem, SearchableVec},
     tooltip::Tooltip,
 };
-use rig::providers::ollama::Ollama;
 
 use crate::{
     Cowork,
@@ -175,7 +174,7 @@ impl Cowork {
     /// picker follows on the next frame; see [`Cowork::sync_model_picker`].
     pub(crate) fn refresh_models(&mut self, cx: &mut Context<Self>) {
         let task = self.tokio_handle.spawn(async {
-            Ollama::new()
+            crate::submission::provider(ModelProvider::Ollama)?
                 .list_models()
                 .await
                 .map_err(anyhow::Error::from)
@@ -187,7 +186,6 @@ impl Cowork {
                     catalog.set_provider(
                         ModelProvider::Ollama,
                         models
-                            .data
                             .into_iter()
                             .filter(|model| !model.id.is_empty())
                             .map(|model| {

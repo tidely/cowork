@@ -46,43 +46,29 @@ fn empty_thread(
 }
 
 fn agent_ended(id: Uuid, outcome: protocol::RunOutcome) -> protocol::HostMessage {
-    protocol::HostMessage::AgentEnded {
-        id: id.into_bytes(),
-        outcome,
-        duration: Duration::from_secs(1),
-    }
+    ScriptedHost::default().ended(id, outcome)
 }
 
-/// The events a host broadcasts while answering one prompt: a turn that
+/// Whether `event` previews text of the answer.
+fn previews_text(event: &protocol::HostMessage) -> bool {
+    matches!(
+        event,
+        protocol::HostMessage::AgentEvent {
+            event: protocol::RunEvent::Preview(protocol::Preview {
+                delta: protocol::PreviewDelta::Text(_),
+                ..
+            }),
+            ..
+        }
+    )
+}
+
+/// The messages a host sends while answering one prompt: a reply that
 /// thinks, answers, and replies to a comment with a tool call, then the
-/// tool's result and a second turn.
-fn agent_stream_events(message_id: Uuid) -> Vec<protocol::HostMessage> {
+/// tool's result and a second reply.
+fn agent_stream_events(host: &mut ScriptedHost, message_id: Uuid) -> Vec<protocol::HostMessage> {
     let user_message_id = Uuid::new_v4().into_bytes();
     let comment_id = Uuid::new_v4().into_bytes();
-    let first_turn = model_turn(
-        [
-            streamed_text("thinking", "Weighing ", true),
-            streamed_text("thinking", "options.", true),
-            // The thinking stays open until the turn ends, but the answer
-            // follows it from its first token.
-            streamed_text("answer", "Here is ", false),
-            streamed_text("answer", "the answer.", false),
-            streamed_tool_call(
-                "call",
-                "respond_to_comment",
-                serde_json::json!({"comment_id": "comment_1", "response": "Because of this."}),
-            ),
-        ],
-        1_024,
-    );
-    let results = tool_results(&first_turn, "Recorded");
-    let second_turn = model_turn([streamed_text("second", " Done.", false)], 2_048);
-    let agent = first_turn
-        .into_iter()
-        .chain(results)
-        .chain(second_turn)
-        .map(|event| agent_event(message_id, event));
-
     let mut events = vec![
         protocol::HostMessage::ThreadTitled("Explain this".into()),
         protocol::HostMessage::UserMessage(protocol::UserMessage {
@@ -104,9 +90,30 @@ fn agent_stream_events(message_id: Uuid) -> Vec<protocol::HostMessage> {
                 body: "why?".into(),
             }],
         }),
-        agent_started(message_id, Some(user_message_id), "Explain this"),
+        host.started(message_id, Some(user_message_id)),
+        host.prompt(message_id, "Explain this"),
     ];
-    events.extend(agent);
+    events.extend(host.turn(
+        message_id,
+        [
+            streamed_text("thinking", "Weighing ", true),
+            streamed_text("thinking", "options.", true),
+            streamed_text("answer", "Here is ", false),
+            streamed_text("answer", "the answer.", false),
+            streamed_tool_call(
+                "call",
+                "respond_to_comment",
+                serde_json::json!({"comment_id": "comment_1", "response": "Because of this."}),
+            ),
+        ],
+        1_024,
+    ));
+    events.extend(host.results(message_id, "Recorded"));
+    events.extend(host.turn(
+        message_id,
+        [streamed_text("second", " Done.", false)],
+        2_048,
+    ));
     events.extend([
         protocol::HostMessage::AgentEnded {
             id: message_id.into_bytes(),
@@ -135,17 +142,18 @@ fn agent_stream_events(message_id: Uuid) -> Vec<protocol::HostMessage> {
 
 /// Someone joining after any event of two runs ends up with the host's
 /// thread: the snapshot shows what the host showed then, deriving it from
-/// the transcript and pending events where the host showed it
+/// the transcript and pending previews where the host showed it
 /// incrementally, and the events that follow bring them to where the host
-/// ends up. The second run's turn calls two tools, answered one at a time,
-/// so results arrive for committed calls before they join the transcript.
+/// ends up. The second run's reply calls two tools, answered one at a time.
 #[gpui::test]
 fn joining_after_any_event_converges_on_the_host(cx: &mut gpui::TestAppContext) {
     let first_id = Uuid::new_v4();
     let second_id = Uuid::new_v4();
-    let mut events = agent_stream_events(first_id);
-    events.push(agent_started(second_id, None, "Calculate both"));
-    let mut turn = model_turn(
+    let mut host_script = ScriptedHost::default();
+    let mut events = agent_stream_events(&mut host_script, first_id);
+    events.extend(host_script.start(second_id, "Calculate both"));
+    events.extend(host_script.turn(
+        second_id,
         [
             streamed_text("thinking", "Two sums.", true),
             streamed_tool_call(
@@ -160,17 +168,16 @@ fn joining_after_any_event_converges_on_the_host(cx: &mut gpui::TestAppContext) 
             ),
         ],
         300,
-    );
-    let results = tool_results(&turn, "sum");
-    turn.extend(results);
-    turn.extend(model_turn(
+    ));
+    events.extend(host_script.results(second_id, "sum"));
+    events.extend(host_script.turn(
+        second_id,
         [
             streamed_text("answer", "3 and ", false),
             streamed_text("answer", "7.", false),
         ],
         400,
     ));
-    events.extend(turn.into_iter().map(|event| agent_event(second_id, event)));
     events.push(agent_ended(second_id, protocol::RunOutcome::Completed));
 
     let collaborator = ParticipantId::new();
@@ -219,7 +226,7 @@ fn joining_after_any_event_converges_on_the_host(cx: &mut gpui::TestAppContext) 
         };
         let calls = first.ui.output.tool_calls().collect::<Vec<_>>();
         assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].call.function.name, "respond_to_comment");
+        assert_eq!(calls[0].call.name, "respond_to_comment");
         assert_eq!(calls[0].result_text().as_deref(), Some("Recorded"));
         assert_eq!(first.ui.comment_responses.len(), 1);
         let TimelineMessage::Agent(second) = &host.timeline[2] else {
@@ -240,26 +247,30 @@ fn joining_after_any_event_converges_on_the_host(cx: &mut gpui::TestAppContext) 
     });
 }
 
+/// A run that fails mid-reply keeps what it previewed, which the transcript
+/// never got, for joiners too.
 #[gpui::test]
 fn failed_run_keeps_output_the_transcript_never_got_for_joiners(cx: &mut gpui::TestAppContext) {
-    use rig::{completion::AssistantContent, streaming::StreamEvent};
-
     let message_id = Uuid::new_v4();
-    let events = agent_stream_events(message_id);
-    let through_call = events
+    let mut host = ScriptedHost::default();
+    let events = agent_stream_events(&mut host, message_id);
+    // Through the first reply's previews, before it joins the transcript.
+    let previewed = events
         .iter()
         .position(|event| {
-            matches!(event, protocol::HostMessage::AgentEvent { event, .. }
-            if matches!(event.to_agent(), Ok(agent::AgentEvent::Model(
-                StreamEvent::End { content: AssistantContent::ToolCall(_), .. }
-            ))))
+            matches!(
+                event,
+                protocol::HostMessage::AgentEvent {
+                    event: protocol::RunEvent::Usage { .. },
+                    ..
+                }
+            )
         })
-        .unwrap()
-        + 1;
+        .unwrap();
     let (thread, cx) = empty_thread(cx, Arc::default());
     cx.update(|_, cx| {
         thread.update(cx, |thread, cx| {
-            for event in events.iter().take(through_call) {
+            for event in events.iter().take(previewed) {
                 thread.apply_for_test(event.clone(), cx);
             }
             thread.apply_for_test(
@@ -274,12 +285,18 @@ fn failed_run_keeps_output_the_transcript_never_got_for_joiners(cx: &mut gpui::T
         let protocol::TimelineMessage::Agent(message) = &welcome.thread.messages[1] else {
             panic!("expected agent message");
         };
-        // The turn never ended, so all of it is pending.
+        // The reply never completed, so all of it is pending.
         assert_eq!(
             message.pending_events.len(),
-            events[..through_call]
+            events[..previewed]
                 .iter()
-                .filter(|event| matches!(event, protocol::HostMessage::AgentEvent { .. }))
+                .filter(|event| matches!(
+                    event,
+                    protocol::HostMessage::AgentEvent {
+                        event: protocol::RunEvent::Preview(_),
+                        ..
+                    }
+                ))
                 .count()
         );
         let restored = Thread::join_for_test(welcome, cx);
@@ -288,47 +305,8 @@ fn failed_run_keeps_output_the_transcript_never_got_for_joiners(cx: &mut gpui::T
             panic!("expected agent message");
         };
         assert_eq!(restored.record.run.failure(), Some("stream failed"));
-        let calls = restored.ui.output.tool_calls().collect::<Vec<_>>();
-        assert_eq!(calls[0].call.function.name, "respond_to_comment");
-        assert!(calls[0].result.is_none());
-    });
-}
-
-/// A part's end may state other content than its fragments did, superseding
-/// what streamed. What the message shows follows Rig's accumulation, so it
-/// shows the content the end states, as the transcript records it.
-#[gpui::test]
-fn a_restated_part_shows_as_rig_accumulates_it(cx: &mut gpui::TestAppContext) {
-    let message_id = Uuid::new_v4();
-    let event = |value: serde_json::Value| {
-        agent::AgentEvent::Model(serde_json::from_value(value).expect("a stream event"))
-    };
-    let turn = [
-        event(serde_json::json!({"event": "start", "part": 0, "kind": "reasoning"})),
-        event(serde_json::json!({"event": "reasoning", "part": 0, "text": "Hm"})),
-        event(serde_json::json!({"event": "end", "part": 0,
-            "content": {"type": "reasoning", "text": "Considered."}})),
-        event(serde_json::json!({"event": "start", "part": 1, "kind": "text"})),
-        event(serde_json::json!({"event": "text", "part": 1, "text": "Yes."})),
-        event(serde_json::json!({"event": "end", "part": 1,
-            "content": {"type": "text", "text": "Yes."}})),
-    ];
-    let (thread, cx) = empty_thread(cx, Arc::default());
-    cx.update(|_, cx| {
-        thread.update(cx, |thread, cx| {
-            thread.apply_for_test(agent_started(message_id, None, "Is it?"), cx);
-            for event in turn {
-                thread.apply_for_test(agent_event(message_id, event), cx);
-            }
-            let message = thread
-                .agent_message_mut(message_id.into_bytes())
-                .expect("the agent message");
-            assert_eq!(
-                message.ui.output.thinking().collect::<Vec<_>>(),
-                ["Considered."]
-            );
-            assert_eq!(message.ui.output.text, "Yes.");
-        });
+        assert_eq!(restored.ui.output.text, "Here is the answer.");
+        assert_eq!(restored.ui.output.tool_calls().count(), 0);
     });
 }
 
@@ -342,7 +320,7 @@ fn snapshots_with_agent_runs_the_transcript_cannot_hold_are_rejected(
     let (thread, cx) = empty_thread(cx, Arc::default());
     cx.update(|_, cx| {
         thread.update(cx, |thread, cx| {
-            for event in agent_stream_events(message_id) {
+            for event in agent_stream_events(&mut ScriptedHost::default(), message_id) {
                 thread.apply_for_test(event, cx);
             }
         });
@@ -358,26 +336,24 @@ fn snapshots_with_agent_runs_the_transcript_cannot_hold_are_rejected(
             Thread::validate_welcome(&welcome)
         };
 
-        // The prompt must be a user message: here it is the agent's reply.
-        assert!(
-            with_agent_message(&|message| message.start = crate::transcript::TranscriptIndex(1))
-                .is_err()
-        );
         assert!(
             with_agent_message(&|message| message.start = crate::transcript::TranscriptIndex(99))
                 .is_err()
         );
-        // Events completing a turn would have joined the transcript.
-        let more = model_turn([streamed_text("answer", "More", false)], 1)
-            .into_iter()
-            .map(protocol::Json::shared)
-            .collect::<Vec<_>>();
-        assert!(with_agent_message(&|message| message.pending_events = more.clone()).is_err());
-        assert!(with_agent_message(&|message| message.pending_events = more[..2].to_vec()).is_ok());
-        // Events Rig's stream could not have produced: text before its part
-        // started.
+        // An ended run may keep previews; a call it never made can't wait.
+        let preview = protocol::Preview {
+            index: 0,
+            delta: protocol::PreviewDelta::Text("More".into()),
+        };
         assert!(
-            with_agent_message(&|message| message.pending_events = more[1..2].to_vec()).is_err()
+            with_agent_message(&|message| message.pending_events = vec![preview.clone()]).is_ok()
+        );
+        assert!(
+            with_agent_message(&|message| {
+                message.run = protocol::AgentRun::Generating;
+                message.awaiting_approval = Some(agent::model::ToolCallId("missing".into()));
+            })
+            .is_err()
         );
 
         // Only the last run can still be generating.
@@ -389,15 +365,11 @@ fn snapshots_with_agent_runs_the_transcript_cannot_hold_are_rejected(
             .find(|message| matches!(message, protocol::TimelineMessage::Agent(_)))
             .cloned()
             .expect("an agent message");
-        let mut transcript = two_generating.thread.transcript.to_transcript().unwrap();
-        let second_prompt = transcript.end();
-        transcript.append(RigMessage::user("Next"));
-        two_generating.thread.transcript = transcript.to_protocol();
         let protocol::TimelineMessage::Agent(mut second) = first.clone() else {
             unreachable!();
         };
         second.id = Uuid::new_v4().into_bytes();
-        second.start = second_prompt;
+        second.start = thread.read(cx).transcript.end();
         second.pending_events.clear();
         let protocol::TimelineMessage::Agent(mut first) = first else {
             unreachable!();
@@ -446,21 +418,16 @@ fn snapshots_with_agent_runs_the_transcript_cannot_hold_are_rejected(
 }
 
 /// Thinking collapses when it completes, but once someone expands it again,
-/// later turns and the end of the run leave it open.
+/// later replies and the end of the run leave it open.
 #[gpui::test]
 fn expanded_thinking_stays_open_as_the_run_continues(cx: &mut gpui::TestAppContext) {
     let message_id = Uuid::new_v4();
-    let events = agent_stream_events(message_id);
-    // Through the first answer token, which completes the thinking.
+    let events = agent_stream_events(&mut ScriptedHost::default(), message_id);
+    // Through the first answer fragment, which completes the thinking.
     let thinking_done = events
         .iter()
-        .position(|event| {
-            matches!(event, protocol::HostMessage::AgentEvent { event, .. }
-            if matches!(event.to_agent(), Ok(agent::AgentEvent::Model(
-                rig::streaming::StreamEvent::Text { .. }
-            ))))
-        })
-        .expect("an answer token")
+        .position(previews_text)
+        .expect("an answer fragment")
         + 1;
     let (thread, cx) = empty_thread(cx, Arc::default());
     cx.update(|_, cx| {
@@ -495,7 +462,10 @@ fn expanded_thinking_stays_open_as_the_run_continues(cx: &mut gpui::TestAppConte
 #[gpui::test]
 fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
     let message_id = Uuid::new_v4();
-    let mut turn = model_turn(
+    let mut host = ScriptedHost::default();
+    let mut events = host.start(message_id, "Add 1 and 2");
+    events.extend(host.turn(
+        message_id,
         [
             streamed_text("thinking", "Add first.", true),
             streamed_tool_call(
@@ -505,12 +475,12 @@ fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
             ),
         ],
         100,
-    );
-    turn.extend(tool_results(&turn, "3"));
-    // Through the first fragment of the second thinking: its part's start,
-    // then the fragment.
-    let second_thinking_started = turn.len() + 2;
-    turn.extend(model_turn(
+    ));
+    events.extend(host.results(message_id, "3"));
+    // Through the first fragment of the second thinking.
+    let second_thinking_started = events.len() + 1;
+    events.extend(host.turn(
+        message_id,
         [
             streamed_text("second-thinking", "Now ", true),
             streamed_text("second-thinking", "answer.", true),
@@ -521,9 +491,8 @@ fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
     let (thread, cx) = empty_thread(cx, Arc::default());
     cx.update(|_, cx| {
         thread.update(cx, |thread, cx| {
-            thread.apply_for_test(agent_started(message_id, None, "Add 1 and 2"), cx);
-            for event in turn.iter().take(second_thinking_started) {
-                thread.apply_for_test(agent_event(message_id, event.clone()), cx);
+            for event in events.iter().take(second_thinking_started) {
+                thread.apply_for_test(event.clone(), cx);
             }
             let message = thread
                 .agent_message_mut(message_id.into_bytes())
@@ -543,8 +512,8 @@ fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
             assert!(!message.ui.step_view(0).unwrap().expanded());
             assert!(message.ui.work_expanded, "work shows while the run goes");
 
-            for event in turn.iter().skip(second_thinking_started) {
-                thread.apply_for_test(agent_event(message_id, event.clone()), cx);
+            for event in events.iter().skip(second_thinking_started) {
+                thread.apply_for_test(event.clone(), cx);
             }
             thread.apply_for_test(agent_ended(message_id, protocol::RunOutcome::Completed), cx);
         });
@@ -607,7 +576,10 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
         .build()
         .expect("test runtime");
     let (cowork, _, cx) = attachment_test_cowork(cx, runtime.handle().clone());
-    let turn = |total: u64| Usage::new().total_tokens(total);
+    let turn = |total: u64| Usage {
+        total_tokens: Some(total),
+        ..Usage::default()
+    };
 
     cowork.update(cx, |cowork, cx| {
         let local = cowork.active_thread(cx).expect("active thread");
@@ -652,20 +624,23 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
 fn context_tokens_are_estimated_while_streaming(cx: &mut gpui::TestAppContext) {
     let (thread, cx) = empty_thread(cx, Arc::default());
     let id = Uuid::new_v4();
-    let apply = |thread: &mut Thread, events: &[agent::AgentEvent], cx: &mut Context<Thread>| {
-        for event in events {
-            thread.apply_for_test(agent_event(id, event.clone()), cx);
-        }
-    };
-    // Each turn streams its text's start, then the text.
-    let first = model_turn([streamed_text("answer", "12345", false)], 100);
-    let (first_text, first_end) = first.split_at(2);
-    let second = model_turn([streamed_text("answer", "12345678", false)], 200);
+    let apply =
+        |thread: &mut Thread, events: &[protocol::HostMessage], cx: &mut Context<Thread>| {
+            for event in events {
+                thread.apply_for_test(event.clone(), cx);
+            }
+        };
+    // Each reply previews its text, then reports its usage and joins.
+    let mut host = ScriptedHost::default();
+    let start = host.start(id, "prompt");
+    let first = host.turn(id, [streamed_text("answer", "12345", false)], 100);
+    let (first_text, first_end) = first.split_at(1);
+    let second = host.turn(id, [streamed_text("answer", "12345678", false)], 200);
 
     cx.update(|_, cx| {
         thread.update(cx, |thread, cx| {
             assert_eq!(thread.live_context_tokens(), None);
-            thread.apply_for_test(agent_started(id, None, "prompt"), cx);
+            apply(thread, &start, cx);
 
             // Before any count, streamed output is all there is.
             apply(thread, first_text, cx);
@@ -674,7 +649,7 @@ fn context_tokens_are_estimated_while_streaming(cx: &mut gpui::TestAppContext) {
             // A measurement replaces the estimate, which then grows on.
             apply(thread, first_end, cx);
             assert_eq!(thread.live_context_tokens(), Some(100));
-            apply(thread, &second[..2], cx);
+            apply(thread, &second[..1], cx);
             assert_eq!(thread.live_context_tokens(), Some(102));
         });
 
@@ -700,13 +675,13 @@ fn running_agent_message_is_the_incomplete_one(cx: &mut gpui::TestAppContext) {
         thread.update(cx, |thread, cx| {
             assert_eq!(thread.running_agent_message_id(), None);
             for event in [
-                agent_started(finished, None, "prompt"),
+                ScriptedHost::default().started(finished, None),
                 protocol::HostMessage::AgentEnded {
                     id: finished.into_bytes(),
                     outcome: crate::protocol::RunOutcome::Completed,
                     duration: Duration::from_secs(3),
                 },
-                agent_started(running, None, "prompt"),
+                ScriptedHost::default().started(running, None),
             ] {
                 thread.apply_for_test(event, cx);
             }
@@ -738,7 +713,6 @@ fn collaborator_requests_select_models_and_stop_only_the_running_generation(
         .expect("test runtime");
     let (cowork, thread_id, cx) = attachment_test_cowork(cx, runtime.handle().clone());
     let running_message_id = Uuid::new_v4();
-    let task = runtime.spawn(std::future::pending::<()>());
     let cancelled = Arc::new(AtomicBool::new(false));
 
     cowork.update(cx, |cowork, cx| {
@@ -755,7 +729,7 @@ fn collaborator_requests_select_models_and_stop_only_the_running_generation(
         });
         cowork.active_generations.insert(
             thread_id,
-            ActiveGeneration::for_test(running_message_id, task.abort_handle(), cancelled.clone()),
+            ActiveGeneration::for_test(running_message_id, cancelled.clone()),
         );
 
         for request in [
@@ -788,28 +762,36 @@ fn collaborator_requests_select_models_and_stop_only_the_running_generation(
         // local user's choice.
         assert_eq!(cowork.new_thread_model, None);
     });
-    let aborted = runtime
-        .block_on(task)
-        .expect_err("generation task was aborted");
-    assert!(aborted.is_cancelled());
 }
 
-/// The text parts of a user message sent to the agent.
-fn prompt_texts(message: &RigMessage) -> Vec<String> {
-    let RigMessage::User { content } = message else {
-        panic!("expected a user message, got {message:?}");
-    };
-    content
+/// The text parts of the prompt the agent is sent for `thread`'s last
+/// submission.
+fn last_prompt_texts(thread: &Thread) -> Vec<String> {
+    let group = thread
+        .timeline
         .iter()
-        .filter_map(|part| match part {
-            UserContent::Text(text) => Some(text.text.clone()),
-            _ => None,
+        .rev()
+        .find_map(|message| match message {
+            TimelineMessage::User(group) => Some(group),
+            TimelineMessage::Agent(_) => None,
         })
-        .collect()
+        .expect("a submission");
+    crate::prompt::agent_message(
+        None,
+        &group.record.blocks,
+        &thread.draft().files,
+        &thread.prompt_names,
+    )
+    .into_iter()
+    .filter_map(|part| match part {
+        Content::Text { text } => Some(text),
+        _ => None,
+    })
+    .collect()
 }
 
 #[gpui::test]
-fn renaming_never_changes_what_the_agent_was_sent(cx: &mut gpui::TestAppContext) {
+fn renaming_never_changes_what_the_agent_is_sent(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     let derived_name = cowork.read_with(cx, |cowork, _| cowork.local_participant_id.display_name());
     cx.simulate_input("first");
@@ -823,16 +805,12 @@ fn renaming_never_changes_what_the_agent_was_sent(cx: &mut gpui::TestAppContext)
             .active_thread(cx)
             .expect("the submission started a thread")
     });
-    // The prompt is recorded before the run starts, and this test's run
-    // never does.
-    let first_prompt = thread.read_with(cx, |thread, _| {
-        assert_eq!(thread.transcript.messages().len(), 1);
-        thread.transcript.messages()[0].clone()
+    thread.read_with(cx, |thread, _| {
+        assert_eq!(
+            last_prompt_texts(thread),
+            [format!("{derived_name}:\nfirst")]
+        );
     });
-    // The first prompt tells the agent where its commands run.
-    let [note, first] = prompt_texts(&first_prompt).try_into().expect("two parts");
-    assert!(note.starts_with(sandbox::ENVIRONMENT_NOTE_START), "{note}");
-    assert_eq!(first, format!("{derived_name}:\nfirst"));
 
     cowork.update(cx, |cowork, cx| {
         cowork.set_profile(
@@ -859,14 +837,8 @@ fn renaming_never_changes_what_the_agent_was_sent(cx: &mut gpui::TestAppContext)
     cx.run_until_parked();
 
     thread.read_with(cx, |thread, _| {
-        assert_eq!(thread.transcript.messages().len(), 2);
         assert_eq!(
-            prompt_texts(&thread.transcript.messages()[0]),
-            prompt_texts(&first_prompt)
-        );
-        // The project did not change, so the note is not repeated.
-        assert_eq!(
-            prompt_texts(&thread.transcript.messages()[1]),
+            last_prompt_texts(thread),
             [format!("{derived_name}:\nsecond")]
         );
     });
@@ -882,7 +854,12 @@ fn renaming_never_changes_what_the_agent_was_sent(cx: &mut gpui::TestAppContext)
 #[gpui::test]
 fn a_stopped_run_keeps_its_outcome_and_collapses_its_work(cx: &mut gpui::TestAppContext) {
     let message_id = Uuid::new_v4();
-    let mut turn = model_turn(
+    let mut host = ScriptedHost::default();
+    let mut events = host.start(message_id, "Add 1 and 2");
+    // The reply previews its text, then joins with a call that never
+    // returns: the run is stopped first.
+    events.extend(host.turn(
+        message_id,
         [
             streamed_text("answer", "Let me check.", false),
             streamed_tool_call(
@@ -892,24 +869,21 @@ fn a_stopped_run_keeps_its_outcome_and_collapses_its_work(cx: &mut gpui::TestApp
             ),
         ],
         100,
-    );
-    // Stopped before the turn ended.
-    turn.pop();
+    ));
+    let previewed = 3;
     let (thread, cx) = empty_thread(cx, Arc::default());
     cx.update(|_, cx| {
         thread.update(cx, |thread, cx| {
-            thread.apply_for_test(agent_started(message_id, None, "Add 1 and 2"), cx);
-            // The text's start, then the text.
-            for event in &turn[..2] {
-                thread.apply_for_test(agent_event(message_id, event.clone()), cx);
+            for event in &events[..previewed] {
+                thread.apply_for_test(event.clone(), cx);
             }
             let message = thread
                 .agent_message_mut(message_id.into_bytes())
                 .expect("the agent message");
             // Until a tool call follows, the text may be the response.
             assert_eq!(message.ui.output.text, "Let me check.");
-            for event in turn.iter().skip(2) {
-                thread.apply_for_test(agent_event(message_id, event.clone()), cx);
+            for event in events.iter().skip(previewed) {
+                thread.apply_for_test(event.clone(), cx);
             }
             thread.apply_for_test(
                 protocol::HostMessage::AgentEnded {

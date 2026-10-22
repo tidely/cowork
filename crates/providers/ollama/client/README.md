@@ -1,7 +1,7 @@
 # ollama
 
-Ollama's native HTTP provider for `language_model::LanguageModelProvider`, alongside the
-existing Rig application. It uses `ollama-types` for the native wire protocol;
+Ollama's native HTTP provider for `language_model::LanguageModelProvider`, which
+the Cowork app runs its models on. It uses `ollama-types` for the native wire protocol;
 the accepted messages and persistence schemas are owned by `language-model`.
 No agent loop, tool executor, approvals, database, or retries are included.
 

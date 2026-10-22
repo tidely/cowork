@@ -34,11 +34,10 @@ use crate::{
     settings::SettingsPage,
     sharing::JoinDialog,
     sidebar::SIDEBAR_WIDTH,
-    submission::ActiveGeneration,
+    submission::{ActiveGeneration, ThreadAgent},
     thread::{Thread, ThreadStore},
     thread_draft::ThreadDraft,
     timeline::{PromptBlock, ThreadMessageId, TimelineMessage},
-    timeline_projection::{TimelineItem, TimelineProjection},
     timeline_view::{SegmentTextView, ShownSegments},
     timeline_virtualization::DeferredTimelineRow,
     top_bar::macos_traffic_light_position,
@@ -163,6 +162,8 @@ struct Cowork {
     /// each hosted thread's project and scratch folder.
     sandboxes: Arc<sandbox::Sandboxes>,
     active_generations: HashMap<Uuid, ActiveGeneration>,
+    /// The agent session of each local or hosted thread that has run.
+    agents: HashMap<Uuid, ThreadAgent>,
     /// Tokens used across local threads, excluding ones joined from someone
     /// else; see [`Cowork::record_turn_usage`].
     tokens_used: u64,
@@ -326,13 +327,6 @@ impl Cowork {
             && !gpui_base::TextSelection::has_selection(window, cx);
         let messages = Rc::new(messages);
         let comments = Rc::new(comments);
-        let projection = active_thread_id
-            .and_then(|id| self.thread_store.read(cx).thread(id, cx))
-            .map(|thread| {
-                let thread = thread.read(cx);
-                TimelineProjection::new(&messages, &thread.transcript)
-            })
-            .unwrap_or_default();
         let mut timeline_messages = Vec::new();
         if let Some(thread_id) = active_thread_id {
             let user_stable = |group: &timeline::UserMessage| {
@@ -343,20 +337,7 @@ impl Cowork {
                         .iter()
                         .all(|block| block.attachments.is_empty())
             };
-            for item in projection.history() {
-                let index = match *item {
-                    TimelineItem::Compaction(id) => {
-                        timeline_messages.push(
-                            div()
-                                .w_full()
-                                .px(px(40.))
-                                .child(Self::render_compaction_marker(id.0 as usize, false, cx))
-                                .into_any_element(),
-                        );
-                        continue;
-                    }
-                    TimelineItem::Message(index) => index,
-                };
+            for index in 0..messages.len() {
                 let message = &messages[index];
                 let submitted_comments = match message {
                     TimelineMessage::Agent(message) => message
@@ -822,6 +803,7 @@ pub fn run() -> anyhow::Result<()> {
                         tokio_handle,
                         sandboxes,
                         active_generations: HashMap::new(),
+                        agents: HashMap::new(),
                         tokens_used: 0,
                         token_activity: Vec::new(),
                         deleted_chats: 0,

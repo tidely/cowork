@@ -1,8 +1,7 @@
 # language-model
 
 Cowork-owned conversation data and an object-safe `LanguageModelProvider` boundary. It
-has no dependency on Rig, GPUI, HTTP, a database, or a provider wire schema.
-This is parallel groundwork; the existing application still uses Rig.
+has no dependency on GPUI, HTTP, a database, or a provider wire schema.
 
 `latest::Message` is the current in-memory type. It deliberately has no Serde
 implementation. `v1::Message` is the first frozen storage DTO and implements

@@ -1,19 +1,15 @@
-use crate::tool_approval::ToolDecision;
-use rig::message::CallId;
-use tokio::sync::oneshot;
+use agent::model::ToolCallId;
 
 use super::*;
 
 /// A run of the host's thread waiting for approval of a non-allowlisted call.
 struct WaitingCall {
     message_id: Uuid,
-    call: CallId,
-    decision: oneshot::Receiver<ToolDecision>,
-    task: tokio::task::JoinHandle<()>,
+    call: ToolCallId,
 }
 
-/// Starts a run on the host whose reply calls a non-allowlisted tool, and has it wait
-/// for approval as the agent's hook would, until everyone sees it waiting.
+/// Starts a run on the host whose reply calls a non-allowlisted tool, and has
+/// it wait for approval as its session would, until everyone sees it waiting.
 fn wait_for_approval(session: &mut Collaboration<'_>) -> WaitingCall {
     wait_for_approval_of(
         session,
@@ -31,37 +27,31 @@ fn wait_for_approval_of(
     let host_thread = session.host_thread.clone();
     let thread_id = host_thread.read_with(session.cx, |thread, _| thread.instance_id);
     let message_id = Uuid::new_v4();
-    let call = CallId::from_wire("c");
-    let task = session._runtime.spawn(std::future::pending::<()>());
-    let (decide, decision) = oneshot::channel();
+    let mut host = ScriptedHost::default();
+    let mut events = host.start(message_id, "1 + 2?");
+    events.extend(host.turn(message_id, [streamed_tool_call("c", tool, arguments)], 10));
+    let call = host.pending_calls()[0].id.clone();
     session.host.update(session.cx, |cowork, cx| {
         cowork.active_generations.insert(
             thread_id,
-            ActiveGeneration::for_test(message_id, task.abort_handle(), Arc::default()),
+            ActiveGeneration::for_test(message_id, Arc::default()),
         );
         host_thread.update(cx, |thread, cx| {
-            thread.emit_for_test(agent_started(message_id, None, "1 + 2?"), cx);
-            let turn = model_turn([streamed_tool_call("c", tool, arguments)], 10);
-            for event in turn {
-                thread.emit_for_test(agent_event(message_id, event), cx);
+            for event in events {
+                thread.emit_for_test(event, cx);
             }
         });
-        cowork.await_tool_approval(thread_id, message_id, call.clone(), tool, decide, cx);
+        cowork.await_tool_approval(thread_id, message_id, call.clone(), tool, cx);
     });
     let mirror = session.collaborator_thread().expect("joined");
     session.wait_until("the mirror sees the call waiting", |this| {
         awaiting(&mirror, this.cx).as_ref() == Some(&call)
     });
-    WaitingCall {
-        message_id,
-        call,
-        decision,
-        task,
-    }
+    WaitingCall { message_id, call }
 }
 
 /// The call the thread's last agent message waits for approval of.
-fn awaiting(thread: &Entity<Thread>, cx: &mut gpui::VisualTestContext) -> Option<CallId> {
+fn awaiting(thread: &Entity<Thread>, cx: &mut gpui::VisualTestContext) -> Option<ToolCallId> {
     thread.read_with(cx, |thread, _| {
         thread.timeline.iter().rev().find_map(|entry| match entry {
             TimelineMessage::Agent(message) => Some(message.record.awaiting_approval.clone()),
@@ -70,17 +60,29 @@ fn awaiting(thread: &Entity<Thread>, cx: &mut gpui::VisualTestContext) -> Option
     })
 }
 
+/// The decisions the host handed its run.
+fn decisions(session: &mut Collaboration<'_>) -> Vec<(ToolCallId, bool)> {
+    let thread_id = session
+        .host_thread
+        .read_with(session.cx, |thread, _| thread.instance_id);
+    session.host.read_with(session.cx, |cowork, _| {
+        cowork.active_generations[&thread_id]
+            .decisions_for_test()
+            .to_vec()
+    })
+}
+
 #[gpui::test]
 fn only_admins_decide_a_waiting_call(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
     let mirror = session.collaborator_thread().expect("joined");
-    let mut waiting = wait_for_approval(&mut session);
+    let waiting = wait_for_approval(&mut session);
     let message_id = waiting.message_id;
 
     // Neither the mirror's guard nor the host lets a `Write` peer decide.
     let request = protocol::CollaboratorMessage::DecideToolCall {
         message_id: waiting.message_id.into_bytes(),
-        call: protocol::Json::call_id(&waiting.call),
+        call: waiting.call.clone(),
         allow: true,
     };
     mirror.read_with(session.cx, |thread, _| {
@@ -89,7 +91,7 @@ fn only_admins_decide_a_waiting_call(cx: &mut gpui::TestAppContext) {
         assert!(request_unchecked(thread, request));
     });
     session.settle();
-    assert!(waiting.decision.try_recv().is_err(), "the run still waits");
+    assert!(decisions(&mut session).is_empty(), "the run still waits");
     let host_thread = session.host_thread.clone();
     assert_eq!(
         awaiting(&host_thread, session.cx),
@@ -108,11 +110,7 @@ fn only_admins_decide_a_waiting_call(cx: &mut gpui::TestAppContext) {
     session.wait_until("everyone sees the call decided", |this| {
         awaiting(&host_thread, this.cx).is_none() && awaiting(&mirror, this.cx).is_none()
     });
-    assert!(matches!(
-        waiting.decision.try_recv(),
-        Ok(ToolDecision::Deny { .. })
-    ));
-    waiting.task.abort();
+    assert_eq!(decisions(&mut session), [(waiting.call, false)]);
 }
 
 /// A command runs on the host's computer, so not even an admin may allow it.
@@ -120,7 +118,7 @@ fn only_admins_decide_a_waiting_call(cx: &mut gpui::TestAppContext) {
 fn only_the_host_decides_a_command(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
     set_default(&mut session, PeerMode::Admin);
-    let mut waiting = wait_for_approval_of(
+    let waiting = wait_for_approval_of(
         &mut session,
         "run_command",
         serde_json::json!({"command": "ls"}),
@@ -143,13 +141,13 @@ fn only_the_host_decides_a_command(cx: &mut gpui::TestAppContext) {
             thread,
             protocol::CollaboratorMessage::DecideToolCall {
                 message_id: message_id.into_bytes(),
-                call: protocol::Json::call_id(&waiting.call),
+                call: waiting.call.clone(),
                 allow: true,
             },
         ));
     });
     session.settle();
-    assert!(waiting.decision.try_recv().is_err(), "the run still waits");
+    assert!(decisions(&mut session).is_empty(), "the run still waits");
     let host_thread = session.host_thread.clone();
     assert_eq!(
         awaiting(&host_thread, session.cx),
@@ -167,8 +165,7 @@ fn only_the_host_decides_a_command(cx: &mut gpui::TestAppContext) {
     session.wait_until("everyone sees the call decided", |this| {
         awaiting(&host_thread, this.cx).is_none() && awaiting(&mirror, this.cx).is_none()
     });
-    assert_eq!(waiting.decision.try_recv(), Ok(ToolDecision::Allow));
-    waiting.task.abort();
+    assert_eq!(decisions(&mut session), [(waiting.call, true)]);
 }
 
 /// Someone joining while a call waits sees it waiting, and a host cannot
@@ -185,7 +182,7 @@ fn waiting_calls_reach_joiners_and_are_checked(cx: &mut gpui::TestAppContext) {
         .update(|_, cx| cx.new(|cx| Thread::join_for_test(welcome.clone(), cx)));
     assert_eq!(awaiting(&joined, session.cx), Some(waiting.call.clone()));
 
-    let elsewhere = protocol::Json::call_id(&CallId::from_wire("elsewhere"));
+    let elsewhere = ToolCallId("elsewhere".into());
     let mut claimed = welcome.clone();
     for message in &mut claimed.thread.messages {
         if let protocol::TimelineMessage::Agent(message) = message {
@@ -208,7 +205,6 @@ fn waiting_calls_reach_joiners_and_are_checked(cx: &mut gpui::TestAppContext) {
                 .is_err()
         );
     });
-    waiting.task.abort();
 }
 
 /// A run that ends while a call waits, as when someone stops it, no longer
@@ -233,5 +229,4 @@ fn an_ended_run_waits_for_nothing(cx: &mut gpui::TestAppContext) {
         awaiting(&mirror, this.cx).is_none()
     });
     assert_eq!(awaiting(&host_thread, session.cx), None);
-    waiting.task.abort();
 }

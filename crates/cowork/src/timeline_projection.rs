@@ -1,50 +1,9 @@
-//! Pure placement of thread records and operational state in the timeline.
-//! Items are references to facts, not agent events or another shared history.
-//! Projection chooses ordering and collapse behavior; renderers only draw it.
+//! Pure placement of a run's output and operational state in its agent
+//! message. Items are references to facts, not agent events or another
+//! shared history. Projection chooses ordering and collapse behavior;
+//! renderers only draw it.
 
-use crate::{
-    timeline::{AgentMessage, RunActivity, TimelineMessage},
-    transcript::{Transcript, TranscriptIndex},
-};
-
-pub(crate) enum TimelineItem {
-    Message(usize),
-    Compaction(TranscriptIndex),
-}
-
-#[derive(Default)]
-pub(crate) struct TimelineProjection {
-    history: Vec<TimelineItem>,
-}
-
-impl TimelineProjection {
-    pub(crate) fn history(&self) -> &[TimelineItem] {
-        &self.history
-    }
-    pub(crate) fn new(messages: &[TimelineMessage], transcript: &Transcript) -> Self {
-        let mut history = Vec::new();
-        for (index, message) in messages.iter().enumerate() {
-            let run = match message {
-                TimelineMessage::User(_) => messages.get(index + 1),
-                TimelineMessage::Agent(_)
-                    if index == 0 || !matches!(messages[index - 1], TimelineMessage::User(_)) =>
-                {
-                    Some(message)
-                }
-                _ => None,
-            };
-            if let Some(TimelineMessage::Agent(run)) = run {
-                history.extend(
-                    transcript
-                        .leading_compactions(run.record.start)
-                        .map(|index| TimelineItem::Compaction(TranscriptIndex(index as u64))),
-                );
-            }
-            history.push(TimelineItem::Message(index));
-        }
-        Self { history }
-    }
-}
+use crate::timeline::{AgentMessage, RunActivity};
 
 pub(crate) enum RunItem {
     Content(usize),

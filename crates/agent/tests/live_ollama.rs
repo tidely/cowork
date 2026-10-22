@@ -2,11 +2,15 @@
 
 use std::time::Duration;
 
-use futures::StreamExt as _;
-use language_models::{
-    CompletionRequest, Content, Envelope, FinishReason, LanguageModel, LanguageModelProvider,
-    Message, Ollama, OpenAiCompatible, StreamEvent, Thinking, reqwest,
+use agent::{
+    Ollama, OpenAiCompatible,
+    model::{
+        CompletionRequest, Content, Envelope, FinishReason, LanguageModel, LanguageModelProvider,
+        Message, StreamEvent, Thinking,
+    },
+    reqwest,
 };
+use futures::StreamExt as _;
 
 async fn check_stream(native: bool) {
     let base = std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".into());

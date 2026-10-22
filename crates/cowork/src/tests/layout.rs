@@ -7,31 +7,36 @@ use super::*;
 fn inline_compaction_status_becomes_persistent_dividers(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     let message_id = Uuid::new_v4();
+    // The run's answer is its step 0; the summaries follow it.
     let first_marker: &'static str =
-        Box::leak(format!("compaction-marker-{message_id}-0").into_boxed_str());
-    let second_marker: &'static str =
         Box::leak(format!("compaction-marker-{message_id}-1").into_boxed_str());
+    let second_marker: &'static str =
+        Box::leak(format!("compaction-marker-{message_id}-2").into_boxed_str());
+    let host = Rc::new(RefCell::new(ScriptedHost::default()));
+    let event = |id: Uuid, event: protocol::RunEvent| protocol::HostMessage::AgentEvent {
+        id: id.into_bytes(),
+        event,
+    };
     cx.update(|_, cx| {
         cowork.update(cx, |cowork, cx| {
-            let message = AgentMessage::new(
-                message_id,
-                None,
-                SystemTime::now(),
-                crate::transcript::TranscriptIndex(0),
-                protocol::AgentRun::Generating,
-                Vec::new(),
-                cx,
-            );
             let thread_id = Uuid::new_v4();
             let thread = cx.new(|cx| {
                 let mut thread = test_thread(
                     thread_id,
-                    vec![TimelineMessage::Agent(message)],
+                    Vec::new(),
                     ThreadDraft::new(ParticipantId::new()),
                 );
-                thread.transcript.append(RigMessage::user("Request"));
-                thread.set_generating_for_test(true, cx);
-                thread.apply_for_test(protocol::HostMessage::CompactionStarted, cx);
+                let mut host = host.borrow_mut();
+                let mut events = host.start(message_id, &"Request ".repeat(20));
+                events.extend(host.turn(
+                    message_id,
+                    [streamed_text("answer", &"Answer ".repeat(20), false)],
+                    100,
+                ));
+                events.push(event(message_id, protocol::RunEvent::CompactionStarted));
+                for event in events {
+                    thread.apply_for_test(event, cx);
+                }
                 thread
             });
             cowork
@@ -50,24 +55,20 @@ fn inline_compaction_status_becomes_persistent_dividers(cx: &mut gpui::TestAppCo
     cx.update(|_, cx| {
         cowork.update(cx, |cowork, cx| {
             cowork.active_thread(cx).unwrap().update(cx, |thread, cx| {
+                let mut host = host.borrow_mut();
                 // The first summary is the one already running.
-                for index in 0..2 {
-                    if index > 0 {
-                        thread.apply_for_test(protocol::HostMessage::CompactionStarted, cx);
-                    }
-                    thread.apply_for_test(
-                        protocol::HostMessage::CompactionFinished {
-                            context: Some("Summary".into()),
-                        },
-                        cx,
-                    );
+                let mut events = host.compaction(message_id, 1, "Summary");
+                events.remove(0);
+                events.extend(host.compaction(message_id, 2, "Summary"));
+                for event in events {
+                    thread.apply_for_test(event, cx);
                 }
                 thread
                     .agent_message_mut(message_id.into_bytes())
                     .unwrap()
                     .ui
                     .work_expanded = false;
-                thread.apply_for_test(protocol::HostMessage::CompactionStarted, cx);
+                thread.apply_for_test(event(message_id, protocol::RunEvent::CompactionStarted), cx);
             });
             cx.notify();
         })
@@ -82,15 +83,8 @@ fn inline_compaction_status_becomes_persistent_dividers(cx: &mut gpui::TestAppCo
     cx.update(|_, cx| {
         cowork.update(cx, |cowork, cx| {
             cowork.active_thread(cx).unwrap().update(cx, |thread, cx| {
-                thread.set_generating_for_test(false, cx);
-                thread
-                    .agent_message_mut(message_id.into_bytes())
-                    .unwrap()
-                    .record
-                    .run = protocol::AgentRun::Ended {
-                    outcome: protocol::RunOutcome::Stopped,
-                    duration: Duration::from_secs(1),
-                };
+                let host = host.borrow();
+                thread.apply_for_test(host.ended(message_id, protocol::RunOutcome::Stopped), cx);
             });
             cx.notify();
         })
@@ -109,8 +103,6 @@ fn inline_compaction_status_becomes_persistent_dividers(cx: &mut gpui::TestAppCo
     cx.update(|_, cx| {
         cowork.update(cx, |cowork, cx| {
             cowork.active_thread(cx).unwrap().update(cx, |thread, cx| {
-                let prompt = thread.transcript.end();
-                thread.transcript.append(RigMessage::user("Next request"));
                 let group = UserMessageGroup {
                     id: Uuid::new_v4(),
                     comments: Vec::new(),
@@ -123,28 +115,18 @@ fn inline_compaction_status_becomes_persistent_dividers(cx: &mut gpui::TestAppCo
                     }],
                 };
                 thread.timeline.push(TimelineMessage::User(group.into()));
-                thread
-                    .timeline
-                    .push(TimelineMessage::Agent(AgentMessage::new(
-                        next_message_id,
-                        None,
-                        SystemTime::now(),
-                        prompt,
-                        protocol::AgentRun::Ended {
-                            outcome: protocol::RunOutcome::Completed,
-                            duration: Duration::from_secs(1),
-                        },
-                        Vec::new(),
-                        cx,
-                    )));
-                thread
-                    .transcript
-                    .append(RigMessage::assistant("Next answer"));
-                thread
-                    .transcript
-                    .install_compaction("Later summary".into())
-                    .unwrap();
-                thread.restore_agent_output(false, cx);
+                let mut host = host.borrow_mut();
+                let mut events = host.start(next_message_id, "Next request");
+                events.extend(host.turn(
+                    next_message_id,
+                    [streamed_text("answer", "Next answer", false)],
+                    100,
+                ));
+                events.extend(host.compaction(next_message_id, 4, "Later summary"));
+                events.push(host.ended(next_message_id, protocol::RunOutcome::Completed));
+                for event in events {
+                    thread.apply_for_test(event, cx);
+                }
             });
             cx.notify();
         });
@@ -286,15 +268,7 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
             Vec::new(),
             cx,
         );
-        let call = |id: &str, name: &str, arguments: serde_json::Value| {
-            rig::message::ToolCall::from_wire(
-                id,
-                rig::message::ToolFunction::new(
-                    rig::message::ToolName::new(name).expect("a valid name"),
-                    arguments,
-                ),
-            )
-        };
+        let call = crate::timeline::tool_call;
         let steps = vec![
             AgentStep::Thinking("Plan the sums.".into()),
             AgentStep::ToolCall(crate::timeline::AgentToolCall {
@@ -303,7 +277,9 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
                     "run_command",
                     serde_json::json!({"command": "echo \"café\"; ".repeat(100)}),
                 ),
-                result: Some(vec![rig::completion::message::ToolResultContent::text("3")]),
+                result: Some(vec![agent::model::ToolResultContent::Text {
+                    text: "3".into(),
+                }]),
             }),
             AgentStep::ToolCall(crate::timeline::AgentToolCall {
                 call: call(

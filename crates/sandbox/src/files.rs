@@ -13,11 +13,11 @@ use std::{
     sync::Arc,
 };
 
-use rig::tool::{ContextValue, Tool, ToolContext, ToolExecutionError};
-use serde::{Deserialize, Serialize};
+use agent::tool::{Tool, ToolCall, ToolError, ToolErrorKind};
+use serde::Deserialize;
 
 use crate::{
-    CallApprovals, Sandboxes,
+    Needs, Sandboxes, ThreadSandbox,
     paths::{FileError, Location, Places, Resolved, Root},
 };
 
@@ -33,27 +33,30 @@ note lists them, followed by a path inside it (`myproject/src/main.rs`), or with
 this conversation's scratch folder (`scratch://notes.md`). Absolute paths anywhere on the host \
 can be listed or read, except denied credentials. Writes stay within project and scratch folders.";
 
-fn map_error(error: FileError) -> ToolExecutionError {
-    match error {
-        FileError::Invalid(message) => ToolExecutionError::invalid_args(message),
-        FileError::NotFound(message) => ToolExecutionError::not_found(message),
-        FileError::Refused(message) => ToolExecutionError::permission_denied(message),
-        FileError::Failed(message) => ToolExecutionError::other(message),
+impl From<FileError> for ToolError {
+    fn from(error: FileError) -> Self {
+        let (kind, message) = match error {
+            FileError::Invalid(message) => (ToolErrorKind::InvalidArguments, message),
+            FileError::NotFound(message) => (ToolErrorKind::NotFound, message),
+            FileError::Refused(message) => (ToolErrorKind::PermissionDenied, message),
+            FileError::Failed(message) => (ToolErrorKind::Execution, message),
+        };
+        ToolError::new(kind, message)
     }
 }
 
 /// Runs `work` with the thread's places as they are now, off the async
 /// runtime, as it does blocking file I/O.
 async fn with_places<T: Send + 'static>(
-    sandboxes: &Arc<Sandboxes>,
-    thread: &str,
+    sandbox: Arc<ThreadSandbox>,
     work: impl FnOnce(&Sandboxes, &Places) -> Result<T, FileError> + Send + 'static,
 ) -> Result<T, FileError> {
-    let sandboxes = sandboxes.clone();
-    let thread = thread.to_owned();
-    tokio::task::spawn_blocking(move || work(&sandboxes, &sandboxes.places(&thread)))
-        .await
-        .unwrap_or_else(|error| Err(FileError::Failed(error.to_string())))
+    tokio::task::spawn_blocking(move || {
+        let sandboxes = sandbox.sandboxes();
+        work(sandboxes, &sandboxes.places(sandbox.thread()))
+    })
+    .await
+    .unwrap_or_else(|error| Err(FileError::Failed(error.to_string())))
 }
 
 fn location(places: &Places, path: &str, what: &str) -> Result<Location, FileError> {
@@ -82,25 +85,21 @@ pub struct ListDirectoryArgs {
 }
 
 /// Lists a host folder, excluding denied credentials.
-pub struct ListDirectory {
-    sandboxes: Arc<Sandboxes>,
-    thread: String,
-}
+pub struct ListDirectory;
 
 impl ListDirectory {
-    pub fn new(sandboxes: Arc<Sandboxes>, thread: impl Into<String>) -> Self {
-        Self {
-            sandboxes,
-            thread: thread.into(),
-        }
-    }
+    pub const NAME: &'static str = "list_directory";
 }
 
 impl Tool for ListDirectory {
-    const NAME: &'static str = "list_directory";
-    type Error = FileError;
     type Args = ListDirectoryArgs;
     type Output = String;
+    type Context = ThreadSandbox;
+    type Access = Needs;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
 
     fn description(&self) -> String {
         format!(
@@ -110,23 +109,13 @@ impl Tool for ListDirectory {
         )
     }
 
-    fn parameters(&self) -> serde_json::Value {
-        schemars::schema_for!(ListDirectoryArgs).into()
-    }
-
-    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
-        map_error(error)
-    }
-
-    async fn call(
+    async fn run(
         &self,
-        _context: &mut ToolContext,
+        _call: ToolCall<Needs>,
+        sandbox: Arc<ThreadSandbox>,
         args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
-        with_places(&self.sandboxes, &self.thread, move |_, places| {
-            list_directory(places, &args.path)
-        })
-        .await
+    ) -> Result<Self::Output, ToolError> {
+        Ok(with_places(sandbox, move |_, places| list_directory(places, &args.path)).await?)
     }
 }
 
@@ -226,25 +215,21 @@ pub struct ReadFileArgs {
 }
 
 /// Reads a host text file, excluding denied credentials.
-pub struct ReadFile {
-    sandboxes: Arc<Sandboxes>,
-    thread: String,
-}
+pub struct ReadFile;
 
 impl ReadFile {
-    pub fn new(sandboxes: Arc<Sandboxes>, thread: impl Into<String>) -> Self {
-        Self {
-            sandboxes,
-            thread: thread.into(),
-        }
-    }
+    pub const NAME: &'static str = "read_file";
 }
 
 impl Tool for ReadFile {
-    const NAME: &'static str = "read_file";
-    type Error = FileError;
     type Args = ReadFileArgs;
     type Output = String;
+    type Context = ThreadSandbox;
+    type Access = Needs;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
 
     fn description(&self) -> String {
         format!(
@@ -257,23 +242,16 @@ impl Tool for ReadFile {
         )
     }
 
-    fn parameters(&self) -> serde_json::Value {
-        schemars::schema_for!(ReadFileArgs).into()
-    }
-
-    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
-        map_error(error)
-    }
-
-    async fn call(
+    async fn run(
         &self,
-        _context: &mut ToolContext,
+        _call: ToolCall<Needs>,
+        sandbox: Arc<ThreadSandbox>,
         args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
-        with_places(&self.sandboxes, &self.thread, move |_, places| {
+    ) -> Result<Self::Output, ToolError> {
+        Ok(with_places(sandbox, move |_, places| {
             read_file(places, &args.path, args.start_line, args.end_line)
         })
-        .await
+        .await?)
     }
 }
 
@@ -397,40 +375,21 @@ pub struct WriteFileArgs {
 
 /// Creates or replaces a file in the thread's project folders or scratch
 /// folder.
-pub struct WriteFile {
-    sandboxes: Arc<Sandboxes>,
-    thread: String,
-}
+pub struct WriteFile;
 
 impl WriteFile {
-    pub fn new(sandboxes: Arc<Sandboxes>, thread: impl Into<String>) -> Self {
-        Self {
-            sandboxes,
-            thread: thread.into(),
-        }
-    }
-
-    /// Allows this call's target to be written without changing the
-    /// project's mode. The target remains subject to all path checks.
-    pub fn context(path: String) -> ToolContext {
-        let mut context = ToolContext::new();
-        context.insert(ApprovedWrite(path)).expect("a path encodes");
-        context
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct ApprovedWrite(String);
-
-impl ContextValue for ApprovedWrite {
-    const KEY: &'static str = "sandbox.write_file.path";
+    pub const NAME: &'static str = "write_file";
 }
 
 impl Tool for WriteFile {
-    const NAME: &'static str = "write_file";
-    type Error = FileError;
     type Args = WriteFileArgs;
     type Output = String;
+    type Context = ThreadSandbox;
+    type Access = Needs;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
 
     fn description(&self) -> String {
         format!(
@@ -446,28 +405,28 @@ impl Tool for WriteFile {
         )
     }
 
-    fn parameters(&self) -> serde_json::Value {
-        schemars::schema_for!(WriteFileArgs).into()
+    fn access(&self, args: &WriteFileArgs, _: &ThreadSandbox) -> Needs {
+        Needs::Write {
+            path: args.path.clone(),
+        }
     }
 
-    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
-        map_error(error)
-    }
-
-    async fn call(
+    /// Writes the target the call was allowed to write: in a read-only
+    /// project, that is the one write the host approved. The target remains
+    /// subject to every path check.
+    async fn run(
         &self,
-        context: &mut ToolContext,
+        call: ToolCall<Needs>,
+        sandbox: Arc<ThreadSandbox>,
         args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
-        let approved = CallApprovals::approved(context, Self::NAME)
-            .get::<ApprovedWrite>()
-            .ok()
-            .flatten()
-            .is_some_and(|ApprovedWrite(path)| path == args.path);
-        let sandboxes = self.sandboxes.clone();
-        let thread = self.thread.clone();
-        tokio::task::spawn_blocking(move || {
-            let mut places = sandboxes.places(&thread);
+    ) -> Result<Self::Output, ToolError> {
+        let approved = call.access
+            == Needs::Write {
+                path: args.path.clone(),
+            };
+        Ok(tokio::task::spawn_blocking(move || {
+            let sandboxes = sandbox.sandboxes();
+            let mut places = sandboxes.places(sandbox.thread());
             if approved {
                 places.allow_project_write();
             }
@@ -479,7 +438,7 @@ impl Tool for WriteFile {
             write_file(&places, &args.path, &args.content)
         })
         .await
-        .unwrap_or_else(|error| Err(FileError::Failed(error.to_string())))
+        .unwrap_or_else(|error| Err(FileError::Failed(error.to_string())))?)
     }
 }
 

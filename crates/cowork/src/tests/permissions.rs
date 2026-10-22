@@ -336,7 +336,7 @@ fn stopping_sharing_from_the_menu_preserves_the_canonical_local_thread(
                 thread.draft().id,
                 thread.draft().encode_state(),
                 thread.model().cloned(),
-                serde_json::to_string(&thread.transcript.messages()).expect("serialize transcript"),
+                thread.transcript.clone(),
             )
         });
     click_access_control(&mut session, "thread-menu-trigger");
@@ -354,10 +354,7 @@ fn stopping_sharing_from_the_menu_preserves_the_canonical_local_thread(
         assert_eq!(thread.draft().id, draft_id);
         assert_eq!(thread.draft().encode_state(), draft_state);
         assert_eq!(thread.model().cloned(), model);
-        assert_eq!(
-            serde_json::to_string(&thread.transcript.messages()).unwrap(),
-            transcript
-        );
+        assert_eq!(thread.transcript, transcript);
     });
     assert_eq!(
         session
@@ -478,7 +475,7 @@ fn write_peers_cannot_submit_by_keyboard_or_direct_actions(cx: &mut gpui::TestAp
     session.host_thread.read_with(session.cx, |thread, _| {
         assert_eq!(thread.submission_count(), 0);
         assert!(!thread.is_generating());
-        assert!(thread.transcript.messages().is_empty());
+        assert!(thread.transcript.entries().is_empty());
         assert_eq!(thread.model().cloned(), Some(ollama_qwen()));
     });
     collaborator.read_with(session.cx, |cowork, _| {
@@ -555,7 +552,6 @@ fn direct_cancel_only_aborts_the_run_it_names(cx: &mut gpui::TestAppContext) {
     let (cowork, thread_id, cx) = attachment_test_cowork(cx, runtime.handle().clone());
     let actor = ParticipantId::new();
     let message_id = Uuid::new_v4();
-    let task = runtime.spawn(std::future::pending::<()>());
     let cancelled = Arc::new(AtomicBool::new(false));
     cowork.update(cx, |cowork, cx| {
         let thread = cowork.active_thread(cx).expect("thread");
@@ -569,7 +565,7 @@ fn direct_cancel_only_aborts_the_run_it_names(cx: &mut gpui::TestAppContext) {
         });
         cowork.active_generations.insert(
             thread_id,
-            ActiveGeneration::for_test(message_id, task.abort_handle(), cancelled.clone()),
+            ActiveGeneration::for_test(message_id, cancelled.clone()),
         );
         cowork.cancel_generation(thread_id, actor, Some(Uuid::new_v4()), cx);
         assert!(
@@ -579,12 +575,6 @@ fn direct_cancel_only_aborts_the_run_it_names(cx: &mut gpui::TestAppContext) {
         cowork.cancel_generation(thread_id, actor, Some(message_id), cx);
         assert!(cancelled.load(Ordering::Acquire));
     });
-    assert!(
-        runtime
-            .block_on(task)
-            .expect_err("authorized abort")
-            .is_cancelled()
-    );
 }
 
 #[gpui::test]
@@ -596,12 +586,11 @@ fn unauthorized_wire_controls_do_not_mutate_state_or_disconnect_the_peer(
     let mirror = session.collaborator_thread().expect("joined");
     let host_thread = session.host_thread.clone();
     let message_id = Uuid::new_v4();
-    let task = session._runtime.spawn(std::future::pending::<()>());
     let cancelled = Arc::new(AtomicBool::new(false));
     session.host.update(session.cx, |cowork, cx| {
         cowork.active_generations.insert(
             host_thread.read(cx).instance_id,
-            ActiveGeneration::for_test(message_id, task.abort_handle(), cancelled.clone()),
+            ActiveGeneration::for_test(message_id, cancelled.clone()),
         );
     });
     let snapshot = |session: &mut Collaboration<'_>| {
@@ -634,7 +623,6 @@ fn unauthorized_wire_controls_do_not_mutate_state_or_disconnect_the_peer(
         "permission denial is not a protocol disconnect"
     );
     assert_eq!(session.bodies(&mirror), ["from the host"]);
-    task.abort();
 }
 
 #[gpui::test]

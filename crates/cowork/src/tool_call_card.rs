@@ -14,6 +14,7 @@
 
 use std::rc::Rc;
 
+use agent::model::ToolCall;
 use gpui::{
     AnyElement, App, ClickEvent, FontWeight, IntoElement, Pixels, RenderOnce, SharedString,
     StyleRefinement, StyledText, Window, div, prelude::*, px, relative,
@@ -28,7 +29,6 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 use gpui_kit_assets::IconName;
-use rig::{message::ToolCall, tool::Tool as _};
 use sandbox::{Access, Folders, Grant, RequestPermissions, RunCommand};
 
 use crate::highlight::highlight_code_block_in_mode;
@@ -167,12 +167,12 @@ impl RenderOnce for ToolCallCard {
     fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         let id = self.id;
         let muted = cx.theme().muted_foreground;
-        let tool = self.call.function.name.as_str();
+        let tool = self.call.name.as_str();
         let (icon, title) = title(tool);
         let mut access = None;
         let body =
             self.body.unwrap_or_else(|| {
-                let arguments = self.call.function.arguments_value();
+                let arguments = crate::timeline::arguments_value(&self.call);
                 if tool == RunCommand::NAME
                     && let Some(command) = arguments["command"].as_str()
                 {
@@ -369,7 +369,8 @@ const MAX_ARGUMENTS_HEIGHT: Pixels = px(112.);
 /// The call's arguments as pretty-printed JSON, in a block of their own.
 fn arguments_view(id: &SharedString, call: &ToolCall, cx: &App) -> AnyElement {
     // A `Value` always encodes.
-    let json = serde_json::to_string_pretty(&call.function.arguments_value()).unwrap_or_default();
+    let json =
+        serde_json::to_string_pretty(&crate::timeline::arguments_value(call)).unwrap_or_default();
     code_block(format!("{id}-arguments"), json, cx)
 }
 
@@ -500,18 +501,17 @@ mod tests {
     use std::{cell::Cell, rc::Rc};
 
     use gpui::{Modifiers, Render};
-    use rig::message::{CallId, ToolFunction, ToolName};
     use serde_json::json;
+
+    use crate::timeline::tool_call;
 
     use super::*;
 
     fn call() -> ToolCall {
-        ToolCall::new(
-            CallId::from_wire("call_1"),
-            ToolFunction::new(
-                ToolName::new("calculate").expect("a valid name"),
-                json!({"a": 1, "b": 2, "operation": "add"}),
-            ),
+        tool_call(
+            "call_1",
+            "calculate",
+            json!({"a": 1, "b": 2, "operation": "add"}),
         )
     }
 
@@ -717,12 +717,7 @@ mod tests {
             gpui_component::init(cx);
             crate::theme::init(cx);
         });
-        let request = |arguments| {
-            ToolCall::new(
-                CallId::from_wire("request_1"),
-                ToolFunction::new(ToolName::new(RequestPermissions::NAME).unwrap(), arguments),
-            )
-        };
+        let request = |arguments| tool_call("request_1", RequestPermissions::NAME, arguments);
         for (project, arguments, access, folders) in [
             (
                 Access::Read,
@@ -822,10 +817,7 @@ mod tests {
     }
 
     fn command_call(arguments: serde_json::Value) -> ToolCall {
-        ToolCall::new(
-            CallId::from_wire("command_1"),
-            ToolFunction::new(ToolName::new(RunCommand::NAME).unwrap(), arguments),
-        )
+        tool_call("command_1", RunCommand::NAME, arguments)
     }
 
     #[gpui::test]

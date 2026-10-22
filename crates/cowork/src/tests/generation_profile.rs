@@ -2,10 +2,11 @@
 //! Run isolated with `timeout 120s cargo test --release -p cowork generation_profile
 //! -- --ignored --nocapture --test-threads=1`. The ignored test itself is opt-in.
 //! OLLAMA_API_BASE_URL selects the server (e.g. http://localhost:11435); model is
-//! qwen3.8:27b. No downloads, tools, normal Cowork startup, statistics or persistence.
+//! qwen3.8:27b, run by the agent crate's managed `Agent`. No downloads, tools,
+//! normal Cowork startup, statistics or persistence.
 //! COWORK_GENERATION_PROFILE_{HISTORY,VARIANT,REASONING,NUM_PREDICT} accept respectively
 //! 0/100/1000, short/markdown-long, true/false, 1..=256; defaults 1000,short,false,128.
-//! Context 4096; producer timeout 60s, GPUI watchdog 90s, cap 2048 agent events.
+//! Context 4096; producer timeout 60s, GPUI watchdog 90s, cap 2048 run events.
 //! Optional COWORK_GENERATION_PROFILE_CONTROL names an existing Linux perf FIFO;
 //! its reader MUST be running (`-D -1 --control=fifo:target/control`); open waits.
 //! Enable follows a GPUI 500ms warmup timer, before AgentStarted/model spawn.
@@ -26,25 +27,22 @@ use crate::{
     Cowork,
     assets::Assets,
     participant::ParticipantId,
-    protocol::{self, HostMessage, RunOutcome},
+    protocol::{HostMessage, Preview, PreviewDelta, RunEvent, RunOutcome},
     thread::{Thread, ThreadStore},
     thread_draft::ThreadDraft,
     timeline::{AgentStep, TimelineMessage},
-    transcript::validate_agent_runs,
+    transcript::{RunSource, shared_entry, validate_agent_runs},
 };
-use agent::AgentEvent;
+use agent::{
+    Agent, AgentDefinition, Entry, EventKind, Origin,
+    model::{Content, ContentDelta, JsonObject, LanguageModel, Message, Reasoning, Thinking},
+};
 use futures::FutureExt as _;
 use gpui::{
     App, AppContext, Application, Bounds, Entity, Subscription, WindowBounds, WindowOptions, px,
     size,
 };
 use gpui_component::Root;
-use rig::{
-    AgentBuilder,
-    agent::{AgentHook, HookContext, RunSettled},
-    completion::{AssistantContent, Message},
-    providers::ollama::Ollama,
-};
 use std::{
     cell::RefCell,
     env,
@@ -64,18 +62,6 @@ use uuid::Uuid;
 const PROMPT: &str = "Explain presentation batching in a short Markdown paragraph and three bullets. Do not call tools.";
 const EVENT_CAP: usize = 2048;
 
-/// Keeps the messages a run commits, the history its events must fold into.
-#[derive(Clone, Default)]
-struct Committed(Arc<std::sync::Mutex<Vec<Message>>>);
-
-impl AgentHook for Committed {
-    async fn on_run_settled(&self, _: &HookContext, event: RunSettled<'_>) {
-        *self.0.lock().unwrap() = event
-            .messages
-            .map(|messages| messages.iter().map(|message| (**message).clone()).collect())
-            .unwrap_or_default();
-    }
-}
 fn setting<T: std::str::FromStr>(key: &str, default: &str) -> T
 where
     T::Err: std::fmt::Debug,
@@ -177,7 +163,6 @@ impl Drop for RunGuard {
 struct Stats {
     events: usize,
     host_events: usize,
-    json: Duration,
     ingest: Duration,
     lag_max: Duration,
 }
@@ -246,56 +231,40 @@ impl Fixture {
         stats.ingest += start.elapsed();
         stats.host_events += 1;
     }
-    fn check(&self, events: &[AgentEvent], expected: &[Message], cx: &App) -> anyhow::Result<()> {
-        let mut history = vec![Message::user(PROMPT)];
-        let mut fold = agent::TurnFold::default();
-        for event in events {
-            history.extend(fold.apply(event)?.message);
-        }
-        anyhow::ensure!(
-            fold.partial().is_none() && fold.pending_calls().is_empty(),
-            "unfinished fold"
-        );
-        anyhow::ensure!(
-            history == expected,
-            "capture differs from native Rig history"
-        );
+    fn check(&self, reply: &Message, cx: &App) -> anyhow::Result<()> {
         let thread = self.thread.read(cx);
         anyhow::ensure!(
-            thread.transcript.messages() == expected,
-            "production transcript differs from Rig"
+            thread
+                .transcript
+                .entries()
+                .last()
+                .map(|entry| &entry.message)
+                == Some(reply),
+            "production transcript differs from the agent's reply"
         );
         let timeline = &thread.timeline;
         let Some(TimelineMessage::Agent(message)) = timeline.last() else {
             anyhow::bail!("missing live message")
         };
         anyhow::ensure!(
-            !message.is_generating() && message.pending_events.is_empty(),
+            !message.is_generating() && message.record.pending_events.is_empty(),
             "unfinished run"
         );
         // Synthetic history has no transcript: validate only the real run.
-        validate_agent_runs(
-            &thread.transcript.entries,
-            &[&message.record.to_protocol()],
-            false,
-        )?;
-        anyhow::ensure!(expected.len() == 2, "expected one tool-free turn");
-        let Message::Assistant(reply) = &expected[1] else {
-            anyhow::bail!("missing reply")
-        };
+        validate_agent_runs(&thread.transcript, &[&message.record.to_protocol()], false)?;
         let (mut answer, mut reasoning) = (String::new(), String::new());
         for part in &reply.content {
             match part {
-                AssistantContent::Text(text) => answer.push_str(&text.text),
-                AssistantContent::Reasoning(text) => reasoning.push_str(&text.text),
-                AssistantContent::ToolCall(_) => anyhow::bail!("tool call in tool-free profile"),
+                Content::Text { text } => answer.push_str(text),
+                Content::Reasoning(Reasoning::Text { text }) => reasoning.push_str(text),
+                Content::ToolCall(_) => anyhow::bail!("tool call in tool-free profile"),
                 _ => {}
             }
         }
         let shown: String = message
             .ui
             .output
-            .steps
+            .steps()
             .iter()
             .filter_map(|step| match step {
                 AgentStep::Thinking(text) => Some(text.as_str()),
@@ -317,9 +286,44 @@ impl Fixture {
         Ok(())
     }
 }
+
+/// What the agent's event reports for the thread, as the host relays it:
+/// previews, committed entries, and usage.
+fn relayed(event: agent::AgentEvent<agent::BasicHost>) -> Option<RunEvent> {
+    Some(match event.kind {
+        EventKind::Preview { index, delta } => RunEvent::Preview(Preview {
+            index: index as u32,
+            delta: match delta {
+                ContentDelta::Text(text) => PreviewDelta::Text(text),
+                ContentDelta::Reasoning(text) => PreviewDelta::Reasoning(text),
+                ContentDelta::ToolCall { .. } => return None,
+            },
+        }),
+        EventKind::MessageCommitted { index, entry } => RunEvent::Committed {
+            index: index as u64,
+            entry: shared_entry(&Entry {
+                message: entry.message,
+                origin: match entry.origin {
+                    Origin::Input { id, .. } => Origin::Input {
+                        id,
+                        source: RunSource::Schedule,
+                    },
+                    Origin::Model { revision } => Origin::Model { revision },
+                    Origin::Tool => Origin::Tool,
+                    Origin::Context { sections } => Origin::Context { sections },
+                },
+            }),
+        },
+        EventKind::UsageReported(usage) => RunEvent::Usage {
+            tokens: crate::usage::usage_tokens(&usage),
+        },
+        _ => return None,
+    })
+}
+
 enum Update {
-    Event(Instant, Box<AgentEvent>),
-    Done(Result<Vec<Message>, String>, Duration),
+    Event(Instant, Box<RunEvent>),
+    Done(Result<Message, String>, Duration),
 }
 
 #[test]
@@ -395,7 +399,7 @@ fn generation_profile() {
                 let mut stats = Stats::default();
                 cx.update(|cx| fixture.emit(HostMessage::AgentStarted {
                     id: fixture.message_id.into_bytes(), comment_group_id: None,
-                    started_at: SystemTime::now(), prompt: protocol::Json::from_rig(&Message::user(PROMPT)),
+                    started_at: SystemTime::now(),
                 }, &mut stats, cx));
                 let (sender, mut receiver) = mpsc::unbounded_channel();
                 let queued = Arc::new(AtomicUsize::new(0));
@@ -404,33 +408,40 @@ fn generation_profile() {
                 let producer_max = queued_max.clone();
                 let task = runtime.spawn(async move {
                     let started = Instant::now();
-                    let committed = Committed::default();
                     let result = async {
-                        let model = Ollama::from_env()?.native_completion("qwen3.8:27b");
-                        // rig-core 0.45 native Chat: think top-level, options merged.
-                        let runner = AgentBuilder::new(model).additional_params(serde_json::json!({
-                            "think": reasoning, "options": {"num_ctx": 4096, "num_predict": num_predict}
-                        })).build().prompt(Message::user(PROMPT)).add_hook(committed.clone());
-                        let cap = tokio::sync::Notify::new();
-                        let mut count = 0;
-                        let run = agent::run(runner, |event| {
-                            if count >= EVENT_CAP { cap.notify_one(); return; }
-                            count += 1;
-                            let pending = producer_queued.fetch_add(1, Ordering::SeqCst) + 1;
-                            producer_max.fetch_max(pending, Ordering::SeqCst);
-                            if sender.send(Update::Event(Instant::now(), Box::new(event))).is_err() { cap.notify_one(); }
-                        });
-                        tokio::time::timeout(Duration::from_secs(60), async {
-                            tokio::select! {
-                                result = run => result,
-                                _ = cap.notified() => Err(anyhow::anyhow!("event cap reached or consumer closed")),
-                            }
-                        }).await.map_err(|_| anyhow::anyhow!("producer timeout (60s)"))??;
-                        Ok::<_, anyhow::Error>(())
+                        let base = env::var("OLLAMA_API_BASE_URL")
+                            .unwrap_or_else(|_| "http://localhost:11434".into());
+                        let mut options = JsonObject::new();
+                        options.insert(
+                            "options".into(),
+                            serde_json::json!({"num_ctx": 4096, "num_predict": num_predict}),
+                        );
+                        let definition = AgentDefinition {
+                            tools: Vec::new(),
+                            thinking: Some(if reasoning { Thinking::Enabled } else { Thinking::Disabled }),
+                            options,
+                            ..AgentDefinition::new(LanguageModel::new("qwen3.8:27b"))
+                        };
+                        let count = Arc::new(AtomicUsize::new(0));
+                        let sender = sender.clone();
+                        let agent = Agent::builder(agent::Ollama::new(&base)?, definition)
+                            .sampling(agent::Sampling { max_output_tokens: None, ..Default::default() })
+                            .on_event(move |event| {
+                                let Some(event) = relayed(event) else { return };
+                                if count.fetch_add(1, Ordering::SeqCst) >= EVENT_CAP { return; }
+                                let pending = producer_queued.fetch_add(1, Ordering::SeqCst) + 1;
+                                producer_max.fetch_max(pending, Ordering::SeqCst);
+                                let _ = sender.send(Update::Event(Instant::now(), Box::new(event)));
+                            })
+                            .build()
+                            .await?;
+                        let reply = tokio::time::timeout(Duration::from_secs(60), agent.prompt(PROMPT))
+                            .await
+                            .map_err(|_| anyhow::anyhow!("producer timeout (60s)"))??;
+                        agent.close().await?;
+                        Ok::<_, anyhow::Error>(reply.message)
                     }.await;
-                    // The prompt and every message the run added.
-                    let history = committed.0.lock().unwrap().clone();
-                    let _ = sender.send(Update::Done(result.map(|()| history).map_err(|e| format!("{e:#}")), started.elapsed()));
+                    let _ = sender.send(Update::Done(result.map_err(|e| format!("{e:#}")), started.elapsed()));
                 });
                 control.borrow_mut().abort = Some(task.abort_handle());
                 // Same serial recv/update flow as production. No arbitrary poll
@@ -445,10 +456,7 @@ fn generation_profile() {
                             stats.lag_max = stats.lag_max.max(arrived.elapsed());
                             anyhow::ensure!(events.len() < EVENT_CAP, "event cap exceeded");
                             events.push((*event).clone());
-                            let start = Instant::now();
-                            let event = protocol::Json::shared(*event);
-                            stats.json += start.elapsed();
-                            cx.update(|cx| fixture.emit(HostMessage::AgentEvent { id: fixture.message_id.into_bytes(), event }, &mut stats, cx));
+                            cx.update(|cx| fixture.emit(HostMessage::AgentEvent { id: fixture.message_id.into_bytes(), event: *event }, &mut stats, cx));
                             stats.events += 1;
                         }
                         Update::Done(result, wall) => break (result, wall),
@@ -472,9 +480,9 @@ fn generation_profile() {
                     println!("# queued_events_max={} model_wall={model_wall:?} region_wall={:?} (model/network latency is not CPU cost)", queued_max.load(Ordering::SeqCst), region_wall);
                     anyhow::ensure!(renders > 0 && calls.iter().all(|&n| n > 0), "no actual stage renders");
                     anyhow::ensure!(queued.load(Ordering::SeqCst) == 0 && stats.events == events.len() && stats.host_events == events.len() + 2, "event counts differ");
-                    let expected = result.map_err(anyhow::Error::msg)?;
+                    let reply = result.map_err(anyhow::Error::msg)?;
                     anyhow::ensure!(!events.is_empty(), "empty generation");
-                    fixture.check(&events, &expected, cx)
+                    fixture.check(&reply, cx)
                 })
             }).catch_unwind().await;
             let result = match run {

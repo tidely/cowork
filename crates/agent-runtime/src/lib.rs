@@ -12,7 +12,7 @@ mod model;
 pub mod persistence;
 mod request;
 mod session;
-pub mod tools;
+mod tools;
 
 pub use agent::{Agent, AgentBuilder, AgentError, CompactionOutcome};
 pub use compaction::{Compaction, CompactionError, CompactionPlan, CompactionPolicy};

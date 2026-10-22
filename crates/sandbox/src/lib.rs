@@ -17,7 +17,7 @@
 //! The file tools ([`files`]) reach the same folders from the host process
 //! itself, with every path they accept mapped in [`paths`].
 
-mod approval;
+mod context;
 pub mod environment;
 pub mod files;
 pub mod grant;
@@ -47,7 +47,7 @@ use mxc_sdk::v1::{
     NetworkIngressPolicy, NetworkPolicy, StreamCloser,
 };
 
-pub use approval::CallApprovals;
+pub use context::{Needs, ThreadSandbox};
 pub use environment::{EnvironmentSource, PRINT_ENV_FLAG, print_env};
 pub use files::{ListDirectory, ReadFile, WriteFile};
 pub use grant::{Folders, Grant};
@@ -56,10 +56,6 @@ pub use paths::FileError;
 pub use permissions::{RequestPermissions, RequestPermissionsArgs};
 pub use project::{Access, Project, ProjectFolder, folder_name};
 pub use tool::{RunCommand, RunCommandArgs};
-
-/// How the environment note sent to the model starts; see
-/// [`Sandboxes::environment_note`].
-pub const ENVIRONMENT_NOTE_START: &str = "<environment>";
 
 /// How often a running command is checked for having exited or been
 /// stopped. mxc-sdk's processes are waited on synchronously and cannot be
@@ -132,6 +128,9 @@ pub struct Sandboxes {
     /// The project each thread's next command sees. Never locked across an
     /// `await`.
     projects: Mutex<HashMap<String, Project>>,
+    /// What `request_permissions` granted each thread's current run; see
+    /// [`ThreadSandbox::run_grant`].
+    run_grants: Mutex<HashMap<String, Grant>>,
 }
 
 impl Sandboxes {
@@ -148,6 +147,7 @@ impl Sandboxes {
             lock: Mutex::new(None),
             environment: tokio::sync::OnceCell::new(),
             projects: Mutex::new(HashMap::new()),
+            run_grants: Mutex::new(HashMap::new()),
         }
     }
 
@@ -170,16 +170,38 @@ impl Sandboxes {
             .unwrap_or_default()
     }
 
+    /// What `thread`'s current run has been granted so far: read access and
+    /// no folders until `request_permissions` grants more.
+    pub fn run_grant(&self, thread: &str) -> Grant {
+        lock(&self.run_grants)
+            .get(thread)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Adds `grant` to what `thread`'s current run's later commands get.
+    pub fn grant_for_run(&self, thread: &str, grant: &Grant) {
+        lock(&self.run_grants)
+            .entry(thread.to_owned())
+            .or_default()
+            .extend(grant);
+    }
+
+    /// Forgets what `thread`'s run was granted, as a run starts or ends.
+    pub fn end_run(&self, thread: &str) {
+        lock(&self.run_grants).remove(thread);
+    }
+
     /// What the model is told about where `thread`'s commands run: the
     /// project's folders at the paths commands see them, whether commands may
-    /// change them, where they start, and the scratch folder. Starts with
-    /// [`ENVIRONMENT_NOTE_START`]. The same project always gives the same
-    /// note, so it only needs sending when it changed.
+    /// change them, where they start, and the scratch folder. The agent
+    /// wraps it in `<environment>` tags. The same project always gives the
+    /// same note, so it only needs sending when it changed.
     pub fn environment_note(&self, thread: &str) -> String {
         let project = self.project(thread);
         let scratch = self.scratch_dir(thread);
         let folders = resolved_folders(&project);
-        let mut note = format!("{ENVIRONMENT_NOTE_START}\n");
+        let mut note = String::new();
         if folders.is_empty() {
             note.push_str("The user has added no project folders.\n");
         } else {
@@ -209,7 +231,7 @@ impl Sandboxes {
             "Commands start in {}. Their TMPDIR is the scratch folder {}, which the file \
              tools call `{}`. Their HOME is the user's home folder{}, so `~` means the same \
              in commands as in `read_folders` and `write_folders`.\n\
-             This replaces any earlier environment note.\n</environment>",
+             This replaces any earlier environment note.",
             working_directory(&folders, &scratch).display(),
             scratch.display(),
             paths::SCRATCH,
@@ -285,6 +307,7 @@ impl Sandboxes {
     /// thread is deleted. Its commands end with its run.
     pub async fn remove(&self, thread: &str) {
         lock(&self.projects).remove(thread);
+        lock(&self.run_grants).remove(thread);
         let scratch = self.scratch_dir(thread);
         _ = tokio::task::spawn_blocking(move || remove_dir(&scratch)).await;
     }
@@ -692,6 +715,58 @@ pub(crate) fn test_sandboxes() -> (Arc<Sandboxes>, TestRoot) {
     (Arc::new(sandboxes), root)
 }
 
+#[cfg(test)]
+impl agent::tool::Provides<ThreadSandbox> for ThreadSandbox {
+    fn provide(self: &Arc<Self>) -> Arc<ThreadSandbox> {
+        self.clone()
+    }
+}
+
+/// Prepares a call of `tool` with `arguments` in `sandbox`, as a session
+/// does before authorizing it: its arguments decoded and its needs known.
+#[cfg(test)]
+pub(crate) fn prepare<T>(
+    tool: T,
+    sandbox: &Arc<ThreadSandbox>,
+    arguments: serde_json::Value,
+) -> Result<agent::tool::PreparedCall<Needs>, agent::tool::ToolError>
+where
+    T: agent::tool::Tool<Context = ThreadSandbox>,
+    Needs: From<T::Access>,
+{
+    agent::tool::ToolDyn::<ThreadSandbox, Needs>::prepare(Arc::new(tool), arguments, sandbox)
+}
+
+/// Runs a call of `tool` with `arguments` in `sandbox` as if the host
+/// allowed it, returning what the model reads.
+#[cfg(test)]
+pub(crate) async fn call<T>(
+    tool: T,
+    sandbox: &Arc<ThreadSandbox>,
+    arguments: serde_json::Value,
+) -> Result<String, agent::tool::ToolError>
+where
+    T: agent::tool::Tool<Context = ThreadSandbox>,
+    Needs: From<T::Access>,
+{
+    let prepared = prepare(tool, sandbox, arguments)?;
+    let output = agent::tool::collect_output(
+        prepared
+            .execute(agent::model::ToolCallId::new(), Default::default())
+            .await,
+    )
+    .await?;
+    Ok(output
+        .model_output
+        .iter()
+        .map(|content| match content {
+            agent::model::ToolResultContent::Text { text } => text.clone(),
+            agent::model::ToolResultContent::Json { value } => value.to_string(),
+            agent::model::ToolResultContent::Image(_) => "[image]".to_owned(),
+        })
+        .collect())
+}
+
 /// A temporary folder removed on drop.
 #[cfg(test)]
 pub(crate) struct TestRoot(pub(crate) PathBuf);
@@ -823,7 +898,6 @@ mod tests {
     fn the_note_names_the_folders_mode_and_scratch() {
         let (sandboxes, root) = test_sandboxes();
         let empty = sandboxes.environment_note("thread");
-        assert!(empty.starts_with(ENVIRONMENT_NOTE_START), "{empty}");
         assert!(empty.contains("no project folders"), "{empty}");
         let home = std::env::home_dir().unwrap();
         assert!(

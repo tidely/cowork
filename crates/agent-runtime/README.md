@@ -2,7 +2,7 @@
 
 The provider-independent session driver above `language-model`, `tool-runtime`,
 and `agent-input`. It owns one conversation and one active run at a time. The
-Cowork app still uses Rig; this is the stack it will move to. The architecture
+Cowork app runs one session per thread on it, through the `agent` crate. The architecture
 behind it, and why state lives where it does, is described in
 [docs/agent-architecture.md](../../docs/agent-architecture.md).
 
@@ -53,8 +53,8 @@ travel in `CompletionRequest::instructions`.
 
 `admit` sees every request with its source before the session acts on it.
 `authorize` decides one call: `Allow`, `Deny`, or `Ask`. It receives the real
-tool, the call's access, the source that started the run, the permissions, and
-the run's grants. `describe_permissions` puts the policy in words for the model.
+tool and its arguments, the call's access, the source that started the run,
+the permissions, and the run's grants. `describe_permissions` puts the policy in words for the model.
 Tool contexts come from the host too: a tool whose `Context` is `T` registers
 when the host implements `Provides<T>`.
 
@@ -197,8 +197,8 @@ The managed builder opts in with `.create_at(path)`, `.resume_from(path)`, or
 ## Examples
 
 ```text
-cargo run -p language-models --example prompt   # prompting
-cargo run -p language-models --example agent    # host, tools, approvals, dynamic tools
+cargo run -p agent --example prompt   # prompting
+cargo run -p agent --example agent    # host, tools, approvals, dynamic tools
 ```
 
 Both use Ollama at `http://localhost:11434` with `gemma4:e4b`.

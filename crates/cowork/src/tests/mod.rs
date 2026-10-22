@@ -5,9 +5,11 @@
 use super::*;
 
 use std::{
+    cell::RefCell,
     collections::{HashMap, VecDeque},
     ops::Range,
     path::PathBuf,
+    rc::Rc,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -15,6 +17,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use agent::model::{Content, Usage};
 use draft::{
     AttachmentId, AttachmentKind, AttachmentRecord, CommentTarget, Draft, DraftItem, DraftItemKind,
     ItemId, TextEdit,
@@ -31,7 +34,6 @@ use gpui_base::{
 use gpui_component::Root;
 use iroh::{Endpoint, endpoint::presets};
 use itertools::Itertools;
-use rig::completion::{Message as RigMessage, Usage, message::UserContent};
 use tools::TurnComments;
 use uuid::Uuid;
 
@@ -245,6 +247,7 @@ fn test_cowork(
         tokio_handle,
         sandboxes: crate::test_support::unused_sandboxes(),
         active_generations: HashMap::new(),
+        agents: HashMap::new(),
         tokens_used: 0,
         token_activity: Vec::new(),
         deleted_chats: 0,
@@ -267,84 +270,6 @@ fn test_cowork(
         _model_picker_subscription: model_picker_subscription,
         _window_activation_subscription: cx.observe_window_activation(window, |_, _, _| {}),
     }
-}
-
-/// The agent starting message `id` in reply to `prompt`.
-fn agent_started(
-    id: Uuid,
-    comment_group_id: Option<uuid::Bytes>,
-    prompt: &str,
-) -> protocol::HostMessage {
-    protocol::HostMessage::AgentStarted {
-        id: id.into_bytes(),
-        comment_group_id,
-        started_at: SystemTime::UNIX_EPOCH,
-        prompt: protocol::Json::from_rig(&RigMessage::user(prompt)),
-    }
-}
-
-/// What the host sends for an event of the agent producing message `id`.
-fn agent_event(id: Uuid, event: agent::AgentEvent) -> protocol::HostMessage {
-    protocol::HostMessage::AgentEvent {
-        id: id.into_bytes(),
-        event: protocol::Json::shared(event),
-    }
-}
-
-/// The events of a model turn whose provider streams `script`, then ends the
-/// reply having used `total` tokens. See [`agent::test_support::turn`].
-fn model_turn(
-    script: impl IntoIterator<Item = agent::test_support::MockStreamEvent>,
-    total: u64,
-) -> Vec<agent::AgentEvent> {
-    use agent::test_support::{MockStreamEvent, mock_final_with_total_tokens};
-
-    agent::test_support::turn(script.into_iter().chain([MockStreamEvent::FinalResponse(
-        mock_final_with_total_tokens(total),
-    )]))
-}
-
-/// A streamed call of the `name` tool with `arguments`.
-fn streamed_tool_call(
-    id: &str,
-    name: &str,
-    arguments: serde_json::Value,
-) -> agent::test_support::MockStreamEvent {
-    agent::test_support::MockStreamEvent::tool_call(id, name, arguments)
-}
-
-/// A fragment of thinking, streamed as reasoning item `id`, or of the
-/// answer.
-fn streamed_text(id: &str, text: &str, thinking: bool) -> agent::test_support::MockStreamEvent {
-    use agent::test_support::MockStreamEvent;
-
-    if thinking {
-        MockStreamEvent::ReasoningDelta {
-            id: id.into(),
-            reasoning: text.into(),
-        }
-    } else {
-        MockStreamEvent::text(text)
-    }
-}
-
-/// The results of every tool the turn in `events` called, as a run would
-/// report them.
-fn tool_results(events: &[agent::AgentEvent], output: &str) -> Vec<agent::AgentEvent> {
-    let mut fold = agent::TurnFold::default();
-    for event in events {
-        fold.apply(event).expect("a valid event");
-    }
-    fold.pending_calls()
-        .iter()
-        .map(|call| {
-            agent::AgentEvent::tool_result(
-                call.id.clone(),
-                call.function.name.clone(),
-                &rig::tool::ToolResult::success(rig::tool::ToolOutput::text(output)),
-            )
-        })
-        .collect()
 }
 
 /// `participant` joining with the profile derived from their id.
@@ -568,51 +493,19 @@ impl<'a> Collaboration<'a> {
         let (root, cx) = cx.add_window_view(|window, cx| {
             let mut draft = ThreadDraft::new(ParticipantId::new());
             draft.create_prompt(draft.author.as_uuid(), "from the host");
-            let timeline = if long_history {
+            let mut thread = test_thread(thread_id, Vec::new(), draft);
+            if long_history {
                 let text = (0..60)
                     .map(|index| format!("Paragraph {index}: a response to scroll past.\n\n"))
                     .collect::<String>();
-                vec![TimelineMessage::Agent(AgentMessage {
-                    record: crate::timeline::AgentRunRecord {
-                        id: Uuid::new_v4(),
-                        comment_group_id: None,
-                        started_at: SystemTime::UNIX_EPOCH,
-                        start: crate::transcript::TranscriptIndex(0),
-                        pending_events: Vec::new(),
-                        run: crate::protocol::AgentRun::Ended {
-                            outcome: crate::protocol::RunOutcome::Completed,
-                            duration: std::time::Duration::ZERO,
-                        },
-                        awaiting_approval: None,
-                    },
-                    ui: crate::timeline::AgentMessageUi {
-                        output: crate::timeline::AgentOutput::for_test(
-                            Vec::new(),
-                            text.clone(),
-                            true,
-                        ),
-                        committed: Default::default(),
-                        comment_calls_checked: 0,
-                        step_views: Default::default(),
-                        text_view: cx.new(|cx| TextViewState::markdown(&text, cx)),
-                        comment_responses: Vec::new(),
-                        work_expanded: false,
-                    },
-                })]
-            } else {
-                Vec::new()
-            };
-            let mut thread = test_thread(thread_id, timeline, draft);
-            if long_history {
-                // What a joiner derives the message's text from.
-                let TimelineMessage::Agent(message) = &thread.timeline[0] else {
-                    unreachable!("the long history's agent message");
-                };
-                let reply = RigMessage::assistant(message.ui.output.text.clone());
-                thread
-                    .transcript
-                    .append(RigMessage::user("Long history prompt"));
-                thread.transcript.append(reply);
+                let message_id = Uuid::new_v4();
+                let mut host = ScriptedHost::default();
+                let mut events = host.start(message_id, "Long history prompt");
+                events.extend(host.turn(message_id, [streamed_text("answer", &text, false)], 100));
+                events.push(host.ended(message_id, protocol::RunOutcome::Completed));
+                for event in events {
+                    thread.apply_for_test(event, cx);
+                }
             }
             assert!(thread.set_model_catalog(test_catalog(), cx));
             thread

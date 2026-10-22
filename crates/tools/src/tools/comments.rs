@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use rig::tool::{Tool, ToolContext, ToolExecutionError};
+use agent::tool::{Tool, ToolCall, ToolError, ToolErrorKind, ToolOutput};
 use serde::{Deserialize, Serialize};
 
 /// A stable, model-facing identifier for a comment in one agent turn.
@@ -180,26 +180,84 @@ pub struct CommentResponseRecorded {
     pub recorded: bool,
 }
 
-/// Records an agent's response to one of the comments in the current turn.
-pub struct RespondToComment {
-    comments: Arc<TurnComments>,
+impl ToolOutput for CommentResponseRecorded {}
+
+/// The comments of the run in progress, which [`RespondToComment`] records
+/// replies in. A session outlives its runs, so the host replaces them before
+/// each run starts; until then there are none.
+pub struct RunComments(Mutex<Arc<TurnComments>>);
+
+impl Default for RunComments {
+    fn default() -> Self {
+        Self(Mutex::new(Arc::new(TurnComments::new(0))))
+    }
 }
 
-impl RespondToComment {
-    pub fn new(comments: Arc<TurnComments>) -> Self {
-        Self { comments }
+impl RunComments {
+    /// Makes `comments` the next run's.
+    pub fn set(&self, comments: Arc<TurnComments>) {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = comments;
     }
 
-    pub fn comments(&self) -> &Arc<TurnComments> {
-        &self.comments
+    pub fn current(&self) -> Arc<TurnComments> {
+        self.0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+/// Records an agent's response to one of the comments in the current turn,
+/// in the host's [`RunComments`].
+pub struct RespondToComment;
+
+impl RespondToComment {
+    pub const NAME: &'static str = "respond_to_comment";
+
+    /// Records `args` in `comments`.
+    pub fn respond(
+        comments: &TurnComments,
+        args: RespondToCommentArgs,
+    ) -> Result<CommentResponseRecorded, CommentToolError> {
+        if !comments.has_comments() {
+            return Ok(CommentResponseRecorded {
+                comment_id: args.comment_id,
+                recorded: false,
+            });
+        }
+        let comment_id = comments.record_response(&args.comment_id, args.response)?;
+        Ok(CommentResponseRecorded {
+            comment_id: comment_id.to_string(),
+            recorded: true,
+        })
+    }
+}
+
+impl From<CommentToolError> for ToolError {
+    fn from(error: CommentToolError) -> Self {
+        let kind = match error {
+            CommentToolError::UnknownComment(_) => ToolErrorKind::NotFound,
+            CommentToolError::AlreadyResponded(_) | CommentToolError::EmptyResponse => {
+                ToolErrorKind::InvalidArguments
+            }
+            CommentToolError::StoreUnavailable => ToolErrorKind::Execution,
+        };
+        ToolError::new(kind, error.to_string())
     }
 }
 
 impl Tool for RespondToComment {
-    const NAME: &'static str = "respond_to_comment";
-    type Error = CommentToolError;
     type Args = RespondToCommentArgs;
     type Output = CommentResponseRecorded;
+    type Context = RunComments;
+    type Access = ();
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
 
     fn description(&self) -> String {
         "Reply to an inline comment: a note a participant attached to an excerpt of an earlier assistant message. \
@@ -209,39 +267,13 @@ impl Tool for RespondToComment {
             .into()
     }
 
-    fn parameters(&self) -> serde_json::Value {
-        schemars::schema_for!(RespondToCommentArgs).into()
-    }
-
-    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
-        match error {
-            CommentToolError::UnknownComment(_) => ToolExecutionError::not_found(error.to_string()),
-            CommentToolError::AlreadyResponded(_) | CommentToolError::EmptyResponse => {
-                ToolExecutionError::invalid_args(error.to_string())
-            }
-            CommentToolError::StoreUnavailable => ToolExecutionError::other(error.to_string()),
-        }
-    }
-
-    async fn call(
+    async fn run(
         &self,
-        _context: &mut ToolContext,
+        _call: ToolCall<()>,
+        comments: Arc<RunComments>,
         args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
-        if !self.comments.has_comments() {
-            return Ok(CommentResponseRecorded {
-                comment_id: args.comment_id,
-                recorded: false,
-            });
-        }
-
-        let comment_id = self
-            .comments
-            .record_response(&args.comment_id, args.response)?;
-        Ok(CommentResponseRecorded {
-            comment_id: comment_id.to_string(),
-            recorded: true,
-        })
+    ) -> Result<Self::Output, ToolError> {
+        Ok(Self::respond(&comments.current(), args)?)
     }
 }
 
@@ -251,15 +283,14 @@ mod tests {
 
     #[test]
     fn stale_calls_are_ignored_when_the_turn_has_no_comments() {
-        let comments = Arc::new(TurnComments::new(0));
-        let tool = RespondToComment::new(comments.clone());
-        let result = futures::executor::block_on(tool.call(
-            &mut ToolContext::new(),
+        let comments = TurnComments::new(0);
+        let result = RespondToComment::respond(
+            &comments,
             RespondToCommentArgs {
                 comment_id: "comment_1".into(),
                 response: "Stale response".into(),
             },
-        ))
+        )
         .unwrap();
 
         assert!(!result.recorded);

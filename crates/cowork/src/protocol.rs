@@ -12,10 +12,15 @@ use tokio_util::{
     codec::{FramedRead, FramedWrite, LengthDelimitedCodec},
 };
 
+use agent::{
+    model::ToolCallId,
+    persistence::record::{StoredCompaction, StoredEntry},
+};
+
 use crate::models::{ModelCatalog, ModelRef};
 pub(crate) use crate::project_mode::ProjectMode;
 pub(crate) use crate::thread::{PeerMode, PeerPermissions, PermissionDenied};
-use crate::transcript::{Transcript, TranscriptIndex};
+use crate::transcript::{TranscriptIndex, TranscriptRecord};
 
 /// Bounds how much memory a single frame from a peer can make us buffer.
 ///
@@ -40,7 +45,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 33;
+pub(crate) const PROTOCOL_VERSION: u32 = 34;
 
 /// A request from a collaborator to the host.
 ///
@@ -88,7 +93,7 @@ pub(crate) enum CollaboratorMessage {
     /// waiting on, so a decision that raced another one changes nothing.
     DecideToolCall {
         message_id: uuid::Bytes,
-        call: Json<rig::message::CallId>,
+        call: ToolCallId,
         allow: bool,
     },
 }
@@ -240,8 +245,9 @@ pub(crate) enum HostMessage {
         id: uuid::Bytes,
         group: UserMessage,
     },
-    /// The agent started responding to `prompt`, which joins the transcript;
-    /// an empty message is appended and the thread is marked as generating.
+    /// The agent started a run producing message `id`: an empty message is
+    /// appended and the thread is marked as generating. Its prompt joins the
+    /// transcript as the run's first input, in an `AgentEvent`.
     /// `comment_group_id` identifies the submitted user comments rendered at
     /// the top of this response. `started_at` is when the host started
     /// generating it.
@@ -249,22 +255,13 @@ pub(crate) enum HostMessage {
         id: uuid::Bytes,
         comment_group_id: Option<uuid::Bytes>,
         started_at: SystemTime,
-        prompt: Json<rig::completion::Message>,
     },
-    /// Creates the response before pre-run compaction, without recording its
-    /// prompt yet. AgentStarted commits that prompt after the summary finishes.
-    AgentPreparing {
-        id: uuid::Bytes,
-        comment_group_id: Option<uuid::Bytes>,
-        started_at: SystemTime,
-    },
-    /// Something the agent did while producing message `id`, exactly as the
-    /// host's agent loop reported it. Every participant, the host included,
-    /// folds these into the message and the transcript the same way; see
-    /// `transcript.rs`.
+    /// Something the host's agent session reported while producing message
+    /// `id`. Every participant, the host included, folds these into the
+    /// message and the transcript the same way; see `transcript.rs`.
     AgentEvent {
         id: uuid::Bytes,
-        event: Json<agent::AgentEvent>,
+        event: RunEvent,
     },
     /// The agent finished, and how. `duration` is how long the host spent
     /// generating the message, whether or not it completed.
@@ -272,13 +269,6 @@ pub(crate) enum HostMessage {
         id: uuid::Bytes,
         outcome: RunOutcome,
         duration: Duration,
-    },
-    /// Summary generation belongs to the active run and shares its cancellation.
-    CompactionStarted,
-    /// Only a validated, smaller summary replaces request history. None
-    /// reports a failed attempt without changing the last successful summary.
-    CompactionFinished {
-        context: Option<String>,
     },
     /// `participant` is called `name` in prompts from now on. Sent when their
     /// first item is submitted; a name never changes afterwards.
@@ -306,14 +296,55 @@ pub(crate) enum HostMessage {
     /// reply that has not returned.
     ToolApprovalRequested {
         id: uuid::Bytes,
-        call: Json<rig::message::CallId>,
+        call: ToolCallId,
     },
     /// `call` was allowed or denied, and its result follows as an
     /// `AgentEvent`: a denied call's says so.
     ToolApprovalResolved {
         id: uuid::Bytes,
-        call: Json<rig::message::CallId>,
+        call: ToolCallId,
     },
+}
+
+/// What the host's agent session reports for a run, as everyone folds it:
+/// the session's own events, projected onto what a thread keeps. Committed
+/// entries and compactions travel in the agent's versioned records.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum RunEvent {
+    /// A fragment of the reply being sampled. Only previews it; the reply
+    /// joins the transcript whole, once it is complete.
+    Preview(Preview),
+    /// An entry joined the conversation at `index`: the run's input, a
+    /// context note, a reply, or a tool's result.
+    Committed {
+        index: u64,
+        entry: Json<StoredEntry>,
+    },
+    /// The tokens a request used (the provider's total, or input plus
+    /// output), measuring how full the context is.
+    Usage { tokens: u64 },
+    /// Summarizing the older part of the context began, at a point where
+    /// every call has its result.
+    CompactionStarted,
+    /// The summary replaces the entries it covers for later requests; the
+    /// entries stay in the transcript.
+    Compacted(Json<StoredCompaction>),
+    /// Summarizing failed or saved nothing; the context is unchanged.
+    CompactionFailed,
+}
+
+/// A fragment of the reply being sampled, for the part at `index` of it.
+/// Text and reasoning only: tool calls show once the reply is complete.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct Preview {
+    pub(crate) index: u32,
+    pub(crate) delta: PreviewDelta,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum PreviewDelta {
+    Text(String),
+    Reasoning(String),
 }
 
 /// A typed value encoded as a JSON string on the wire. This lets types that
@@ -420,8 +451,9 @@ pub(crate) struct ThreadSnapshot {
     /// Bytes of agent output streamed since `context_tokens` was measured.
     pub(crate) streamed_bytes: u64,
     pub(crate) messages: Vec<TimelineMessage>,
-    /// Rig messages need JSON's self-describing format; postcard alone cannot decode them.
-    pub(crate) transcript: Json<Transcript>,
+    /// The agent's records need JSON's self-describing format; postcard
+    /// alone cannot decode them.
+    pub(crate) transcript: Json<TranscriptRecord>,
     /// Everyone's name in prompts, sorted by participant.
     pub(crate) prompt_names: Vec<(uuid::Bytes, String)>,
     /// The names of the project's folders; see
@@ -485,23 +517,23 @@ pub(crate) struct AgentMessage {
     pub(crate) comment_group_id: Option<uuid::Bytes>,
     /// See [`HostMessage::AgentStarted`].
     pub(crate) started_at: SystemTime,
-    /// Where this run starts in the ordered transcript, before any pre-run
-    /// summaries and its prompt. Its first ordinary entry is the user prompt.
-    /// Only the active run may still be preparing without that entry.
+    /// Where this run starts in the ordered transcript. Its first input
+    /// entry is its prompt, possibly after context notes. Only the active
+    /// run may still lack it.
     pub(crate) start: TranscriptIndex,
-    /// The run's events since its output last joined the transcript, exactly
-    /// as the host folded them. While generating, they are the turn in
-    /// progress, which someone joining folds on from. Once a run is stopped
-    /// or fails mid-turn, they are output the transcript never gets. Empty
-    /// after a turn completes.
+    /// The previews of the reply since the run's last reply joined the
+    /// transcript, exactly as the host folded them. While generating, they
+    /// are the reply in progress, which someone joining folds on from. Once
+    /// a run is stopped or fails mid-reply, they are output the transcript
+    /// never gets.
     ///
     /// What the message shows is derived from its transcript entries and
     /// these, never sent separately; see `transcript.rs`.
-    pub(crate) pending_events: Vec<Json<agent::AgentEvent>>,
+    pub(crate) pending_events: Vec<Preview>,
     pub(crate) run: AgentRun,
     /// The tool call the run is waiting for approval of; see
     /// [`HostMessage::ToolApprovalRequested`].
-    pub(crate) awaiting_approval: Option<Json<rig::message::CallId>>,
+    pub(crate) awaiting_approval: Option<ToolCallId>,
 }
 
 /// Whether an agent message's run is still going.
@@ -904,22 +936,18 @@ mod tests {
                     comment_group_id: Some([2; 16]),
                     started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
                     start: TranscriptIndex(0),
-                    pending_events: vec![json("{}")],
+                    pending_events: vec![Preview {
+                        index: 0,
+                        delta: PreviewDelta::Text("Answ".into()),
+                    }],
                     run: AgentRun::Ended {
                         outcome: RunOutcome::Failed("Failed".into()),
                         duration: Duration::from_millis(12_345),
                     },
-                    awaiting_approval: Some(Json::call_id(&rig::message::CallId::from_wire(
-                        "call_1",
-                    ))),
+                    awaiting_approval: Some(ToolCallId("call_1".into())),
                 }),
             ],
-            transcript: {
-                let mut transcript = Transcript::default();
-                transcript.append(rig::completion::Message::user("Question"));
-                transcript.append(rig::completion::Message::assistant("Answer"));
-                transcript.to_protocol()
-            },
+            transcript: json(r#"{"entries":[],"compactions":[]}"#),
             prompt_names: vec![([11; 16], "Ada".into())],
             project_folders: vec!["zed".into(), "cowork".into()],
             project_mode: ProjectMode::Write,
@@ -1007,24 +1035,40 @@ mod tests {
                 }],
             },
             HostMessage::PendingDelivered { id: [9; 16], group },
-            HostMessage::AgentPreparing {
-                id: [7; 16],
-                comment_group_id: Some([8; 16]),
-                started_at: SystemTime::UNIX_EPOCH,
-            },
-            HostMessage::CompactionStarted,
-            HostMessage::CompactionFinished {
-                context: Some("Summary".into()),
-            },
             HostMessage::AgentStarted {
                 id: [7; 16],
                 comment_group_id: Some([8; 16]),
                 started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-                prompt: json(r#"{"role":"user"}"#),
             },
             HostMessage::AgentEvent {
                 id: [7; 16],
-                event: json(r#"{"Model":{}}"#),
+                event: RunEvent::Preview(Preview {
+                    index: 1,
+                    delta: PreviewDelta::Reasoning("Hm".into()),
+                }),
+            },
+            HostMessage::AgentEvent {
+                id: [7; 16],
+                event: RunEvent::Committed {
+                    index: 3,
+                    entry: json(r#"{"message":{}}"#),
+                },
+            },
+            HostMessage::AgentEvent {
+                id: [7; 16],
+                event: RunEvent::Usage { tokens: 42 },
+            },
+            HostMessage::AgentEvent {
+                id: [7; 16],
+                event: RunEvent::CompactionStarted,
+            },
+            HostMessage::AgentEvent {
+                id: [7; 16],
+                event: RunEvent::Compacted(json(r#"{"end":2}"#)),
+            },
+            HostMessage::AgentEvent {
+                id: [7; 16],
+                event: RunEvent::CompactionFailed,
             },
             HostMessage::AgentEnded {
                 id: [7; 16],
@@ -1037,11 +1081,11 @@ mod tests {
             },
             HostMessage::ToolApprovalRequested {
                 id: [7; 16],
-                call: Json::call_id(&rig::message::CallId::from_wire("call_1")),
+                call: ToolCallId("call_1".into()),
             },
             HostMessage::ToolApprovalResolved {
                 id: [7; 16],
-                call: Json::call_id(&rig::message::CallId::from_wire("call_1")),
+                call: ToolCallId("call_1".into()),
             },
         ] {
             assert_eq!(round_trip(&message), message);
@@ -1066,7 +1110,7 @@ mod tests {
             CollaboratorMessage::AttachmentData(sample_chunk()),
             CollaboratorMessage::DecideToolCall {
                 message_id: [2; 16],
-                call: Json::call_id(&rig::message::CallId::from_wire("call_1")),
+                call: ToolCallId("call_1".into()),
                 allow: true,
             },
         ] {
@@ -1074,26 +1118,6 @@ mod tests {
             let decoded: CollaboratorMessage =
                 postcard::from_bytes(&encoded).expect("decode protocol message");
             assert_eq!(decoded, message);
-        }
-    }
-
-    /// A call id comes back as the same id, including one rig minted, which
-    /// cannot be rebuilt from its text.
-    #[test]
-    fn call_ids_survive_the_wire() {
-        for call in [
-            rig::message::CallId::from_wire("call_1"),
-            rig::message::CallId::from_wire(""),
-        ] {
-            let message = HostMessage::ToolApprovalRequested {
-                id: [7; 16],
-                call: Json::call_id(&call),
-            };
-            let HostMessage::ToolApprovalRequested { call: decoded, .. } = round_trip(&message)
-            else {
-                unreachable!()
-            };
-            assert_eq!(decoded.to_call_id().expect("a call id"), call);
         }
     }
 }

@@ -25,7 +25,6 @@ itertools.workspace = true
 nucleo-matcher.workspace = true
 parking_lot.workspace = true
 postcard.workspace = true
-rig.workspace = true
 rrule.workspace = true
 sandbox.workspace = true
 serde.workspace = true
@@ -38,5 +37,4 @@ unicode-segmentation.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-agent = { workspace = true, features = ["test-support"] }
 gpui = { workspace = true, features = ["test-support"] }

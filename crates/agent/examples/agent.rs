@@ -4,20 +4,23 @@
 //! found with `search_tools` and run through `call_tool`. Needs a local
 //! Ollama server with `gemma4:e4b`.
 //!
-//! cargo run -p language-models --example agent
+//! cargo run -p agent --example agent
 
 use std::sync::{Arc, Mutex};
 
-use agent_runtime::{
+use agent::tool::{Provides, Tool, ToolCall, ToolCapabilities, ToolDescriptor, ToolError};
+use agent::{
     Agent, AgentBuilder, AgentDefinition, AgentHost, ApprovalDecision, CallAuthorization,
     ConfigurationChange, Decision, DynamicToolChange, Entry, EventKind, Origin, Request,
     RequestKind,
 };
-use language_models::{LanguageModel, Ollama, Thinking, ToolArguments};
+use agent::{
+    Ollama,
+    model::{LanguageModel, Thinking, ToolArguments},
+};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tool_runtime::{Provides, Tool, ToolCall, ToolCapabilities, ToolDescriptor, ToolError};
 
 /// An application service the note tools share.
 #[derive(Default)]

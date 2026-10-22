@@ -6,8 +6,8 @@
 
 use std::{collections::BTreeMap, fmt, marker::PhantomData};
 
+use agent::model::ToolCallId;
 use gpui::AppContext;
-use rig::message::CallId;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -331,23 +331,23 @@ impl Authorized<'_, ApproveTools> {
     /// Tells everyone that the call agent message `message_id` was waiting
     /// on has been decided. Only the host decides; the run it belongs to
     /// holds the decision itself.
-    pub(crate) fn resolved(self, message_id: Uuid, call: &CallId, cx: &mut impl AppContext) {
+    pub(crate) fn resolved(self, message_id: Uuid, call: &ToolCallId, cx: &mut impl AppContext) {
         if self.thread.is_host() {
             self.thread.emit(
                 protocol::HostMessage::ToolApprovalResolved {
                     id: message_id.into_bytes(),
-                    call: protocol::Json::call_id(call),
+                    call: call.clone(),
                 },
                 cx,
             );
         }
     }
 
-    pub(crate) fn request_decision(self, message_id: Uuid, call: &CallId, allow: bool) -> bool {
+    pub(crate) fn request_decision(self, message_id: Uuid, call: &ToolCallId, allow: bool) -> bool {
         self.thread
             .request(protocol::CollaboratorMessage::DecideToolCall {
                 message_id: message_id.into_bytes(),
-                call: protocol::Json::call_id(call),
+                call: call.clone(),
                 allow,
             })
     }

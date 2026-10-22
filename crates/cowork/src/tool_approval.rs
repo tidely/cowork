@@ -1,29 +1,30 @@
-//! Auto-approve calls within the project's level and the run's grants;
-//! ask for more, granting each approved command its exact sandbox scope.
-//! Explicit narrower access is respected, and reads are global except
-//! denied credentials. File writes get a target-specific approval context.
+//! Deciding which tool calls run: the thread agent's host policy, and the
+//! decisions of whoever may approve a call that asks.
 //!
-//! Only the host may approve commands, file writes, and run permissions;
-//! Admin peers may approve other tools. Scheduled calls needing approval
-//! fail once, then an identical repeat asks. See `docs/permissions.md`.
+//! Calls within the project's level and the run's grants run at once; every
+//! other call asks, and runs with exactly what it asked for once allowed.
+//! Explicit narrower access is respected, and reads are global except
+//! denied credentials. Only the host may approve commands, file writes, and
+//! run permissions; Admin peers may approve other tools. Scheduled calls
+//! needing approval fail once, then an identical repeat asks. See
+//! `docs/permissions.md`.
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicU64},
+};
 
-use agent::AgentEvent;
-use futures::future::BoxFuture;
+use agent::{
+    AgentHost, CallAuthorization, Decision,
+    model::{Content, ToolCallId},
+    tool::Provides,
+};
 use gpui::Context;
 use parking_lot::Mutex;
-use rig::{
-    agent::{AgentHook, DispatchAction, DispatchEvent, HookContext, OutcomeAction, OutcomeEvent},
-    message::{CallId, ToolCall, ToolFunction, ToolName},
-    tool::{Tool as _, ToolContext},
-};
 use sandbox::{
-    Access, CallApprovals, Folders, Grant, ListDirectory, ReadFile, RequestPermissions, RunCommand,
-    Sandboxes, WriteFile,
+    ListDirectory, Needs, ReadFile, RequestPermissions, RunCommand, ThreadSandbox, WriteFile,
 };
-use tokio::sync::{mpsc, oneshot};
-use tools::{Calculate, RespondToComment};
+use tools::{Calculate, RespondToComment, RunComments};
 use uuid::Uuid;
 
 use crate::{
@@ -31,12 +32,13 @@ use crate::{
     participant::ParticipantId,
     project_mode::ProjectMode,
     thread::{ApproveTools, Thread, ThreadSharing},
+    transcript::RunSource,
 };
 
 /// Tools whose calls always run, as they only compute, act within the thread,
-/// or read what the host shared with it. Every other tool's calls wait for
-/// approval, so a tool added without a thought about it is asked about
-/// rather than trusted.
+/// or read what the host shared with it. Every other tool's calls are decided
+/// by what they need, and a tool added without a thought about it is asked
+/// about rather than trusted.
 pub(crate) const ALWAYS_ALLOWED: &[&str] = &[
     Calculate::NAME,
     RespondToComment::NAME,
@@ -45,11 +47,7 @@ pub(crate) const ALWAYS_ALLOWED: &[&str] = &[
 ];
 
 /// What the model is told about a call someone denied.
-const DENIED: &str = "The user denied this tool call.";
-
-/// What the model is told about a call nobody could decide, as when the
-/// thread is gone.
-const UNDECIDED: &str = "The tool call was not approved.";
+pub(crate) const DENIED: &str = "The user denied this tool call.";
 
 /// What a scheduled run's model is told about a call it makes the first
 /// time, rather than waiting for someone who may not be there.
@@ -97,103 +95,64 @@ impl ApprovalRights {
     }
 }
 
-/// What a run reports to its thread, in the order it happened.
-// Nearly every update is an event, so boxing it would only add an allocation
-// per streamed fragment.
-#[allow(clippy::large_enum_variant)]
-pub(crate) enum RunUpdate {
-    Event(AgentEvent),
-    CompactionStarted,
-    CompactionFinished {
-        context: Option<String>,
-        usage: rig::completion::Usage,
-    },
-
-    /// A call of the last reply waits for a decision, given through `decide`.
-    Approval {
-        call: CallId,
-        /// The tool called, which decides who may answer.
-        tool: String,
-        decide: oneshot::Sender<ToolDecision>,
-    },
+/// The application side of a thread's agent session: its tools' context
+/// (the thread's sandbox, and the run's comments), its policy for each call,
+/// and when to compact.
+pub(crate) struct CoworkHost {
+    sandbox: Arc<ThreadSandbox>,
+    comments: Arc<RunComments>,
+    /// The calls a scheduled run already made once without being asked
+    /// about, by tool and arguments (whose keys may come in any order).
+    unattended: Mutex<Vec<(String, serde_json::Value)>>,
+    pub(crate) compaction: CompactionTrigger,
 }
 
-/// Whether a tool call may run.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ToolDecision {
-    Allow,
-    /// The call runs with `context` as its tool's context, as when it is
-    /// allowed only on conditions the tool itself must keep.
-    AllowWith {
-        context: ToolContext,
-    },
-    /// The call is answered with `reason` instead of running, which the
-    /// model reads as the call's result.
-    Deny {
-        reason: String,
-    },
+/// When the session summarizes its context, from the token counts its
+/// requests report; see `generation.rs`.
+#[derive(Default)]
+pub(crate) struct CompactionTrigger {
+    /// Tokens at which to compact; `u64::MAX` for never.
+    pub(crate) threshold: AtomicU64,
+    /// Whether the next run compacts as soon as it starts, as the context
+    /// was already full.
+    pub(crate) at_start: AtomicBool,
+    /// Whether a compaction was asked for and has not settled yet.
+    pub(crate) requested: AtomicBool,
 }
 
-/// Decides each call of a run before its tool sees it: lets calls that need
-/// no approval through, and asks the thread about the rest. It shares the
-/// run's channel with its events, so a request always arrives after the
-/// reply whose call it is.
-pub(crate) struct ApprovalGate {
-    updates: mpsc::UnboundedSender<RunUpdate>,
-    /// Where the run's commands run, whose project decides whether they
-    /// are asked about.
-    sandboxes: Arc<Sandboxes>,
-    thread: String,
-    /// For a scheduled run, the calls already refused once, by tool and
-    /// arguments; `None` for a run someone started.
-    unattended: Option<Mutex<Vec<CallKey>>>,
-    /// What the host allowed through `request_permissions` in this run,
-    /// which its later commands get; read access and no folders until then.
-    granted: Mutex<Grant>,
-}
-
-/// What makes two calls the same: the tool, and its arguments however their
-/// keys are ordered.
-type CallKey = (
-    String,
-    serde_json::Map<String, serde_json::Value>,
-    Option<String>,
-);
-
-impl ApprovalGate {
-    /// The gate of a run of `thread`, someone started or scheduled.
-    pub(crate) fn new(
-        updates: mpsc::UnboundedSender<RunUpdate>,
-        sandboxes: Arc<Sandboxes>,
-        thread: impl Into<String>,
-        scheduled: bool,
-    ) -> Arc<Self> {
-        Arc::new(Self {
-            updates,
-            sandboxes,
-            thread: thread.into(),
-            unattended: scheduled.then(Mutex::default),
-            granted: Mutex::default(),
-        })
+impl CoworkHost {
+    pub(crate) fn new(sandbox: Arc<ThreadSandbox>) -> Self {
+        Self {
+            sandbox,
+            comments: Arc::default(),
+            unattended: Mutex::default(),
+            compaction: CompactionTrigger {
+                threshold: AtomicU64::new(u64::MAX),
+                ..CompactionTrigger::default()
+            },
+        }
     }
 
-    /// What the run has been granted so far.
-    pub(crate) fn granted(&self) -> Grant {
-        self.granted.lock().clone()
+    pub(crate) fn sandbox(&self) -> &Arc<ThreadSandbox> {
+        &self.sandbox
     }
 
-    /// Whether a scheduled run makes `call` for the first time, which is then
-    /// remembered so that the same call again is asked about.
-    fn refuses_unattended(&self, call: &ToolCall) -> bool {
-        let Some(refused) = &self.unattended else {
-            return false;
-        };
-        let key = (
-            call.function.name.to_string(),
-            call.function.arguments.clone(),
-            call.function.invalid_arguments.clone(),
-        );
-        let mut refused = refused.lock();
+    /// The comments the next run answers.
+    pub(crate) fn comments(&self) -> &RunComments {
+        &self.comments
+    }
+
+    /// Forgets the last run's grants and unattended calls, as a run starts.
+    pub(crate) fn run_started(&self) {
+        self.sandbox.end_run();
+        self.unattended.lock().clear();
+    }
+
+    /// Whether a scheduled run makes this call for the first time, which is
+    /// then remembered so that the same call again is asked about.
+    fn refuses_unattended(&self, tool: &str, arguments: &serde_json::Value) -> bool {
+        let mut refused = self.unattended.lock();
+        let key = (tool.to_owned(), arguments.clone());
         if refused.contains(&key) {
             return false;
         }
@@ -202,220 +161,53 @@ impl ApprovalGate {
     }
 }
 
-/// What a call of a tool that grants permissions asks for, resolved before
-/// anyone is asked.
-enum Asked {
-    /// A file write, approved for this target only.
-    WriteFile(String),
-    /// A command: the access it asks for of its own, if any, and the folders
-    /// outside the project it names.
-    Command {
-        access: Option<Access>,
-        folders: Folders,
-    },
-    /// More for the rest of the run.
-    Permissions(Grant),
+impl Provides<ThreadSandbox> for CoworkHost {
+    fn provide(self: &Arc<Self>) -> Arc<ThreadSandbox> {
+        self.sandbox.clone()
+    }
 }
 
-impl ApprovalGate {
-    /// Decides `call`, waiting for someone to when it needs approval. Called
-    /// once per call, in the order the reply made them; dropping the run
-    /// drops the pending decision with it.
-    pub(crate) fn before_tool_call<'a>(
-        &'a self,
-        call: &'a ToolCall,
-    ) -> BoxFuture<'a, ToolDecision> {
-        Box::pin(async move {
-            let tool = call.function.name.as_str();
-            if !needs_approval(tool) {
-                return ToolDecision::Allow;
-            }
-            let asked = match Self::asked(call) {
-                Ok(asked) => asked,
-                Err(reason) => return ToolDecision::Deny { reason },
-            };
-            if let Some(asked) = &asked
-                && self.already_granted(asked)
+impl Provides<RunComments> for CoworkHost {
+    fn provide(self: &Arc<Self>) -> Arc<RunComments> {
+        self.comments.clone()
+    }
+}
+
+impl std::fmt::Debug for CoworkHost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CoworkHost")
+            .field("thread", &self.sandbox.thread())
+            .finish_non_exhaustive()
+    }
+}
+
+impl AgentHost for CoworkHost {
+    type Source = RunSource;
+    type Input = Vec<Content>;
+    type Access = Needs;
+    /// The project's mode and folders are the sandbox's, which the tools
+    /// and authorization read as they are when a call starts.
+    type Permissions = ();
+
+    fn authorize(&self, call: &CallAuthorization<'_, Self>) -> Decision {
+        let tool = call.tool.name();
+        if !needs_approval(tool) {
+            return Decision::Allow;
+        }
+        match call.access {
+            Needs::Refused(reason) => return Decision::Deny(reason.clone()),
+            Needs::Command { .. } | Needs::Write { .. } | Needs::Permissions(_)
+                if self.sandbox.covers(call.access) =>
             {
-                if let Asked::Permissions(requested) = asked {
-                    self.granted.lock().extend(requested);
-                }
-                return self.allow(asked);
+                return Decision::Allow;
             }
-            if self.refuses_unattended(call) {
-                return ToolDecision::Deny {
-                    reason: UNATTENDED.into(),
-                };
-            }
-            let (decide, decision) = oneshot::channel();
-            let undecided = || ToolDecision::Deny {
-                reason: UNDECIDED.into(),
-            };
-            if self
-                .updates
-                .send(RunUpdate::Approval {
-                    call: call.id.clone(),
-                    tool: call.function.name.to_string(),
-                    decide,
-                })
-                .is_err()
-            {
-                return undecided();
-            }
-            match (decision.await.unwrap_or_else(|_| undecided()), &asked) {
-                (ToolDecision::Allow, Some(asked)) => {
-                    if let Asked::Permissions(requested) = asked {
-                        self.granted.lock().extend(requested);
-                    }
-                    self.allow(asked)
-                }
-                (decision, _) => decision,
-            }
-        })
-    }
-}
-
-impl ApprovalGate {
-    /// Whether `tool` is `write_file` in a project whose mode lets it
-    /// change the project's folders; see the module documentation.
-    fn writes_writable_project(&self, tool: &str) -> bool {
-        tool == WriteFile::NAME && self.sandboxes.project(&self.thread).writable()
-    }
-
-    /// What `call` asks for, if it is a call of a tool that grants
-    /// permissions, or why it can't be granted.
-    fn asked(call: &ToolCall) -> Result<Option<Asked>, String> {
-        let arguments = call.function.arguments_value();
-        Ok(match call.function.name.as_str() {
-            WriteFile::NAME => Some(Asked::WriteFile(
-                arguments["path"]
-                    .as_str()
-                    .ok_or("A file path is required.")?
-                    .to_owned(),
-            )),
-            RunCommand::NAME => Some(Asked::Command {
-                access: RunCommand::requested_access(&arguments),
-                folders: RunCommand::requested_folders(&arguments)?,
-            }),
-            RequestPermissions::NAME => Some(Asked::Permissions(RequestPermissions::requested(
-                &arguments,
-            )?)),
-            _ => None,
-        })
-    }
-
-    /// Whether what `asked` asks for needs nobody's approval: for a command,
-    /// that it needs nothing beyond the project level and the run's grants, and
-    /// for more permissions, that the run has them already.
-    fn already_granted(&self, asked: &Asked) -> bool {
-        let mut granted = self.granted();
-        let project = self.sandboxes.project(&self.thread);
-        granted.access = granted.access.max(project.access);
-        // Naming a folder already in the project does not ask for more.
-        // Only resolve existing roots; the sandbox and file tools still
-        // enforce their credential and symlink restrictions.
-        for folder in project.folders {
-            if let Ok(path) = std::fs::canonicalize(folder.path) {
-                if granted.access.writable() {
-                    granted.folders.write.push(path);
-                } else {
-                    granted.folders.read.push(path);
-                }
-            }
+            _ => {}
         }
-        match asked {
-            Asked::WriteFile(_) => self.writes_writable_project(WriteFile::NAME),
-            Asked::Command { access, folders } => granted.covers(&Grant {
-                access: self.command_access(*access, &granted),
-                // Reads are already allowed across the host filesystem.
-                // Resolution above still rejects denied credential paths.
-                folders: Folders {
-                    read: Vec::new(),
-                    write: folders.write.clone(),
-                },
-            }),
-            Asked::Permissions(requested) => granted.covers(&Grant {
-                access: requested.access,
-                folders: Folders {
-                    read: Vec::new(),
-                    write: requested.folders.write.clone(),
-                },
-            }),
+        if *call.origin == RunSource::Schedule && self.refuses_unattended(tool, call.arguments) {
+            return Decision::Deny(UNATTENDED.into());
         }
-    }
-
-    /// Lets `asked` through with what it is granted now.
-    fn allow(&self, asked: &Asked) -> ToolDecision {
-        let granted = self.granted();
-        ToolDecision::AllowWith {
-            context: match asked {
-                Asked::WriteFile(path) => WriteFile::context(path.clone()),
-                Asked::Command { access, folders } => {
-                    let mut grant = Grant {
-                        access: self.command_access(*access, &granted),
-                        folders: granted.folders,
-                    };
-                    grant.folders.extend(folders);
-                    RunCommand::context(grant)
-                }
-                Asked::Permissions(_) => RequestPermissions::context(granted),
-            },
-        }
-    }
-
-    /// The access a command asking for `access` of its own runs with now:
-    /// that, or the project's mode or the run's grant, whichever is more.
-    fn command_access(&self, access: Option<Access>, granted: &Grant) -> Access {
-        access.unwrap_or_else(|| {
-            self.sandboxes
-                .project(&self.thread)
-                .access
-                .max(granted.access)
-        })
-    }
-}
-
-/// The [`ApprovalGate`] as the hook of a Rig run: each call dispatches only
-/// once the gate allows it, and a call allowed with a context gets it
-/// through `approvals`, which the run's tool context carries. The run must
-/// dispatch its calls one at a time; see [`CallApprovals`].
-pub(crate) struct GateHook {
-    gate: Arc<ApprovalGate>,
-    approvals: Arc<CallApprovals>,
-}
-
-impl GateHook {
-    pub(crate) fn new(gate: Arc<ApprovalGate>, approvals: Arc<CallApprovals>) -> Self {
-        Self { gate, approvals }
-    }
-}
-
-impl AgentHook for GateHook {
-    async fn on_dispatch(&self, _: &HookContext, event: DispatchEvent<'_>) -> DispatchAction {
-        let (Some(call), Some(name), Some(arguments)) =
-            (event.call_id, event.tool_name(), event.tool_args())
-        else {
-            return DispatchAction::proceed();
-        };
-        let Ok(tool) = ToolName::new(name) else {
-            return DispatchAction::skip(UNDECIDED);
-        };
-        let call = ToolCall::new(call.clone(), ToolFunction::parse(tool, arguments));
-        match self.gate.before_tool_call(&call).await {
-            ToolDecision::Allow => DispatchAction::proceed(),
-            ToolDecision::AllowWith { context } => {
-                self.approvals.approve(name, context);
-                DispatchAction::proceed()
-            }
-            ToolDecision::Deny { reason } => DispatchAction::skip(reason),
-        }
-    }
-
-    async fn on_outcome(&self, _: &HookContext, event: OutcomeEvent<'_>) -> OutcomeAction {
-        if event.call_id.is_some() {
-            self.approvals.clear();
-        }
-        OutcomeAction::proceed()
+        Decision::Ask
     }
 }
 
@@ -426,7 +218,7 @@ impl Cowork {
     pub(crate) fn decide_tool_call(
         &mut self,
         message_id: Uuid,
-        call: CallId,
+        call: ToolCallId,
         allow: bool,
         cx: &mut Context<Self>,
     ) {
@@ -456,7 +248,7 @@ impl Cowork {
         thread_id: Uuid,
         actor: ParticipantId,
         message_id: Uuid,
-        call: &CallId,
+        call: &ToolCallId,
         allow: bool,
         cx: &mut Context<Self>,
     ) {
@@ -481,16 +273,9 @@ impl Cowork {
                 if actor != host && generation.approval_is_host_only(call) {
                     return false;
                 }
-                let Some(decide) = generation.take_approval(call) else {
+                if !generation.decide(call, allow) {
                     return false;
-                };
-                _ = decide.send(if allow {
-                    ToolDecision::Allow
-                } else {
-                    ToolDecision::Deny {
-                        reason: DENIED.into(),
-                    }
-                });
+                }
                 auth.resolved(message_id, call, cx);
                 true
             })
@@ -503,6 +288,9 @@ impl Cowork {
 
 #[cfg(test)]
 mod tests {
+    use agent::tool::{ToolDescriptor, ToolDyn};
+    use sandbox::{Access, Folders, Grant};
+
     use super::*;
 
     #[test]
@@ -519,59 +307,26 @@ mod tests {
         };
         let writer = ApprovalRights::default();
         assert!(host.may_decide(RunCommand::NAME));
-        assert!(host.may_decide(tools::Calculate::NAME));
+        assert!(host.may_decide(Calculate::NAME));
         assert!(!admin.may_decide(RunCommand::NAME));
         assert!(!admin.may_decide(WriteFile::NAME));
         assert!(!admin.may_decide(RequestPermissions::NAME));
-        assert!(admin.may_decide(tools::Calculate::NAME));
-        assert!(!writer.may_decide(tools::Calculate::NAME));
+        assert!(admin.may_decide(Calculate::NAME));
+        assert!(!writer.may_decide(Calculate::NAME));
     }
 
-    fn call(name: &str) -> ToolCall {
-        call_with(
-            name,
-            if name == WriteFile::NAME {
-                serde_json::json!({"path": "scratch://approved.txt", "content": "hello"})
-            } else {
-                serde_json::json!({})
-            },
-        )
-    }
-
-    fn call_with(name: &str, arguments: serde_json::Value) -> ToolCall {
-        ToolCall::new(
-            CallId::from_wire("call_1"),
-            rig::message::ToolFunction::new(
-                rig::message::ToolName::new(name).expect("a valid name"),
-                arguments,
-            ),
-        )
-    }
-
-    /// A gate for a run someone started, or a scheduled one, in a project in
-    /// write mode unless [`gate_in`] says otherwise.
-    fn gate(scheduled: bool) -> (Arc<ApprovalGate>, mpsc::UnboundedReceiver<RunUpdate>) {
-        let (gate, asked, _) = gate_in(scheduled, Access::Write);
-        (gate, asked)
-    }
-
-    fn gate_in(
-        scheduled: bool,
-        access: Access,
-    ) -> (
-        Arc<ApprovalGate>,
-        mpsc::UnboundedReceiver<RunUpdate>,
-        Arc<Sandboxes>,
-    ) {
-        let (updates, asked) = mpsc::unbounded_channel();
+    /// A host for thread `thread` in a project in `access` mode.
+    fn host_in(access: Access) -> Arc<CoworkHost> {
         let sandboxes = crate::test_support::unused_sandboxes();
-        set_mode(&sandboxes, access);
-        let gate = ApprovalGate::new(updates, sandboxes.clone(), "thread", scheduled);
-        (gate, asked, sandboxes)
+        let host = Arc::new(CoworkHost::new(Arc::new(ThreadSandbox::new(
+            sandboxes, "thread",
+        ))));
+        set_mode(&host, access);
+        host
     }
 
-    fn set_mode(sandboxes: &Sandboxes, access: Access) {
-        sandboxes.set_project(
+    fn set_mode(host: &CoworkHost, access: Access) {
+        host.sandbox().sandboxes().set_project(
             "thread",
             sandbox::Project {
                 folders: Vec::new(),
@@ -580,23 +335,47 @@ mod tests {
         );
     }
 
+    /// What `host` decides about a call of `tool` with `arguments` in a run
+    /// `origin` started, as a session would ask it.
+    fn decide<T>(
+        host: &Arc<CoworkHost>,
+        tool: T,
+        arguments: serde_json::Value,
+        origin: RunSource,
+    ) -> Decision
+    where
+        T: agent::tool::Tool,
+        CoworkHost: Provides<T::Context>,
+        Needs: From<T::Access>,
+    {
+        let tool = Arc::new(tool);
+        let descriptor = ToolDescriptor {
+            definition: ToolDyn::<CoworkHost, Needs>::definition(&*tool),
+            capabilities: Default::default(),
+        };
+        let prepared = ToolDyn::<CoworkHost, Needs>::prepare(tool, arguments.clone(), host)
+            .expect("valid arguments");
+        host.authorize(&CallAuthorization {
+            tool: &descriptor,
+            arguments: &arguments,
+            access: prepared.access(),
+            origin: &origin,
+            permissions: &(),
+            grants: &[],
+        })
+    }
+
+    fn by_someone() -> RunSource {
+        RunSource::Participant([1; 16])
+    }
+
     /// A `run_command` call, asking for `access` of its own if given.
-    fn command(access: Option<&str>) -> ToolCall {
+    fn command(access: Option<&str>) -> serde_json::Value {
         let mut arguments = serde_json::json!({ "command": "ls" });
         if let Some(access) = access {
             arguments["access"] = access.into();
         }
-        call_with(RunCommand::NAME, arguments)
-    }
-
-    fn granted(access: Access) -> ToolDecision {
-        granted_with(access, Folders::default())
-    }
-
-    fn granted_with(access: Access, folders: Folders) -> ToolDecision {
-        ToolDecision::AllowWith {
-            context: RunCommand::context(Grant { access, folders }),
-        }
+        arguments
     }
 
     /// A folder outside any project, removed on drop, and its resolved path
@@ -607,8 +386,6 @@ mod tests {
         fn new() -> Self {
             let path = std::env::temp_dir().join(format!("cowork-outside-{}", Uuid::new_v4()));
             std::fs::create_dir_all(&path).unwrap();
-            // Resolved as the gate resolves named folders: on Windows that is
-            // not `canonicalize`'s verbatim `\\?\` form.
             let named = path.to_string_lossy().into_owned();
             Self(Folders::resolve(&[], &[named]).unwrap().write.remove(0))
         }
@@ -624,576 +401,230 @@ mod tests {
         }
     }
 
-    fn writing(folder: &Outside) -> Folders {
-        Folders {
-            read: Vec::new(),
-            write: vec![folder.0.clone()],
-        }
-    }
-
-    /// A command naming a folder outside the project is asked about even
-    /// in read mode, and allowed with exactly that folder; one naming a
-    /// folder that can't be granted is refused without asking.
-    #[tokio::test]
-    async fn commands_naming_folders_are_asked_about() {
-        let cache = Outside::new();
-        let (gate, mut asked, _) = gate_in(false, Access::Read);
-        let call = call_with(
-            RunCommand::NAME,
-            serde_json::json!({ "command": "cargo fetch", "write_folders": [cache.text()] }),
-        );
-        assert_eq!(
-            decide_allowing(&gate, &call, &mut asked).await,
-            (
-                granted_with(Access::Read, writing(&cache)),
-                Some(RunCommand::NAME.to_owned())
-            )
-        );
-        assert_eq!(gate.granted(), Grant::default(), "for that command only");
-
-        for mode in [Access::Write, Access::Network] {
-            let (gate, mut asked, _) = gate_in(false, mode);
-            assert_eq!(
-                decide_allowing(&gate, &call, &mut asked).await,
-                (
-                    granted_with(mode, writing(&cache)),
-                    Some(RunCommand::NAME.to_owned())
-                ),
-                "even {mode:?} needs approval for extra folders"
-            );
-        }
-
-        let missing = cache.0.join("no-such-folder");
-        let missing = call_with(
-            RunCommand::NAME,
-            serde_json::json!({ "command": "ls", "read_folders": [missing] }),
-        );
-        let decided = decide_allowing(&gate, &missing, &mut asked).await;
-        assert!(
-            matches!(&decided, (ToolDecision::Deny { reason }, None) if reason.contains("does not exist")),
-            "{decided:?}"
-        );
-    }
-
-    /// Once the host allows `request_permissions`, the run's later commands
-    /// get what it granted, and run without asking unless they need more.
-    #[tokio::test]
-    async fn granted_permissions_apply_to_later_commands() {
-        let cache = Outside::new();
-        let (gate, mut asked, _) = gate_in(false, Access::Read);
-        let request = call_with(
-            RequestPermissions::NAME,
-            serde_json::json!({
-                "reason": "Fetch dependencies.",
-                "access": "network",
-                "write_folders": [cache.text()],
-            }),
-        );
-        let expected = Grant {
-            access: Access::Network,
-            folders: writing(&cache),
-        };
-        assert_eq!(
-            decide_allowing(&gate, &request, &mut asked).await,
-            (
-                ToolDecision::AllowWith {
-                    context: RequestPermissions::context(expected.clone()),
-                },
-                Some(RequestPermissions::NAME.to_owned())
-            )
-        );
-        assert_eq!(gate.granted(), expected);
-
-        // Commands get the grant without asking, the mode's or their own
-        // access as long as the grant covers it.
-        assert_eq!(
-            decide_allowing(&gate, &command(None), &mut asked).await,
-            (granted_with(Access::Network, writing(&cache)), None)
-        );
-        assert_eq!(
-            decide_allowing(&gate, &command(Some("read")), &mut asked).await,
-            (granted_with(Access::Read, writing(&cache)), None)
-        );
-        let inside = call_with(
-            RunCommand::NAME,
-            serde_json::json!({ "command": "ls", "read_folders": [cache.text()] }),
-        );
-        assert_eq!(
-            decide_allowing(&gate, &inside, &mut asked).await,
-            (granted_with(Access::Network, writing(&cache)), None)
-        );
-
-        // Asking again for what the run has needs nobody either.
-        assert!(matches!(
-            decide_allowing(&gate, &request, &mut asked).await,
-            (ToolDecision::AllowWith { .. }, None)
-        ));
-
-        // Global reads need no new grant; an extra write still asks.
-        let other = Outside::new();
-        let beyond = call_with(
-            RunCommand::NAME,
-            serde_json::json!({ "command": "ls", "read_folders": [other.text()] }),
-        );
-        let mut both = writing(&cache);
-        both.read.push(other.0.clone());
-        assert_eq!(
-            decide_allowing(&gate, &beyond, &mut asked).await,
-            (granted_with(Access::Network, both), None)
-        );
-        let beyond = call_with(
-            RunCommand::NAME,
-            serde_json::json!({"command": "touch", "write_folders": [other.text()]}),
-        );
-        assert_eq!(
-            decide_allowing(&gate, &beyond, &mut asked)
-                .await
-                .1
-                .as_deref(),
-            Some(RunCommand::NAME)
-        );
-    }
-
-    /// A denied request grants nothing, and one asking for nothing is
-    /// refused without asking.
-    #[tokio::test]
-    async fn denied_or_empty_requests_grant_nothing() {
-        let (gate, mut asked, _) = gate_in(false, Access::Read);
-        let request = call_with(
-            RequestPermissions::NAME,
-            serde_json::json!({ "reason": "Write.", "access": "write" }),
-        );
-        let decision = gate.before_tool_call(&request);
-        let answer = async {
-            let Some(RunUpdate::Approval { decide, .. }) = asked.recv().await else {
-                panic!("the request asks");
-            };
-            decide
-                .send(ToolDecision::Deny {
-                    reason: DENIED.into(),
-                })
-                .expect("the gate waits");
-        };
-        let (decision, ()) = tokio::join!(decision, answer);
-        assert!(matches!(decision, ToolDecision::Deny { .. }));
-        assert_eq!(gate.granted(), Grant::default());
-
-        let nothing = call_with(
-            RequestPermissions::NAME,
-            serde_json::json!({ "reason": "Nothing." }),
-        );
-        assert!(matches!(
-            decide_allowing(&gate, &nothing, &mut asked).await,
-            (ToolDecision::Deny { .. }, None)
-        ));
-    }
-
     /// The project mode is prior approval, while explicit narrower access
-    /// still restricts the command. Escalations ask even in scheduled runs.
-    #[tokio::test]
-    async fn commands_ask_only_beyond_the_auto_approval_level() {
-        let asked_for = Some(RunCommand::NAME.to_owned());
+    /// still restricts the command. Escalations ask, and a scheduled run
+    /// refuses them the first time.
+    #[test]
+    fn commands_ask_only_beyond_the_auto_approval_level() {
         let cases = [
-            (Access::Read, None, Access::Read, false),
-            (Access::Read, Some("write"), Access::Write, true),
-            (Access::Read, Some("network"), Access::Network, true),
-            (Access::Write, None, Access::Write, false),
-            (Access::Write, Some("read"), Access::Read, false),
-            (Access::Write, Some("write"), Access::Write, false),
-            (Access::Write, Some("network"), Access::Network, true),
-            (Access::Network, None, Access::Network, false),
-            (Access::Network, Some("read"), Access::Read, false),
-            (Access::Network, Some("write"), Access::Write, false),
-            (Access::Network, Some("network"), Access::Network, false),
+            (Access::Read, None, false),
+            (Access::Read, Some("write"), true),
+            (Access::Read, Some("network"), true),
+            (Access::Write, None, false),
+            (Access::Write, Some("read"), false),
+            (Access::Write, Some("write"), false),
+            (Access::Write, Some("network"), true),
+            (Access::Network, None, false),
+            (Access::Network, Some("read"), false),
+            (Access::Network, Some("network"), false),
         ];
-        for (mode, requested, access, asks) in cases {
-            let call = command(requested);
-            let (gate, mut asked, _) = gate_in(false, mode);
-            let expected = (granted(access), asks.then(|| asked_for.clone()).flatten());
+        for (mode, requested, asks) in cases {
+            let host = host_in(mode);
+            let expected = if asks { Decision::Ask } else { Decision::Allow };
             assert_eq!(
-                decide_allowing(&gate, &call, &mut asked).await,
+                decide(&host, RunCommand, command(requested), by_someone()),
                 expected,
                 "{mode:?} mode, asking for {requested:?}"
             );
-
-            // A scheduled run refuses a call that asks the first time.
-            let (gate, mut asked, _) = gate_in(true, mode);
-            let decided = decide_allowing(&gate, &call, &mut asked).await;
+            let host = host_in(mode);
+            let decided = decide(&host, RunCommand, command(requested), RunSource::Schedule);
             if asks {
-                assert!(matches!(decided, (ToolDecision::Deny { .. }, None)));
+                assert_eq!(decided, Decision::Deny(UNATTENDED.into()));
             } else {
-                assert_eq!(decided, (granted(access), None));
+                assert_eq!(decided, Decision::Allow);
             }
         }
     }
 
+    /// A command naming a folder outside the project to write asks even in
+    /// network mode; one naming a folder that can't be granted is refused
+    /// without asking. Reading anywhere needs nothing.
+    #[test]
+    fn commands_naming_folders_are_asked_about() {
+        let cache = Outside::new();
+        let writes =
+            serde_json::json!({ "command": "cargo fetch", "write_folders": [cache.text()] });
+        for mode in [Access::Read, Access::Write, Access::Network] {
+            assert_eq!(
+                decide(&host_in(mode), RunCommand, writes.clone(), by_someone()),
+                Decision::Ask,
+                "{mode:?}"
+            );
+        }
+        let reads = serde_json::json!({ "command": "ls", "read_folders": [cache.text()] });
+        assert_eq!(
+            decide(&host_in(Access::Read), RunCommand, reads, by_someone()),
+            Decision::Allow
+        );
+        let missing = cache.0.join("no-such-folder");
+        let missing = serde_json::json!({ "command": "ls", "read_folders": [missing] });
+        assert!(matches!(
+            decide(&host_in(Access::Read), RunCommand, missing, by_someone()),
+            Decision::Deny(reason) if reason.contains("does not exist")
+        ));
+    }
+
+    /// Once the run is granted more, its later commands and requests within
+    /// the grant run without asking, also after the mode is lowered; a new
+    /// run starts without them.
+    #[test]
+    fn run_grants_apply_to_later_calls_until_the_run_ends() {
+        let cache = Outside::new();
+        let host = host_in(Access::Read);
+        let request = serde_json::json!({
+            "reason": "Fetch dependencies.",
+            "access": "network",
+            "write_folders": [cache.text()],
+        });
+        assert_eq!(
+            decide(&host, RequestPermissions, request.clone(), by_someone()),
+            Decision::Ask
+        );
+        // What the tool does once allowed.
+        host.sandbox().sandboxes().grant_for_run(
+            "thread",
+            &Grant {
+                access: Access::Network,
+                folders: Folders {
+                    read: Vec::new(),
+                    write: vec![cache.0.clone()],
+                },
+            },
+        );
+        let writes = serde_json::json!({
+            "command": "cargo fetch",
+            "access": "network",
+            "write_folders": [cache.text()],
+        });
+        assert_eq!(
+            decide(&host, RunCommand, writes.clone(), by_someone()),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(&host, RequestPermissions, request, by_someone()),
+            Decision::Allow,
+            "asking again for what the run has needs nobody"
+        );
+        let other = Outside::new();
+        let beyond = serde_json::json!({"command": "touch", "write_folders": [other.text()]});
+        assert_eq!(
+            decide(&host, RunCommand, beyond, by_someone()),
+            Decision::Ask
+        );
+
+        host.run_started();
+        assert_eq!(
+            decide(&host, RunCommand, writes, by_someone()),
+            Decision::Ask
+        );
+    }
+
     /// Writing a file runs at once in write and network mode, even in a
     /// scheduled run, and is asked about in read mode.
-    #[tokio::test]
-    async fn writing_a_file_is_asked_about_only_in_read_mode() {
+    #[test]
+    fn writing_a_file_is_asked_about_only_in_read_mode() {
+        let write = serde_json::json!({"path": "scratch://approved.txt", "content": "hello"});
         for (mode, asks) in [
             (Access::Read, true),
             (Access::Write, false),
             (Access::Network, false),
         ] {
-            let expected = (
-                ToolDecision::AllowWith {
-                    context: WriteFile::context("scratch://approved.txt".into()),
-                },
-                asks.then(|| WriteFile::NAME.to_owned()),
-            );
-            let (gate, mut asked, _) = gate_in(false, mode);
+            let expected = if asks { Decision::Ask } else { Decision::Allow };
             assert_eq!(
-                decide_allowing(&gate, &call(WriteFile::NAME), &mut asked).await,
+                decide(&host_in(mode), WriteFile, write.clone(), by_someone()),
                 expected,
                 "{mode:?}"
             );
-            let (gate, mut asked, _) = gate_in(true, mode);
-            let decided = decide_allowing(&gate, &call(WriteFile::NAME), &mut asked).await;
+            let scheduled = decide(
+                &host_in(mode),
+                WriteFile,
+                write.clone(),
+                RunSource::Schedule,
+            );
             if asks {
-                assert!(
-                    matches!(decided, (ToolDecision::Deny { .. }, None)),
-                    "{mode:?}"
-                );
+                assert_eq!(scheduled, Decision::Deny(UNATTENDED.into()), "{mode:?}");
             } else {
-                assert_eq!(decided, expected, "{mode:?}");
+                assert_eq!(scheduled, Decision::Allow, "{mode:?}");
             }
         }
     }
 
-    /// Allowing a Read-mode write grants that call, without changing the
-    /// project or allowing the following write automatically.
-    #[tokio::test]
-    async fn an_approved_file_write_succeeds_in_read_mode() {
-        let project = Outside::new();
-        let (gate, mut asked, sandboxes) = gate_in(false, Access::Read);
-        sandboxes.set_project(
+    /// A request for nothing is refused without asking.
+    #[test]
+    fn empty_permission_requests_are_refused() {
+        let nothing = serde_json::json!({ "reason": "Nothing." });
+        assert!(matches!(
+            decide(
+                &host_in(Access::Read),
+                RequestPermissions,
+                nothing,
+                by_someone()
+            ),
+            Decision::Deny(_)
+        ));
+    }
+
+    #[test]
+    fn a_scheduled_run_asks_only_when_a_call_is_repeated() {
+        let host = host_in(Access::Write);
+        let network = |order: bool| {
+            if order {
+                serde_json::json!({"command": "curl a", "access": "network"})
+            } else {
+                serde_json::json!({"access": "network", "command": "curl a"})
+            }
+        };
+        assert_eq!(
+            decide(&host, RunCommand, network(true), RunSource::Schedule),
+            Decision::Deny(UNATTENDED.into())
+        );
+        // Other arguments are another call, refused once too.
+        let other = serde_json::json!({"command": "curl b", "access": "network"});
+        assert_eq!(
+            decide(&host, RunCommand, other, RunSource::Schedule),
+            Decision::Deny(UNATTENDED.into())
+        );
+        // The same arguments, in any order, ask.
+        assert_eq!(
+            decide(&host, RunCommand, network(false), RunSource::Schedule),
+            Decision::Ask
+        );
+        // Calls that need no approval still run at once.
+        let sum = serde_json::json!({"operation": "add", "a": 1, "b": 2});
+        assert_eq!(
+            decide(&host, Calculate, sum, RunSource::Schedule),
+            Decision::Allow
+        );
+    }
+
+    /// A mode reduction changes later automatic approvals; it does not
+    /// erase permissions granted for the rest of the run.
+    #[test]
+    fn lowering_auto_approval_preserves_only_run_grants() {
+        let host = host_in(Access::Network);
+        assert_eq!(
+            decide(&host, RunCommand, command(None), by_someone()),
+            Decision::Allow
+        );
+        set_mode(&host, Access::Read);
+        assert_eq!(
+            decide(&host, RunCommand, command(Some("write")), by_someone()),
+            Decision::Ask
+        );
+        host.sandbox().sandboxes().grant_for_run(
             "thread",
-            sandbox::Project {
-                folders: vec![sandbox::ProjectFolder {
-                    name: "project".into(),
-                    path: project.0.clone(),
-                }],
-                access: Access::Read,
+            &Grant {
+                access: Access::Write,
+                ..Grant::default()
             },
         );
-        let args = serde_json::json!({"path": "project/new.txt", "content": "approved"});
-        let call = call_with(WriteFile::NAME, args.clone());
-        let (decision, asked_tool) = decide_allowing(&gate, &call, &mut asked).await;
-        assert_eq!(asked_tool.as_deref(), Some(WriteFile::NAME));
-        let ToolDecision::AllowWith { mut context } = decision else {
-            panic!("the write has a grant")
-        };
-        WriteFile::new(sandboxes.clone(), "thread")
-            .call(&mut context, serde_json::from_value(args.clone()).unwrap())
-            .await
-            .unwrap();
         assert_eq!(
-            std::fs::read_to_string(project.0.join("new.txt")).unwrap(),
-            "approved"
-        );
-        assert_eq!(sandboxes.project("thread").access, Access::Read);
-        assert_eq!(
-            decide_allowing(&gate, &call, &mut asked).await.1.as_deref(),
-            Some(WriteFile::NAME)
-        );
-        // Approval cannot be reused for another target, nor to escape the project.
-        for path in ["project/other.txt", "../outside.txt"] {
-            let result = WriteFile::new(sandboxes.clone(), "thread")
-                .call(
-                    &mut context,
-                    serde_json::from_value(serde_json::json!({"path": path, "content": "no"}))
-                        .unwrap(),
-                )
-                .await;
-            assert!(result.is_err(), "{path}");
-        }
-    }
-
-    /// A mode reduction changes subsequent automatic approvals; it does
-    /// not erase permissions explicitly requested for the rest of the run.
-    #[tokio::test]
-    async fn lowering_auto_approval_preserves_only_run_grants() {
-        let (gate, mut asked, sandboxes) = gate_in(false, Access::Network);
-        assert_eq!(
-            decide_allowing(&gate, &command(None), &mut asked).await,
-            (granted(Access::Network), None)
-        );
-        set_mode(&sandboxes, Access::Read);
-        assert_eq!(
-            decide_allowing(&gate, &command(Some("write")), &mut asked)
-                .await
-                .1
-                .as_deref(),
-            Some(RunCommand::NAME)
-        );
-        set_mode(&sandboxes, Access::Write);
-        let request = call_with(
-            RequestPermissions::NAME,
-            serde_json::json!({"reason": "Edit the project.", "access": "write"}),
-        );
-        assert_eq!(decide_allowing(&gate, &request, &mut asked).await.1, None);
-        set_mode(&sandboxes, Access::Read);
-        assert_eq!(
-            decide_allowing(&gate, &command(None), &mut asked).await,
-            (granted(Access::Write), None)
+            decide(&host, RunCommand, command(Some("write")), by_someone()),
+            Decision::Allow
         );
         assert_eq!(
-            decide_allowing(&gate, &command(Some("read")), &mut asked).await,
-            (granted(Access::Read), None)
-        );
-    }
-
-    /// A waiting command is allowed with the access its card shows when
-    /// it is decided: the mode's at that moment, unless it asked for its own.
-    #[tokio::test]
-    async fn an_allowed_command_gets_the_access_shown_when_deciding() {
-        for (requested, access) in [(None, Access::Read), (Some("write"), Access::Write)] {
-            let (gate, mut asked, sandboxes) = gate_in(false, Access::Write);
-            // Extra folders make this wait even though Write is automatic.
-            let outside = Outside::new();
-            let mut call = command(requested);
-            call.function
-                .arguments
-                .insert("write_folders".into(), serde_json::json!([outside.text()]));
-            let decision = gate.before_tool_call(&call);
-            let answer = async {
-                let Some(RunUpdate::Approval { decide, .. }) = asked.recv().await else {
-                    panic!("the command asks");
-                };
-                set_mode(&sandboxes, Access::Read);
-                decide.send(ToolDecision::Allow).expect("the gate waits");
-            };
-            let (decision, ()) = tokio::join!(decision, answer);
-            assert_eq!(
-                decision,
-                granted_with(
-                    access,
-                    Folders {
-                        read: vec![],
-                        write: vec![outside.0.clone()]
-                    }
-                ),
-                "asking for {requested:?}"
-            );
-        }
-    }
-
-    /// What `gate` decides about `call`, allowing it if it asks, with the
-    /// tool it asked about.
-    async fn decide_allowing(
-        gate: &ApprovalGate,
-        call: &ToolCall,
-        asked: &mut mpsc::UnboundedReceiver<RunUpdate>,
-    ) -> (ToolDecision, Option<String>) {
-        let decision = gate.before_tool_call(call);
-        tokio::pin!(decision);
-        tokio::select! {
-            decision = &mut decision => (decision, None),
-            Some(RunUpdate::Approval { tool, decide, .. }) = asked.recv() => {
-                decide.send(ToolDecision::Allow).expect("the gate waits");
-                (decision.await, Some(tool))
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn a_scheduled_run_asks_only_when_a_call_is_repeated() {
-        let (gate, mut asked) = gate(true);
-        let first = call_with("approval_test_tool", serde_json::json!({ "a": 1, "b": 2 }));
-        assert_eq!(
-            gate.before_tool_call(&first).await,
-            ToolDecision::Deny {
-                reason: UNATTENDED.into()
-            }
-        );
-        assert!(asked.try_recv().is_err(), "nobody was asked");
-
-        // Other arguments are another call, refused once too.
-        let other = call_with("approval_test_tool", serde_json::json!({ "a": 3 }));
-        assert!(matches!(
-            gate.before_tool_call(&other).await,
-            ToolDecision::Deny { .. }
-        ));
-        assert!(asked.try_recv().is_err());
-
-        // The same arguments, in any order, ask the user and wait.
-        let repeat = call_with("approval_test_tool", serde_json::json!({ "b": 2, "a": 1 }));
-        let decision = gate.before_tool_call(&repeat);
-        let answer = async {
-            let Some(RunUpdate::Approval { decide, .. }) = asked.recv().await else {
-                panic!("a repeated call asks");
-            };
-            decide.send(ToolDecision::Allow).expect("the gate waits");
-        };
-        let (decision, ()) = tokio::join!(decision, answer);
-        assert_eq!(decision, ToolDecision::Allow);
-
-        // Calls that need no approval still run at once, while a command is
-        // beyond the project level is refused the first time.
-        let comment = call(RespondToComment::NAME);
-        assert_eq!(gate.before_tool_call(&comment).await, ToolDecision::Allow);
-        let calculation = call(Calculate::NAME);
-        assert_eq!(
-            gate.before_tool_call(&calculation).await,
-            ToolDecision::Allow
-        );
-        assert!(asked.try_recv().is_err());
-        assert!(matches!(
-            gate.before_tool_call(&command(Some("network"))).await,
-            ToolDecision::Deny { .. }
-        ));
-    }
-
-    #[tokio::test]
-    async fn the_gate_asks_only_about_calls_that_need_approval() {
-        let (gate, mut asked) = gate(false);
-
-        let comment = call(RespondToComment::NAME);
-        assert_eq!(gate.before_tool_call(&comment).await, ToolDecision::Allow);
-        assert!(asked.try_recv().is_err(), "comments are never asked about");
-
-        let calculation = call(Calculate::NAME);
-        assert_eq!(
-            gate.before_tool_call(&calculation).await,
-            ToolDecision::Allow
-        );
-        assert!(
-            asked.try_recv().is_err(),
-            "calculations are never asked about"
-        );
-
-        let unknown = call("approval_test_tool");
-        let decision = gate.before_tool_call(&unknown);
-        let answer = async {
-            let Some(RunUpdate::Approval { call, tool, decide }) = asked.recv().await else {
-                panic!("expected an approval request");
-            };
-            assert_eq!(call, CallId::from_wire("call_1"));
-            assert_eq!(tool, "approval_test_tool");
-            decide.send(ToolDecision::Allow).expect("the gate waits");
-        };
-        let (decision, ()) = tokio::join!(decision, answer);
-        assert_eq!(decision, ToolDecision::Allow);
-    }
-
-    /// A reply making several calls, run by Rig's agent with the gate: each
-    /// call is asked about on its own, so allowing the first decides nothing
-    /// for the rest, and the allowed one reaches its tool with what was
-    /// approved, here a write in a Read-mode project. Also when the provider
-    /// sends no call ids, as Ollama may, since Rig gives each call its own.
-    #[tokio::test]
-    async fn each_call_of_a_reply_is_asked_about_on_its_own() {
-        use rig::test_utils::{MockCompletionModel, MockStreamEvent, mock_final_with_total_tokens};
-
-        for ids in [["c1", "c2", "c3", "c4"], ["", "", "", ""]] {
-            let project = Outside::new();
-            let (gate, mut asked, sandboxes) = gate_in(false, Access::Read);
-            sandboxes.set_project(
-                "thread",
-                sandbox::Project {
-                    folders: vec![sandbox::ProjectFolder {
-                        name: "project".into(),
-                        path: project.0.clone(),
-                    }],
-                    access: Access::Read,
-                },
-            );
-            let mut first = ids
-                .iter()
-                .enumerate()
-                .map(|(index, id)| {
-                    MockStreamEvent::tool_call(
-                        *id,
-                        WriteFile::NAME,
-                        serde_json::json!({"path": format!("project/{index}.txt"), "content": "approved"}),
-                    )
-                })
-                .collect::<Vec<_>>();
-            first.push(MockStreamEvent::FinalResponse(
-                mock_final_with_total_tokens(10),
-            ));
-            let model = MockCompletionModel::from_stream_turns([
-                first,
-                vec![
-                    MockStreamEvent::Text("Done.".into()),
-                    MockStreamEvent::FinalResponse(mock_final_with_total_tokens(20)),
-                ],
-            ]);
-            let approvals = Arc::new(CallApprovals::default());
-            let runner = rig::AgentBuilder::new(model)
-                .tool(WriteFile::new(sandboxes.clone(), "thread"))
-                .build()
-                .prompt("go")
-                .max_turns(10)
-                .tool_concurrency(1)
-                .tool_context(CallApprovals::run_context(&approvals))
-                .add_hook(GateHook::new(gate, approvals));
-            let run = tokio::spawn(async move {
-                let mut results = Vec::new();
-                agent::run(runner, |event| {
-                    if let AgentEvent::ToolResult(result) = event {
-                        results.push((result.call, result.is_error));
-                    }
-                })
-                .await
-                .expect("the run");
-                results
-            });
-            let mut approvals = Vec::new();
-            while let Some(update) = asked.recv().await {
-                let RunUpdate::Approval { call, decide, .. } = update else {
-                    continue;
-                };
-                approvals.push(call);
-                // Allow only the first; deny the rest.
-                _ = decide.send(if approvals.len() == 1 {
-                    ToolDecision::Allow
-                } else {
-                    ToolDecision::Deny {
-                        reason: DENIED.into(),
-                    }
-                });
-            }
-            let results = run.await.expect("the run");
-            assert_eq!(approvals.len(), 4, "every call asks: {ids:?}");
-            assert_eq!(
-                results
-                    .iter()
-                    .map(|(call, _)| call.clone())
-                    .collect::<Vec<_>>(),
-                approvals,
-                "asked one at a time, in order, each a call of its own"
-            );
-            assert_eq!(
-                results.iter().map(|(_, error)| *error).collect::<Vec<_>>(),
-                [false, true, true, true],
-                "only the allowed call ran"
-            );
-            assert_eq!(
-                std::fs::read_to_string(project.0.join("0.txt")).unwrap(),
-                "approved"
-            );
-            assert!(!project.0.join("1.txt").exists());
-        }
-    }
-
-    /// A request nobody answers, as when the thread is gone, denies the call
-    /// rather than leaving the run waiting.
-    #[tokio::test]
-    async fn an_abandoned_request_denies_the_call() {
-        let (gate, mut asked) = gate(false);
-        let unknown = call("approval_test_tool");
-        let decision = gate.before_tool_call(&unknown);
-        let abandon = async {
-            drop(asked.recv().await);
-        };
-        let (decision, ()) = tokio::join!(decision, abandon);
-        assert_eq!(
-            decision,
-            ToolDecision::Deny {
-                reason: UNDECIDED.into()
-            }
+            decide(&host, RunCommand, command(Some("network")), by_someone()),
+            Decision::Ask
         );
     }
 }

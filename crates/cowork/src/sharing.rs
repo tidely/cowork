@@ -552,9 +552,6 @@ impl Cowork {
                 call,
                 allow,
             } => {
-                let call = call
-                    .to_call_id()
-                    .with_context(|| format!("Invalid tool call id from {participant:?}."))?;
                 thread.update(cx, |thread, _| {
                     thread.with_authorized::<ApproveTools, _>(participant, |_| ())
                 })?;

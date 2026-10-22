@@ -6,7 +6,6 @@ members = [
     "crates/cowork",
     "crates/draft",
     "crates/language-model",
-    "crates/language-models",
     "crates/provider-sse",
     "crates/sandbox",
     "crates/tools",
@@ -34,7 +33,6 @@ sandbox = { path = "crates/sandbox" }
 tools = { path = "crates/tools" }
 tool-runtime = { path = "crates/tool-runtime" }
 language-model = { path = "crates/language-model" }
-language-models = { path = "crates/language-models" }
 ollama-types = { path = "crates/providers/ollama/types" }
 ollama = { path = "crates/providers/ollama/client" }
 openai-compatible-types = { path = "crates/providers/openai-compatible/types" }
@@ -80,10 +78,6 @@ mime = "0.3"
 nucleo-matcher = "0.3"
 parking_lot = "0.12"
 postcard = { version = "1.1.3", features = ["use-std"] }
-rig = "0.45.0"
-# What the `rig` facade doesn't re-export, such as `tool::feedback`; the same
-# version and features the facade uses, so upgrade it with `rig`.
-rig-core = { version = "0.45.0", default-features = false }
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "stream",

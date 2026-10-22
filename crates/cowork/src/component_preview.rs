@@ -3,15 +3,12 @@
 //! column per mode. Combinations that run without asking show that instead
 //! of a card. `cargo run -p cowork --example component_preview` opens it.
 
+use agent::model::ToolCall;
 use gpui::{
     AnyElement, App, Context, FontWeight, IntoElement, Pixels, QuitMode, Render, SharedString,
     Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 use gpui_component::{ActiveTheme as _, Root};
-use rig::{
-    message::{CallId, ToolCall, ToolFunction, ToolName},
-    tool::Tool as _,
-};
 use sandbox::{Access, RunCommand};
 use serde_json::json;
 
@@ -87,7 +84,7 @@ impl ComponentPreview {
                 .child("Runs without asking")
                 .into_any_element();
         }
-        let label = format!("{} in {}", call.function.name, mode.label());
+        let label = format!("{} in {}", call.name, mode.label());
         let allowed = SharedString::from(format!("Allowed {label}"));
         let denied = SharedString::from(format!("Denied {label}"));
         ToolCallCard::new(format!("preview-{key}-{}", mode.key()), call.clone())
@@ -179,10 +176,10 @@ impl Render for ComponentPreview {
 /// as `tool_approval` decides at the start of a run: a command with read
 /// access and no folders runs at once, and every other call asks.
 fn asks(call: &ToolCall, project: Access) -> bool {
-    if call.function.name.as_str() != RunCommand::NAME {
+    if call.name != RunCommand::NAME {
         return true;
     }
-    let arguments = call.function.arguments_value();
+    let arguments = crate::timeline::arguments_value(call);
     let access = RunCommand::requested_access(&arguments).unwrap_or(project);
     let (read, write) = RunCommand::named_folders(&arguments);
     access > Access::Read || !read.is_empty() || !write.is_empty()
@@ -287,10 +284,7 @@ fn combinations() -> Vec<(&'static str, &'static str, ToolCall)> {
 }
 
 fn tool_call(name: &str, arguments: serde_json::Value) -> ToolCall {
-    ToolCall::new(
-        CallId::from_wire(format!("preview_{name}")),
-        ToolFunction::new(ToolName::new(name).expect("a valid name"), arguments),
-    )
+    crate::timeline::tool_call(&format!("preview_{name}"), name, arguments)
 }
 
 /// Opens a focused, interactive example of compaction settings and the

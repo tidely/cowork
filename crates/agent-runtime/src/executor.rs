@@ -84,9 +84,10 @@ async fn run<H: AgentHost>(
     };
     let name = tool.descriptor.name().to_owned();
     send(ExecutionEvent::Resolved(name.clone()));
-    let prepared = tool.prepare(args, &scope.host)?;
+    let prepared = tool.prepare(args.clone(), &scope.host)?;
     let decision = scope.host.authorize(&CallAuthorization {
         tool: &tool.descriptor,
+        arguments: &args,
         access: prepared.access(),
         origin: &scope.origin,
         permissions: &scope.permissions,

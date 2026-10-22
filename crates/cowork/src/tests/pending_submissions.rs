@@ -2,21 +2,20 @@
 use super::*;
 use crate::thread::submission::RunTotals;
 
-fn generating(session: &mut Collaboration<'_>) -> (Uuid, tokio::task::JoinHandle<()>) {
+fn generating(session: &mut Collaboration<'_>) -> Uuid {
     let message_id = Uuid::new_v4();
-    let task = session._runtime.spawn(std::future::pending::<()>());
     let thread = session.host_thread.clone();
     let thread_id = thread.read_with(session.cx, |thread, _| thread.instance_id);
     session.host.update(session.cx, |cowork, cx| {
         cowork.active_generations.insert(
             thread_id,
-            ActiveGeneration::for_test(message_id, task.abort_handle(), Arc::default()),
+            ActiveGeneration::for_test(message_id, Arc::default()),
         );
         thread.update(cx, |thread, cx| {
-            thread.emit_for_test(agent_started(message_id, None, "initial"), cx)
+            thread.emit_for_test(ScriptedHost::default().started(message_id, None), cx)
         });
     });
-    (message_id, task)
+    message_id
 }
 
 fn accept(session: &mut Collaboration<'_>, text: &str) {
@@ -44,7 +43,7 @@ fn accept(session: &mut Collaboration<'_>, text: &str) {
 #[gpui::test]
 fn pending_submissions_queue_in_order_and_cancel_removes_only_one(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
-    let (_message_id, task) = generating(&mut session);
+    let _message_id = generating(&mut session);
     accept(&mut session, "one");
     accept(&mut session, "two");
     accept(&mut session, "three");
@@ -73,13 +72,12 @@ fn pending_submissions_queue_in_order_and_cancel_removes_only_one(cx: &mut gpui:
     thread.read_with(session.cx, |thread, _| {
         assert_eq!(texts(thread), ["one", "three", "four"]);
     });
-    task.abort();
 }
 
 #[gpui::test]
 fn write_peers_cannot_cancel_pending_submissions(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
-    let (_message_id, task) = generating(&mut session);
+    let _message_id = generating(&mut session);
     let thread = session.host_thread.clone();
     let mirror = session.collaborator_thread().unwrap();
     let peer = mirror.read_with(session.cx, |thread, _| thread.participant_id());
@@ -111,7 +109,6 @@ fn write_peers_cannot_cancel_pending_submissions(cx: &mut gpui::TestAppContext) 
         );
         assert_eq!(thread.read(cx).pending_submissions().len(), 1);
     });
-    task.abort();
 }
 
 #[gpui::test]
@@ -119,7 +116,7 @@ fn completed_runs_start_one_queued_message_but_stopping_preserves_pending(
     cx: &mut gpui::TestAppContext,
 ) {
     let mut session = Collaboration::start(cx);
-    let (message_id, task) = generating(&mut session);
+    let message_id = generating(&mut session);
     accept(&mut session, "first queued");
     accept(&mut session, "second queued");
     let thread = session.host_thread.clone();
@@ -131,7 +128,7 @@ fn completed_runs_start_one_queued_message_but_stopping_preserves_pending(
             RunTotals {
                 started_at: SystemTime::now(),
                 duration: Duration::ZERO,
-                usage: rig::completion::Usage::default(),
+                usage: Usage::default(),
             },
             cx,
         )
@@ -154,7 +151,7 @@ fn completed_runs_start_one_queued_message_but_stopping_preserves_pending(
             RunTotals {
                 started_at: SystemTime::now(),
                 duration: Duration::ZERO,
-                usage: rig::completion::Usage::default(),
+                usage: Usage::default(),
             },
             cx,
         )
@@ -163,13 +160,12 @@ fn completed_runs_start_one_queued_message_but_stopping_preserves_pending(
         assert!(!thread.is_generating());
         assert_eq!(thread.pending_submissions().len(), 1);
     });
-    task.abort();
 }
 
 #[gpui::test]
 fn stop_wins_late_completion_and_resume_delivers_the_queue_in_order(cx: &mut gpui::TestAppContext) {
     let mut session = Collaboration::start(cx);
-    let (message_id, task) = generating(&mut session);
+    let message_id = generating(&mut session);
     accept(&mut session, "queue one");
     accept(&mut session, "queue two");
     accept(&mut session, "queue three");
@@ -186,7 +182,7 @@ fn stop_wins_late_completion_and_resume_delivers_the_queue_in_order(cx: &mut gpu
             RunTotals {
                 started_at: SystemTime::now(),
                 duration: Duration::ZERO,
-                usage: rig::completion::Usage::default(),
+                usage: Usage::default(),
             },
             cx,
         );
@@ -229,7 +225,7 @@ fn stop_wins_late_completion_and_resume_delivers_the_queue_in_order(cx: &mut gpu
                 RunTotals {
                     started_at: SystemTime::now(),
                     duration: Duration::ZERO,
-                    usage: rig::completion::Usage::default(),
+                    usage: Usage::default(),
                 },
                 cx,
             );
@@ -245,7 +241,6 @@ fn stop_wins_late_completion_and_resume_delivers_the_queue_in_order(cx: &mut gpu
             assert_eq!(state.submission_count(), 3);
         }
     });
-    task.abort();
 }
 
 #[gpui::test]
@@ -253,7 +248,7 @@ fn pending_snapshot_keeps_comments_and_attachment_bytes_for_late_join(
     cx: &mut gpui::TestAppContext,
 ) {
     let mut session = Collaboration::start(cx);
-    let (message_id, task) = generating(&mut session);
+    let message_id = generating(&mut session);
     let thread = session.host_thread.clone();
     let file = crate::test_support::text_attachment("instructions.txt", "Keep this file");
     let attachment_id = AttachmentId::new();
@@ -319,7 +314,6 @@ fn pending_snapshot_keeps_comments_and_attachment_bytes_for_late_join(
         assert!(thread.draft().files.contains_key(&attachment_id));
         assert!(thread.draft().items().is_empty());
     });
-    task.abort();
 }
 
 #[gpui::test]
@@ -327,7 +321,7 @@ fn empty_draft_resume_rejects_write_only_peer_before_starting_any_run(
     cx: &mut gpui::TestAppContext,
 ) {
     let mut session = Collaboration::start(cx);
-    let (message_id, task) = generating(&mut session);
+    let message_id = generating(&mut session);
     accept(&mut session, "pending");
     let thread = session.host_thread.clone();
     let peer = session
@@ -342,7 +336,7 @@ fn empty_draft_resume_rejects_write_only_peer_before_starting_any_run(
             RunTotals {
                 started_at: SystemTime::now(),
                 duration: Duration::ZERO,
-                usage: rig::completion::Usage::default(),
+                usage: Usage::default(),
             },
             cx,
         );
@@ -360,5 +354,4 @@ fn empty_draft_resume_rejects_write_only_peer_before_starting_any_run(
         assert_eq!(thread.read(cx).pending_submissions().len(), 1);
         assert_eq!(thread.read(cx).submission_count(), 1);
     });
-    task.abort();
 }

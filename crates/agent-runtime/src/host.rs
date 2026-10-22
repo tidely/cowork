@@ -38,6 +38,10 @@ pub struct Grant<A> {
 pub struct CallAuthorization<'a, H: AgentHost> {
     /// The real tool, also when the model reached it through `call_tool`.
     pub tool: &'a ToolDescriptor,
+    /// The arguments the real tool receives (for `call_tool`, the inner
+    /// call's), for policies that recognize a call by what it says, such as
+    /// asking only when the same call is repeated.
+    pub arguments: &'a serde_json::Value,
     /// What these arguments need, as the tool computed it.
     pub access: &'a H::Access,
     /// Who sent the input that started this run.

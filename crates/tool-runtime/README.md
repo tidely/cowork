@@ -1,9 +1,10 @@
 # Tool runtime
 
 The tool primitives for Cowork's provider-independent stack. This crate has no
-Rig, GPUI, networking, sandbox policy, or agent-loop dependency; authorization
-and scheduling belong to [agent-runtime](../agent-runtime/README.md). The
-existing Rig tools have not migrated yet.
+GPUI, networking, sandbox policy, or agent-loop dependency; authorization and
+scheduling belong to [agent-runtime](../agent-runtime/README.md). Cowork's
+tools (`crates/tools`, and the sandbox's commands and file tools) implement
+`Tool`.
 
 A `Tool` has four associated types:
 

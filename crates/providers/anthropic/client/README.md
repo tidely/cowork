@@ -3,7 +3,7 @@
 An Anthropic Messages implementation of `language_model::LanguageModelProvider`.
 One cloneable client is one connection, with credentials and transport policy
 separate from model metadata and stored messages. No agent loop, automatic
-retries, approvals, background tasks, or Rig dependency are included.
+retries, approvals, or background tasks are included.
 
 ```rust,no_run
 use language_model::{CompletionRequest, LanguageModel, LanguageModelProvider, Message, collect_completion};
@@ -22,7 +22,7 @@ let completion = collect_completion(provider.stream(&model, request).await?).awa
 # }
 ```
 
-The facade exports this client as `language_models::Anthropic`. Clients implement
+The facade exports this client as `agent::Anthropic`. Clients implement
 the object-safe provider trait and can be stored as `Box<dyn LanguageModelProvider>`
 or `Arc<dyn LanguageModelProvider>` alongside the other providers.
 

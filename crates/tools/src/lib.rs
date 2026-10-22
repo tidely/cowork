@@ -7,17 +7,26 @@ pub use tools::comments::*;
 mod tests {
     use std::sync::Arc;
 
-    use rig::tool::{Tool as _, ToolContext, ToolErrorKind, ToolSet};
+    use agent::tool::{Provides, ToolErrorKind, ToolRegistry};
     use serde_json::json;
 
     use super::*;
 
+    struct Host(Arc<RunComments>);
+
+    impl Provides<RunComments> for Host {
+        fn provide(self: &Arc<Self>) -> Arc<RunComments> {
+            self.0.clone()
+        }
+    }
+
     /// Invented arguments reach the model as actionable errors.
     #[test]
     fn unknown_arguments_return_model_feedback() {
-        let mut tools = ToolSet::default();
-        tools.add_tool(Calculate);
-        tools.add_tool(RespondToComment::new(Arc::new(TurnComments::new(1))));
+        let mut tools = ToolRegistry::<Host, ()>::default();
+        tools.register(Calculate).unwrap();
+        tools.register(RespondToComment).unwrap();
+        let host = Arc::new(Host(Arc::default()));
 
         for (name, mut arguments, expected) in [
             (
@@ -32,19 +41,12 @@ mod tests {
             ),
         ] {
             arguments["timeout"] = json!("60000");
-            let result = futures::executor::block_on(tools.execute(
-                name,
-                arguments.to_string(),
-                &mut ToolContext::new(),
-            ));
-            assert_eq!(
-                result.error().unwrap().kind(),
-                ToolErrorKind::InvalidArgs,
-                "{name}"
-            );
-            let feedback = result.output().as_text().unwrap();
-            assert!(feedback.contains("unknown field `timeout`"), "{feedback}");
-            assert!(feedback.contains(expected), "{feedback}");
+            let Err(error) = tools.prepare(name, arguments, &host) else {
+                panic!("{name} accepted an unknown argument");
+            };
+            assert_eq!(error.kind, ToolErrorKind::InvalidArguments, "{name}");
+            assert!(error.message.contains("unknown field `timeout`"), "{error}");
+            assert!(error.message.contains(expected), "{error}");
         }
     }
 }

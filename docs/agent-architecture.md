@@ -2,12 +2,12 @@
 
 This is the architecture of the provider-independent agent stack. That stack is
 `language-model`, the provider crates, `tool-runtime`, `agent-input`, and
-`agent-runtime`, assembled by `language-models` and exercised by its examples.
-This document introduces the stack's concepts and why each piece of state lives
-where it does; the crates' READMEs describe their APIs. The design was proposed
-here first and is now implemented; [Implementation](#implementation) maps it to
-the code. The Cowork app still runs on Rig; nothing here describes the app.
-Where the app is mentioned, it is only an example of a future consumer.
+`agent-runtime`, re-exported together by the `agent` crate and exercised by its
+examples. This document introduces the stack's concepts and why each piece of
+state lives where it does; the crates' READMEs describe their APIs. The design
+was proposed here first and is now implemented; [Implementation](#implementation)
+maps it to the code, and [The Cowork app](#the-cowork-app) shows how the app
+uses it.
 
 The goal is an agent that is easy to extend without making it unclear where
 state lives. Every piece of state has one owner, one lifetime, and one way to
@@ -671,9 +671,31 @@ Where each concept lives:
 | The session actor and request assembly | [session.rs](../crates/agent-runtime/src/session.rs) |
 | The managed `Agent` | [agent.rs](../crates/agent-runtime/src/agent.rs) |
 
-The examples in `crates/language-models/examples` show the simple API
-(`prompt.rs`) and a custom host with tools, approvals, a policy change, and a
-dynamic tool (`agent.rs`).
+The examples in `crates/agent/examples` show the simple API (`prompt.rs`) and
+a custom host with tools, approvals, a policy change, and a dynamic tool
+(`agent.rs`).
+
+## The Cowork app
+
+The host of a thread runs one `AgentSession` for it, created with the
+thread's first run and kept for its later ones, so what the model was told
+(such as the environment note) carries over between runs. Only the host runs
+the agent; collaborators see what the session commits.
+
+| Concept | In Cowork |
+| --- | --- |
+| `AgentHost` | `CoworkHost` ([tool_approval.rs](../crates/cowork/src/tool_approval.rs)): sources are the participant or schedule that started a run, inputs are a submission's content, access is the sandbox's `Needs`, and permissions are the sandbox's project, read when a call starts |
+| Tool contexts | The thread's `sandbox::ThreadSandbox` (commands and file tools) and the run's `tools::RunComments` (`respond_to_comment`) |
+| Authorization | Calls within the project's mode, its folders, and the run's grants run; others ask, and only the host may decide commands, writes, and permission requests. A scheduled run refuses a call that would ask the first time |
+| Definition | The selected model, the system prompt, the seven tools without `search_tools` and `call_tool`, medium thinking, and Ollama's `num_ctx`. A model change replaces it before the next run |
+| Context sections | `environment`: the project's folders and mode and the scratch folder, sent whenever they changed |
+| Inputs | Cowork keeps its own queue of pending submissions, which collaborators see and cancel, and hands the session one input at a time when no run is going |
+| Compaction | Requested when a request reports the context past the user's threshold, or when a run starts on a full context |
+| Events | The host projects each run's events onto `RunEvent`s (previews, committed entries, usage, compactions), which every participant folds into a replica of the conversation; see [collaboration.md](collaboration.md) |
+
+`request_permissions` grants what it asked for when it runs, into the
+sandbox's run grants, which later commands of the run get; the runtime's
+`AllowForRun` grants are not used.
 
 ## Decisions
 
@@ -704,5 +726,6 @@ Follow-ups, none needed for the current design to hold:
   with a size budget), and rank search results.
 - Run parallel-safe calls concurrently, committing results in call order.
 - Provider-native tool search, through concrete clients.
-- Move Cowork from Rig onto this stack.
+- Move Cowork's pending submissions into the session's inbox, and its
+  approvals' `AllowForRun`.
 

@@ -873,7 +873,7 @@ impl Cowork {
                 .min_w_0()
                 .truncate()
                 .child(if running {
-                    format!("Running {}", call.call.function.name)
+                    format!("Running {}", call.call.name)
                 } else {
                     call.description()
                 })
@@ -963,7 +963,7 @@ impl Cowork {
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
         let id = format!("tool-approval-{message_id}-{step_index}");
-        let tool = call.call.function.name.to_string();
+        let tool = call.call.name.to_string();
         let mut card =
             ToolCallCard::new(id, call.call.clone()).project_access(rights.project_mode.access());
         if let Some(mut approved) = self

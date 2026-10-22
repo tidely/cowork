@@ -2,17 +2,19 @@
 //! run, as Codex's `request_permissions`: more access to the project, and
 //! folders outside it.
 //!
-//! The tool itself grants nothing. The host's approval hook resolves what a
-//! call asks for (see [`RequestPermissions::requested`]), asks the host, and
-//! keeps what was allowed for the run's later commands; it then lets the
-//! call through with everything the run has been granted, which the tool
-//! reports back to the model. Like `run_command`'s, the definition never
-//! changes and names no host paths.
+//! A call needs what it asks for ([`Needs::Permissions`]), resolved before
+//! anyone is asked. The host lets it run when the run has that already or
+//! someone allows it; running, it adds what it asked for to the run's grants
+//! (see [`ThreadSandbox::run_grant`]), which the run's later commands get,
+//! and reports everything granted back to the model. Like `run_command`'s,
+//! the definition never changes and names no host paths.
 
-use rig::tool::{ContextValue, Tool, ToolContext, ToolExecutionError};
-use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 
-use crate::{Access, CallApprovals, Folders, Grant, RunCommand, grant::named_folders};
+use agent::tool::{Tool, ToolCall, ToolError, ToolErrorKind};
+use serde::Deserialize;
+
+use crate::{Access, Folders, Grant, Needs, ThreadSandbox};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -41,14 +43,15 @@ pub struct RequestPermissionsArgs {
 pub struct RequestPermissions;
 
 impl RequestPermissions {
-    /// What a call with `arguments` asks for, resolved on this computer, or
-    /// why it can't be granted. A call must ask for something beyond reading
+    pub const NAME: &'static str = "request_permissions";
+
+    /// What a call with `args` asks for, resolved on this computer, or why
+    /// it can't be granted. A call must ask for something beyond reading
     /// the project, which every command may do.
-    pub fn requested(arguments: &serde_json::Value) -> Result<Grant, String> {
-        let (read, write) = named_folders(arguments);
+    pub fn requested(args: &RequestPermissionsArgs) -> Result<Grant, String> {
         let grant = Grant {
-            access: RunCommand::requested_access(arguments).unwrap_or_default(),
-            folders: Folders::resolve(&read, &write)?,
+            access: args.access.unwrap_or_default(),
+            folders: Folders::resolve(&args.read_folders, &args.write_folders)?,
         };
         if grant == Grant::default() {
             return Err(
@@ -59,39 +62,7 @@ impl RequestPermissions {
         }
         Ok(grant)
     }
-
-    /// The context for an allowed call, with everything the run has been
-    /// granted, `granted`, for the tool to report.
-    pub fn context(granted: Grant) -> ToolContext {
-        let mut context = ToolContext::new();
-        context
-            .insert(Granted(granted))
-            .expect("a grant always encodes");
-        context
-    }
 }
-
-/// Everything the run was granted once the call was allowed; see
-/// [`RequestPermissions::context`].
-#[derive(Serialize, Deserialize)]
-struct Granted(Grant);
-
-impl ContextValue for Granted {
-    const KEY: &'static str = "sandbox.request_permissions.granted";
-}
-
-/// Why a call reached the tool without the host allowing it, as from an
-/// agent without an approval hook.
-#[derive(Debug)]
-pub struct NotGranted;
-
-impl std::fmt::Display for NotGranted {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("Nothing was granted: only the user can grant permissions.")
-    }
-}
-
-impl std::error::Error for NotGranted {}
 
 const DESCRIPTION: &str = "Ask the user for more permissions for the commands you run next, \
 when several commands will need them: `access` to the project (`write` to change it, `network` to \
@@ -104,115 +75,116 @@ everything granted. They don't apply to the file tools. For a single command, as
 `run_command` arguments instead. If the user denies it, carry on without it.";
 
 impl Tool for RequestPermissions {
-    const NAME: &'static str = "request_permissions";
-    type Error = NotGranted;
     type Args = RequestPermissionsArgs;
     type Output = String;
+    type Context = ThreadSandbox;
+    type Access = Needs;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
 
     fn description(&self) -> String {
         DESCRIPTION.to_owned()
     }
 
-    fn parameters(&self) -> serde_json::Value {
-        schemars::schema_for!(RequestPermissionsArgs).into()
+    fn access(&self, args: &RequestPermissionsArgs, _: &ThreadSandbox) -> Needs {
+        match Self::requested(args) {
+            Ok(grant) => Needs::Permissions(grant),
+            Err(reason) => Needs::Refused(reason),
+        }
     }
 
-    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
-        ToolExecutionError::permission_denied(error.to_string())
-    }
-
-    async fn call(
+    async fn run(
         &self,
-        context: &mut ToolContext,
+        call: ToolCall<Needs>,
+        sandbox: Arc<ThreadSandbox>,
         _: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
-        let Granted(granted) = CallApprovals::approved(context, Self::NAME)
-            .get::<Granted>()
-            .ok()
-            .flatten()
-            .ok_or(NotGranted)?;
+    ) -> Result<Self::Output, ToolError> {
+        let Needs::Permissions(grant) = call.access else {
+            return Err(ToolError::new(
+                ToolErrorKind::PermissionDenied,
+                "Nothing was granted: only the user can grant permissions.",
+            ));
+        };
+        sandbox.sandboxes().grant_for_run(sandbox.thread(), &grant);
         Ok(format!(
             "The user allowed it. For the rest of this turn, `run_command` calls run with these \
              permissions unless they ask for other access, and without asking the user when they \
              need nothing more:\n{}",
-            granted.describe()
+            sandbox.run_grant().describe()
         ))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use rig::tool::ToolSet;
     use serde_json::json;
 
     use super::*;
-    use crate::TestRoot;
+    use crate::{TestRoot, call, prepare, test_sandboxes};
+
+    fn needs(arguments: serde_json::Value) -> Needs {
+        let (sandboxes, _root) = test_sandboxes();
+        let sandbox = Arc::new(ThreadSandbox::new(sandboxes, "thread"));
+        prepare(RequestPermissions, &sandbox, arguments)
+            .unwrap()
+            .access()
+            .clone()
+    }
 
     #[test]
     fn calls_must_ask_for_something_that_can_be_granted() {
         let folder = TestRoot::new();
         let path = folder.0.to_string_lossy().into_owned();
-        let requested = RequestPermissions::requested(&json!({
+        let Needs::Permissions(requested) = needs(json!({
             "reason": "Fetch dependencies.",
             "access": "network",
             "write_folders": [path],
-        }))
-        .unwrap();
+        })) else {
+            panic!("a grant");
+        };
         assert_eq!(requested.access, Access::Network);
         assert_eq!(
             requested.folders.write,
             [crate::resolved(&folder.0).unwrap()]
         );
 
-        let only_folders = RequestPermissions::requested(&json!({
+        let Needs::Permissions(only_folders) = needs(json!({
             "reason": "Read the docs.",
             "read_folders": [path],
-        }))
-        .unwrap();
+        })) else {
+            panic!("a grant");
+        };
         assert_eq!(only_folders.access, Access::Read);
 
         for nothing in [
             json!({"reason": "Nothing."}),
             json!({"reason": "Nothing.", "access": "read"}),
         ] {
-            assert!(
-                RequestPermissions::requested(&nothing)
-                    .unwrap_err()
-                    .contains("asks for nothing")
-            );
+            assert!(matches!(
+                needs(nothing),
+                Needs::Refused(reason) if reason.contains("asks for nothing")
+            ));
         }
     }
 
-    /// The tool reports what the hook allowed, and nothing without it.
+    /// Running, the tool grants the run what it asked for and reports
+    /// everything granted.
     #[tokio::test]
-    async fn the_tool_reports_what_was_granted() {
-        let mut tools = ToolSet::default();
-        tools.add_tool(RequestPermissions);
-        let arguments = json!({"reason": "Fetch.", "access": "network"}).to_string();
-
-        let refused = tools
-            .execute(
-                RequestPermissions::NAME,
-                arguments.clone(),
-                &mut ToolContext::new(),
-            )
-            .await;
-        let refused = refused.error().expect("refused").message().to_owned();
-        assert!(refused.contains("only the user"), "{refused}");
-
-        let granted = Grant {
-            access: Access::Network,
-            ..Grant::default()
-        };
-        let reported = tools
-            .execute(
-                RequestPermissions::NAME,
-                arguments,
-                &mut RequestPermissions::context(granted),
-            )
-            .await;
-        assert!(reported.is_success());
-        let reported = reported.output().render();
+    async fn the_tool_grants_the_run_what_it_asked_for() {
+        let (sandboxes, _root) = test_sandboxes();
+        let sandbox = Arc::new(ThreadSandbox::new(sandboxes, "thread"));
+        let reported = call(
+            RequestPermissions,
+            &sandbox,
+            json!({"reason": "Fetch.", "access": "network"}),
+        )
+        .await
+        .unwrap();
         assert!(reported.contains("project access: network"), "{reported}");
+        assert_eq!(sandbox.run_grant().access, Access::Network);
+        sandbox.end_run();
+        assert_eq!(sandbox.run_grant(), Grant::default());
     }
 }

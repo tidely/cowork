@@ -6,9 +6,9 @@ use crate::{ToolError, ToolErrorKind};
 
 /// The application's built-in result vocabulary. Named variants will let the UI
 /// and other consumers match known results without interpreting arbitrary JSON
-/// or scraping model-facing prose. No built-ins have migrated to this runtime
-/// yet, so only the dynamic case exists; it also remains the escape hatch for
-/// custom and runtime-discovered tools as named built-in variants are added.
+/// or scraping model-facing prose. No tool has a named variant yet, so only
+/// the dynamic case exists; it also remains the escape hatch for custom and
+/// runtime-discovered tools as named built-in variants are added.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum BuiltinToolOutput {
@@ -37,7 +37,12 @@ pub trait ToolOutput: Serialize {
 }
 
 impl ToolOutput for Value {}
-impl ToolOutput for String {}
+/// Text reaches the model as text, not as a JSON string.
+impl ToolOutput for String {
+    fn model_output(&self) -> Option<Vec<ToolResultContent>> {
+        Some(vec![ToolResultContent::Text { text: self.clone() }])
+    }
+}
 
 impl ToolOutput for BuiltinToolOutput {
     fn into_output(self) -> Result<BuiltinToolOutput, serde_json::Error> {

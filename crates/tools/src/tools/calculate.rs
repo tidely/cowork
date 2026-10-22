@@ -1,6 +1,8 @@
 use std::fmt;
 
-use rig::tool::{Tool, ToolContext, ToolExecutionError};
+use std::sync::Arc;
+
+use agent::tool::{Tool, ToolCall, ToolError, ToolErrorKind, ToolOutput};
 use serde::{Deserialize, Serialize};
 
 /// Basic arithmetic operations available to the agent.
@@ -29,6 +31,8 @@ pub struct Calculation {
     pub result: f64,
 }
 
+impl ToolOutput for Calculation {}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum CalculateError {
     NonFiniteOperand,
@@ -38,11 +42,11 @@ pub enum CalculateError {
 
 impl fmt::Display for CalculateError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::NonFiniteOperand => formatter.write_str("operands must be finite numbers"),
-            Self::DivisionByZero => formatter.write_str("cannot divide by zero"),
-            Self::NonFiniteResult => formatter.write_str("result is not a finite number"),
-        }
+        formatter.write_str(match self {
+            Self::NonFiniteOperand => "operands must be finite numbers",
+            Self::DivisionByZero => "cannot divide by zero",
+            Self::NonFiniteResult => "result is not a finite number",
+        })
     }
 }
 
@@ -51,32 +55,11 @@ impl std::error::Error for CalculateError {}
 /// Computes one arithmetic operation on two numbers without external side effects.
 pub struct Calculate;
 
-impl Tool for Calculate {
-    const NAME: &'static str = "calculate";
-    type Error = CalculateError;
-    type Args = CalculateArgs;
-    type Output = Calculation;
+impl Calculate {
+    pub const NAME: &'static str = "calculate";
 
-    fn description(&self) -> String {
-        "Calculate the sum, difference, product, or quotient of two numbers. Use for arithmetic rather than estimating. \
-         Operands and the result are 64-bit floating-point numbers, so very large integers and decimal fractions may be rounded. \
-         It returns an error, and no result, for non-finite operands, a zero divisor, or a result that overflows."
-            .into()
-    }
-
-    fn parameters(&self) -> serde_json::Value {
-        schemars::schema_for!(CalculateArgs).into()
-    }
-
-    fn map_error(&self, error: Self::Error) -> ToolExecutionError {
-        ToolExecutionError::invalid_args(error.to_string())
-    }
-
-    async fn call(
-        &self,
-        _context: &mut ToolContext,
-        args: Self::Args,
-    ) -> Result<Self::Output, Self::Error> {
+    /// The calculation `args` ask for.
+    pub fn calculate(args: CalculateArgs) -> Result<Calculation, CalculateError> {
         if !args.a.is_finite() || !args.b.is_finite() {
             return Err(CalculateError::NonFiniteOperand);
         }
@@ -97,15 +80,40 @@ impl Tool for Calculate {
     }
 }
 
+impl Tool for Calculate {
+    type Args = CalculateArgs;
+    type Output = Calculation;
+    type Context = ();
+    type Access = ();
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> String {
+        "Calculate the sum, difference, product, or quotient of two numbers. Use for arithmetic rather than estimating. \
+         Operands and the result are 64-bit floating-point numbers, so very large integers and decimal fractions may be rounded. \
+         It returns an error, and no result, for non-finite operands, a zero divisor, or a result that overflows."
+            .into()
+    }
+
+    async fn run(
+        &self,
+        _call: ToolCall<()>,
+        _context: Arc<()>,
+        args: Self::Args,
+    ) -> Result<Self::Output, ToolError> {
+        Self::calculate(args)
+            .map_err(|error| ToolError::new(ToolErrorKind::InvalidArguments, error.to_string()))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn calculate(operation: Operation, a: f64, b: f64) -> Result<f64, CalculateError> {
-        futures::executor::block_on(
-            Calculate.call(&mut ToolContext::new(), CalculateArgs { operation, a, b }),
-        )
-        .map(|output| output.result)
+        Calculate::calculate(CalculateArgs { operation, a, b }).map(|output| output.result)
     }
 
     #[test]
