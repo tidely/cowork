@@ -81,45 +81,42 @@ fn archive_from_sidebar(thread_id: Uuid, cx: &mut gpui::VisualTestContext) {
 }
 
 #[gpui::test]
-fn usage_statistics_outlast_the_threads_of_an_earlier_session(cx: &mut gpui::TestAppContext) {
+fn deleted_threads_still_count_after_a_restart(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     let dir = std::env::temp_dir().join(format!("cowork-statistics-{}", Uuid::new_v4()));
     let path = dir.join("statistics.json");
     cowork.update(cx, |cowork, _| cowork.start_statistics(Some(path.clone())));
-    add_thread(&cowork, 20, cx);
-    let used = add_thread(&cowork, 90, cx);
+    let kept = add_thread(&cowork, 20, cx);
+    let deleted = add_thread(&cowork, 90, cx);
     cowork.update(cx, |cowork, cx| {
-        let thread = cowork.thread_store.read(cx).thread(used, cx).unwrap();
-        let usage = Usage {
-            total_tokens: Some(100),
-            ..Usage::default()
-        };
-        cowork.record_turn_usage(&thread, usage, SystemTime::now(), Duration::ZERO, cx);
-        cowork.save_statistics(cx);
+        for (thread_id, tokens) in [(kept, 10), (deleted, 100)] {
+            let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
+            let usage = Usage {
+                total_tokens: Some(tokens),
+                ..Usage::default()
+            };
+            cowork.record_turn_usage(&thread, usage, SystemTime::now(), Duration::ZERO, cx);
+        }
+        let thread = cowork.thread_store.read(cx).thread(deleted, cx).unwrap();
+        cowork.thread_store.update(cx, |store, _| {
+            store.threads.retain(|other| *other != thread);
+            store.archived.push_front(thread);
+        });
+        cowork.delete_archived_thread(deleted, cx);
     });
-    let before = cowork.read_with(cx, |cowork, cx| cowork.statistics(cx));
 
-    // Threads aren't saved, so a restart starts with none of them.
-    cowork.update(cx, |cowork, cx| {
-        cowork
-            .thread_store
-            .update(cx, |store, _| store.threads.clear());
-        cowork.tokens_used = 0;
-        cowork.token_activity.clear();
-        cowork.deleted_chats = 0;
-        cowork.longest_deleted_chat = Duration::ZERO;
+    // The kept thread is read back with its folder; the deleted one's
+    // statistics come from the file.
+    cowork.update(cx, |cowork, _| {
+        cowork.deleted = Default::default();
         cowork.start_statistics(Some(path.clone()));
     });
-
     cowork.read_with(cx, |cowork, cx| {
-        assert_eq!(cowork.statistics(cx), before);
-        assert_eq!(cowork.tokens_used, 100);
-        assert_eq!(cowork.token_activity.len(), 1);
+        assert_eq!(cowork.tokens_used(cx), 110);
+        assert_eq!(cowork.token_activity(cx).len(), 2);
         assert_eq!(cowork.total_chats(cx), 2);
         assert_eq!(cowork.longest_chat(cx), Duration::from_secs(90));
     });
-    add_thread(&cowork, 5, cx);
-    cowork.read_with(cx, |cowork, cx| assert_eq!(cowork.total_chats(cx), 3));
 
     _ = std::fs::remove_dir_all(dir);
 }
@@ -275,7 +272,7 @@ fn archived_threads_are_restored_or_deleted_from_the_archive(cx: &mut gpui::Test
     );
     // What was done in the deleted thread still counts.
     cowork.read_with(cx, |cowork, cx| {
-        assert_eq!(cowork.tokens_used, 100);
+        assert_eq!(cowork.tokens_used(cx), 100);
         assert_eq!(cowork.longest_chat(cx), Duration::from_secs(90));
         assert_eq!(cowork.total_chats(cx), 3);
     });

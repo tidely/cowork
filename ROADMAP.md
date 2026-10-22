@@ -24,12 +24,11 @@ owner's own feature notes.
 
 ## Provider-independent agent runtime
 
-The agent stack replaced the Rig integration: `language-model`, the provider
-crates, `tool-runtime`, `agent-input`, and `agent-runtime`, re-exported by the
-`agent` crate. These are responsibility
-boundaries, not a requirement to create a separate crate for every item. Existing
-Cowork behavior should inform the implementation; some of these mechanisms
-already exist in the app but have not moved into the new stack.
+The agent stack is `language-model`, the provider crates, `tool-runtime`,
+`agent-input`, and `agent-runtime`, re-exported by the `agent` crate. These are
+responsibility boundaries, not a requirement to create a separate crate for every
+item. Existing Cowork behavior should inform the implementation; Cowork's
+pending-submission queue, for one, has not moved into the session inbox yet.
 
 The [agent-input layer](crates/agent-input/README.md) covers source-independent
 queueing, steering, interjection, and interrupt follow-ups. It is integrated into
@@ -87,8 +86,7 @@ handle for typed input sources, controls, and event observation.
 - [ ] **Request assembly and context maintenance.** Assemble a stable prompt/tool
       prefix, changing environment context, selected history, and token reservations.
       Support compaction through an explicit conversation transition that preserves
-      concurrent additions, tool correlation, and provider-native replay data. Reuse
-      lessons from Cowork's existing request prefix and compaction implementation.
+      concurrent additions, tool correlation, and provider-native replay data.
       Manual and automatic compaction now run at safe boundaries and preserve full
       transcript/UI records. The initial trigger measures serialized context bytes;
       token reservations, model-aware thresholds, and richer context selection remain.

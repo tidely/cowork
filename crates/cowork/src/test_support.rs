@@ -68,11 +68,12 @@ pub(crate) fn request_unchecked(thread: &Thread, request: protocol::Collaborator
 }
 
 /// Sandboxes for a test `Cowork`. Nothing is set up until a command runs, and
-/// tests run none, so the scratch root is never created.
+/// tests run none, so no thread folder is ever created.
 pub(crate) fn unused_sandboxes() -> Arc<sandbox::Sandboxes> {
     Arc::new(sandbox::Sandboxes::new(
-        std::env::temp_dir().join("cowork-test-sandboxes-unused"),
-        Uuid::new_v4().simple().to_string(),
+        std::env::temp_dir()
+            .join("cowork-test-sandboxes-unused")
+            .join(Uuid::new_v4().simple().to_string()),
         sandbox::EnvironmentSource::Process,
     ))
 }

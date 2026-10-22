@@ -1,5 +1,4 @@
-//! The environment commands inherit: the user's login shell environment,
-//! captured the way Zed does it.
+//! The environment commands inherit: the user's login shell environment.
 //!
 //! An app started from the Dock or a desktop launcher gets a bare
 //! environment, without the `PATH` entries and variables the user's shell

@@ -68,7 +68,8 @@ pub(crate) struct TranscriptIndex(pub(crate) u64);
 /// The conversation of a thread's agent session, and where each of its
 /// compactions was accepted, so a run's output can show it in place.
 ///
-/// All entries remain resident today; nothing is persisted.
+/// All entries remain resident. A saved thread keeps them as
+/// [`TranscriptLine`]s; see `thread_files.rs`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Transcript {
     conversation: Conversation<RunSource>,
@@ -200,6 +201,64 @@ impl Json<TranscriptRecord> {
     }
 }
 
+/// A transcript record as a saved thread keeps it, one per line of its
+/// message log in the order they were accepted, so the log only grows.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum TranscriptLine {
+    Entry(StoredEntry),
+    /// Accepted with as many entries as the lines before it hold.
+    Compaction(StoredCompaction),
+}
+
+/// How much of a transcript is saved: its first `entries` entries and
+/// `compactions` compactions.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct TranscriptExtent {
+    pub(crate) entries: usize,
+    pub(crate) compactions: usize,
+}
+
+impl Transcript {
+    pub(crate) fn extent(&self) -> TranscriptExtent {
+        TranscriptExtent {
+            entries: self.len(),
+            compactions: self.compacted_at.len(),
+        }
+    }
+
+    /// The records after `saved`, in the order they were accepted: a
+    /// compaction accepted with `n` entries follows the `n`th entry.
+    pub(crate) fn lines_after(&self, saved: TranscriptExtent) -> Vec<TranscriptLine> {
+        let entry_line = |index: usize| {
+            TranscriptLine::Entry(
+                StoredEntry::encode(&self.entries()[index]).expect("committed entries encode"),
+            )
+        };
+        let mut lines = Vec::new();
+        let mut next = saved.entries;
+        let compactions = self.conversation.compactions();
+        for (index, at) in self.compacted_at.iter().enumerate().skip(saved.compactions) {
+            lines.extend((next..*at).map(entry_line));
+            next = next.max(*at);
+            lines.push(TranscriptLine::Compaction(
+                StoredCompaction::encode(&compactions[index]).expect("accepted summaries encode"),
+            ));
+        }
+        lines.extend((next..self.len()).map(entry_line));
+        lines
+    }
+
+    /// Adds the record after the ones applied so far, checking it as it was
+    /// checked when it was first accepted.
+    pub(crate) fn apply_line(&mut self, line: &TranscriptLine) -> anyhow::Result<()> {
+        match line {
+            TranscriptLine::Entry(entry) => self.commit(self.len() as u64, entry.decode()?),
+            TranscriptLine::Compaction(compaction) => self.compact(compaction.decode()?),
+        }
+    }
+}
+
 /// An entry as it is sent.
 pub(crate) fn shared_entry(entry: &Entry<RunSource>) -> Json<StoredEntry> {
     Json::from_value(&StoredEntry::encode(entry).expect("committed entries encode"))
@@ -254,12 +313,33 @@ impl ReplyPreview {
             .then(|| Message::new(Role::Assistant, self.parts.values().cloned().collect()))
     }
 
-    fn of(previews: &[Preview]) -> Self {
+    pub(crate) fn of(previews: &[Preview]) -> Self {
         let mut preview = Self::default();
         for delta in previews {
             preview.apply(delta);
         }
         preview
+    }
+
+    /// Previews that bring a reply as far as `partial`, a reply that
+    /// [`ReplyPreview::partial`] gave: one for each part's text or reasoning.
+    pub(crate) fn previews_of(partial: &Message) -> Vec<Preview> {
+        partial
+            .content
+            .iter()
+            .filter_map(|content| match content {
+                Content::Text { text } => Some(PreviewDelta::Text(text.clone())),
+                Content::Reasoning(Reasoning::Text { text }) => {
+                    Some(PreviewDelta::Reasoning(text.clone()))
+                }
+                _ => None,
+            })
+            .enumerate()
+            .map(|(index, delta)| Preview {
+                index: index as u32,
+                delta,
+            })
+            .collect()
     }
 }
 

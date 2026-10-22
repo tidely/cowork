@@ -9,13 +9,9 @@ Implemented: the Scheduled page (`schedules.rs`, opened from the sidebar),
 the task model and its occurrence policy (`scheduled_task.rs`), and the
 scheduler running the queue and saving tasks (`scheduler.rs`), with every
 option and behavior below. Tasks and their run history are saved to
-`~/.cowork/schedules.json`.
-
-Not yet implemented:
-
-- saving threads, so after a restart a **continue the last thread** task's
-  thread is gone and its next run starts a new one (see
-  [Constraints](#constraints)).
+`~/.cowork/schedules.json`. A **continue the last thread** task finds its
+thread by id after a restart too, as threads are saved (see
+[Saved threads](collaboration.md#saved-threads)).
 
 ## Task options
 
@@ -59,7 +55,7 @@ The same folders and mode a thread's bottom bar sets (see
 [Project folders](collaboration.md#project-folders)), chosen in the task's
 dialog with the same folder picker. Before each run is submitted, its thread
 is given exactly the task's folders and mode, so the run's commands use them
-from the first one, and its prompt carries an environment note naming them
+from the first one, and an environment note naming them precedes its prompt
 when they changed. An edit applies from the next run, also in a continued
 thread, whose folders someone may have changed meanwhile. The user's own
 new-thread project is left alone. The mode can be picked before any folder is
@@ -172,14 +168,12 @@ approval, for its thread, or for models.
   goes through the same code path as anyone else's (see
   [collaboration.md](collaboration.md)) and doesn't touch the shared draft. A
   shared thread's collaborators see the run like any other.
-- Tasks and their run history are the first state Cowork saves (the
-  profile's statistics, in `statistics.rs`, are the only other). The file is
-  written whole, replacing the old one only once written. One that can't be
-  read, or has another format version, is moved aside rather than
-  overwritten.
-- **Continue the last thread** needs the thread itself to survive a restart,
-  so threads must be saved to disk too. Until they are, the next run after a
-  restart starts a new thread.
+- The tasks file is written whole, replacing the old one only once written.
+  One that can't be read, or has another format version, is moved aside
+  rather than overwritten.
+- A **continue the last thread** run after a restart goes on in the thread
+  as it was last saved. A thread that is gone, deleted or unreadable, gets a
+  new one, which later runs continue.
 
 ## Open questions
 

@@ -135,7 +135,7 @@ impl Cowork {
 
     /// The chats the user started here, archived ones included, excluding
     /// joined ones.
-    fn own_threads<'a>(&self, cx: &'a App) -> impl Iterator<Item = &'a Thread> {
+    pub(crate) fn own_threads<'a>(&self, cx: &'a App) -> impl Iterator<Item = &'a Thread> {
         let store = self.thread_store.read(cx);
         store
             .threads
@@ -147,7 +147,7 @@ impl Cowork {
 
     /// How many chats the user has started, including deleted ones.
     pub(crate) fn total_chats(&self, cx: &App) -> usize {
-        self.own_threads(cx).count() + self.deleted_chats
+        self.own_threads(cx).count() + self.deleted.chats
     }
 
     /// The most time the agent has spent generating in one of the user's
@@ -155,13 +155,13 @@ impl Cowork {
     pub(crate) fn longest_chat(&self, cx: &App) -> Duration {
         self.own_threads(cx)
             .map(Thread::generation_time)
-            .fold(self.longest_deleted_chat, Duration::max)
+            .fold(self.deleted.longest_chat, Duration::max)
     }
 
     /// A row of the user's usage statistics, each a value over its label.
     fn render_usage_stats(&self, cx: &App) -> impl IntoElement {
         let stats = [
-            (format_stat_count(self.tokens_used), "Lifetime tokens"),
+            (format_stat_count(self.tokens_used(cx)), "Lifetime tokens"),
             (self.total_chats(cx).to_string(), "Total chats"),
             (format_stat_duration(self.longest_chat(cx)), "Longest chat"),
         ];
@@ -222,7 +222,8 @@ impl Cowork {
         /// Room above the plot, so that its highest value meets the line.
         const PEAK_LABEL_ROOM: f32 = PEAK_LINE_TOP - PLOT_TOP_INSET;
 
-        let chart = token_activity_chart(&self.token_activity, self.activity_range, Local::now());
+        let chart =
+            token_activity_chart(&self.token_activity(cx), self.activity_range, Local::now());
         let last_index = chart.buckets.len().saturating_sub(1);
         let peak = chart.peak().map(|(index, bucket)| {
             let text = format!(

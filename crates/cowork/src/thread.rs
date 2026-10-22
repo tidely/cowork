@@ -152,6 +152,9 @@ pub(crate) struct Thread {
     /// turn; see [`Cowork::record_turn_usage`]. Only the host, which runs
     /// the agent, fills it.
     pub(crate) tokens_used: u64,
+    /// When those tokens were used, turn by turn, which the profile's
+    /// activity chart adds up over the user's own threads.
+    pub(crate) token_activity: Vec<crate::usage::TokenActivity>,
     /// The selected model. It may be missing from `models`, in which case it
     /// cannot run until another is picked; see [`Thread::runnable_model`].
     model: Option<ModelRef>,
@@ -179,10 +182,10 @@ pub(crate) struct Thread {
     ownership: ThreadOwnership,
     /// The folders the thread works in, in the order the host added them.
     /// The host knows their paths; a mirror only their names, since they
-    /// are on the host's machine. Not yet given to the agent.
+    /// are on the host's machine.
     project_folders: Vec<ProjectFolder>,
     /// Whether the project is open for writing or only reading. Chosen by
-    /// the host and mirrored. Not yet given to the agent.
+    /// the host and mirrored.
     project_mode: ProjectMode,
 }
 
@@ -312,6 +315,7 @@ impl Thread {
             active_run: None,
             prompt_names: HashMap::new(),
             tokens_used: 0,
+            token_activity: Vec::new(),
             model,
             models,
             context_tokens: None,
@@ -593,6 +597,7 @@ impl Thread {
             active_run: None,
             prompt_names: HashMap::new(),
             tokens_used: 0,
+            token_activity: Vec::new(),
             model: None,
             models: Arc::default(),
             context_tokens: None,
@@ -615,10 +620,54 @@ impl Thread {
         thread
     }
 
+    /// Builds one of the user's own threads as it was saved: `prepared`, a
+    /// snapshot of its records checked as a host's is, with its folders on
+    /// this machine and the files its messages attach. It comes back with a
+    /// fresh draft, and is not shared.
+    pub(crate) fn from_saved(
+        prepared: PreparedWelcome,
+        project_folders: Vec<ProjectFolder>,
+        files: HashMap<AttachmentId, crate::attachments::FileAttachment>,
+        cx: &mut impl AppContext,
+    ) -> Self {
+        let id = Uuid::from_bytes(prepared.welcome.thread.id);
+        let participant_id = ParticipantId::from_bytes(prepared.welcome.participant_id);
+        let mut thread = Self::new_local(
+            String::new(),
+            Vec::new(),
+            ThreadDraft::new(participant_id),
+            participant_id,
+            Arc::default(),
+            None,
+        );
+        thread.instance_id = id;
+        thread.summary.id = id;
+        thread
+            .apply_welcome(prepared, cx)
+            .expect("a prepared snapshot installs checked draft state");
+        // Installing a snapshot sets a joined thread's file handling.
+        thread.draft.keeps_removed_files = false;
+        thread.draft.stored.extend(files.keys().copied());
+        thread.draft.files = files;
+        thread.project_folders = project_folders;
+        thread
+    }
+
     /// Validates a host's draft snapshot and nested agent records, including that
     /// agent messages fit the transcript, before creating a mirror or installing
     /// a replacement epoch into an existing one.
     pub(crate) fn prepare_welcome(welcome: protocol::Welcome) -> anyhow::Result<PreparedWelcome> {
+        let transcript = welcome.thread.transcript.to_transcript()?;
+        Self::prepare_snapshot(welcome, transcript)
+    }
+
+    /// [`Thread::prepare_welcome`] with the snapshot's transcript already
+    /// rebuilt as `transcript`, as a saved thread's is; the snapshot's own
+    /// is ignored.
+    pub(crate) fn prepare_snapshot(
+        welcome: protocol::Welcome,
+        transcript: Transcript,
+    ) -> anyhow::Result<PreparedWelcome> {
         // Epoch changes install a fresh document, so check its state before
         // constructing a mirror or changing any existing thread state.
         let snapshot = ::draft::Draft::new();
@@ -648,7 +697,6 @@ impl Thread {
                 "oversized pending submission"
             );
         }
-        let transcript = welcome.thread.transcript.to_transcript()?;
         let mut message_ids = std::collections::HashSet::new();
         for message in &welcome.thread.messages {
             let id = match message {

@@ -23,11 +23,9 @@
 //! keeps captured stdout/stderr. Stopping the run also ends commands and any
 //! background processes. See `docs/permissions.md` for approval behavior.
 
-/// Where each thread's scratch folder is, under Cowork's home
-/// (`~/.cowork/scratch/<app instance>/<thread>`). It is kept between the
-/// thread's commands, removed when the thread is deleted, and removed with
-/// the rest of the instance's when Cowork quits. Scratch folders of an
-/// instance that did not quit cleanly are removed by the next instance.
+/// Where each thread's scratch folder is, in the thread's own folder
+/// (`~/.cowork/threads/<thread>/scratch`). It is kept as long as the thread,
+/// across restarts too, and removed with it when the thread is deleted.
 pub const SCRATCH_DIR: &str = "scratch";
 
 /// Linux's synthetic devices must not be shadowed by policy binds: ordinary

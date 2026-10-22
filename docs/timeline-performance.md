@@ -83,7 +83,7 @@ Perf's Rust v0 symbols were mangled; the names below are interpreted symbols.
 The live investigation uses **Linux perf sampling of an actual GPUI window**, not
 headless draw timings. `crates/cowork/src/tests/generation_profile.rs` is an
 ignored, Linux-only harness that creates the real center stage with production
-GPUI scheduling. Native Rig/Ollama events are received asynchronously and follow
+GPUI scheduling. The agent session's Ollama events are received asynchronously and follow
 `Thread::emit` and `Cowork::thread_updated`; Markdown parsing and rendering run
 normally. It neither manually draws nor imposes a frame cadence.
 
@@ -172,7 +172,7 @@ can request work independently of token arrival.
 
 A reasoning-enabled empty-history capture also completed (253 events, 372 stage
 renders, about 2.94 ms event application). A later repeat exhausted its 256-token
-budget entirely in reasoning and correctly failed with Rig's no-answer/Length
+budget entirely in reasoning and correctly failed with a no-answer/length
 error. `--reasoning` is therefore useful for exploratory profiles but is not a
 reliable smoke test at the deliberately small output cap. Failed-run captures
 are retained and the supervisor still attempts to generate reports.
@@ -186,7 +186,7 @@ supervisor's empty-history capture is in
 
 ## Implemented fix: app-level history culling
 
-`main.rs::render_main_editor` now wraps timeline bodies in the custom GPUI
+`lib.rs::render_main_editor` now wraps timeline bodies in the custom GPUI
 `DeferredTimelineRow` element (`timeline_virtualization.rs`). With at least
 64 messages, stable text-only rows retain measured heights and construct their
 bodies only near the viewport (128 px overdraw). Offscreen bodies skip prepaint
@@ -291,7 +291,7 @@ an ablation, not an equivalent replacement for the production stage. A separate
 
 ### 1. The outer timeline is not virtualized
 
-`crates/cowork/src/main.rs`, `Cowork::render_main_editor`, clones the timeline and
+`crates/cowork/src/lib.rs`, `Cowork::render_main_editor`, clones the timeline and
 constructs every message inside one scrolling flex column. Clipping does not
 prevent those offscreen rows from taking part in layout/prepaint/CPU paint.
 Unchanged Markdown is parsed already, but its block element tree is reconstructed
@@ -357,19 +357,20 @@ patches or vendored/forked dependencies.
 | Implemented | Cull stable variable-height timeline bodies at app level | Stops revisiting the entire history during generation. Preserve cross-row selection/copy, UTF-8 byte-offset comment anchors, focused editors, expanded work, and stable bottom-follow. Render-generation-based segment-cache eviction must not destroy offscreen state. Larger app-level change, but addresses ordinary linear work as well as the quadratic hotspots. |
 | 2 | Isolate historical rows and live animation into cached views | An alternative/intermediate step: unchanged historical rows should not reconstruct Markdown trees when the active reply or shimmer changes. Cache invalidation must include width/theme/selection/comments; caching is not automatically equivalent to virtualization. Measure animation-only stacks before deciding how much to suppress it. |
 | 3 | Separate authoritative event ingestion from presentation updates | Apply every ordered event, but update preview views/notify/follow at a bounded presentation cadence. Flush approvals, errors, stop, part/turn/run ends promptly. Notifications already coalesce, and event ingestion is currently small; throttling notify alone will not cure expensive individual frames. |
-| 3 | Avoid redundant streamed-response parsing and growing-prefix copies | Production updates both a text step's Markdown state and the separate response state, although that step view is unused for the response. Create hidden work views lazily or share appropriate state. Incremental preview updates must still defer to Rig's finalized part content/positions. Most relevant to long replies; not established as dominant in these captures. |
+| 3 | Avoid redundant streamed-response parsing and growing-prefix copies | Production updates both a text step's Markdown state and the separate response state, although that step view is unused for the response. Create hidden work views lazily or share appropriate state. Incremental preview updates must still defer to the committed reply's content. Most relevant to long replies; not established as dominant in these captures. |
 | 4 | Bound queues and improve fairness/backpressure | Queues visibly build behind long frames. Do not drop arbitrary agent events; a bounded queue requires adapting the synchronous emit callback or another lossless strategy, with cancellation/approval behavior designed explicitly. Bounding the queue alone does not fix the redraw bottleneck. |
 
 ### Source-backed streaming costs to investigate after the measured hot paths
 
-- There is **no replay of committed conversation history per token**. `TurnFold`
-  applies only the new event. However, `TurnFold::partial` clones the current
-  partial reply, and `AgentMessage::advance` rewinds/reconstructs its changing
-  output and response string. Long growing replies can incur substantial
-  cumulative prefix-copy work.
-- Live events are serialized to `protocol::Json` and decoded on the local
-  authoritative path. `pending_events` accumulates until completion; the
-  render-time `timeline.clone()` copies it. Prefer a render-facing snapshot
+- There is **no replay of committed conversation history per token**.
+  `ReplyPreview::apply` appends only the new preview. However,
+  `ReplyPreview::partial` clones the current partial reply, and
+  `AgentMessageUi::advance` rewinds/reconstructs its changing output and
+  response string. Long growing replies can incur substantial cumulative
+  prefix-copy work.
+- Committed entries are serialized to `protocol::Json` and decoded on the local
+  authoritative path too. `pending_events` accumulates a reply's previews until
+  it is committed; the render-time `timeline.clone()` copies it. Prefer a render-facing snapshot
   excluding protocol-only data rather than changing wire semantics casually.
 - GPUI Base appends coalesce queued parser updates (up to 64 per parse) and
   normally reparse the **last Markdown block**, not the whole document. A huge
@@ -381,9 +382,9 @@ patches or vendored/forked dependencies.
   perform layout per token. Parsing later changes height, so bottom anchoring
   should be checked after parser commits when designing batching/virtualization.
 
-Relevant source: `generation.rs::start_generation/thread_updated`,
-`transcript.rs::apply_agent_event/AgentMessage::advance/show_tail`,
-`crates/agent/src/lib.rs::TurnFold::partial`, and installed GPUI Base's
+Relevant source: `generation.rs::agent_event/thread_updated`,
+`transcript.rs::apply_agent_event/ReplyPreview::partial`,
+`timeline.rs::AgentMessageUi::advance/show_tail`, and installed GPUI Base's
 `text/state.rs::parse_content`, `text/inline.rs::retain_layout`, and
 `text_selection.rs::register_participant/publish_snapshots/copy_items`.
 

@@ -1,10 +1,10 @@
 # Agent input
 
-A reusable input lifecycle for the new provider-independent agent loop. The
-[agent-runtime](../agent-runtime/README.md) driver uses this layer; Cowork has not
-migrated yet. This crate owns pending work and the
-handoff into a conversation; it has no Rig, GPUI, provider, tool, async-runtime,
-or persistence dependency.
+A reusable input lifecycle for the provider-independent agent loop. The
+[agent-runtime](../agent-runtime/README.md) driver uses this layer; Cowork still
+keeps its own pending-submission queue and hands its session one input at a
+time. This crate owns pending work and the handoff into a conversation; it has
+no GPUI, provider, tool, async-runtime, or persistence dependency.
 
 `Inbox<Source, Payload>` is owned by the session actor. Source and payload are
 application types: adding a scheduler, parent agent, collaborator, background
@@ -114,7 +114,7 @@ pending; reconnect/replay deduplication, crash recovery, event encoding, capacit
 limits and backpressure belong to the session owner/journal. IDs and policies
 here introduce no new wire or storage format.
 
-## Placement in the new stack
+## Placement in the stack
 
 The [agent-runtime](../agent-runtime/README.md) session uses this layer above
 `LanguageModelProvider` and `tool-runtime`. The integration boundaries are:

@@ -51,8 +51,7 @@ fn supported() -> bool {
 
 fn sandboxes(root: &Root) -> Arc<Sandboxes> {
     Arc::new(Sandboxes::new(
-        root.0.join("scratch"),
-        "test",
+        root.0.join("threads"),
         EnvironmentSource::Process,
     ))
 }
@@ -334,7 +333,7 @@ async fn a_timeout_returns_output_and_stops_child_processes() {
     assert!(feedback.contains("stderr:\ndiagnostic\n"), "{feedback}");
     assert!(started.elapsed() < Duration::from_secs(5), "{feedback}");
 
-    let ticks = root.0.join("scratch/test/thread/ticks");
+    let ticks = root.0.join("threads/thread/scratch/ticks");
     let after_timeout = std::fs::read_to_string(&ticks).unwrap();
     assert!(!after_timeout.is_empty(), "the child ran before timeout");
     tokio::time::sleep(Duration::from_millis(300)).await;
@@ -374,12 +373,8 @@ async fn stopping_a_run_kills_its_command() {
     let root = Root::new("stopped");
     let sandboxes = sandboxes(&root);
     let ticks = || {
-        std::fs::read_dir(root.0.join("scratch"))
-            .unwrap()
-            .flatten()
-            .find_map(|instance| {
-                std::fs::read_to_string(instance.path().join("thread").join("ticks")).ok()
-            })
+        std::fs::read_to_string(root.0.join("threads/thread/scratch/ticks"))
+            .ok()
             .map_or(0, |ticks| ticks.lines().count())
     };
     let running = sandboxes.run(

@@ -54,8 +54,10 @@ impl Cowork {
                 .retain(|thread| thread.read(cx).instance_id != thread_id);
             store.archived.push_front(thread.clone());
         });
-        // A run still being stopped settles this again once it has ended.
+        // A run still being stopped settles this again once it has ended,
+        // and saves it then.
         self.settle_retired_thread(&thread, cx);
+        self.save_thread(&thread, cx);
         self.published_presence.remove(&thread_id);
         self.segment_text_views
             .retain(|(message, _), _| message.thread_id != thread_id);
@@ -96,6 +98,9 @@ impl Cowork {
                 store.threads.push_front(thread);
             }
         });
+        if let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) {
+            self.save_thread(&thread, cx);
+        }
         cx.notify();
     }
 
@@ -107,11 +112,12 @@ impl Cowork {
                 store.threads.push_front(thread);
             }
         });
+        self.save_all_threads(cx);
         cx.notify();
     }
 
-    /// Deletes an archived thread for good. The profile's statistics keep
-    /// counting it.
+    /// Deletes an archived thread for good, its folder too. The profile's
+    /// statistics keep counting it.
     pub(crate) fn delete_archived_thread(&mut self, thread_id: Uuid, cx: &mut Context<Self>) {
         let Some(thread) = self.thread_store.read(cx).archived_thread(thread_id, cx) else {
             return;
@@ -121,7 +127,8 @@ impl Cowork {
                 .archived
                 .retain(|thread| thread.read(cx).instance_id != thread_id);
         });
-        self.deleted_chats += 1;
+        self.deleted.add_thread(thread.read(cx));
+        self.save_statistics();
         self.forget_scheduled_thread(thread_id);
         self.settle_retired_thread(&thread, cx);
         cx.notify();
@@ -279,11 +286,11 @@ impl Cowork {
     }
 
     /// Keeps a deleted thread's longest stretch of generating for the
-    /// profile's statistics, and removes its commands' scratch folder. Also
-    /// called for a thread that left the sidebar and when a run of such a
-    /// thread ends, which adds that run's time. An archived thread keeps its
-    /// scratch folder, so restoring it continues where it was; its commands
-    /// end with its run, as does its agent session.
+    /// profile's statistics, and removes its folder, with its commands'
+    /// scratch folder. Also called for a thread that left the sidebar and
+    /// when a run of such a thread ends, which adds that run's time. An
+    /// archived thread keeps its folder, so restoring it continues where it
+    /// was; its commands end with its run, as does its agent session.
     pub(crate) fn settle_retired_thread(&mut self, thread: &Entity<Thread>, cx: &App) {
         let thread = thread.read(cx);
         let thread_id = thread.instance_id;
@@ -297,11 +304,9 @@ impl Cowork {
         {
             return;
         }
-        self.longest_deleted_chat = self.longest_deleted_chat.max(thread.generation_time());
-        let sandboxes = self.sandboxes.clone();
-        self.tokio_handle.spawn(async move {
-            sandboxes.remove(&thread_id.to_string()).await;
-        });
+        self.deleted.longest_chat = self.deleted.longest_chat.max(thread.generation_time());
+        self.sandboxes.forget(&thread_id.to_string());
+        self.delete_thread_files(thread_id);
     }
 
     pub(crate) fn render_archive_page(&self, cx: &mut Context<Self>) -> impl IntoElement {

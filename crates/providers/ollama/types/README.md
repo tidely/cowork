@@ -56,10 +56,5 @@ Research references (reviewed 2026-10-19):
 - [Ollama streaming](https://docs.ollama.com/api/streaming)
 - [Ollama errors](https://docs.ollama.com/api/errors)
 - [Ollama authoritative wire declarations](https://github.com/ollama/ollama/blob/main/api/types.go)
-- [Zed's Ollama integration](https://github.com/zed-industries/zed/blob/main/crates/ollama/src/ollama.rs)
-
-Zed was inspected as a design reference. Its Ollama crate is GPL-3.0-or-later;
-this implementation was written independently from Ollama's documented wire
-protocol rather than copied from Zed.
 
 

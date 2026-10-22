@@ -570,6 +570,37 @@ fn membership_events_are_idempotent_and_uncatalogued_models_cannot_run(
     });
 }
 
+/// Only the host saves a thread: one joined from someone else is theirs.
+#[gpui::test]
+fn only_the_users_own_threads_are_saved(cx: &mut gpui::TestAppContext) {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("test runtime");
+    let (cowork, local_id, cx) = attachment_test_cowork(cx, runtime.handle().clone());
+    let root = std::env::temp_dir().join(format!("cowork-threads-{}", Uuid::new_v4()));
+    let finished = cowork.update(cx, |cowork, cx| {
+        let local = cowork.active_thread(cx).expect("active thread");
+        let joined = cx.new(|cx| Thread::join_for_test(local.read(cx).welcome_for_test(), cx));
+        cowork
+            .thread_store
+            .update(cx, |store, _| store.threads.push_back(joined));
+        let (files, saved) = crate::thread_files::ThreadFiles::open(Some(root.clone()));
+        assert!(saved.is_empty());
+        cowork.thread_files = Some(files);
+        cowork.save_all_threads(cx);
+        cowork.thread_files.as_ref().unwrap().quit()
+    });
+    futures::executor::block_on(finished).unwrap();
+    let saved = std::fs::read_dir(&root)
+        .unwrap()
+        .flatten()
+        .filter(|entry| entry.path().is_dir())
+        .map(|entry| entry.file_name().into_string().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(saved, [local_id.to_string()]);
+    _ = std::fs::remove_dir_all(root);
+}
+
 #[gpui::test]
 fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppContext) {
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -594,10 +625,10 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
 
         assert_eq!(local.read(cx).tokens_used, 150);
         assert_eq!(joined.read(cx).tokens_used, 30);
-        assert_eq!(cowork.tokens_used, 150);
+        assert_eq!(cowork.tokens_used(cx), 150);
         // Only the user's own turns that used tokens are charted.
         assert_eq!(
-            cowork.token_activity,
+            cowork.token_activity(cx),
             [
                 TokenActivity {
                     at: at(10),

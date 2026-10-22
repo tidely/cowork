@@ -199,7 +199,6 @@ mod tests {
             assert!(error.message.contains("unknown field `timeout`"), "{error}");
             assert!(error.message.contains("expected"), "{error}");
         }
-        sandboxes.shutdown();
     }
 
     #[tokio::test]
@@ -219,7 +218,6 @@ mod tests {
                 error.message.contains("invalid value") || error.message.contains("invalid type")
             );
         }
-        sandboxes.shutdown();
     }
 
     /// A call needs what it asks for of its own and the folders it names;
@@ -273,7 +271,6 @@ mod tests {
             return;
         }
         let (sandboxes, _scratch) = test_sandboxes();
-        // Not under the scratch root, where it would be taken for a leftover.
         let project = TestRoot::new();
         let folder = project.0.clone();
         let set_mode = |access| {
@@ -311,7 +308,6 @@ mod tests {
         set_mode(Access::Read);
         _ = call(RunCommand, &sandbox, write("granted.txt", Some("write"))).await;
         assert!(folder.join("granted.txt").exists(), "granted write access");
-        sandboxes.shutdown();
     }
 
     /// A folder outside the project is writable only for a command naming
@@ -365,7 +361,6 @@ mod tests {
         );
         _ = call(RunCommand, &sandbox, json!({ "command": command })).await;
         assert!(file.exists(), "granted for the run");
-        sandboxes.shutdown();
     }
 
     #[test]

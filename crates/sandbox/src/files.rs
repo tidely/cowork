@@ -430,11 +430,6 @@ impl Tool for WriteFile {
             if approved {
                 places.allow_project_write();
             }
-            // Claimed first, so this instance removes a scratch folder the
-            // write creates when it quits.
-            sandboxes
-                .claim()
-                .map_err(|error| FileError::Failed(error.to_string()))?;
             write_file(&places, &args.path, &args.content)
         })
         .await

@@ -9,7 +9,6 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use anyhow::Context as _;
 use gpui::{
     App, AppContext, Bounds, Context, Entity, EntityId, ExternalPaths, IntoElement, KeyBinding,
     MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput, QuitMode, Render, ScrollHandle,
@@ -41,7 +40,7 @@ use crate::{
     timeline_view::{SegmentTextView, ShownSegments},
     timeline_virtualization::DeferredTimelineRow,
     top_bar::macos_traffic_light_position,
-    usage::{ActivityRange, TokenActivity},
+    usage::ActivityRange,
 };
 
 mod archive;
@@ -83,6 +82,7 @@ mod statistics;
 mod test_support;
 mod theme;
 mod thread;
+mod thread_files;
 use thread::{draft as thread_draft, sharing, submission};
 mod timeline;
 mod timeline_projection;
@@ -164,20 +164,16 @@ struct Cowork {
     active_generations: HashMap<Uuid, ActiveGeneration>,
     /// The agent session of each local or hosted thread that has run.
     agents: HashMap<Uuid, ThreadAgent>,
-    /// Tokens used across local threads, excluding ones joined from someone
-    /// else; see [`Cowork::record_turn_usage`].
-    tokens_used: u64,
-    /// When those tokens were used, turn by turn, in the order turns ended.
-    token_activity: Vec<TokenActivity>,
-    /// How many chats were deleted from the archive or are gone since an
-    /// earlier session, and the longest the agent generated in one of them,
-    /// which the profile's statistics still count; see
+    /// What the profile's statistics still count of the user's deleted
+    /// threads; the rest they count from the threads themselves. See
     /// [`Cowork::delete_archived_thread`] and `statistics.rs`.
-    deleted_chats: usize,
-    longest_deleted_chat: std::time::Duration,
+    deleted: statistics::Statistics,
     /// Where the profile's statistics are saved; `None` keeps them in
     /// memory, as in tests.
     statistics_file: Option<std::path::PathBuf>,
+    /// Where the user's own threads are saved; `None` keeps them in memory,
+    /// as in tests. See `thread_files.rs`.
+    thread_files: Option<thread_files::ThreadFiles>,
     /// The scheduled tasks, and the queue running them; see `scheduler.rs`.
     scheduler: scheduler::Scheduler,
     /// The period the profile page's token activity chart shows.
@@ -717,11 +713,15 @@ pub fn run() -> anyhow::Result<()> {
         TOKIO_RUNTIME.set(runtime).is_ok(),
         "the agent runtime was already initialized",
     );
+    // Read before the window opens, so the scheduler finds the threads its
+    // tasks continue.
+    let (thread_files, saved_threads) =
+        thread_files::ThreadFiles::open(thread_files::threads_dir());
     let sandboxes = Arc::new(sandbox::Sandboxes::new(
-        scratch_root()?,
-        Uuid::new_v4().simple().to_string(),
+        thread_files.root().to_owned(),
         command_environment(),
     ));
+    let mut thread_files = Some((thread_files, saved_threads));
 
     gpui_platform::application()
         .with_assets(Assets)
@@ -742,21 +742,6 @@ pub fn run() -> anyhow::Result<()> {
                 window_decorations: Some(WindowDecorations::Client),
                 ..TitleBar::window_options()
             };
-
-            // Removes this instance's scratch folders. Ones left by a crash
-            // are removed by the next instance.
-            cx.on_app_quit({
-                let sandboxes = sandboxes.clone();
-                let tokio_handle = tokio_handle.clone();
-                move |_| {
-                    let sandboxes = sandboxes.clone();
-                    let removed = tokio_handle.spawn_blocking(move || sandboxes.shutdown());
-                    async move {
-                        _ = removed.await;
-                    }
-                }
-            })
-            .detach();
 
             if let Err(error) = cx.open_window(window_options, move |window, cx| {
                 let tokio_handle = tokio_handle.clone();
@@ -804,11 +789,9 @@ pub fn run() -> anyhow::Result<()> {
                         sandboxes,
                         active_generations: HashMap::new(),
                         agents: HashMap::new(),
-                        tokens_used: 0,
-                        token_activity: Vec::new(),
-                        deleted_chats: 0,
-                        longest_deleted_chat: Default::default(),
+                        deleted: Default::default(),
                         statistics_file: None,
+                        thread_files: None,
                         scheduler: Default::default(),
                         activity_range: ActivityRange::default(),
                         local_participant_id,
@@ -829,6 +812,9 @@ pub fn run() -> anyhow::Result<()> {
                 });
                 let window_handle = window.window_handle();
                 cowork.update(cx, |cowork, cx| {
+                    if let Some((files, saved)) = thread_files.take() {
+                        cowork.start_thread_files(files, saved, cx);
+                    }
                     cowork.start_statistics(statistics::statistics_file());
                     cowork.start_scheduler(scheduler::schedule_file(), Some(window_handle), cx);
                 });
@@ -846,15 +832,10 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Where the agent's commands keep their threads' scratch folders.
-fn scratch_root() -> anyhow::Result<std::path::PathBuf> {
-    let home = std::env::home_dir().context("the home directory is unknown")?;
-    Ok(home.join(".cowork").join(sandbox::settings::SCRATCH_DIR))
-}
-
-/// Where the agent's commands get their environment, as Zed decides it: an
-/// app started from a terminal already has the user's shell environment,
-/// while one started from the Dock or a launcher reads it from a login shell.
+/// Where the agent's commands get their environment: an app started from a
+/// terminal already has the user's shell environment, while one started from
+/// the Dock or a launcher, whose standard output is not a terminal, reads it
+/// from a login shell.
 fn command_environment() -> sandbox::EnvironmentSource {
     use std::io::IsTerminal as _;
     if cfg!(unix) && !std::io::stdout().is_terminal() {

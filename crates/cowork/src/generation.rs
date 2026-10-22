@@ -737,8 +737,10 @@ impl Cowork {
         }
         if self.thread_store.read(cx).thread(thread_id, cx).is_none() {
             self.settle_retired_thread(thread, cx);
+            self.save_statistics();
         }
-        self.save_statistics(cx);
+        // A turn boundary, before the next pending submission starts.
+        self.save_thread(thread, cx);
         self.thread_updated(thread_id, cx);
         if matches!(outcome, protocol::RunOutcome::Completed) {
             self.start_next_pending(thread, cx);
@@ -782,10 +784,11 @@ impl Cowork {
         self.scheduled_run_waits(thread_id, message_id, tool, cx);
     }
 
-    /// Adds a finished turn's usage to its thread and, unless the thread was
-    /// joined from someone else, to the global count and the activity log,
+    /// Adds a finished turn's usage to its thread, with when it was used:
     /// spread across the `duration` of the response it started at
-    /// `started_at`.
+    /// `started_at`. The profile's statistics add up the user's own threads;
+    /// a turn ending after its thread was deleted is counted with the
+    /// deleted ones.
     pub(crate) fn record_turn_usage(
         &mut self,
         thread: &Entity<Thread>,
@@ -795,19 +798,22 @@ impl Cowork {
         cx: &mut App,
     ) {
         let tokens = usage_tokens(&usage);
-        let ownership = thread.update(cx, |thread, _| {
-            thread.tokens_used += tokens;
-            thread.ownership()
+        let activity = (tokens > 0).then_some(TokenActivity {
+            at: started_at,
+            duration,
+            tokens,
         });
-        if ownership == ThreadOwnership::Local {
-            self.tokens_used += tokens;
-            if tokens > 0 {
-                self.token_activity.push(TokenActivity {
-                    at: started_at,
-                    duration,
-                    tokens,
-                });
-            }
+        let (thread_id, ownership) = thread.update(cx, |thread, _| {
+            thread.tokens_used += tokens;
+            thread.token_activity.extend(activity);
+            (thread.instance_id, thread.ownership())
+        });
+        let store = self.thread_store.read(cx);
+        let deleted =
+            store.thread(thread_id, cx).is_none() && store.archived_thread(thread_id, cx).is_none();
+        if ownership == ThreadOwnership::Local && deleted {
+            self.deleted.tokens_used += tokens;
+            self.deleted.token_activity.extend(activity);
         }
     }
 

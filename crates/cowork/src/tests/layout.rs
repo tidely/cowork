@@ -520,7 +520,7 @@ fn the_profile_button_opens_the_profile_page(cx: &mut gpui::TestAppContext) {
     // The peak is marked once there is any activity.
     assert!(cx.debug_bounds("token-activity-peak").is_none());
     cowork.update(cx, |cowork, cx| {
-        cowork.token_activity.push(TokenActivity {
+        cowork.deleted.token_activity.push(TokenActivity {
             at: SystemTime::now(),
             duration: Duration::ZERO,
             tokens: 1_200,

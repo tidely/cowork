@@ -12,7 +12,9 @@
 //! it is when the command starts, so a thread's commands may run at the same
 //! time and a project change needs no restart. Nothing runs before the first
 //! command: the login shell environment is captured then, and the scratch
-//! folders are created as threads first need them.
+//! folders are created as threads first need them. Each thread's scratch
+//! folder is in that thread's own folder, whose owner removes it with the
+//! thread.
 //!
 //! The file tools ([`files`]) reach the same folders from the host process
 //! itself, with every path they accept mapped in [`paths`].
@@ -31,7 +33,6 @@ mod tool;
 
 use std::{
     collections::HashMap,
-    fs::File,
     io::Read,
     path::{Path, PathBuf},
     sync::{
@@ -72,7 +73,7 @@ pub enum SandboxError {
     /// This computer has no sandbox mxc-sdk can use, such as Linux without
     /// `bwrap`, with why.
     Unsupported(String),
-    /// The scratch folders could not be set up.
+    /// The scratch folder could not be set up.
     Setup(String),
     /// The command could not be started or waited on.
     Failed(String),
@@ -112,18 +113,12 @@ impl std::error::Error for SandboxError {}
 /// The commands of this app instance, with each thread's project and scratch
 /// folder, by thread id.
 pub struct Sandboxes {
-    /// Every instance's scratch folders: `<root>/<instance>/<thread>`, and
-    /// the lock `<root>/<instance>.lock` that a running instance holds.
+    /// The threads' folders, `<root>/<thread>`, each with its scratch folder
+    /// in [`settings::SCRATCH_DIR`]. Whoever keeps the threads owns them.
     root: PathBuf,
-    instance: String,
     source: EnvironmentSource,
     /// Set by the first command; see [`Sandboxes::ready`].
     ready: OnceLock<Result<(), SandboxError>>,
-    /// Set by the first command or file write; see [`Sandboxes::claim`].
-    claimed: OnceLock<Result<(), SandboxError>>,
-    /// Held while this instance runs, so another instance does not take its
-    /// scratch folders for leftovers.
-    lock: Mutex<Option<File>>,
     environment: tokio::sync::OnceCell<Arc<HashMap<String, String>>>,
     /// The project each thread's next command sees. Never locked across an
     /// `await`.
@@ -134,17 +129,13 @@ pub struct Sandboxes {
 }
 
 impl Sandboxes {
-    /// Commands whose scratch folders are kept under `root`, with their
-    /// environment from `source`. `instance` must be unique among running
-    /// Cowork instances.
-    pub fn new(root: PathBuf, instance: impl Into<String>, source: EnvironmentSource) -> Self {
+    /// Commands whose threads' folders are under `root`, with their
+    /// environment from `source`.
+    pub fn new(root: PathBuf, source: EnvironmentSource) -> Self {
         Self {
             root,
-            instance: instance.into(),
             source,
             ready: OnceLock::new(),
-            claimed: OnceLock::new(),
-            lock: Mutex::new(None),
             environment: tokio::sync::OnceCell::new(),
             projects: Mutex::new(HashMap::new()),
             run_grants: Mutex::new(HashMap::new()),
@@ -303,39 +294,20 @@ impl Sandboxes {
         result.unwrap_or_else(|error| Err(SandboxError::Failed(error.to_string())))
     }
 
-    /// Forgets `thread`'s project and removes its scratch folder, as when the
-    /// thread is deleted. Its commands end with its run.
-    pub async fn remove(&self, thread: &str) {
+    /// Forgets `thread`'s project and run grant, as when the thread is
+    /// deleted. Its commands end with its run; its folder, scratch folder
+    /// included, is its owner's to remove.
+    pub fn forget(&self, thread: &str) {
         lock(&self.projects).remove(thread);
         lock(&self.run_grants).remove(thread);
-        let scratch = self.scratch_dir(thread);
-        _ = tokio::task::spawn_blocking(move || remove_dir(&scratch)).await;
     }
 
-    /// Removes this instance's scratch folders, as when Cowork quits.
-    pub fn shutdown(&self) {
-        if lock(&self.lock).is_none() {
-            // Never started, or already shut down: nothing of this instance's
-            // is there, and another instance with the same name, as in tests,
-            // keeps its folders.
-            return;
-        }
-        remove_dir(&self.root.join(&self.instance));
-        if lock(&self.lock).take().is_some() {
-            _ = std::fs::remove_file(self.lock_path(&self.instance));
-        }
+    /// `thread`'s scratch folder, which need not exist yet.
+    pub fn scratch_dir(&self, thread: &str) -> PathBuf {
+        self.root.join(thread).join(settings::SCRATCH_DIR)
     }
 
-    fn scratch_dir(&self, thread: &str) -> PathBuf {
-        self.root.join(&self.instance).join(thread)
-    }
-
-    fn lock_path(&self, instance: &str) -> PathBuf {
-        self.root.join(format!("{instance}.lock"))
-    }
-
-    /// Checks, once, that this computer has a sandbox, and claims the
-    /// scratch folders.
+    /// Checks, once, that this computer has a sandbox.
     fn ready(&self) -> Result<(), SandboxError> {
         self.ready
             .get_or_init(|| {
@@ -347,63 +319,9 @@ impl Sandboxes {
                             .unwrap_or_else(|| "mxc-sdk supports no sandbox here".into()),
                     ));
                 }
-                self.claim()
-            })
-            .clone()
-    }
-
-    /// Takes, once, this instance's lock, so its scratch folders are
-    /// removed when it quits rather than taken for leftovers, and removes
-    /// the scratch folders of instances that did not quit cleanly. Needed
-    /// before anything creates a scratch folder.
-    pub(crate) fn claim(&self) -> Result<(), SandboxError> {
-        self.claimed
-            .get_or_init(|| {
-                let setup = |error: std::io::Error| SandboxError::Setup(error.to_string());
-                std::fs::create_dir_all(&self.root).map_err(setup)?;
-                // Locked before the folder exists, so a folder without a lock
-                // file is always a leftover.
-                let held = File::create(self.lock_path(&self.instance)).map_err(setup)?;
-                held.try_lock().map_err(|error| {
-                    SandboxError::Setup(format!("the scratch lock is taken: {error}"))
-                })?;
-                *lock(&self.lock) = Some(held);
-                self.remove_leftovers();
                 Ok(())
             })
             .clone()
-    }
-
-    fn remove_leftovers(&self) {
-        let Ok(entries) = std::fs::read_dir(&self.root) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-                continue;
-            };
-            let instance = name.strip_suffix(".lock").unwrap_or(name);
-            if instance == self.instance {
-                continue;
-            }
-            let lock_path = self.lock_path(instance);
-            let abandoned = match File::open(&lock_path) {
-                // Unlocked on drop, before the lock file is removed.
-                Ok(file) => file.try_lock().is_ok(),
-                Err(_) => true,
-            };
-            if abandoned {
-                remove_dir(&self.root.join(instance));
-                _ = std::fs::remove_file(lock_path);
-            }
-        }
-    }
-}
-
-impl Drop for Sandboxes {
-    fn drop(&mut self) {
-        self.shutdown();
     }
 }
 
@@ -411,14 +329,6 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn remove_dir(path: &Path) {
-    if let Err(error) = std::fs::remove_dir_all(path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        eprintln!("could not remove {}: {error}", path.display());
-    }
 }
 
 /// Tells a command's blocking task, when its run is stopped, to kill it.
@@ -711,7 +621,7 @@ impl Output {
 #[cfg(test)]
 pub(crate) fn test_sandboxes() -> (Arc<Sandboxes>, TestRoot) {
     let root = TestRoot::new();
-    let sandboxes = Sandboxes::new(root.0.clone(), "test", EnvironmentSource::Process);
+    let sandboxes = Sandboxes::new(root.0.clone(), EnvironmentSource::Process);
     (Arc::new(sandboxes), root)
 }
 
@@ -875,8 +785,8 @@ mod tests {
         assert!(sandboxes.ready.get().is_none(), "nothing was set up");
     }
 
-    #[tokio::test]
-    async fn removing_a_thread_forgets_its_project_and_scratch() {
+    #[test]
+    fn forgetting_a_thread_forgets_only_its_project() {
         let (sandboxes, _root) = test_sandboxes();
         let writable = Project {
             folders: Vec::new(),
@@ -884,14 +794,11 @@ mod tests {
         };
         sandboxes.set_project("thread", writable.clone());
         sandboxes.set_project("other", writable.clone());
-        let scratch = sandboxes.scratch_dir("thread");
-        std::fs::create_dir_all(&scratch).unwrap();
 
-        sandboxes.remove("thread").await;
+        sandboxes.forget("thread");
 
         assert_eq!(sandboxes.project("thread"), Project::default());
         assert_eq!(sandboxes.project("other"), writable);
-        assert!(!scratch.exists());
     }
 
     #[test]
@@ -984,7 +891,7 @@ mod tests {
         if !git(&["init", "-q"], &repo.path) {
             return;
         }
-        let sandboxes = Sandboxes::new(root.0.join("scratch"), "test", EnvironmentSource::Process);
+        let sandboxes = Sandboxes::new(root.0.join("threads"), EnvironmentSource::Process);
         sandboxes.set_project(
             "thread",
             Project {
@@ -1013,7 +920,6 @@ mod tests {
                 .unwrap();
             assert_ne!(read.exit_code, 0, "credentials stay denied: {read:?}");
         }
-        sandboxes.shutdown();
     }
 
     #[cfg(target_os = "linux")]
@@ -1172,31 +1078,5 @@ mod tests {
         assert!(filesystem.readonly_paths.contains(&text(&docs.path)));
         assert!(filesystem.readonly_paths.contains(&text(&zed.path)));
         assert!(!filesystem.readwrite_paths.contains(&text(&zed.path)));
-    }
-
-    #[test]
-    fn leftovers_of_other_instances_are_removed_but_not_live_ones() {
-        let root = TestRoot::new();
-        if !v1::platform_support().is_supported {
-            return;
-        }
-        let stale = root.0.join("stale");
-        std::fs::create_dir_all(stale.join("thread")).unwrap();
-        std::fs::write(root.0.join("stale.lock"), "").unwrap();
-        let live = Sandboxes::new(root.0.clone(), "live", EnvironmentSource::Process);
-        live.ready().unwrap();
-        let live_scratch = live.scratch_dir("thread");
-        std::fs::create_dir_all(&live_scratch).unwrap();
-
-        let current = Sandboxes::new(root.0.clone(), "current", EnvironmentSource::Process);
-        current.ready().unwrap();
-
-        assert!(!stale.exists(), "an unlocked instance's folders go");
-        assert!(!root.0.join("stale.lock").exists());
-        assert!(live_scratch.exists(), "a running instance's stay");
-
-        live.shutdown();
-        assert!(!root.0.join("live").exists());
-        assert!(!root.0.join("live.lock").exists());
     }
 }

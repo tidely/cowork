@@ -2,7 +2,7 @@
 
 Secure & collaborative agentic workspace.
 
-Share an agent thread with your collaborators. You can write the next prompt together, comment on the agent's replies, and decide what the agent may do. Connections are peer-to-peer and end-to-end encrypted, so nobody else can read your threads. Models run locally through [Ollama](https://ollama.com), so your work never has to leave the computers of the people in the thread. The agent's shell commands run with your own tools, inside your operating system's sandbox, with no network access, and only after the host allows each one.
+Share an agent thread with your collaborators. You can write the next prompt together, comment on the agent's replies, and decide what the agent may do. Connections are peer-to-peer and end-to-end encrypted, so nobody else can read your threads. Models run locally through [Ollama](https://ollama.com), so your work never has to leave the computers of the people in the thread. The agent's shell commands run with your own tools, inside your operating system's sandbox, and anything beyond the project's mode waits until the host allows it.
 
 ## Installation
 

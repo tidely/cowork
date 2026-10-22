@@ -1,7 +1,9 @@
-//! Saving the profile page's statistics to disk, so they outlast the threads
-//! they count. Threads aren't saved, so every chat of an earlier session is
-//! gone once Cowork starts again, and counts as deleted ones do; see
-//! [`Cowork::total_chats`] and [`Cowork::longest_chat`].
+//! Saving what the profile page's statistics count of deleted threads, so
+//! they outlast them. The rest they count from the user's own threads, which
+//! are saved themselves (see `thread_files.rs`), adding them up when Cowork
+//! starts; see [`Cowork::tokens_used`], [`Cowork::total_chats`], and
+//! [`Cowork::longest_chat`]. A thread whose folder is removed by hand is no
+//! longer counted.
 
 use std::{
     path::{Path, PathBuf},
@@ -11,20 +13,35 @@ use std::{
 use gpui::App;
 use serde::{Deserialize, Serialize};
 
-use crate::{Cowork, usage::TokenActivity};
+use crate::{Cowork, thread::Thread, usage::TokenActivity};
 
 /// The saved file's format. Older or newer files aren't read, nor
 /// overwritten.
-const FILE_VERSION: u32 = 1;
+const FILE_VERSION: u32 = 2;
 
-/// Everything the profile page counts, as of the last save.
+/// Format 1 counted every chat, as threads weren't saved: all of them were
+/// gone by the next start, just as deleted ones are, so it reads the same.
+const DELETED_EVERYTHING_VERSION: u32 = 1;
+
+/// What the profile page counts of deleted threads.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Statistics {
     pub(crate) tokens_used: u64,
-    /// Every chat the user has started, those still open included.
     pub(crate) chats: usize,
     pub(crate) longest_chat: Duration,
     pub(crate) token_activity: Vec<TokenActivity>,
+}
+
+impl Statistics {
+    /// Counts `thread`, which is being deleted, as it is now. A run of it
+    /// still ending adds its usage with [`Cowork::record_turn_usage`].
+    pub(crate) fn add_thread(&mut self, thread: &Thread) {
+        self.chats += 1;
+        self.longest_chat = self.longest_chat.max(thread.generation_time());
+        self.tokens_used += thread.tokens_used;
+        self.token_activity
+            .extend(thread.token_activity.iter().copied());
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -73,7 +90,9 @@ fn load_statistics(path: &Path) -> Statistics {
         }
     };
     match serde_json::from_slice::<StatisticsFile>(&bytes) {
-        Ok(file) if file.version == FILE_VERSION => file.statistics,
+        Ok(file) if matches!(file.version, FILE_VERSION | DELETED_EVERYTHING_VERSION) => {
+            file.statistics
+        }
         result => {
             let aside = path.with_extension("json.unreadable");
             match result {
@@ -96,36 +115,44 @@ fn load_statistics(path: &Path) -> Statistics {
 }
 
 impl Cowork {
-    /// Loads the statistics saved at `file` and saves them there from now
-    /// on. None of the chats they count are open any more.
+    /// Loads what the statistics saved at `file` count of deleted threads,
+    /// and saves it there from now on.
     pub(crate) fn start_statistics(&mut self, file: Option<PathBuf>) {
         if let Some(path) = &file {
-            let saved = load_statistics(path);
-            self.tokens_used = saved.tokens_used;
-            self.token_activity = saved.token_activity;
-            self.deleted_chats = saved.chats;
-            self.longest_deleted_chat = saved.longest_chat;
+            self.deleted = load_statistics(path);
         }
         self.statistics_file = file;
     }
 
-    pub(crate) fn statistics(&self, cx: &App) -> Statistics {
-        Statistics {
-            tokens_used: self.tokens_used,
-            chats: self.total_chats(cx),
-            longest_chat: self.longest_chat(cx),
-            token_activity: self.token_activity.clone(),
-        }
+    /// Tokens used across the user's own threads, deleted ones included,
+    /// and none joined from someone else.
+    pub(crate) fn tokens_used(&self, cx: &App) -> u64 {
+        self.own_threads(cx)
+            .map(|thread| thread.tokens_used)
+            .fold(self.deleted.tokens_used, u64::saturating_add)
     }
 
-    /// Saves the statistics, which change when the user starts a chat and
-    /// when a run ends. Small and written only then, so it is written in
-    /// place of waiting on another thread.
-    pub(crate) fn save_statistics(&self, cx: &App) {
+    /// When those tokens were used, turn by turn.
+    pub(crate) fn token_activity(&self, cx: &App) -> Vec<TokenActivity> {
+        self.deleted
+            .token_activity
+            .iter()
+            .chain(
+                self.own_threads(cx)
+                    .flat_map(|thread| &thread.token_activity),
+            )
+            .copied()
+            .collect()
+    }
+
+    /// Saves what the statistics count of deleted threads, which changes
+    /// when one is deleted or a run of one ends. Small and written only
+    /// then, so it is written in place of waiting on another thread.
+    pub(crate) fn save_statistics(&self) {
         let Some(path) = &self.statistics_file else {
             return;
         };
-        if let Err(error) = save_statistics(path, self.statistics(cx)) {
+        if let Err(error) = save_statistics(path, self.deleted.clone()) {
             eprintln!("could not save statistics to {}: {error:#}", path.display());
         }
     }

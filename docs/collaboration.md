@@ -18,7 +18,9 @@ all history stays in memory. Only records cross the sharing boundary. Welcome
 snapshots carry the whole transcript as one `Json<TranscriptRecord>` value, its
 entries and compactions in the agent's versioned records, plus the run records
 and their pending previews. All history and local views remain
-in memory; there is no transcript offloading or history paging.
+in memory; there is no transcript offloading or history paging. The host saves
+its own threads at turn boundaries and reads them back when it starts; see
+[Saved threads](#saved-threads).
 
 The visible timeline is a local, pure projection of these records, pending
 submissions, and active run activity. Compactions fold into output steps in the
@@ -31,40 +33,41 @@ UUID and step index; no transcript positions flow through folded output. A threa
 owns at most one active execution, whose activity and event fold end together;
 stopped and failed run records still retain their unfinished replay events.
 
-Ollama context compaction runs before a new agent run, never within one.
-This includes queued and scheduled runs. The host triggers it when the last measured
-context (plus unmeasured tool-result or streamed-output estimates) reaches the
-configured percentage of the context window (default: 80%), with no minimum-used-token
-floor. The Context settings page also controls the default Ollama window
+Context compaction is the agent runtime's, run at a safe boundary of the host's
+session: before a run's first request, or between two requests of a run once
+every tool call has its result. This includes queued and scheduled runs. The host
+asks for it when a request's reported usage reaches the configured percentage of
+the context window (default: 80%), and before a run starts when the last measured
+context plus unmeasured tool-result or streamed-output estimates already does,
+with no minimum-used-token floor. The Context settings page also controls the default Ollama window
 (131,072 tokens), accepting custom counts down to 1,024 tokens and stepping through
 powers of two. Window changes update all local thread catalogs,
 including archived threads, and reach collaborators through `ModelCatalogChanged`.
 Discovery uses the current setting. The indicator and examples update immediately;
 runs already in progress keep their captured window and compaction policy until
 the next run. Settings are local to the host for this session.
-A single summary request appends a user instruction to the current request
-history, preserving the ordinary system prompt, tools, and model options; it
-never executes tool calls. Empty, failed, or tool-bearing summaries are rejected,
-and the run starts with its old context. Stop cancels the whole run.
+A single summary request sends the older part of the model context (about 70%,
+cut where every tool call has its result) with the runtime's summary instruction,
+preserving the ordinary system prompt, tools, and model options; it never
+executes tool calls. Empty, failed, or tool-bearing summaries are rejected, and
+the run goes on with its old context. Stop cancels the whole run.
 A successful summary (including its wrapper) must also be smaller than the
-previous request history in encoded bytes. Only model request history replaces the earlier
-transcript prefix with a summary user message; the complete transcript and
-timeline stay intact. Host events and snapshots mirror accepted summaries and
+history it replaces in encoded bytes. Only model request history replaces the earlier
+transcript prefix with a summary user message, followed by the entries after the
+cut; the complete transcript and timeline stay intact. Host events and snapshots mirror accepted summaries and
 compacting indicator. Usage includes successful summary requests. The context
 indicator is also shown inline as “Compacting context…” while a summary runs.
 Every accepted summary appends a compaction entry and leaves a “Context compacted”
-divider at that position, before the new prompt. Collapsed work keeps its dividers
+divider at that position in the run's output. Collapsed work keeps its dividers
 visible above the response. Failed, skipped, and canceled summaries leave no divider;
 snapshots restore all accepted dividers from the ordered transcript entries.
-The context estimate immediately after compaction counts summary bytes, excluding system,
-tools, wrapper, and the next prompt until normal provider usage arrives.
-The prompt after a summary always carries the environment note, so project access
-information remains available. As compaction waits for the next run, a single long
-run can still exhaust the context window.
-Completed summary requests log token and timing diagnostics without message
-content: total input, cached input, output, time to first output, model loading,
-prompt evaluation, and generation. Input tokens include cache hits; a large
-input count alone does not imply that the entire conversation was re-evaluated.
+The context estimate immediately after compaction counts the encoded bytes of the
+summary and the entries kept after it, excluding system and tools, until normal
+provider usage arrives.
+The request after a summary always carries the environment note in full, so
+project access information remains available. A single request whose context
+already exceeds the window can still fail. Failed summaries are logged to the
+host's standard error without message content.
 
 All five steps of the [implementation order](#implementation-order) are done:
 participant identity, the protocol version handshake, shared model selection
@@ -99,7 +102,7 @@ The agent's commands run on the host's computer, contained by its operating
 system's sandbox. The project auto-approval level provides the default
 access; each command may request narrower access or approval for more.
 Collaborators see the folders by name with that level, and
-the agent learns their paths from an environment note in its prompt; see
+the agent learns their paths from an environment note before its prompt; see
 [Project folders](#project-folders).
 
 Not yet implemented:
@@ -522,8 +525,9 @@ An idle composer with an empty draft shows a labelled **Resume messages** button
 with a play icon. Clicking it (or pressing the submit shortcut) resumes the
 queue in FIFO order, without creating a new submission. Sending a new draft
 while idle starts its run at once; the queue continues after it completes.
-Archived threads do not start queued runs. Queues are session state, like
-threads, and are not saved across app restarts.
+Archived threads do not start queued runs. Queues are session state, and are
+not saved across app restarts, though the host's threads are (see
+[Saved threads](#saved-threads)).
 
 The composer shows the red Stop control while generating with an empty draft.
 With any non-empty block, comment, or attachment it shows the blue Queue
@@ -785,8 +789,38 @@ This is independent of the draft document and is the first feature to build.
   application stays open. `Welcome` validates draft and transcript/run state
   before installation.
 
-Nothing is persisted. A draft lives as long as its thread exists in the
-host's app.
+Drafts are not persisted. A draft lives as long as its thread exists in the
+host's app; a saved thread comes back with an empty one.
+
+### Saved threads
+
+The host saves its own threads, archived ones included, each in a folder of
+its own, `~/.cowork/threads/<thread id>/`: `thread.json` (title, model,
+project folders and mode, the profiles and prompt names of everyone who took
+part, token usage, and the timeline's messages and run records),
+`messages.jsonl` (the transcript, one of the agent's versioned entry or
+compaction records per line, only appended to), `attachments/` (the bytes of
+the files its messages attach), and `scratch/` (its commands' scratch
+folder). `crates/cowork/src/thread_files.rs` has the format.
+
+- Only the host saves a thread. Collaborators save nothing of a thread they
+  joined.
+- A thread is saved at turn boundaries: when a run ends, when it is archived
+  or restored, and when the app quits. Never during a run, so every tool call
+  in a saved transcript has its result; a crash during a run loses what that
+  run did since the last save.
+- The draft, pending submissions, sharing, and per-peer permissions are not
+  saved. A thread comes back unshared, in the sidebar or archive where it
+  was, with an empty draft and the profiles kept so earlier messages still
+  name their authors.
+- Loading checks a saved thread as a collaborator checks a host's `Welcome`
+  snapshot: the files are converted to one in memory. The files have their
+  own format version, independent of `PROTOCOL_VERSION`; a file of another
+  version is neither read nor overwritten.
+- One app instance keeps the threads, holding `~/.cowork/threads/.lock`.
+  Another running at the same time saves nothing and keeps its threads'
+  folders in a temporary folder removed when it quits.
+- Deleting a thread from the archive removes its folder.
 
 ## Document layout
 
@@ -980,7 +1014,7 @@ still a defensive check, not a security boundary. Validating against a
 scratch copy before applying and broadcasting would be needed to isolate
 such writes.
 
-Protocol versions must match exactly and nothing is persisted, so the
+Protocol versions must match exactly and drafts are not persisted, so the
 document needs no schema version or compatibility with older clients.
 
 ## Implementation notes
@@ -1060,7 +1094,7 @@ These fit the design without changing the document layout:
 - **Reordering blocks**: possible because order is separate from content. No
   UI is planned.
 
-Out of scope: host migration, persistence, keeping identity across
+Out of scope: host migration, persisting drafts, keeping identity across
 reconnects, collaborative undo semantics beyond undoing local changes, and an
 invitation format beyond today's endpoint ID.
 
