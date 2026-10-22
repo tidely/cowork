@@ -269,6 +269,7 @@ impl LanguageModelProvider for Client {
                         id: info.id,
                         name: info.display_name,
                         context_window: info.max_input_tokens,
+                        max_output_tokens: info.max_tokens,
                         metadata,
                         ..LanguageModel::new("")
                     });

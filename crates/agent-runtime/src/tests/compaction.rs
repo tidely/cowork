@@ -1,84 +1,94 @@
 use super::*;
-use crate::compaction::encoded_bytes;
+use crate::compaction::{encoded_bytes, finish_summary};
 
-/// Instructions, three large old exchanges, and a small recent one.
+fn entry(message: Message) -> Entry<String> {
+    Entry {
+        message,
+        origin: Origin::Tool,
+    }
+}
+
+/// Three large old exchanges and a small recent one.
 pub(super) fn history() -> Vec<Message> {
-    let mut messages = vec![Message::system("keep instructions")];
+    let mut messages = Vec::new();
     for turn in 0..3 {
         messages.push(Message::user(format!("old request {turn} ").repeat(60)));
-        let mut answer = reply(
-            vec![Content::text(format!("old answer {turn} ").repeat(60))],
-            "stop",
-        );
+        let mut answer = text(&format!("old answer {turn} ").repeat(60));
         if turn == 0 {
             answer.replay.push(ReplayData {
                 provider: "scripted".into(),
                 model: None,
                 format: "signed".into(),
                 version: 1,
-                payload: serde_json::json!({"signature":"unaltered"}),
+                payload: json!({"signature":"unaltered"}),
             });
         }
         messages.push(answer);
     }
     messages.push(Message::user("recent request"));
-    messages.push(reply(vec![Content::text("recent answer")], "stop"));
+    messages.push(text("recent answer"));
     messages
 }
 
-pub(super) fn policy(automatic: bool) -> CompactionPolicy {
-    CompactionPolicy {
-        trigger_bytes: NonZeroUsize::new(if automatic { 1 } else { usize::MAX }).unwrap(),
-        ..CompactionPolicy::default()
-    }
+pub(super) fn conversation(messages: &[Message]) -> Conversation<String> {
+    let mut conversation = Conversation::new();
+    conversation
+        .append(messages.iter().cloned().map(entry).collect())
+        .unwrap();
+    conversation
 }
 
-/// The size of `fraction` of `conversation`'s model context.
-fn target(conversation: &Conversation, fraction: f64) -> usize {
+fn messages(conversation: &Conversation<String>) -> Vec<Message> {
+    conversation
+        .entries()
+        .iter()
+        .map(|entry| entry.message.clone())
+        .collect()
+}
+
+fn summary(reason: FinishReason, text_: &str) -> Message {
+    reply(vec![Content::text(text_)], reason)
+}
+
+/// A session continuing `history`, compacting automatically or on request.
+pub(super) fn seeded(automatic: bool) -> Fixture {
+    let mut fixture = fixture(Mode::Allow);
+    fixture.session = fixture
+        .session
+        .with_conversation(conversation(&history()), 0)
+        .unwrap();
+    if automatic {
+        fixture.session.configuration_mut().compaction.trigger_bytes = NonZeroUsize::new(1);
+    }
+    fixture
+}
+
+fn target(conversation: &Conversation<String>, fraction: f64) -> usize {
     (conversation.context_bytes() as f64 * fraction) as usize
 }
 
-pub(super) fn seeded(
-    provider: Arc<dyn LanguageModelProvider>,
-    executor: ToolExecutor,
-    automatic: bool,
-) -> (AgentSession<&'static str>, SessionHandle<&'static str>) {
-    let (session, handle) = AgentSession::new(
-        provider,
-        LanguageModel::new("scripted"),
-        executor,
-        CompletionRequest::new(history()),
-    )
-    .unwrap();
-    (session.with_compaction(policy(automatic)), handle)
-}
-
 /// A compaction summarizes the context up to the last point within the
-/// fraction, and the context goes on with the summary and the messages past
+/// fraction, and the context goes on with the summary and the entries past
 /// it, verbatim; the next compaction summarizes the previous summary too.
 #[test]
 fn compaction_summarizes_the_older_part_and_keeps_the_rest_across_revisions() {
     let original = history();
-    let mut conversation = Conversation::new(original.clone()).unwrap();
+    let mut conversation = conversation(&original);
     let target = target(&conversation, 0.7);
     let plan = conversation.plan_compaction(0.7).unwrap();
-    assert_eq!(plan.context, original[..plan.range.end]);
+    assert_eq!(plan.context, original[..plan.end]);
     assert!(encoded_bytes(&plan.context) <= target);
-    assert!(encoded_bytes(&original[..=plan.range.end]) > target);
-    assert!(plan.range.end < original.len() - 1);
+    assert!(encoded_bytes(&original[..=plan.end]) > target);
+    assert!(plan.end < original.len() - 1);
 
     let late = Message::user("arrived during summary");
-    conversation.append(vec![late.clone()]).unwrap();
-    let compacted = crate::compaction::finish_summary(
-        &plan,
-        &reply(vec![Content::text("older work summarized")], "stop"),
-    )
-    .unwrap();
+    conversation.append(vec![entry(late.clone())]).unwrap();
+    let compacted =
+        finish_summary(&plan, &summary(FinishReason::Stop, "older work summarized")).unwrap();
     conversation.apply_compaction(compacted.clone()).unwrap();
-    assert_eq!(&conversation.messages()[..original.len()], &original);
-    assert_eq!(conversation.messages().last(), Some(&late));
-    let mut expected = vec![original[0].clone(), compacted.summary.clone()];
-    expected.extend_from_slice(&original[plan.range.end..]);
+    assert_eq!(messages(&conversation)[..original.len()], original);
+    let mut expected = vec![compacted.summary.clone()];
+    expected.extend_from_slice(&original[plan.end..]);
     expected.push(late);
     assert_eq!(conversation.model_messages(), expected);
     assert_eq!(
@@ -88,23 +98,23 @@ fn compaction_summarizes_the_older_part_and_keeps_the_rest_across_revisions() {
 
     conversation
         .append(vec![
-            reply(vec![Content::text("large new answer ".repeat(200))], "stop"),
-            Message::user("newest"),
+            entry(text(&"large new answer ".repeat(200))),
+            entry(Message::user("newest")),
         ])
         .unwrap();
     let next = conversation.plan_compaction(0.7).unwrap();
     assert_eq!(next.previous_revision, 1);
-    assert_eq!(next.context[..2], [original[0].clone(), compacted.summary]);
-    assert!(next.range.end > plan.range.end);
-    let second = crate::compaction::finish_summary(
+    assert_eq!(next.context[0], compacted.summary);
+    assert!(next.end > plan.end);
+    let second = finish_summary(
         &next,
-        &reply(vec![Content::text("all earlier work summarized")], "stop"),
+        &summary(FinishReason::Stop, "all earlier work summarized"),
     )
     .unwrap();
     conversation.apply_compaction(second.clone()).unwrap();
     assert_eq!(conversation.compactions().len(), 2);
-    let mut expected = vec![original[0].clone(), second.summary];
-    expected.extend_from_slice(&conversation.messages()[next.range.end..]);
+    let mut expected = vec![second.summary];
+    expected.extend_from_slice(&messages(&conversation)[next.end..]);
     assert_eq!(conversation.model_messages(), expected);
 }
 
@@ -113,75 +123,92 @@ fn compaction_summarizes_the_older_part_and_keeps_the_rest_across_revisions() {
 #[test]
 fn compaction_covers_a_first_exchange_past_the_fraction() {
     let original = history();
-    let conversation = Conversation::new(original.clone()).unwrap();
-    let plan = conversation.plan_compaction(0.01).unwrap();
-    assert_eq!(plan.range, 1..2);
-    assert_eq!(plan.context, original[..2]);
+    let plan = conversation(&original).plan_compaction(0.01).unwrap();
+    assert_eq!(plan.end, 1);
+    assert_eq!(plan.context, original[..1]);
 }
 
 #[test]
 fn compaction_never_splits_tool_batches_and_rejects_non_reducing_or_stale_replacements() {
-    let mut messages = history();
+    let mut original = history();
     let call = call();
-    messages.push(reply(vec![Content::ToolCall(call.clone())], "tool_calls"));
-    messages.push(Message::new(
+    original.push(calls(vec![call.clone()]));
+    original.push(Message::new(
         Role::Tool,
         vec![Content::ToolResult(language_model::ToolResult {
             call: call.id,
             provider_id: call.provider_id,
             name: Some(call.name),
-            content: vec![language_model::ToolResultContent::Text {
+            content: vec![ToolResultContent::Text {
                 text: "actual output".into(),
             }],
             is_error: false,
         })],
     ));
-    messages.push(Message::user("after the tool"));
-    let call_index = messages.len() - 3;
-    let mut conversation = Conversation::new(messages.clone()).unwrap();
+    original.push(Message::user("after the tool"));
+    let call_index = original.len() - 3;
+    let mut conversation = conversation(&original);
     // A fraction ending right after the call: the cut stays before it.
     let fraction =
-        (encoded_bytes(&messages[..=call_index]) + 1) as f64 / conversation.context_bytes() as f64;
+        (encoded_bytes(&original[..=call_index]) + 1) as f64 / conversation.context_bytes() as f64;
     let plan = conversation.plan_compaction(fraction).unwrap();
-    assert_eq!(plan.range.end, call_index);
-    let invalid = Compaction {
+    assert_eq!(plan.end, call_index);
+    let unsettled = Compaction {
         previous_revision: 0,
-        range: 1..call_index + 1,
+        end: call_index + 1,
         summary: Message::user("small"),
     };
     assert!(matches!(
-        conversation.apply_compaction(invalid),
+        conversation.apply_compaction(unsettled),
         Err(CompactionError::Conversation(
             ConversationError::UnsettledCalls
         ))
     ));
     let large = Compaction {
         previous_revision: 0,
-        range: plan.range.clone(),
+        end: plan.end,
         summary: Message::user("too large ".repeat(5000)),
     };
     assert_eq!(
         conversation.apply_compaction(large),
         Err(CompactionError::NotSmaller)
     );
-    assert_eq!(conversation.messages(), messages);
+    assert_eq!(messages(&conversation), original);
     assert!(conversation.compactions().is_empty());
 }
 
-/// A summary request is the turn's request with its messages cut short and
+/// What the model was told is forgotten when a compaction summarizes the
+/// entry that told it, so the section renders again after the summary.
+#[test]
+fn compaction_forgets_context_delivered_before_its_cut() {
+    let mut conversation = conversation(&history());
+    conversation.deliver("early".into(), json!("old"), 0);
+    let late = conversation.entries().len() - 1;
+    conversation.deliver("late".into(), json!("recent"), late);
+    let plan = conversation.plan_compaction(0.7).unwrap();
+    assert!(plan.end > 0 && plan.end <= late);
+    let compaction = finish_summary(&plan, &summary(FinishReason::Stop, "summary")).unwrap();
+    conversation.apply_compaction(compaction).unwrap();
+    assert_eq!(conversation.delivered("early"), None);
+    assert_eq!(conversation.delivered("late"), Some(&json!("recent")));
+}
+
+/// A summary request is the step's request with its messages cut short and
 /// the instruction after them, so the provider serves them from its cache.
 #[tokio::test]
 async fn automatic_compaction_keeps_steering_during_summary() {
-    let (provider, mut requests) = test_provider();
-    let (executor, _, _) = test_executor(Arc::new(AllowAll));
-    let (session, handle) = seeded(provider, executor, true);
-    let initial = session.conversation().messages().to_vec();
+    let Fixture {
+        session,
+        handle,
+        mut requests,
+        ..
+    } = seeded(true);
+    let initial = messages(session.conversation());
     let mut harness = Harness::start(session, handle);
     harness.submit("new request", Delivery::Queue).await;
-    let summary = recv(&mut requests).await;
-    let summary_request = summary.request.clone();
-    // The older part of the context, which begins it.
-    let (instruction, context) = summary_request.messages.split_last().unwrap();
+    let summary_request = recv(&mut requests).await;
+    let sent = summary_request.request.clone();
+    let (instruction, context) = sent.messages.split_last().unwrap();
     assert!(context.len() > 1 && initial.starts_with(context));
     assert_eq!(instruction.role, Role::User);
     assert_eq!(
@@ -190,87 +217,80 @@ async fn automatic_compaction_keeps_steering_during_summary() {
     );
     harness
         .handle
-        .submit(input("parent", "steer during summary"), Delivery::Steer)
+        .send(Request::new(
+            "parent".into(),
+            input("steer during summary", Delivery::Steer),
+        ))
         .await
         .unwrap();
     respond(
-        summary,
-        reply(vec![Content::text("old work summarized")], "stop"),
+        summary_request,
+        summary(FinishReason::Stop, "old work summarized"),
     );
     let request = recv(&mut requests).await;
-    // Everything but the messages is the turn's.
-    let mut turn = request.request.clone();
-    turn.messages = summary_request.messages.clone();
-    assert_eq!(summary_request, turn);
-    assert!(!summary_request.tools.is_empty());
-    // The instructions, the summary, and the rest verbatim.
+    // Everything but the messages and their cache point is the step's.
+    let mut step = request.request.clone();
+    step.messages = sent.messages.clone();
+    step.cache = sent.cache.clone();
+    assert_eq!(sent, step);
+    assert!(!sent.tools.is_empty());
+    // The summary, the rest verbatim, then the new input with its context.
     let messages = &request.request.messages;
-    let [instructions, summary, rest @ .., new, steer] = messages.as_slice() else {
+    let [summary, rest @ .., _context, new, steer] = messages.as_slice() else {
         panic!("unexpected context {messages:?}");
     };
-    assert_eq!(instructions, &initial[0]);
     assert!(
         matches!(&summary.content[..], [Content::Text { text }] if text.contains("old work summarized"))
     );
     assert_eq!(rest, &initial[context.len()..]);
     assert_eq!(new.content, [Content::text("new request")]);
     assert_eq!(steer.content, [Content::text("steer during summary")]);
-    respond(request, reply(vec![Content::text("done")], "stop"));
+    respond(request, text("done"));
     harness
         .event(|kind| matches!(kind, EventKind::RunFinished { .. }))
         .await;
-    let summary_id = harness
-        .log
-        .lock()
-        .unwrap()
-        .iter()
-        .find_map(|event| match &event.kind {
-            EventKind::Compacted(compaction) => Some(compaction.summary.id.clone()),
-            _ => None,
-        })
-        .unwrap();
-    let mut duplicate = input("human", "reused summary identity");
-    duplicate.payload.id = summary_id;
-    assert!(
-        harness
-            .handle
-            .submit(duplicate, Delivery::Queue)
-            .await
-            .is_err()
-    );
     let (result, events) = harness.finish().await;
-    assert_eq!(&result.conversation.messages()[..initial.len()], &initial);
-    let mut replica = Conversation::new(initial).unwrap();
+    assert_eq!(messages_of(&result)[..initial.len()], initial);
+    let mut replica = conversation(&initial);
     for event in events {
         match event.kind {
-            EventKind::MessageCommitted { index, message, .. } => {
-                replica.apply(index, message).unwrap()
-            }
+            EventKind::MessageCommitted { index, entry } => replica.apply(index, entry).unwrap(),
             EventKind::Compacted(compaction) => replica.apply_compaction(compaction).unwrap(),
             _ => {}
         }
     }
-    assert_eq!(replica.messages(), result.conversation.messages());
+    assert_eq!(replica.entries(), result.conversation.entries());
     assert_eq!(
         replica.model_messages(),
         result.conversation.model_messages()
     );
 }
 
+fn messages_of(result: &SessionResult<Host>) -> Vec<Message> {
+    messages(&result.conversation)
+}
+
 #[tokio::test]
 async fn manual_compaction_failures_preserve_context_and_do_not_fail_the_session() {
     for reason in ["length", "empty", "larger", "transport"] {
-        let (provider, mut requests) = test_provider();
-        let (executor, _, _) = test_executor(Arc::new(AllowAll));
-        let (session, handle) = seeded(provider, executor, false);
-        let initial = session.conversation().messages().to_vec();
+        let Fixture {
+            session,
+            handle,
+            mut requests,
+            ..
+        } = seeded(false);
+        let initial = session.conversation().model_messages();
         let harness = Harness::start(session, handle);
         let commands = harness.handle.clone();
-        let compact = tokio::spawn(async move { commands.compact().await });
-        let summary = recv(&mut requests).await;
+        let compact = tokio::spawn(async move {
+            commands
+                .send(Request::new("human".into(), RequestKind::Compact))
+                .await
+        });
+        let request = recv(&mut requests).await;
         if reason == "transport" {
             assert!(
-                summary
+                request
                     .response
                     .send(
                         stream::iter([Err(language_model::Error::Transport("unavailable".into()))])
@@ -284,21 +304,17 @@ async fn manual_compaction_failures_preserve_context_and_do_not_fail_the_session
                 "larger" => "large".repeat(10000),
                 _ => "summary".into(),
             };
-            respond(
-                summary,
-                reply(
-                    vec![Content::text(text)],
-                    if reason == "length" { "length" } else { "stop" },
-                ),
-            );
+            let finish = if reason == "length" {
+                FinishReason::Length
+            } else {
+                FinishReason::Stop
+            };
+            respond(request, summary(finish, &text));
         }
-        assert!(
-            tokio::time::timeout(WAIT, compact)
-                .await
-                .unwrap()
-                .unwrap()
-                .is_err()
-        );
+        assert!(matches!(
+            tokio::time::timeout(WAIT, compact).await.unwrap().unwrap(),
+            Err(RequestError::Compaction(_))
+        ));
         assert_eq!(harness.handle.snapshot().await.unwrap().phase, Phase::Idle);
         let (result, _) = harness.finish().await;
         assert_eq!(result.conversation.model_messages(), initial);
@@ -308,14 +324,17 @@ async fn manual_compaction_failures_preserve_context_and_do_not_fail_the_session
 
 #[tokio::test]
 async fn stop_during_summary_cancels_it_without_a_context_transition() {
-    let (provider, mut requests) = test_provider();
-    let (executor, _, _) = test_executor(Arc::new(AllowAll));
-    let (session, handle) = seeded(provider, executor, true);
+    let Fixture {
+        session,
+        handle,
+        mut requests,
+        ..
+    } = seeded(true);
     let mut harness = Harness::start(session, handle);
     harness.submit("new request", Delivery::Queue).await;
-    let summary = recv(&mut requests).await;
-    let run = harness.handle.snapshot().await.unwrap().run.unwrap();
-    harness.handle.stop(run).await.unwrap();
+    let request = recv(&mut requests).await;
+    let run = harness.run().await;
+    harness.request(RequestKind::Stop { run }).await.unwrap();
     harness
         .event(|kind| {
             matches!(
@@ -327,12 +346,11 @@ async fn stop_during_summary_cancels_it_without_a_context_transition() {
             )
         })
         .await;
-    assert!(summary.response.is_closed());
+    assert!(request.response.is_closed());
     let (result, events) = harness.finish().await;
     assert!(result.conversation.compactions().is_empty());
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event.kind, EventKind::Compacted(_)))
+    assert_eq!(
+        count(&events, |kind| matches!(kind, EventKind::Compacted(_))),
+        0
     );
 }

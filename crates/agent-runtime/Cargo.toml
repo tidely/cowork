@@ -18,4 +18,5 @@ tokio = { workspace = true, features = ["sync", "fs", "io-util"] }
 tokio-util = { workspace = true, features = ["rt"] }
 
 [dev-dependencies]
+schemars.workspace = true
 tokio = { workspace = true, features = ["time"] }

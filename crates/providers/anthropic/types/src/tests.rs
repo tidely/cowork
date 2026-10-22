@@ -1,8 +1,8 @@
 use super::*;
 use language_model::{
-    CompletionRequest, Content, Error, Image, ImageSource as SharedImageSource, LanguageModel,
-    Message as SharedMessage, ReplayData, Role, Thinking, ToolArguments, ToolCall, ToolCallId,
-    ToolResult, ToolResultContent as SharedResultContent,
+    CachePoint, CompletionRequest, Content, Error, Image, ImageSource as SharedImageSource,
+    LanguageModel, Message as SharedMessage, ReplayData, Role, Thinking, ToolArguments, ToolCall,
+    ToolCallId, ToolDefinition, ToolResult, ToolResultContent as SharedResultContent,
 };
 use serde_json::json;
 
@@ -17,10 +17,9 @@ fn model() -> LanguageModel {
 }
 
 #[test]
-fn converts_system_multimodal_tools_and_correlated_results() {
+fn converts_instructions_multimodal_tools_correlated_results_and_cache_points() {
     let id = ToolCallId::new();
-    let request = input(vec![
-        SharedMessage::system("system"),
+    let mut request = input(vec![
         SharedMessage::new(
             Role::User,
             vec![
@@ -58,10 +57,34 @@ fn converts_system_multimodal_tools_and_correlated_results() {
         ),
         SharedMessage::user("continue"),
     ]);
+    request.instructions = Some("system".into());
+    request.tools = vec![ToolDefinition {
+        name: "read".into(),
+        description: None,
+        parameters: Default::default(),
+    }];
+    // The assistant's call is marked on its own block, before the tool
+    // result merges into the next user turn.
+    request.cache = vec![
+        CachePoint::AfterTools,
+        CachePoint::AfterInstructions,
+        CachePoint::AfterMessage(request.messages[1].id.clone()),
+    ];
     let original = request.clone();
     let native = MessagesRequest::from_completion(&model(), request).unwrap();
     let value = json!(native);
     assert_eq!(value["system"][0]["text"], "system");
+    assert_eq!(value["system"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(value["tools"][0]["cache_control"]["type"], "ephemeral");
+    assert_eq!(
+        value["messages"][1]["content"][0]["cache_control"]["type"],
+        "ephemeral"
+    );
+    assert!(
+        value["messages"][0]["content"][1]
+            .get("cache_control")
+            .is_none()
+    );
     assert_eq!(
         value["messages"][0]["content"][1]["source"]["type"],
         "base64"
@@ -75,7 +98,7 @@ fn converts_system_multimodal_tools_and_correlated_results() {
     assert_eq!(value["messages"][2]["content"][1]["text"], "continue");
     // Resolution is confined to the owned request, not caller history.
     assert!(
-        matches!(&original.messages[3].content[0], Content::ToolResult(result) if result.provider_id.is_none())
+        matches!(&original.messages[2].content[0], Content::ToolResult(result) if result.provider_id.is_none())
     );
 }
 
@@ -131,7 +154,10 @@ fn rejects_unrepresentable_content_and_invalid_tool_sequences() {
             Role::Developer,
             vec![Content::text("instructions")],
         )],
-        vec![SharedMessage::user("hi"), SharedMessage::system("late")],
+        vec![
+            SharedMessage::user("hi"),
+            SharedMessage::new(Role::System, vec![Content::text("late")]),
+        ],
         vec![SharedMessage::new(
             Role::Assistant,
             vec![Content::Reasoning(language_model::Reasoning::Text {

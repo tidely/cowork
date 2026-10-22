@@ -52,6 +52,13 @@ impl native::ChatRequest {
         };
         normalize_tool_results(&mut request.messages)?;
         let mut messages = Vec::new();
+        if let Some(content) = request.instructions {
+            messages.push(native::Message {
+                role: "system".into(),
+                content,
+                ..Default::default()
+            });
+        }
         for message in request.messages {
             messages.extend(self::messages(message)?);
         }
@@ -556,6 +563,7 @@ mod tests {
             Err(Error::InvalidRequest(_))
         ));
         let mut input = request();
+        input.instructions = Some("rules".into());
         input.options = json!({
             "think":false, "format":{"type":"object"}, "keep_alive":-1,
             "options":{"future":{"nested":true}}, "truncate":false, "shift":true,
@@ -568,6 +576,13 @@ mod tests {
             ChatRequest::from_completion(&language_model::LanguageModel::new("test-model"), input)
                 .unwrap();
         assert_eq!(projected.think, Some(native::Think::Enabled(false)));
+        assert_eq!(
+            (
+                projected.messages[0].role.as_str(),
+                projected.messages[0].content.as_str()
+            ),
+            ("system", "rules")
+        );
         assert!(
             matches!(projected.format, Some(native::ResponseFormat::Schema(ref value)) if value["type"] == "object")
         );

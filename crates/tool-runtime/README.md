@@ -1,27 +1,53 @@
 # Tool runtime
 
 The tool primitives for Cowork's provider-independent stack. This crate has no
-Rig, GPUI, networking, sandbox policy, or agent-loop dependency. The existing Rig
-tools have not migrated yet.
+Rig, GPUI, networking, sandbox policy, or agent-loop dependency; authorization
+and scheduling belong to [agent-runtime](../agent-runtime/README.md). The
+existing Rig tools have not migrated yet.
 
-`Tool` has associated `Args` and `Output` types. Arguments deserialize from JSON
-and supply a JSON Schema for the model-facing definition. Outputs implement
-`ToolOutput`, retaining structured data separately from the model-facing content.
-The blanket `ToolDyn` implementation lets unrelated tool implementations share
-one registry through dynamic dispatch.
+A `Tool` has four associated types:
+
+- `Args`: deserialized from the model's JSON, with a generated JSON Schema for
+  the model-facing definition.
+- `Output`: a `ToolOutput`, keeping structured data apart from the content the
+  model sees.
+- `Context`: the host services the tool needs, `()` for none. A registry's host
+  context must provide it (`Provides<T::Context>`), which the compiler checks
+  when the tool is registered, rather than a type-map lookup on every call.
+- `Access`: what one call needs to be allowed, `()` when calls differ only by
+  tool. `Tool::access` computes it from the arguments; the registry converts it
+  into the host's access type (`A: From<T::Access>`) for authorization.
 
 ```rust
+use std::sync::Arc;
+
 use language_model::{ToolCallId, ToolResultContent};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tool_runtime::{
-    Tool, ToolCallContext, ToolCapabilities, ToolDispatch, ToolError, ToolOutput, ToolRegistry,
-    collect_output,
+    CallControl, Provides, Tool, ToolCall, ToolError, ToolOutput, ToolRegistry, collect_output,
 };
 
+/// A service the host owns and hands to the tools that ask for it.
+struct Ledger;
+
+/// The host context of this registry.
+struct Host {
+    ledger: Arc<Ledger>,
+}
+
+impl Provides<Ledger> for Host {
+    fn provide(self: &Arc<Self>) -> Arc<Ledger> {
+        self.ledger.clone()
+    }
+}
+
+/// The host's access type: here, whether a call writes.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct Writes(bool);
+
 #[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct AddArgs { a: i32, b: i32 }
+struct AddArgs { a: i32, b: i32, record: bool }
 
 #[derive(Serialize)]
 struct Sum { value: i64 }
@@ -33,90 +59,77 @@ impl ToolOutput for Sum {
 }
 
 struct Add;
+
 impl Tool for Add {
     type Args = AddArgs;
     type Output = Sum;
+    type Context = Ledger;
+    type Access = Writes;
+
     fn name(&self) -> &str { "add" }
     fn description(&self) -> String { "Add two integers".into() }
-    fn capabilities(&self) -> ToolCapabilities {
-        ToolCapabilities { is_read_only: true, ..Default::default() }
-    }
-    async fn run(&self, _: ToolCallContext, args: AddArgs) -> Result<Sum, ToolError> {
+    fn access(&self, args: &AddArgs, _: &Ledger) -> Writes { Writes(args.record) }
+    async fn run(&self, call: ToolCall<Writes>, _ledger: Arc<Ledger>, args: AddArgs) -> Result<Sum, ToolError> {
+        // `call.access` is exactly what authorization allowed.
+        let _ = call.access;
         Ok(Sum { value: i64::from(args.a) + i64::from(args.b) })
     }
 }
 
 # async fn example() -> Result<(), ToolError> {
-let mut registry = ToolRegistry::default();
+let mut registry = ToolRegistry::<Host, Writes>::default();
 registry.register(Add)?;
-let context = ToolCallContext::new(ToolCallId::new());
-let stream = registry.call("add", serde_json::json!({"a": 2, "b": 3}), context).await;
+let host = Arc::new(Host { ledger: Arc::new(Ledger) });
+// Preparing decodes the arguments and computes access; nothing runs yet.
+let prepared = registry.prepare("add", serde_json::json!({"a": 2, "b": 3, "record": true}), &host)?;
+assert_eq!(prepared.access(), &Writes(true));
+let stream = prepared.execute(ToolCallId::new(), CallControl::default()).await;
 let result = collect_output(stream).await?;
-// result.output retains {"value": 5}; result.model_output contains text "5".
+// result.output keeps {"value": 5}; result.model_output contains text "5".
 # Ok(())
 # }
 ```
 
-`BuiltinToolOutput` is the enum application code will match for known built-in
-results. It currently has only `Dynamic(Value)`, which also supports custom and
-runtime-discovered tools. As built-ins migrate, they can add named variants and
-override `ToolOutput::into_output` to select them. No schema versions or tool
-persistence formats are introduced here.
+Preparing and executing are separate so a host can authorize a call between
+them: `prepare` never runs the tool, and awaiting `execute` may already run a
+simple one. The prepared call keeps the access value it computed and passes it
+to the tool in `ToolCall::access`, so a tool runs with exactly what was allowed
+even if its context changed meanwhile.
 
-Custom outputs usually need only `impl ToolOutput for MyOutput {}`. The default
-serializes the result once into `Dynamic` and presents its JSON to the model.
-An explicit model projection can instead return text, JSON, or images through
-the existing `language_model::ToolResultContent`. An empty explicit projection
-is an error; `None` selects the default. No JSON-shape heuristics interpret
-arbitrary result fields as special content or UI instructions.
+`ToolCall` also carries the local `ToolCallId` and `CallControl`: cooperative
+`cancellation` when the run ends, and `yield_wait` when new input should wake a
+blocking wait without stopping what it observes. Neither promises rollback or
+that external work stopped. Provider-issued call IDs belong to the transcript.
+
+## Outputs and streams
+
+`BuiltinToolOutput` is the enum application code matches for known built-in
+results. It has only `Dynamic(Value)` so far, which also serves custom and
+dynamic tools. Custom outputs usually need only `impl ToolOutput for MyOutput {}`:
+the default serializes the result once and presents its JSON to the model. An
+explicit `model_output` returns text, JSON, or images; an empty projection is an
+error. No JSON-shape heuristics turn result fields into special content.
 
 Simple tools implement `run`. Streaming tools implement `execute`, returning
 `Progress` events followed by exactly one `Finished(Result<Output, ToolError>)`.
-`finished_only`, `deferred_result`, and `with_progress` construct common stream
-shapes. `with_progress` polls the final-result future only after progress ends.
-`collect_output` discards progress and validates the complete stream, rejecting
-missing or repeated final results and events after completion. Streaming callers
-must consume and check that same contract; progress is never an accepted result.
+`finished_only`, `deferred_result`, and `with_progress` build common stream
+shapes. `collect_output` discards progress and rejects missing or repeated final
+results and events after completion; progress is never an accepted result.
 
-`ToolCallContext` retains the shared local `ToolCallId`. Its `TypedExtensions`
-holds host-provided services behind `Arc`, such as permission grants, cancellation
-handles, or an output sink. Neither tool definitions nor context introduce a
-provider identity. A host can implement `ToolDispatch` around a registry to add
-approval, tracing, or other execution policy. Tool names and definitions must
-remain stable for the life of their registration.
+`ToolError` separates dispatch and execution failures from successful domain
+results: a shell command's nonzero exit can be structured output, while a
+refused approval is `PermissionDenied`. Hosts decide how failures become
+model-facing error results.
 
-`ToolError` distinguishes dispatch/execution failures from successful domain
-results. For example, a shell command's nonzero exit code can remain structured
-command output, while an approval refusal is `PermissionDenied`. Host code
-chooses how failures become model-facing error results.
+## Registries and metadata
 
+`ToolRegistry<C, A>` holds tools for host context `C` and host access `A`.
+Registering captures a `ToolDescriptor { definition, capabilities }` once;
+listing and lookups never regenerate it. Only `definition` is sent to a model.
+`ToolDyn` is the object-safe form; typed tools implement it through a blanket
+impl, and dynamic tools (from MCP, for example) can implement it by hand.
 
-## Execution metadata
-
-`Tool::capabilities()` declares host-facing `ToolCapabilities`. The `ToolDyn`
-adapter forwards them, including for heterogeneous toolsets; manually implemented
-dynamic tools can declare them as well. Capabilities describe cancellation and
-progress support, read-only behavior, maximum concurrency, and an optional
-suggested timeout. Concurrency limits use `NonZeroU32`; unspecified limits and
-timeouts leave the decision to the host. No timeout or limiter runs implicitly.
-
-The registry captures a `ToolDescriptor { definition, capabilities }` when a tool
-is registered. `ToolDispatch::descriptors()` lists those snapshots, and
-`descriptor(name)` looks one up before execution. Dispatch wrappers can forward
-or filter descriptors alongside calls. `definitions()` projects only their
-model-facing definitions, keeping execution metadata out of model API schemas.
-Listing or querying metadata never regenerates a registered tool's definition or
-capabilities.
-
-A permission/scheduling wrapper should inspect the descriptor before awaiting
-`inner.call(...)`: simple tools can execute during that await, before their
-stream is returned. The host can then acquire concurrency permits, wait for
-approval, or attach cancellation services and grants to `ToolCallContext`.
-Capabilities are declarations rather than permission grants. Read-only calls
-still require authorization to access data. Cancellation support means the tool
-cooperates with its host's cancellation service, not that dropping a future
-rolls back work or stops a spawned process. The library does not synthesize a
-cancellation service or automatically police progress events.
-
-Metadata has no behavior versions, hub routing scopes, lifecycle hooks, or
-transport frame limits. Those mechanisms are not part of this runtime.
+`ToolCapabilities` declares cancellation and progress support, read-only
+behavior, maximum concurrency, and a suggested timeout. They describe the
+implementation, not one call, and grant nothing: read-only calls still need
+authorization. No timeout or limiter runs implicitly.

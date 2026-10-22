@@ -162,6 +162,7 @@ dependencies = [
  "agent-input",
  "futures",
  "language-model",
+ "schemars 1.2.3",
  "serde",
  "serde_json",
  "thiserror 2.0.21",
@@ -6454,7 +6455,6 @@ dependencies = [
 name = "language-models"
 version = "0.1.0"
 dependencies = [
- "agent-input",
  "agent-runtime",
  "anthropic",
  "futures",
@@ -11854,6 +11854,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "tokio-util",
 ]
 
 [[package]]

@@ -4,33 +4,31 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use agent_input::{Delivery, Fallback, Input, InputId, Lifetime, Policy, QueueAccess};
-use language_model::{
-    CompletionRequest, LanguageModel, LanguageModelProvider, Message, Role, Thinking,
-};
-use serde::Serialize;
-use tool_runtime::{Tool, ToolDispatch, ToolError, ToolErrorKind, ToolRegistry};
+use agent_input::{Delivery, Fallback, Lifetime, Policy, QueueAccess};
+use std::collections::HashSet;
 
-use crate::persistence::record::StoredEvent;
+use futures::future::BoxFuture;
+use language_model::{LanguageModelProvider, ToolCallId};
+use tool_runtime::{Provides, Tool, ToolError};
+
 use crate::{
-    AgentDefinition, AgentEvent, AgentSession, AllowAll, AllowTools, Compaction, CompactionError,
-    CompactionPolicy, PromptError, Reply, RunError, SessionHandle, SessionResult, ToolExecutor,
-    ToolPermissions, ToolPolicy,
-    persistence::{JsonlLog, LogError},
+    AgentDefinition, AgentEvent, AgentHost, AgentSession, BasicHost, Compaction, CompactionError,
+    CompactionPolicy, Configuration, ContextSection, Conversation, PromptError, Reply, Request,
+    RequestError, RequestKind, Response, Sampling, SessionError, SessionHandle, SessionResult,
+    persistence::{JsonlLog, LogError, StoredSource, record::StoredEvent},
+    tools::HostRegistry,
 };
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
-    #[error("invalid session configuration: {0}")]
-    Configuration(String),
     #[error(transparent)]
-    Run(#[from] RunError),
+    Session(#[from] SessionError),
     #[error(transparent)]
     Prompt(#[from] PromptError),
     #[error(transparent)]
-    Tool(#[from] ToolError),
+    Request(#[from] RequestError),
     #[error(transparent)]
-    Compaction(#[from] CompactionError),
+    Tool(#[from] ToolError),
     #[error(transparent)]
     Log(#[from] LogError),
     #[error("session driver failed: {0}")]
@@ -38,307 +36,225 @@ pub enum AgentError {
 }
 
 /// A short conversation or an unhelpful summary is an unchanged view, not a
-/// failed operation. Other errors (transport, invalid summary, cancellation)
-/// remain errors. The low-level handle exposes the original strict Result.
+/// failed operation. Other errors (transport, cancellation) remain errors.
 #[derive(Debug)]
 pub enum CompactionOutcome {
     Applied(Box<Compaction>),
     Unchanged(CompactionError),
 }
 
-enum StorageMode {
-    Create,
-    Resume,
-    OpenOrCreate,
-}
-struct Storage {
-    directory: PathBuf,
-    mode: StorageMode,
-}
-type Observer<S> = Box<dyn FnMut(AgentEvent<S>) + Send>;
-type Encoder<S> = fn(&AgentEvent<S>) -> Result<StoredEvent, LogError>;
+type Observer<H> = Box<dyn FnMut(AgentEvent<H>) + Send>;
+/// Adds a context section once the session exists.
+type SectionInstaller<H> = Box<dyn FnOnce(AgentSession<H>) -> AgentSession<H> + Send>;
+type Encoder<H> = fn(&AgentEvent<H>) -> Result<StoredEvent, LogError>;
+type Restored<S> = Option<(Conversation<S>, u64, HashSet<ToolCallId>)>;
+/// Opens the log for a fresh (empty) or resumed session.
+type Opener<S> =
+    Box<dyn FnOnce() -> BoxFuture<'static, Result<(JsonlLog, Restored<S>), LogError>> + Send>;
 
-/// Configuration for a managed session. Defaults deny tools, execute sequentially,
-/// limit runs to eight model turns and 4096 output tokens per request, and permit
-/// manual compaction only. Storage and observers are opt-in.
-pub struct AgentBuilder<S = String> {
-    definition: AgentDefinition,
-    tools: Option<Vec<String>>,
+/// Builds a managed [`Agent`]: a session, its driver task, and optional
+/// storage. Defaults: tools are refused unless permitted, 16 steps per run,
+/// 4096 output tokens per request, manual compaction only.
+pub struct AgentBuilder<H: AgentHost> {
+    host: Arc<H>,
     provider: Arc<dyn LanguageModelProvider>,
-    model: LanguageModel,
-    source: S,
-    registry: ToolRegistry,
-    dispatch: Option<Arc<dyn ToolDispatch>>,
-    policy: Arc<dyn ToolPolicy>,
-    request: CompletionRequest,
-    max_turns: usize,
+    definition: AgentDefinition,
+    configuration: Configuration<H::Permissions>,
+    registry: HostRegistry<H>,
+    sections: Vec<SectionInstaller<H>>,
+    source: H::Source,
     input_policy: Policy,
-    compaction: Option<CompactionPolicy>,
-    storage: Option<Storage>,
-    saved_instructions: bool,
-    observer: Option<Observer<S>>,
-    encoder: Option<Encoder<S>>,
+    storage: Option<(Opener<H::Source>, Encoder<H>)>,
+    observer: Option<Observer<H>>,
 }
 
-impl<S> AgentBuilder<S> {
-    /// Shared-provider/typed-source entry point. Common callers can use
-    /// Agent::builder with a concrete provider and the default local source.
-    pub fn new(provider: Arc<dyn LanguageModelProvider>, model: LanguageModel, source: S) -> Self {
-        let definition = AgentDefinition::default();
-        Self {
-            provider,
-            model,
-            source,
-            registry: ToolRegistry::default(),
-            dispatch: None,
-            policy: Arc::new(AllowTools::default()),
-            request: CompletionRequest {
-                max_output_tokens: Some(definition.max_output_tokens),
-                ..Default::default()
-            },
-            max_turns: definition.max_turns,
+impl Agent<BasicHost> {
+    /// A single-user agent: string prompts from source `"user"`.
+    pub fn builder(
+        provider: impl LanguageModelProvider + 'static,
+        definition: AgentDefinition,
+    ) -> AgentBuilder<BasicHost> {
+        AgentBuilder::new(
+            Arc::new(BasicHost),
+            Arc::new(provider),
             definition,
-            tools: None,
+            "user".into(),
+        )
+    }
+}
+
+impl<H: AgentHost> AgentBuilder<H> {
+    /// `source` is the source of this agent's own prompts and requests.
+    pub fn new(
+        host: Arc<H>,
+        provider: Arc<dyn LanguageModelProvider>,
+        definition: AgentDefinition,
+        source: H::Source,
+    ) -> Self
+    where
+        H::Permissions: Default,
+    {
+        Self {
+            host,
+            provider,
+            definition,
+            configuration: Configuration::default(),
+            registry: HostRegistry::<H>::default(),
+            sections: Vec::new(),
+            source,
             input_policy: Policy {
                 access: QueueAccess::Protected,
                 fallback: Fallback::Queue,
                 lifetime: Lifetime::Retain,
             },
-            compaction: Some(CompactionPolicy::default()),
             storage: None,
-            saved_instructions: false,
             observer: None,
-            encoder: None,
         }
     }
 
-    /// Applies a reusable definition. Later builder calls override its settings;
-    /// runtime services, storage, observers, and input policy are left in place.
-    /// The definition is cloned so it can seed independent agents.
-    pub fn definition(mut self, definition: &AgentDefinition) -> Self {
-        self.request
-            .messages
-            .retain(|message| message.role != Role::System);
-        if !definition.system_prompt.is_empty() {
-            self.request
-                .messages
-                .insert(0, Message::system(&definition.system_prompt));
-        }
-        self.request.max_output_tokens = Some(definition.max_output_tokens);
-        self.request.thinking = definition.thinking.clone();
-        self.max_turns = definition.max_turns;
-        self.tools = definition.tools.clone();
-        self.policy = match &definition.permissions {
-            ToolPermissions::DenyAll => Arc::new(AllowTools::default()),
-            ToolPermissions::AllowListed(names) => Arc::new(AllowTools::new(names.clone())),
-            ToolPermissions::AllowAll => Arc::new(AllowAll),
-        };
-        self.definition = definition.clone();
-        self
-    }
-
-    /// Exposes only these registered tool names, independently of permission.
-    pub fn tools(mut self, names: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.tools = Some(names.into_iter().map(Into::into).collect());
-        self
-    }
-
-    pub fn source(mut self, source: S) -> Self {
-        self.source = source;
-        self
-    }
-
-    pub fn system_prompt(mut self, text: impl Into<String>) -> Self {
-        let message = Message::system(text);
-        if self
-            .request
-            .messages
-            .first()
-            .is_some_and(|message| message.role == Role::System)
-        {
-            self.request.messages[0] = message;
-        } else {
-            self.request.messages.insert(0, message);
-        }
-        self
-    }
-
-    pub fn tool<T: Tool + 'static>(mut self, tool: T) -> Result<Self, ToolError> {
-        if self.dispatch.is_some() {
-            return Err(ToolError::new(
-                ToolErrorKind::InvalidArguments,
-                "choose registered tools or a custom dispatcher",
-            ));
-        }
+    /// Makes a tool available. The definition decides whether it is offered
+    /// directly; otherwise it can still be added as a dynamic tool by name.
+    pub fn tool<T>(mut self, tool: T) -> Result<Self, ToolError>
+    where
+        T: Tool,
+        H: Provides<T::Context>,
+        H::Access: From<T::Access>,
+    {
         self.registry.register(tool)?;
         Ok(self)
     }
 
-    pub fn tool_dispatch(mut self, dispatch: Arc<dyn ToolDispatch>) -> Self {
-        self.dispatch = Some(dispatch);
+    pub fn configuration(mut self, configuration: Configuration<H::Permissions>) -> Self {
+        self.configuration = configuration;
         self
     }
 
-    /// Replaces the current policy with an explicit allowlist. Read-only metadata
-    /// alone never grants permission. All other tool names remain denied.
-    pub fn allow_tools(mut self, names: impl IntoIterator<Item = impl Into<String>>) -> Self {
-        self.policy = Arc::new(AllowTools::new(names));
+    pub fn permissions(mut self, permissions: H::Permissions) -> Self {
+        self.configuration.permissions = permissions;
         self
     }
 
-    pub fn allow_all_tools(mut self) -> Self {
-        self.policy = Arc::new(AllowAll);
+    pub fn sampling(mut self, sampling: Sampling) -> Self {
+        self.configuration.sampling = sampling;
         self
     }
 
-    pub fn tool_policy(mut self, policy: impl ToolPolicy + 'static) -> Self {
-        self.policy = Arc::new(policy);
+    pub fn max_steps(mut self, limit: NonZeroUsize) -> Self {
+        self.configuration.max_steps = limit;
         self
     }
 
-    pub fn max_turns(mut self, limit: usize) -> Self {
-        self.max_turns = limit;
-        self
-    }
-    pub fn max_output_tokens(mut self, limit: u64) -> Self {
-        self.request.max_output_tokens = Some(limit);
-        self
-    }
-    pub fn thinking(mut self, thinking: Thinking) -> Self {
-        self.request.thinking = Some(thinking);
+    pub fn compaction(mut self, policy: CompactionPolicy) -> Self {
+        self.configuration.compaction = policy;
         self
     }
 
-    /// Replaces all initial history and generation controls. Tool definitions
-    /// must still match the executor. Use this for provider-specific options.
-    pub fn request(mut self, request: CompletionRequest) -> Self {
-        self.request = request;
-        self
-    }
+    /// The policy of inputs sent by [`Agent::prompt`].
     pub fn input_policy(mut self, policy: Policy) -> Self {
         self.input_policy = policy;
         self
     }
-    pub fn compaction(mut self, policy: CompactionPolicy) -> Self {
-        self.compaction = Some(policy);
-        self
-    }
-    pub fn disable_compaction(mut self) -> Self {
-        self.compaction = None;
+
+    pub fn section(mut self, section: impl ContextSection<H>) -> Self {
+        self.sections
+            .push(Box::new(move |session| session.with_section(section)));
         self
     }
 
-    /// Refuses an existing session log. No files are written unless configured.
+    /// Starts a new log; refuses a directory that already has one.
     pub fn create_at(mut self, directory: impl Into<PathBuf>) -> Self
     where
-        S: Serialize,
+        H::Source: StoredSource,
     {
-        self.encoder = Some(StoredEvent::encode::<S>);
-        self.storage = Some(Storage {
-            directory: directory.into(),
-            mode: StorageMode::Create,
-        });
+        let directory = directory.into();
+        self.storage = Some((
+            Box::new(move || Box::pin(create::<H::Source>(directory))),
+            StoredEvent::encode::<H>,
+        ));
         self
     }
+
+    /// Continues a saved session; the log must exist.
     pub fn resume_from(mut self, directory: impl Into<PathBuf>) -> Self
     where
-        S: Serialize,
+        H::Source: StoredSource,
     {
-        self.encoder = Some(StoredEvent::encode::<S>);
-        self.storage = Some(Storage {
-            directory: directory.into(),
-            mode: StorageMode::Resume,
-        });
+        let directory = directory.into();
+        self.storage = Some((
+            Box::new(move || Box::pin(resume::<H::Source>(directory))),
+            StoredEvent::encode::<H>,
+        ));
         self
     }
-    /// Explicitly opt into saved-session reuse, rather than silently replacing
-    /// configured initial history. Saved instructions must match by default.
+
+    /// Continues a saved session if there is one, otherwise starts one.
     pub fn open_or_create(mut self, directory: impl Into<PathBuf>) -> Self
     where
-        S: Serialize,
+        H::Source: StoredSource,
     {
-        self.encoder = Some(StoredEvent::encode::<S>);
-        self.storage = Some(Storage {
-            directory: directory.into(),
-            mode: StorageMode::OpenOrCreate,
-        });
+        let directory = directory.into();
+        self.storage = Some((
+            Box::new(move || {
+                Box::pin(async move {
+                    if tokio::fs::try_exists(directory.join("updates.jsonl")).await? {
+                        resume::<H::Source>(directory).await
+                    } else {
+                        create::<H::Source>(directory).await
+                    }
+                })
+            }),
+            StoredEvent::encode::<H>,
+        ));
         self
     }
-    pub fn use_saved_instructions(mut self) -> Self {
-        self.saved_instructions = true;
-        self
-    }
-    pub fn on_event(mut self, observer: impl FnMut(AgentEvent<S>) + Send + 'static) -> Self {
+
+    /// Observes every event, after storage. Runs on the driver; keep it cheap.
+    pub fn on_event(mut self, observer: impl FnMut(AgentEvent<H>) + Send + 'static) -> Self {
         self.observer = Some(Box::new(observer));
         self
     }
-}
 
-impl<S: Clone + PartialEq + Send + 'static> AgentBuilder<S> {
-    /// Starts the owner on the current Tokio runtime. Validation and optional
-    /// log setup complete before the driver can execute any model/tool request.
-    pub async fn build(self) -> Result<Agent<S>, AgentError> {
-        let limit = NonZeroUsize::new(self.max_turns)
-            .ok_or_else(|| AgentError::Configuration("max_turns must be positive".into()))?;
-        if self.dispatch.is_some() && !self.registry.descriptors().is_empty() {
-            return Err(AgentError::Configuration(
-                "choose registered tools or a custom dispatcher".into(),
-            ));
+    /// Starts the session on the current Tokio runtime. Validation and log
+    /// setup complete before any model or tool request can run.
+    pub async fn build(self) -> Result<Agent<H>, AgentError> {
+        let (mut session, handle) = AgentSession::new(
+            self.host,
+            self.provider,
+            self.definition,
+            self.configuration,
+            self.registry,
+        )?;
+        for add in self.sections {
+            session = add(session);
         }
-        let dispatch = self.dispatch.unwrap_or_else(|| Arc::new(self.registry));
-        let mut executor = ToolExecutor::new(dispatch, self.policy)?;
-        if let Some(names) = &self.tools {
-            executor = executor.select_tools(names)?;
-        }
-        let configured_history = self.request.messages.clone();
-        let (mut owner, handle) =
-            AgentSession::new(self.provider, self.model, executor, self.request)?;
-        owner = owner.with_max_model_turns(limit);
-        if let Some(policy) = self.compaction {
-            owner = owner.with_compaction(policy);
-        }
-        let log = if let Some(storage) = self.storage {
-            let resume = match storage.mode {
-                StorageMode::Create => false,
-                StorageMode::Resume => true,
-                StorageMode::OpenOrCreate => {
-                    tokio::fs::try_exists(storage.directory.join("updates.jsonl"))
-                        .await
-                        .map_err(LogError::Io)?
+        let (log, encoder) = match self.storage {
+            Some((open, encoder)) => {
+                let (log, restored) = open().await?;
+                if let Some((conversation, next_sequence, started)) = restored {
+                    let resumed = session.with_interrupted_conversation(
+                        conversation,
+                        next_sequence,
+                        |call| started.contains(call),
+                    );
+                    session = match resumed {
+                        Ok(session) => session,
+                        Err(error) => {
+                            log.finish().await?;
+                            return Err(error.into());
+                        }
+                    };
                 }
-            };
-            if resume {
-                let (log, loaded) = JsonlLog::open(&storage.directory).await?;
-                if !self.saved_instructions
-                    && !configured_history.is_empty()
-                    && !matching_instructions(&configured_history, loaded.conversation.messages())
-                {
-                    log.finish().await?;
-                    return Err(AgentError::Configuration("saved instructions differ from configured history; use_saved_instructions explicitly selects saved history".into()));
-                }
-                owner = match owner.with_conversation(loaded.conversation, loaded.next_sequence) {
-                    Ok(owner) => owner,
-                    Err(error) => {
-                        log.finish().await?;
-                        return Err(error.into());
-                    }
-                };
-                Some(log)
-            } else {
-                Some(JsonlLog::create(&storage.directory, owner.conversation(), 0).await?)
+                (Some(log), Some(encoder))
             }
-        } else {
-            None
+            None => (None, None),
         };
         let recorder = log.as_ref().map(JsonlLog::recorder);
-        let encoder = self.encoder;
         let log_error = Arc::new(Mutex::new(None));
         let write_error = log_error.clone();
         let mut observer = self.observer;
-        let driver = tokio::spawn(owner.run(move |event| {
-            if let Some(recorder) = &recorder
-                && let Err(error) = encoder.expect("storage has an encoder")(&event)
-                    .and_then(|event| recorder.record_encoded(event))
+        let driver = tokio::spawn(session.run(move |event| {
+            if let (Some(recorder), Some(encoder)) = (&recorder, encoder)
+                && let Err(error) = encoder(&event).and_then(|event| recorder.record_encoded(event))
             {
                 write_error
                     .lock()
@@ -350,7 +266,6 @@ impl<S: Clone + PartialEq + Send + 'static> AgentBuilder<S> {
             }
         }));
         Ok(Agent {
-            definition: self.definition,
             handle,
             driver: Some(driver),
             log,
@@ -361,78 +276,79 @@ impl<S: Clone + PartialEq + Send + 'static> AgentBuilder<S> {
     }
 }
 
-fn matching_instructions(configured: &[Message], saved: &[Message]) -> bool {
-    let instructions = |message: &&Message| matches!(message.role, Role::System | Role::Developer);
-    let prefix = saved.iter().take_while(instructions).collect::<Vec<_>>();
-    configured.len() == prefix.len()
-        && configured
-            .iter()
-            .zip(prefix)
-            .all(|(a, b)| a.role == b.role && a.content == b.content)
+async fn create<S: StoredSource>(directory: PathBuf) -> Result<(JsonlLog, Restored<S>), LogError> {
+    Ok((
+        JsonlLog::create(&directory, &Conversation::<S>::new(), 0).await?,
+        None,
+    ))
 }
 
-/// Managed owner for sequential prompt call sites. The low-level handle remains
-/// available for multiple sources, queue policy, steering, and scoped stops.
-/// close joins both the owner and log writer. Drop only requests shutdown.
-pub struct Agent<S: Clone = String> {
-    definition: AgentDefinition,
-    handle: SessionHandle<S>,
-    driver: Option<tokio::task::JoinHandle<SessionResult<S>>>,
+async fn resume<S: StoredSource>(directory: PathBuf) -> Result<(JsonlLog, Restored<S>), LogError> {
+    let (log, loaded) = JsonlLog::open::<S>(&directory).await?;
+    let started = loaded.started_calls();
+    Ok((
+        log,
+        Some((loaded.conversation, loaded.next_sequence, started)),
+    ))
+}
+
+/// A managed session for sequential prompt call sites. The handle remains
+/// available for other sources, steering, approvals, and state changes.
+/// `close` joins the driver and the log writer; dropping only requests shutdown.
+pub struct Agent<H: AgentHost = BasicHost> {
+    handle: SessionHandle<H>,
+    driver: Option<tokio::task::JoinHandle<SessionResult<H>>>,
     log: Option<JsonlLog>,
     log_error: Arc<Mutex<Option<LogError>>>,
-    source: S,
+    source: H::Source,
     input_policy: Policy,
 }
 
-impl Agent<String> {
-    pub fn builder(
-        provider: impl LanguageModelProvider + 'static,
-        model: LanguageModel,
-    ) -> AgentBuilder<String> {
-        AgentBuilder::new(Arc::new(provider), model, "local".into())
-    }
-}
-
-impl<S: Clone> Agent<S> {
-    /// The authored definition used to build this agent. Per-instance builder
-    /// overrides and live state are separate from this reusable blueprint.
-    pub fn definition(&self) -> &AgentDefinition {
-        &self.definition
-    }
-
-    pub fn handle(&self) -> SessionHandle<S> {
+impl<H: AgentHost> Agent<H> {
+    pub fn handle(&self) -> SessionHandle<H> {
         self.handle.clone()
     }
 
-    pub async fn prompt(&self, text: impl Into<String>) -> Result<Reply, AgentError> {
+    /// Queues a prompt and waits for the reply of the run that consumes it.
+    pub async fn prompt(&self, payload: impl Into<H::Input>) -> Result<Reply, AgentError> {
         Ok(self
             .handle
-            .run_input(
-                Input {
-                    id: InputId::new(),
-                    source: self.source.clone(),
-                    payload: Message::user(text),
-                    policy: self.input_policy,
-                },
+            .run(
+                self.source.clone(),
+                payload.into(),
                 Delivery::Queue,
+                self.input_policy,
             )
             .await?)
     }
 
+    /// Sends a request from this agent's own source.
+    pub async fn send(&self, kind: RequestKind<H>) -> Result<Response<H>, AgentError> {
+        Ok(self
+            .handle
+            .send(Request::new(self.source.clone(), kind))
+            .await?)
+    }
+
     pub async fn compact(&self) -> Result<CompactionOutcome, AgentError> {
-        match self.handle.compact().await {
-            Ok(compaction) => Ok(CompactionOutcome::Applied(Box::new(compaction))),
-            Err(error @ (CompactionError::NothingToCompact | CompactionError::NotSmaller)) => {
-                Ok(CompactionOutcome::Unchanged(error))
+        match self.send(RequestKind::Compact).await {
+            Ok(Response::Compacted(compaction)) => {
+                Ok(CompactionOutcome::Applied(Box::new(compaction)))
             }
-            Err(error) => Err(error.into()),
+            Ok(_) => unreachable!("compaction answers with its result"),
+            Err(AgentError::Request(RequestError::Compaction(
+                error @ (CompactionError::NothingToCompact | CompactionError::NotSmaller),
+            ))) => Ok(CompactionOutcome::Unchanged(error)),
+            Err(error) => Err(error),
         }
     }
 
-    /// Stop accepting work, settle the active run, and flush/join logging even
-    /// if the driver failed. Background write errors are always returned here.
-    pub async fn close(mut self) -> Result<SessionResult<S>, AgentError> {
-        let _ = self.handle.shutdown();
+    /// Stops accepting work, settles the active run, and flushes and joins
+    /// logging even if the driver failed. Background write errors surface here.
+    pub async fn close(mut self) -> Result<SessionResult<H>, AgentError> {
+        let _ = self
+            .handle
+            .post(Request::new(self.source.clone(), RequestKind::Shutdown));
         let result = self
             .driver
             .take()
@@ -453,10 +369,12 @@ impl<S: Clone> Agent<S> {
     }
 }
 
-impl<S: Clone> Drop for Agent<S> {
+impl<H: AgentHost> Drop for Agent<H> {
     fn drop(&mut self) {
         if self.driver.is_some() {
-            let _ = self.handle.shutdown();
+            let _ = self
+                .handle
+                .post(Request::new(self.source.clone(), RequestKind::Shutdown));
         }
     }
 }

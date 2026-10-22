@@ -105,12 +105,23 @@ pub struct Usage {
     pub reasoning_tokens: Option<u64>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FinishReason {
+    Stop,
+    ToolCalls,
+    Length,
+    ContentFilter,
+    Refusal,
+    Other(String),
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenerationMetadata {
     pub provider: String,
     pub model: Option<String>,
-    pub finish_reason: Option<String>,
+    pub finish_reason: Option<FinishReason>,
     pub usage: Option<Usage>,
     pub extra: JsonObject,
 }

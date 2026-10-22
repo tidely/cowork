@@ -24,10 +24,6 @@ impl Message {
         }
     }
 
-    pub fn system(text: impl Into<String>) -> Self {
-        Self::new(Role::System, vec![Content::text(text)])
-    }
-
     pub fn user(text: impl Into<String>) -> Self {
         Self::new(Role::User, vec![Content::text(text)])
     }
@@ -175,12 +171,27 @@ pub struct Usage {
     pub reasoning_tokens: Option<u64>,
 }
 
+/// Why generation ended, normalized by the provider adapter so the runtime
+/// never matches a provider's own vocabulary. Unrecognized reasons keep
+/// their wire string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum FinishReason {
+    /// The model finished its reply, or reached a stop sequence.
+    Stop,
+    /// The model ended its reply to have its tool calls run.
+    ToolCalls,
+    /// The output token limit or the context window ended generation.
+    Length,
+    ContentFilter,
+    Refusal,
+    Other(String),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct GenerationMetadata {
     pub provider: String,
     pub model: Option<String>,
-    /// Raw provider reason, retaining unknown future strings.
-    pub finish_reason: Option<String>,
+    pub finish_reason: Option<FinishReason>,
     pub usage: Option<Usage>,
     pub extra: JsonObject,
 }

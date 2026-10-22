@@ -114,8 +114,10 @@ async fn discovery_preserves_prefix_and_optional_native_metadata() {
     assert_eq!(models[0].id, "exact-id");
     assert_eq!(models[0].context_window, Some(8192));
     assert_eq!(models[0].metadata["remote_host"], "host");
-    assert_eq!(models[0].capabilities.as_ref().unwrap()[1], "future");
-    assert!(models[1].capabilities.is_none());
+    assert_eq!(models[0].tool_calls, Some(true));
+    assert_eq!(models[0].image_input, Some(false));
+    assert_eq!(models[0].metadata["capabilities"][1], "future");
+    assert_eq!(models[1].tool_calls, None);
     assert!(
         observed
             .await
@@ -283,7 +285,10 @@ async fn stream_handles_byte_boundaries_tools_thinking_and_final_usage() {
     assert!(matches!(&invalid.arguments, ToolArguments::Invalid { raw } if raw == "null"));
     let metadata = message.generation.as_ref().unwrap();
     assert_eq!(metadata.model.as_deref(), Some("resolved"));
-    assert_eq!(metadata.finish_reason.as_deref(), Some("custom-stop"));
+    assert_eq!(
+        metadata.finish_reason,
+        Some(language_model::FinishReason::Other("custom-stop".into()))
+    );
     let usage = metadata.usage.as_ref().unwrap();
     assert_eq!(usage.input_tokens, Some(10));
     assert_eq!(usage.cached_input_tokens, Some(4));

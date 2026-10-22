@@ -15,8 +15,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 pub use latest::{
-    Content, GenerationMetadata, Image, ImageSource, Message, Reasoning, ReplayData, Role,
-    ToolArguments, ToolCall, ToolResult, ToolResultContent, Usage,
+    Content, FinishReason, GenerationMetadata, Image, ImageSource, Message, Reasoning, ReplayData,
+    Role, ToolArguments, ToolCall, ToolResult, ToolResultContent, Usage,
 };
 
 pub type JsonObject = Map<String, Value>;
@@ -93,6 +93,8 @@ pub enum SchemaError {
 
 /// The contents of one generation request, independent of model selection.
 /// Owned input allows providers to finish I/O without borrowing UI entities.
+/// A request is assembled once and consumed by one provider call; it is flat
+/// plain data, not state anyone keeps editing.
 ///
 /// Typed controls are the ones every supported provider adopts; `None` (or an
 /// empty `stop`) preserves provider defaults. `options` contains
@@ -100,8 +102,16 @@ pub enum SchemaError {
 /// control and its raw wire option together is an error.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CompletionRequest {
+    /// The system prompt. Its own field, rather than a leading `System`
+    /// message, so instructions in the middle of a conversation cannot be
+    /// expressed; `messages` never contain `System` messages.
+    pub instructions: Option<String>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
+    /// Where the stable prompt prefix ends, in request order. Adapters with
+    /// explicit cache markers place them here (keeping as many as they allow,
+    /// latest first); providers that cache automatically ignore them.
+    pub cache: Vec<CachePoint>,
     /// Explicit controls must be mapped or rejected, never silently replaced
     /// with a different effort.
     pub thinking: Option<Thinking>,
@@ -126,6 +136,33 @@ impl CompletionRequest {
     }
 
     pub fn validate(&self) -> Result<(), Error> {
+        if self
+            .instructions
+            .as_ref()
+            .is_some_and(|text| text.trim().is_empty())
+        {
+            return Err(Error::InvalidRequest(
+                "instructions must not be empty; omit them instead".into(),
+            ));
+        }
+        if self
+            .messages
+            .iter()
+            .any(|message| message.role == Role::System)
+        {
+            return Err(Error::InvalidRequest(
+                "system messages are not allowed; use instructions".into(),
+            ));
+        }
+        for point in &self.cache {
+            if let CachePoint::AfterMessage(id) = point
+                && !self.messages.iter().any(|message| &message.id == id)
+            {
+                return Err(Error::InvalidRequest(
+                    "cache point names a message that is not in the request".into(),
+                ));
+            }
+        }
         if let Some(Thinking::Effort(effort)) = &self.thinking {
             validate_effort_name(effort)?;
         }
@@ -168,6 +205,15 @@ impl CompletionRequest {
         }
         Ok(())
     }
+}
+
+/// The end of a stable request prefix, as the runtime knows it. Each adapter
+/// decides how (and whether) its provider can use the hint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CachePoint {
+    AfterTools,
+    AfterInstructions,
+    AfterMessage(MessageId),
 }
 
 /// Shared thinking intent; effort values are opaque model-defined strings,
@@ -268,15 +314,27 @@ pub type CompletionStream = BoxStream<'static, Result<StreamEvent, Error>>;
 
 /// Information about a model offered by a provider. The ID is scoped to that
 /// provider's connection; this value contains no transport or credentials.
-/// Optional metadata describes what the provider reported, not inferred limits.
+/// The same weights served elsewhere can report different values.
+///
+/// Typed fields are the facts code above the provider acts on. Each is
+/// `None` when unknown, which is not the same as unsupported: unknown values
+/// leave the decision to the provider. How a provider's protocol expresses
+/// things (roles, cache markers, finish strings) is not model metadata; it
+/// stays inside the adapter.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LanguageModel {
     pub id: String,
     pub name: Option<String>,
+    /// Input tokens the model can attend to; drives compaction triggers.
     pub context_window: Option<u64>,
-    /// Provider-declared capabilities only; absence does not mean unsupported.
-    pub capabilities: Option<Vec<String>>,
+    /// The largest output the model can generate in one reply.
+    pub max_output_tokens: Option<u64>,
+    /// Whether the model accepts tool definitions and emits tool calls.
+    pub tool_calls: Option<bool>,
+    /// Whether the model accepts images as input.
+    pub image_input: Option<bool>,
     pub thinking: ThinkingCapabilities,
+    /// Everything else the provider reported, kept verbatim.
     pub metadata: JsonObject,
 }
 
@@ -287,7 +345,9 @@ impl LanguageModel {
             id: id.into(),
             name: None,
             context_window: None,
-            capabilities: None,
+            max_output_tokens: None,
+            tool_calls: None,
+            image_input: None,
             thinking: ThinkingCapabilities::default(),
             metadata: JsonObject::new(),
         }

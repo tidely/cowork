@@ -14,7 +14,6 @@ openai-compatible.workspace = true
 reqwest.workspace = true
 
 [dev-dependencies]
-agent-input.workspace = true
 agent-runtime.workspace = true
 tool-runtime.workspace = true
 schemars.workspace = true

@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 
 use futures::{StreamExt as _, TryStreamExt as _, stream::BoxStream};
 use language_model::{
-    Completion, CompletionStream, Content, ContentDelta, Error, GenerationMetadata, JsonObject,
-    Message, Reasoning, Role, StreamEvent, ToolCall, ToolCallId, Usage,
+    Completion, CompletionStream, Content, ContentDelta, Error, FinishReason, GenerationMetadata,
+    JsonObject, Message, Reasoning, Role, StreamEvent, ToolCall, ToolCallId, Usage,
 };
 use ollama_types as native;
 use serde_json::Value;
@@ -13,6 +13,24 @@ use tokio_util::{
 };
 
 use crate::convert::{argument_text, arguments, response_error};
+
+/// Ollama reports `stop` whether or not the reply called tools; a reply
+/// with calls ended so that they run.
+fn finish_reason(reason: &str, message: &Message) -> FinishReason {
+    match reason {
+        "stop"
+            if message
+                .content
+                .iter()
+                .any(|content| matches!(content, Content::ToolCall(_))) =>
+        {
+            FinishReason::ToolCalls
+        }
+        "stop" => FinishReason::Stop,
+        "length" => FinishReason::Length,
+        other => FinishReason::Other(other.into()),
+    }
+}
 
 pub(crate) fn response_stream(
     response: reqwest::Response,
@@ -278,7 +296,7 @@ impl Fold {
                     .metadata
                     .get("done_reason")
                     .and_then(Value::as_str)
-                    .map(str::to_owned),
+                    .map(|reason| finish_reason(reason, &self.message)),
                 usage: (usage != Usage::default()).then_some(usage),
                 extra,
             });

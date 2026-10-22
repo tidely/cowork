@@ -248,6 +248,7 @@ fn generic_requests_expand_tool_results_and_keep_typed_options_separate() {
         top_p: Some(0.9),
         stop: vec!["end".into()],
         seed: Some(7),
+        instructions: Some("rules".into()),
         ..language_model::CompletionRequest::new(vec![GenericMessage::user("hi")])
     };
     let native = ChatCompletionRequest::from_completion(
@@ -255,6 +256,11 @@ fn generic_requests_expand_tool_results_and_keep_typed_options_separate() {
         typed.clone(),
     )
     .unwrap();
+    assert_eq!(native.messages[0].role, "system");
+    assert_eq!(
+        native.messages[0].content,
+        Some(Content::Text("rules".into()))
+    );
     assert_eq!(
         (
             native.max_tokens,

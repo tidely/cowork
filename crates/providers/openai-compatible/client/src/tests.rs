@@ -86,7 +86,8 @@ async fn discovery_preserves_unknown_model_metadata_and_prefix() {
     .await;
     let models = client.list_models().await.unwrap();
     assert_eq!(models[0].metadata["max_model_len"], 8192);
-    assert_eq!(models[0].capabilities, None);
+    assert_eq!(models[0].context_window, Some(8192));
+    assert_eq!(models[0].tool_calls, None);
     assert!(task.await.unwrap().starts_with("GET /proxy/v1/models "));
 }
 
@@ -243,14 +244,8 @@ async fn ollama_compatible_text_and_legacy_reasoning() {
             .unwrap();
     assert_eq!(result.message.content[1], Content::text("answer"));
     assert_eq!(
-        result
-            .message
-            .generation
-            .as_ref()
-            .unwrap()
-            .finish_reason
-            .as_deref(),
-        Some("length")
+        result.message.generation.as_ref().unwrap().finish_reason,
+        Some(language_model::FinishReason::Length)
     );
     let mut history = input();
     history.messages.push(result.message);

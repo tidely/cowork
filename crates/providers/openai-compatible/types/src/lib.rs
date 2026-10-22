@@ -6,6 +6,7 @@
 //! and stream assembly belong to clients.
 
 mod conversion;
+pub use conversion::finish_reason;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};

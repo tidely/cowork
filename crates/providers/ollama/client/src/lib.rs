@@ -168,11 +168,20 @@ impl LanguageModelProvider for Client {
                     else {
                         unreachable!("native model is an object");
                     };
+                    // Ollama lists capabilities by name; a missing list is unknown.
+                    let has = |name: &str| {
+                        model
+                            .capabilities
+                            .as_ref()
+                            .map(|names| names.iter().any(|capability| capability == name))
+                    };
                     Ok(LanguageModel {
-                        id: model.model.unwrap_or_else(|| model.name.clone()),
+                        tool_calls: has("tools"),
+                        image_input: has("vision"),
+                        id: model.model.clone().unwrap_or_else(|| model.name.clone()),
                         name: Some(model.name),
                         context_window: model.details.and_then(|details| details.context_length),
-                        capabilities: model.capabilities,
+                        max_output_tokens: None,
                         thinking: Default::default(),
                         metadata,
                     })

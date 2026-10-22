@@ -279,13 +279,8 @@ async fn malformed_tool_json_remains_invalid_and_unknown_stops_survive() {
             matches!(&completion.message.content[0], Content::ToolCall(call) if call.arguments == ToolArguments::Invalid { raw: raw.into() })
         );
         assert_eq!(
-            completion
-                .message
-                .generation
-                .unwrap()
-                .finish_reason
-                .as_deref(),
-            Some("future_stop")
+            completion.message.generation.unwrap().finish_reason,
+            Some(language_model::FinishReason::Other("future_stop".into()))
         );
         task.await.unwrap();
     }
@@ -323,9 +318,10 @@ async fn native_entry_point_and_discovery_preserve_metadata() {
     let value: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
     assert_eq!(value["top_k"], 3);
     assert_eq!(value["thinking"]["budget_tokens"], 50);
-    let (client, task) = server(200, json!({"data":[{"id":"model-a","display_name":"A","max_input_tokens":200000,"capabilities":{"thinking":{"supported":true}},"created_at":"today"}],"has_more":false,"last_id":"model-a"}).to_string(), false).await;
+    let (client, task) = server(200, json!({"data":[{"id":"model-a","display_name":"A","max_input_tokens":200000,"max_tokens":64000,"capabilities":{"thinking":{"supported":true}},"created_at":"today"}],"has_more":false,"last_id":"model-a"}).to_string(), false).await;
     let models = client.list_models().await.unwrap();
     assert_eq!(models[0].context_window, Some(200000));
+    assert_eq!(models[0].max_output_tokens, Some(64000));
     assert_eq!(
         models[0].metadata["capabilities"]["thinking"]["supported"],
         true

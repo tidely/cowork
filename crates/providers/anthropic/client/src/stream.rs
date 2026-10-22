@@ -302,7 +302,7 @@ impl Assembly {
         message.generation = Some(GenerationMetadata {
             provider: "anthropic".into(),
             model: Some(native.model),
-            finish_reason: native.stop_reason.map(|reason| reason.wire_str()),
+            finish_reason: native.stop_reason.map(|reason| reason.finish_reason()),
             usage: Some(Usage {
                 input_tokens,
                 output_tokens: native.usage.output_tokens,

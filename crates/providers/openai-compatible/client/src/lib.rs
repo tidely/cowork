@@ -259,12 +259,12 @@ impl LanguageModelProvider for Client {
                         metadata.insert("owned_by".into(), value.into());
                     }
                     LanguageModel {
-                        id: model.id,
-                        name: None,
-                        context_window: None,
-                        capabilities: None,
-                        thinking: Default::default(),
+                        // vLLM reports its configured context length here.
+                        context_window: metadata
+                            .get("max_model_len")
+                            .and_then(serde_json::Value::as_u64),
                         metadata,
+                        ..LanguageModel::new(model.id)
                     }
                 })
                 .collect())

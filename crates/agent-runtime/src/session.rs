@@ -1,11 +1,10 @@
 use std::{
     collections::{HashMap, VecDeque},
-    num::NonZeroUsize,
     sync::Arc,
 };
 
 use agent_input::{
-    Admission, Admitted, Delivery, Inbox, Input, InputId, RunId, RunOutcome, Signal, StateError,
+    Admission, Delivery, DeliveryId, Inbox, Input, InputId, RunId, RunOutcome, Signal,
 };
 use futures::{
     FutureExt, StreamExt,
@@ -13,15 +12,23 @@ use futures::{
     stream::BoxStream,
 };
 use language_model::{
-    CompletionRequest, Content, ContentDelta, LanguageModel, LanguageModelProvider, Message, Role,
-    ToolArguments, ToolCall, ToolResult, ToolResultContent, Usage,
+    CachePoint, CompletionRequest, Content, ContentDelta, FinishReason, LanguageModelProvider,
+    Message, Role, ToolArguments, ToolCall, ToolCallId, ToolResult, ToolResultContent, Usage,
 };
-use tool_runtime::{ToolError, ToolErrorKind, ToolProgress, TypedToolOutput};
+use tool_runtime::{CallControl, ToolError, ToolErrorKind, ToolProgress, TypedToolOutput};
 
 use crate::{
-    Compaction, CompactionError, CompactionPolicy, Conversation, ConversationError,
-    executor::{CallControl, ExecutionEvent, ToolExecutor},
+    AgentDefinition, AgentHost, ApprovalDecision, Command, Compaction, CompactionError,
+    CompletionResponder, Configuration, ConfigurationChange, Conversation, ConversationError,
+    DefinitionRevision, DynamicToolChange, Entry, Grant, Origin, PromptError, RenderInput, Reply,
+    Request, RequestError, RequestKind, Responder, Response, SessionHandle, Snapshot,
+    context::{
+        self, ContextSection, ContextUpdate, DynamicToolsSection, ErasedSection, ModelSection,
+        SessionView, ToolPolicySection,
+    },
+    executor::{self, CallScope, ExecutionEvent},
     model,
+    tools::{BUILTIN_TOOLS, HostRegistry, ToolSnapshot},
 };
 
 #[path = "session_compaction.rs"]
@@ -35,7 +42,6 @@ pub enum Phase {
     Sampling,
     Compacting,
     AwaitingApproval,
-    WaitingForTool,
     ExecutingTools,
     Stopping,
 }
@@ -48,35 +54,36 @@ pub enum RunError {
     Conversation(#[from] ConversationError),
     #[error("unusable completion: {0}")]
     Completion(String),
-    #[error("model turn budget exhausted")]
-    TurnLimit,
+    #[error("the run reached its step limit")]
+    StepLimit,
 }
 
-#[derive(Clone, Debug)]
-pub struct InputOrigin<S> {
-    pub id: InputId,
-    pub source: S,
-}
+/// The session could not be built as configured.
+#[derive(Clone, Debug, PartialEq, thiserror::Error)]
+#[error("invalid session configuration: {0}")]
+pub struct SessionError(pub String);
 
-/// Ordered observations of the single session owner. Committed-message indexes
-/// can be applied to a replica seeded with the same initial history. This is a
-/// runtime vocabulary, not a frozen wire/persistence schema.
+/// Ordered observations of the single session owner. Committed-entry indexes
+/// can be applied to a replica with the same history. A runtime vocabulary,
+/// not a frozen wire or persistence schema.
 #[derive(Clone, Debug)]
-pub struct AgentEvent<S> {
+pub struct AgentEvent<H: AgentHost> {
     pub sequence: u64,
     pub run: Option<RunId>,
-    pub kind: EventKind<S>,
+    pub kind: EventKind<H>,
 }
 
 #[derive(Clone, Debug)]
-pub enum EventKind<S> {
+pub enum EventKind<H: AgentHost> {
     InputAdmitted {
-        input: InputOrigin<S>,
+        id: InputId,
+        source: H::Source,
         delivery: Delivery,
         location: Admission,
     },
+    /// Inputs leaving the inbox without being committed, for producer receipts.
     InputsDiscarded {
-        inputs: Vec<Input<S, Message>>,
+        inputs: Vec<Input<H::Source, H::Input>>,
     },
     RunStarted,
     PhaseChanged(Phase),
@@ -86,233 +93,52 @@ pub enum EventKind<S> {
     },
     MessageCommitted {
         index: usize,
-        message: Message,
-        input: Option<InputOrigin<S>>,
+        entry: Entry<H::Source>,
     },
     UsageReported(Usage),
     CompactionStarted {
-        range: std::ops::Range<usize>,
+        end: usize,
         previous_revision: usize,
     },
     Compacted(Compaction),
     CompactionFailed(CompactionError),
-    ToolStarted(ToolCall),
+    /// Answer with a `ResolveApproval` request naming this call.
+    ApprovalRequested {
+        call: ToolCall,
+        tool: String,
+        access: H::Access,
+    },
+    /// `tool` is the real tool, also when the model used `call_tool`.
+    ToolStarted {
+        call: ToolCall,
+        tool: String,
+    },
     ToolProgress {
         call: ToolCall,
         progress: ToolProgress,
     },
     ToolFinished {
         call: ToolCall,
+        /// `None` when the call never resolved to a tool.
+        tool: Option<String>,
         result: Result<TypedToolOutput, ToolError>,
     },
+    DefinitionReplaced {
+        revision: DefinitionRevision,
+    },
+    ConfigurationChanged(ConfigurationChange<H::Permissions>),
+    DynamicToolAdded(String),
+    DynamicToolRemoved(String),
     RunFinished {
         outcome: RunOutcome,
         error: Option<RunError>,
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum ControlError {
-    #[error("session owner has closed")]
-    Closed,
-    #[error(transparent)]
-    State(#[from] StateError),
-}
-
-/// Completion of a particular run, rather than an admission acknowledgement.
-#[derive(Clone, Debug)]
-pub struct Reply {
-    pub run: RunId,
-    pub message: Message,
-}
-
-impl Reply {
-    pub fn text(&self) -> String {
-        self.message
-            .content
-            .iter()
-            .filter_map(|content| match content {
-                Content::Text { text } => Some(text.as_str()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, thiserror::Error)]
-pub enum PromptError {
-    #[error("session owner has closed")]
-    Closed,
-    #[error("input rejected: {0}")]
-    Rejected(String),
-    #[error("input was withdrawn before delivery")]
-    Discarded,
-    #[error("run {0} was stopped")]
-    Stopped(RunId),
-    #[error(transparent)]
-    Failed(#[from] RunError),
-}
-
-type CompletionResponse = oneshot::Sender<Result<Reply, PromptError>>;
-
-/// Rejection retains the submitted work. If a caller drops a submission future
-/// after sending, admission can still happen; observe events before retrying.
-#[derive(Debug, thiserror::Error)]
-#[error("{reason}")]
-pub struct SubmitError<S> {
-    pub reason: String,
-    pub input: Box<Input<S, Message>>,
-}
-
-#[derive(Clone, Debug)]
-pub struct Snapshot {
-    pub run: Option<RunId>,
-    pub phase: Phase,
-    pub paused: bool,
-    pub pending_inputs: usize,
-    pub committed_messages: usize,
-}
-
-enum Command<S> {
-    Submit {
-        input: Box<Input<S, Message>>,
-        delivery: Delivery,
-        response: oneshot::Sender<Result<Admitted<S, Message>, SubmitError<S>>>,
-        completion: Option<CompletionResponse>,
-    },
-    Stop {
-        run: RunId,
-        response: oneshot::Sender<Result<(), StateError>>,
-    },
-    Resume,
-    Snapshot(oneshot::Sender<Snapshot>),
-    Compact(oneshot::Sender<Result<Compaction, CompactionError>>),
-    ProducerClosed {
-        source: S,
-        response: oneshot::Sender<agent_input::Withdrawn<S, Message>>,
-    },
-    Shutdown,
-}
-
-/// A command endpoint, not a shared mutable session. All producers route through
-/// the same owner, which serializes admission with final completion.
-#[derive(Clone)]
-pub struct SessionHandle<S> {
-    commands: mpsc::UnboundedSender<Command<S>>,
-}
-
-impl<S: Clone> SessionHandle<S> {
-    pub async fn submit(
-        &self,
-        input: Input<S, Message>,
-        delivery: Delivery,
-    ) -> Result<Admitted<S, Message>, SubmitError<S>> {
-        self.send(input, delivery, None).await
-    }
-
-    /// Wait for the run consuming this input. The owner binds the receipt before
-    /// starting any work, so fast completion cannot race an external event watcher.
-    /// A dropped future does not retract an already admitted input.
-    pub async fn run_input(
-        &self,
-        input: Input<S, Message>,
-        delivery: Delivery,
-    ) -> Result<Reply, PromptError> {
-        let (completion, reply) = oneshot::channel();
-        self.send(input, delivery, Some(completion))
-            .await
-            .map_err(|error| PromptError::Rejected(error.reason))?;
-        reply.await.map_err(|_| PromptError::Closed)?
-    }
-
-    async fn send(
-        &self,
-        input: Input<S, Message>,
-        delivery: Delivery,
-        completion: Option<CompletionResponse>,
-    ) -> Result<Admitted<S, Message>, SubmitError<S>> {
-        let backup = Box::new(input.clone());
-        let (response, reply) = oneshot::channel();
-        if let Err(error) = self.commands.unbounded_send(Command::Submit {
-            input: Box::new(input),
-            delivery,
-            response,
-            completion,
-        }) {
-            let Command::Submit { input, .. } = error.into_inner() else {
-                unreachable!()
-            };
-            return Err(SubmitError {
-                reason: "session owner has closed".into(),
-                input,
-            });
-        }
-        reply.await.unwrap_or_else(|_| {
-            Err(SubmitError {
-                reason: "session owner dropped before receipt; admission is unconfirmed".into(),
-                input: backup,
-            })
-        })
-    }
-
-    pub async fn stop(&self, run: RunId) -> Result<(), ControlError> {
-        let (response, reply) = oneshot::channel();
-        self.commands
-            .unbounded_send(Command::Stop { run, response })
-            .map_err(|_| ControlError::Closed)?;
-        reply
-            .await
-            .map_err(|_| ControlError::Closed)?
-            .map_err(ControlError::State)
-    }
-
-    pub fn resume(&self) -> Result<(), ControlError> {
-        self.commands
-            .unbounded_send(Command::Resume)
-            .map_err(|_| ControlError::Closed)
-    }
-
-    pub async fn snapshot(&self) -> Result<Snapshot, ControlError> {
-        let (response, reply) = oneshot::channel();
-        self.commands
-            .unbounded_send(Command::Snapshot(response))
-            .map_err(|_| ControlError::Closed)?;
-        reply.await.map_err(|_| ControlError::Closed)
-    }
-
-    pub fn shutdown(&self) -> Result<(), ControlError> {
-        self.commands
-            .unbounded_send(Command::Shutdown)
-            .map_err(|_| ControlError::Closed)
-    }
-
-    /// Schedule at the next safe boundary. A summary request never dispatches
-    /// tools and failure leaves both transcript and model context unchanged.
-    pub async fn compact(&self) -> Result<Compaction, CompactionError> {
-        let (response, reply) = oneshot::channel();
-        self.commands
-            .unbounded_send(Command::Compact(response))
-            .map_err(|_| CompactionError::Closed)?;
-        reply.await.map_err(|_| CompactionError::Closed)?
-    }
-
-    pub async fn producer_closed(
-        &self,
-        source: S,
-    ) -> Result<agent_input::Withdrawn<S, Message>, ControlError> {
-        let (response, reply) = oneshot::channel();
-        self.commands
-            .unbounded_send(Command::ProducerClosed { source, response })
-            .map_err(|_| ControlError::Closed)?;
-        reply.await.map_err(|_| ControlError::Closed)
-    }
-}
-
-pub struct SessionResult<S> {
-    pub conversation: Conversation,
+pub struct SessionResult<H: AgentHost> {
+    pub conversation: Conversation<H::Source>,
     /// Retained unconsumed work, returned on shutdown or a closed paused session.
-    pub pending: Vec<Input<S, Message>>,
+    pub pending: Vec<Input<H::Source, H::Input>>,
 }
 
 enum Next {
@@ -321,138 +147,208 @@ enum Next {
     Complete,
 }
 
-struct Active {
+/// What one model request offered, for running the calls in its reply.
+struct Step<H: AgentHost> {
+    tools: Arc<ToolSnapshot<H>>,
+    revision: DefinitionRevision,
+}
+
+struct PendingApproval<A> {
+    call: ToolCallId,
+    access: A,
+    respond: oneshot::Sender<ApprovalDecision>,
+}
+
+struct Active<H: AgentHost> {
     id: RunId,
+    /// Who sent the input that started this run.
+    origin: H::Source,
     phase: Phase,
-    turns: usize,
+    steps: usize,
     next: Next,
+    step: Option<Step<H>>,
     calls: VecDeque<ToolCall>,
     current: Option<ToolCall>,
+    current_tool: Option<String>,
     dispatched: bool,
+    approval: Option<PendingApproval<H::Access>>,
+    grants: Vec<Grant<H::Access>>,
     compaction_attempted: bool,
     control: CallControl,
-    completions: HashMap<InputId, CompletionResponse>,
+    completions: HashMap<InputId, CompletionResponder>,
     reply: Option<Message>,
 }
 
-impl Drop for Active {
+impl<H: AgentHost> Drop for Active<H> {
     fn drop(&mut self) {
         self.control.cancellation.cancel();
     }
 }
 
-pub(crate) enum WorkEvent {
+pub(crate) enum WorkEvent<A> {
     Preview { index: usize, delta: ContentDelta },
     Model(Result<Message, language_model::Error>),
     Compaction(Result<Message, language_model::Error>),
-    Tool(ExecutionEvent),
+    Tool(ExecutionEvent<A>),
 }
 
-/// A single-owner session driver. The host polls run (or spawns and joins it),
-/// sends authorized inputs through its handle, and forwards its synchronous
-/// event callback to UI/network/journal channels. No global runtime is required.
-pub struct AgentSession<S> {
+/// A single-owner session driver. The host polls `run` (or spawns and joins
+/// it), sends requests through its handle, and forwards the synchronous event
+/// callback to UI, network, or journal channels.
+pub struct AgentSession<H: AgentHost> {
+    host: Arc<H>,
     provider: Arc<dyn LanguageModelProvider>,
-    model: LanguageModel,
-    executor: ToolExecutor,
-    request: CompletionRequest,
-    max_model_turns: NonZeroUsize,
-    conversation: Conversation,
-    inbox: Inbox<S, Message>,
-    commands: mpsc::UnboundedReceiver<Command<S>>,
-    active: Option<Active>,
-    work: Option<BoxStream<'static, WorkEvent>>,
+    definition: AgentDefinition,
+    revision: DefinitionRevision,
+    configuration: Configuration<H::Permissions>,
+    registry: HostRegistry<H>,
+    dynamic: HostRegistry<H>,
+    /// The current tool snapshot; each step captures it.
+    tools: Arc<ToolSnapshot<H>>,
+    sections: Vec<Box<dyn ErasedSection<H>>>,
+    conversation: Conversation<H::Source>,
+    inbox: Inbox<H::Source, H::Input>,
+    commands: mpsc::UnboundedReceiver<Command<H>>,
+    active: Option<Active<H>>,
+    work: Option<BoxStream<'static, WorkEvent<H::Access>>>,
     sequence: u64,
     closing: bool,
-    compaction_policy: Option<CompactionPolicy>,
     compacting: Option<Compacting>,
-    compaction_requests: Vec<oneshot::Sender<Result<Compaction, CompactionError>>>,
+    compaction_requests: Vec<Responder<H>>,
     last_compaction_attempt: Option<(usize, usize)>,
-    pending_completions: HashMap<InputId, CompletionResponse>,
+    pending_completions: HashMap<InputId, CompletionResponder>,
+    /// Results settled while restoring, reported once the driver starts.
+    recovered: Vec<(usize, Entry<H::Source>)>,
 }
 
-impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
-    /// request.messages seeds the conversation. Tools come from the executor;
-    /// conflicting explicit definitions are rejected. Other request controls are
-    /// preserved for each sample. No automatic retries or compaction are applied.
+impl<H: AgentHost> AgentSession<H> {
+    /// `registry` holds every tool the host makes available; the definition
+    /// selects which are offered. The built-in context sections (tool policy,
+    /// dynamic tools, model) are installed; add others with `with_section`.
     pub fn new(
+        host: Arc<H>,
         provider: Arc<dyn LanguageModelProvider>,
-        model: LanguageModel,
-        executor: ToolExecutor,
-        mut request: CompletionRequest,
-    ) -> Result<(Self, SessionHandle<S>), RunError> {
-        model.validate()?;
-        let tools = executor.definitions();
-        if !request.tools.is_empty() && request.tools != tools {
-            return Err(RunError::Completion(
-                "request tools differ from the executor snapshot".into(),
-            ));
+        definition: AgentDefinition,
+        configuration: Configuration<H::Permissions>,
+        registry: HostRegistry<H>,
+    ) -> Result<(Self, SessionHandle<H>), SessionError> {
+        definition
+            .model
+            .validate()
+            .map_err(|error| SessionError(error.to_string()))?;
+        if let Some(name) = BUILTIN_TOOLS.iter().find(|name| registry.contains(name)) {
+            return Err(SessionError(format!("{name} is a built-in tool name")));
         }
-        request.tools = tools;
-        request.validate()?;
-        let conversation = Conversation::new(std::mem::take(&mut request.messages))?;
-        if !conversation.is_settled() {
-            return Err(ConversationError::UnsettledCalls.into());
-        }
+        let dynamic = HostRegistry::<H>::default();
+        let tools =
+            ToolSnapshot::new(&definition, &registry, dynamic.clone()).map_err(SessionError)?;
         let (commands, receiver) = mpsc::unbounded();
         Ok((
             Self {
+                host,
                 provider,
-                model,
-                executor,
-                request,
-                max_model_turns: NonZeroUsize::new(64).expect("positive turn budget"),
-                conversation,
+                definition,
+                revision: DefinitionRevision::default(),
+                configuration,
+                registry,
+                dynamic,
+                tools: Arc::new(tools),
+                sections: vec![
+                    Box::new(ToolPolicySection),
+                    Box::new(DynamicToolsSection),
+                    Box::new(ModelSection),
+                ],
+                conversation: Conversation::new(),
                 inbox: Inbox::default(),
                 commands: receiver,
                 active: None,
                 work: None,
                 sequence: 0,
                 closing: false,
-                compaction_policy: None,
                 compacting: None,
                 compaction_requests: Vec::new(),
                 last_compaction_attempt: None,
                 pending_completions: HashMap::new(),
+                recovered: Vec::new(),
             },
             SessionHandle { commands },
         ))
     }
 
-    pub fn with_max_model_turns(mut self, limit: NonZeroUsize) -> Self {
-        self.max_model_turns = limit;
+    /// Adds a host context section, rendered after the built-in ones.
+    pub fn with_section(mut self, section: impl ContextSection<H>) -> Self {
+        self.sections.push(Box::new(section));
         self
     }
 
-    /// Initial state for observers before moving the owner into its driver.
-    pub fn conversation(&self) -> &Conversation {
-        &self.conversation
-    }
-
-    pub fn with_compaction(mut self, policy: CompactionPolicy) -> Self {
-        self.compaction_policy = Some(policy);
-        self
-    }
-
-    /// Restore full history and its compacted context before starting the owner.
-    /// Unresolved historical calls require explicit recovery, never re-execution.
+    /// Restore a saved conversation before starting the owner. Unresolved
+    /// historical calls require explicit recovery, never re-execution.
     pub fn with_conversation(
         mut self,
-        conversation: Conversation,
+        conversation: Conversation<H::Source>,
         next_sequence: u64,
-    ) -> Result<Self, RunError> {
+    ) -> Result<Self, SessionError> {
         if !conversation.is_settled() {
-            return Err(ConversationError::UnsettledCalls.into());
+            return Err(SessionError(ConversationError::UnsettledCalls.to_string()));
         }
         self.conversation = conversation;
         self.sequence = next_sequence;
         Ok(self)
     }
 
+    /// Restore a conversation whose session stopped without settling its
+    /// calls (a crash). A call that never started, because it was waiting for
+    /// approval or behind another call, is settled as not run: authorization
+    /// comes before dispatch, so it had no effect. A call that may have
+    /// started is refused; it needs explicit recovery, never re-execution.
+    /// `started` says which calls were dispatched (see
+    /// `LoadedSession::started_calls`).
+    pub fn with_interrupted_conversation(
+        mut self,
+        mut conversation: Conversation<H::Source>,
+        next_sequence: u64,
+        started: impl Fn(&ToolCallId) -> bool,
+    ) -> Result<Self, SessionError> {
+        let pending = conversation.pending_calls();
+        if let Some(call) = pending.iter().find(|call| started(&call.id)) {
+            return Err(SessionError(format!(
+                "call {} to {} may have run before the session stopped; it needs explicit recovery",
+                call.id.0, call.name
+            )));
+        }
+        for call in pending {
+            let error = ToolError::new(
+                ToolErrorKind::Cancelled,
+                "the session stopped before this call ran",
+            )
+            .with_details(serde_json::json!({"execution_may_have_started": false}));
+            let entry = result_entry(&call, &Err(error));
+            let index = conversation
+                .append(vec![entry.clone()])
+                .map_err(|error| SessionError(error.to_string()))?;
+            self.recovered.push((index, entry));
+        }
+        self.conversation = conversation;
+        self.sequence = next_sequence;
+        Ok(self)
+    }
+
+    pub fn conversation(&self) -> &Conversation<H::Source> {
+        &self.conversation
+    }
+
+    #[cfg(test)]
+    pub(crate) fn configuration_mut(&mut self) -> &mut Configuration<H::Permissions> {
+        &mut self.configuration
+    }
+
     /// Closing all handles drains accepted runnable work, then returns. Explicit
     /// shutdown cancels the active run and returns retained queued work. Aborting
     /// this future is hard teardown, not a settled stop; join after shutdown.
-    pub async fn run(mut self, mut emit: impl FnMut(AgentEvent<S>)) -> SessionResult<S> {
+    pub async fn run(mut self, mut emit: impl FnMut(AgentEvent<H>)) -> SessionResult<H> {
+        for (index, entry) in std::mem::take(&mut self.recovered) {
+            self.emit(EventKind::MessageCommitted { index, entry }, &mut emit);
+        }
         let mut disconnected = false;
         loop {
             loop {
@@ -501,18 +397,15 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
                     }
                 };
                 match wake {
-                    futures::future::Either::Left(command) => match command {
-                        Some(command) => self.command(command, &mut emit),
-                        None => disconnected = true,
-                    },
-                    futures::future::Either::Right(event) => {
-                        if let Some(event) = event {
-                            self.observe(event, &mut emit);
-                        } else {
-                            // Every internal stream ends with a terminal event;
-                            // observing that event removes the stream itself.
-                            unreachable!("work stream ended without settlement");
-                        }
+                    futures::future::Either::Left(Some(command)) => {
+                        self.command(command, &mut emit)
+                    }
+                    futures::future::Either::Left(None) => disconnected = true,
+                    futures::future::Either::Right(Some(event)) => self.observe(event, &mut emit),
+                    // Every internal stream ends with a terminal event, and
+                    // observing that event removes the stream itself.
+                    futures::future::Either::Right(None) => {
+                        unreachable!("work stream ended without settlement")
                     }
                 }
             } else if self.active.is_none() {
@@ -524,100 +417,8 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
         }
     }
 
-    fn command(&mut self, command: Command<S>, emit: &mut impl FnMut(AgentEvent<S>)) {
+    fn command(&mut self, command: Command<H>, emit: &mut impl FnMut(AgentEvent<H>)) {
         match command {
-            Command::Submit {
-                input,
-                delivery,
-                response,
-                completion,
-            } => {
-                let input = *input;
-                let invalid = if self.closing {
-                    Some("session owner has closed".into())
-                } else if completion.is_some() && self.inbox.is_paused() {
-                    Some("session is paused; resume before requesting another run".into())
-                } else if !matches!(
-                    input.payload.role,
-                    Role::User | Role::System | Role::Developer
-                ) {
-                    Some("inputs must be user, system, or developer messages".into())
-                } else if self.conversation.contains_message_id(&input.payload.id)
-                    || self
-                        .inbox
-                        .pending()
-                        .any(|pending| pending.payload.id == input.payload.id)
-                {
-                    Some("input message identity is already accepted".into())
-                } else {
-                    input
-                        .payload
-                        .validate()
-                        .err()
-                        .map(|error| error.to_string())
-                };
-                if let Some(reason) = invalid {
-                    let _ = response.send(Err(SubmitError {
-                        reason,
-                        input: Box::new(input),
-                    }));
-                    return;
-                }
-                let origin = InputOrigin {
-                    id: input.id,
-                    source: input.source.clone(),
-                };
-                match self.inbox.admit(input, delivery) {
-                    Ok(admitted) => {
-                        if let Some(completion) = completion {
-                            match admitted.location {
-                                Admission::Queued => {
-                                    self.pending_completions.insert(origin.id, completion);
-                                }
-                                Admission::Active(_) => {
-                                    self.active
-                                        .as_mut()
-                                        .expect("active admission")
-                                        .completions
-                                        .insert(origin.id, completion);
-                                }
-                                Admission::Discarded => {
-                                    let _ = completion.send(Err(PromptError::Discarded));
-                                }
-                            }
-                        }
-                        self.emit(
-                            EventKind::InputAdmitted {
-                                input: origin,
-                                delivery,
-                                location: admitted.location,
-                            },
-                            emit,
-                        );
-                        // Interject wakes only the current call's cooperative wait.
-                        if matches!(self.inbox.signal(), Some(Signal::YieldWait(_)))
-                            && let Some(active) = &self.active
-                        {
-                            active.control.yield_wait.cancel();
-                        }
-                        if let Some(discarded) = &admitted.discarded {
-                            self.discard(vec![discarded.clone()], emit);
-                        }
-                        let _ = response.send(Ok(admitted));
-                    }
-                    Err(rejected) => {
-                        let _ = response.send(Err(SubmitError {
-                            reason: rejected.reason.to_string(),
-                            input: Box::new(rejected.input),
-                        }));
-                    }
-                }
-            }
-            Command::Stop { run, response } => {
-                let _ = response.send(self.inbox.stop(run));
-            }
-            Command::Resume if !self.closing => self.inbox.resume(),
-            Command::Resume => {}
             Command::Snapshot(response) => {
                 let _ = response.send(Snapshot {
                     run: self.inbox.run(),
@@ -630,32 +431,262 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
                     },
                     paused: self.inbox.is_paused(),
                     pending_inputs: self.inbox.pending().count(),
-                    committed_messages: self.conversation.messages().len(),
+                    committed_entries: self.conversation.entries().len(),
+                    revision: self.revision,
                 });
             }
-            Command::Compact(response) => {
+            Command::Request {
+                request,
+                response,
+                completion,
+            } => {
                 if self.closing {
-                    let _ = response.send(Err(CompactionError::Closed));
-                } else {
-                    self.compaction_requests.push(response);
+                    let _ = response.send(Err(RequestError::Closed));
+                    return;
                 }
+                if let Err(reason) = self.host.admit(&request) {
+                    let _ = response.send(Err(RequestError::Rejected(reason)));
+                    return;
+                }
+                let Request { source, kind } = *request;
+                if let RequestKind::Compact = kind {
+                    // Answered when the summary is applied or fails.
+                    self.compaction_requests.push(response);
+                    return;
+                }
+                let result = self.request(source, kind, completion, emit);
+                let _ = response.send(result);
             }
-            Command::ProducerClosed { source, response } => {
+        }
+    }
+
+    fn request(
+        &mut self,
+        source: H::Source,
+        kind: RequestKind<H>,
+        completion: Option<CompletionResponder>,
+        emit: &mut impl FnMut(AgentEvent<H>),
+    ) -> Result<Response<H>, RequestError> {
+        match kind {
+            RequestKind::Input {
+                id,
+                payload,
+                delivery,
+                policy,
+            } => {
+                if completion.is_some() && self.inbox.is_paused() {
+                    return Err(RequestError::Rejected(
+                        "session is paused; resume before requesting another run".into(),
+                    ));
+                }
+                let rendered = Message::new(Role::User, payload.render());
+                if rendered.content.is_empty() {
+                    return Err(RequestError::Rejected("input renders no content".into()));
+                }
+                rendered
+                    .validate()
+                    .map_err(|error| RequestError::Rejected(error.to_string()))?;
+                let input = Input {
+                    id,
+                    source: source.clone(),
+                    payload,
+                    policy,
+                };
+                let admitted = self
+                    .inbox
+                    .admit(input, delivery)
+                    .map_err(|rejected| RequestError::State(rejected.reason))?;
+                if let Some(completion) = completion {
+                    self.bind_completion(id, admitted.location, completion);
+                }
+                self.emit(
+                    EventKind::InputAdmitted {
+                        id,
+                        source,
+                        delivery,
+                        location: admitted.location,
+                    },
+                    emit,
+                );
+                self.wake_waits();
+                if let Some(discarded) = &admitted.discarded {
+                    self.discard(vec![discarded.clone()], emit);
+                }
+                Ok(Response::Admitted(admitted))
+            }
+            RequestKind::EditInput { id, payload } => {
+                self.inbox.edit(id, payload)?;
+                Ok(Response::Done)
+            }
+            RequestKind::RemoveInput { id } => {
+                let input = self.inbox.remove(id)?;
+                self.discard(vec![input.clone()], emit);
+                Ok(Response::Removed(input))
+            }
+            RequestKind::RedirectInput { id, delivery } => {
+                let admitted = self.inbox.redirect(id, delivery)?;
+                if let Some(completion) = self.pending_completions.remove(&id) {
+                    self.bind_completion(id, admitted.location, completion);
+                }
+                self.wake_waits();
+                if let Some(discarded) = &admitted.discarded {
+                    self.discard(vec![discarded.clone()], emit);
+                }
+                Ok(Response::Admitted(admitted))
+            }
+            RequestKind::MoveInput { id, before } => {
+                self.inbox.move_before(id, before)?;
+                Ok(Response::Done)
+            }
+            RequestKind::SourceClosed => {
                 let withdrawn = self.inbox.producer_closed(&source);
                 self.discard(withdrawn.inputs.clone(), emit);
-                let _ = response.send(withdrawn);
+                Ok(Response::Withdrawn(withdrawn))
             }
-            Command::Shutdown => {
+            RequestKind::Stop { run } => {
+                self.inbox.stop(run)?;
+                Ok(Response::Done)
+            }
+            RequestKind::Resume => {
+                self.inbox.resume();
+                Ok(Response::Done)
+            }
+            RequestKind::Compact => unreachable!("compaction requests are deferred"),
+            RequestKind::Shutdown => {
                 self.closing = true;
                 self.commands.close();
                 self.cancel_compaction(emit);
                 let withdrawn = self.inbox.shutdown();
                 self.discard(withdrawn.inputs, emit);
+                Ok(Response::Done)
+            }
+            RequestKind::ReplaceDefinition {
+                definition,
+                provider,
+            } => {
+                definition
+                    .model
+                    .validate()
+                    .map_err(|error| RequestError::Rejected(error.to_string()))?;
+                if !definition.has_dynamic_tools() && !self.dynamic.is_empty() {
+                    return Err(RequestError::Rejected(
+                        "the session has dynamic tools, which need call_tool".into(),
+                    ));
+                }
+                let tools = ToolSnapshot::new(&definition, &self.registry, self.dynamic.clone())
+                    .map_err(RequestError::Rejected)?;
+                self.definition = definition;
+                self.tools = Arc::new(tools);
+                if let Some(provider) = provider {
+                    self.provider = provider;
+                }
+                self.revision.0 += 1;
+                let revision = self.revision;
+                self.emit(EventKind::DefinitionReplaced { revision }, emit);
+                Ok(Response::DefinitionReplaced(revision))
+            }
+            RequestKind::Configure(change) => {
+                self.emit(EventKind::ConfigurationChanged(change.clone()), emit);
+                self.configuration.apply(change);
+                Ok(Response::Done)
+            }
+            RequestKind::DynamicTools(change) => {
+                if !self.definition.has_dynamic_tools() {
+                    return Err(RequestError::Rejected(
+                        "the definition does not offer call_tool".into(),
+                    ));
+                }
+                let event = match change {
+                    DynamicToolChange::Add(tool) => {
+                        let tool = tool_runtime::RegisteredTool::new(tool)
+                            .map_err(|error| RequestError::Rejected(error.message))?;
+                        let name = tool.descriptor.name().to_owned();
+                        if BUILTIN_TOOLS.contains(&name.as_str())
+                            || self.definition.tools.contains(&name)
+                        {
+                            return Err(RequestError::Rejected(format!(
+                                "{name} is already offered directly"
+                            )));
+                        }
+                        self.dynamic
+                            .insert(tool)
+                            .map_err(|error| RequestError::Rejected(error.message))?;
+                        EventKind::DynamicToolAdded(name)
+                    }
+                    DynamicToolChange::Remove(name) => {
+                        self.dynamic.remove(&name).ok_or_else(|| {
+                            RequestError::Rejected(format!("no dynamic tool named {name}"))
+                        })?;
+                        EventKind::DynamicToolRemoved(name)
+                    }
+                };
+                self.tools = Arc::new(
+                    ToolSnapshot::new(&self.definition, &self.registry, self.dynamic.clone())
+                        .expect("the current definition resolves"),
+                );
+                self.emit(event, emit);
+                Ok(Response::Done)
+            }
+            RequestKind::ResolveApproval { call, decision } => {
+                let active = self
+                    .active
+                    .as_mut()
+                    .filter(|active| {
+                        active
+                            .approval
+                            .as_ref()
+                            .is_some_and(|pending| pending.call == call)
+                    })
+                    .ok_or(RequestError::NoApproval(call))?;
+                let pending = active.approval.take().expect("matched approval");
+                if decision == ApprovalDecision::AllowForRun {
+                    active.grants.push(Grant {
+                        tool: active
+                            .current_tool
+                            .clone()
+                            .expect("approval has a resolved tool"),
+                        access: pending.access,
+                    });
+                }
+                let _ = pending.respond.send(decision);
+                Ok(Response::Done)
             }
         }
     }
 
-    fn advance(&mut self, emit: &mut impl FnMut(AgentEvent<S>)) {
+    fn bind_completion(
+        &mut self,
+        id: InputId,
+        location: Admission,
+        completion: CompletionResponder,
+    ) {
+        match location {
+            Admission::Queued => {
+                self.pending_completions.insert(id, completion);
+            }
+            Admission::Active(_) => {
+                self.active
+                    .as_mut()
+                    .expect("active admission")
+                    .completions
+                    .insert(id, completion);
+            }
+            Admission::Discarded => {
+                let _ = completion.send(Err(PromptError::Discarded));
+            }
+        }
+    }
+
+    /// An interjection wakes only the current call's cooperative wait.
+    fn wake_waits(&self) {
+        if matches!(self.inbox.signal(), Some(Signal::YieldWait(_)))
+            && let Some(active) = &self.active
+        {
+            active.control.yield_wait.cancel();
+        }
+    }
+
+    fn advance(&mut self, emit: &mut impl FnMut(AgentEvent<H>)) {
         if self.active.is_none() {
             if self.maybe_compact(false, emit) {
                 return;
@@ -668,12 +699,12 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
                 return;
             };
             let id = self.inbox.run().expect("reserved run");
-            let input_id = self
+            let first = &self
                 .inbox
                 .batch(delivery)
                 .expect("initial reservation")
-                .inputs[0]
-                .id;
+                .inputs[0];
+            let (input_id, origin) = (first.id, first.source.clone());
             let completions = self
                 .pending_completions
                 .remove(&input_id)
@@ -682,12 +713,17 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
                 .collect();
             self.active = Some(Active {
                 id,
+                origin,
                 phase: Phase::Idle,
-                turns: 0,
+                steps: 0,
                 next: Next::Sample,
+                step: None,
                 calls: VecDeque::new(),
                 current: None,
+                current_tool: None,
                 dispatched: false,
+                approval: None,
+                grants: Vec::new(),
                 compaction_attempted: false,
                 control: CallControl::default(),
                 completions,
@@ -696,7 +732,6 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
             self.emit(EventKind::RunStarted, emit);
             if let Err(error) = self.deliver(delivery, emit) {
                 self.finish(RunOutcome::Failed, Some(error.into()), emit);
-                return;
             }
             // Return to command processing before inference can start.
             return;
@@ -704,20 +739,7 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
         let id = self.active.as_ref().expect("active run").id;
         if matches!(self.active.as_ref().expect("active run").next, Next::Tools) {
             if let Some(call) = self.active.as_mut().expect("active run").calls.pop_front() {
-                let active = self.active.as_mut().expect("active run");
-                active.current = Some(call.clone());
-                active.dispatched = false;
-                active.control = CallControl::default();
-                if matches!(self.inbox.signal(), Some(Signal::YieldWait(_))) {
-                    active.control.yield_wait.cancel();
-                }
-                self.work = Some(
-                    self.executor
-                        .execute(id, call, active.control.clone())
-                        .map(WorkEvent::Tool)
-                        .boxed(),
-                );
-                self.phase(Phase::ExecutingTools, emit);
+                self.start_call(call, emit);
                 return;
             }
             self.active.as_mut().expect("active run").next = Next::Sample;
@@ -747,53 +769,165 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
         if self.maybe_compact(true, emit) {
             return;
         }
-        let active = self.active.as_mut().expect("active run");
-        if active.turns >= self.max_model_turns.get() {
-            self.finish(RunOutcome::Failed, Some(RunError::TurnLimit), emit);
+        if self.active.as_ref().expect("active run").steps >= self.configuration.max_steps.get() {
+            self.finish(RunOutcome::Failed, Some(RunError::StepLimit), emit);
             return;
         }
-        active.turns += 1;
-        let mut request = self.request.clone();
-        request.messages = self.conversation.model_messages();
+        // Changes since the last step reach the model before it samples.
+        let update = self.context_update();
+        if let Err(error) = self.commit_context(update, emit) {
+            self.finish(RunOutcome::Failed, Some(error.into()), emit);
+            return;
+        }
+        let request = self.completion_request();
+        let active = self.active.as_mut().expect("active run");
+        active.steps += 1;
+        active.step = Some(Step {
+            tools: self.tools.clone(),
+            revision: self.revision,
+        });
         self.work = Some(model::sample(
             self.provider.clone(),
-            self.model.clone(),
+            self.definition.model.clone(),
             request,
         ));
         self.phase(Phase::Sampling, emit);
     }
 
+    fn start_call(&mut self, call: ToolCall, emit: &mut impl FnMut(AgentEvent<H>)) {
+        let yield_now = matches!(self.inbox.signal(), Some(Signal::YieldWait(_)));
+        let active = self.active.as_mut().expect("active run");
+        active.current = Some(call.clone());
+        active.current_tool = None;
+        active.dispatched = false;
+        active.control = CallControl::default();
+        if yield_now {
+            active.control.yield_wait.cancel();
+        }
+        let scope = CallScope {
+            host: self.host.clone(),
+            tools: active
+                .step
+                .as_ref()
+                .expect("calls follow a step")
+                .tools
+                .clone(),
+            origin: active.origin.clone(),
+            permissions: self.configuration.permissions.clone(),
+            grants: active.grants.clone(),
+        };
+        self.work = Some(
+            executor::execute(scope, call, active.control.clone())
+                .map(WorkEvent::Tool)
+                .boxed(),
+        );
+        self.phase(Phase::ExecutingTools, emit);
+    }
+
+    /// The request for the next step, assembled from the definition, the
+    /// configuration, the tools, and the conversation. Never stored.
+    pub(crate) fn completion_request(&self) -> CompletionRequest {
+        let messages = self.conversation.model_messages();
+        let tools = self.tools.definitions();
+        let instructions = self
+            .definition
+            .instructions
+            .clone()
+            .filter(|text| !text.trim().is_empty());
+        let mut cache = Vec::new();
+        if !tools.is_empty() {
+            cache.push(CachePoint::AfterTools);
+        }
+        if instructions.is_some() {
+            cache.push(CachePoint::AfterInstructions);
+        }
+        if let Some(last) = messages.last() {
+            cache.push(CachePoint::AfterMessage(last.id.clone()));
+        }
+        let sampling = &self.configuration.sampling;
+        CompletionRequest {
+            instructions,
+            messages,
+            tools,
+            cache,
+            thinking: self.definition.thinking.clone(),
+            max_output_tokens: sampling.max_output_tokens,
+            temperature: sampling.temperature,
+            top_p: sampling.top_p,
+            stop: sampling.stop.clone(),
+            seed: sampling.seed,
+            options: self.definition.options.clone(),
+        }
+    }
+
+    fn context_update(&self) -> ContextUpdate<H::Source> {
+        let tools = self.tools.base_descriptors();
+        let dynamic_tools = self.tools.dynamic_descriptors();
+        let view = SessionView {
+            host: &*self.host,
+            definition: &self.definition,
+            revision: self.revision,
+            configuration: &self.configuration,
+            tools: &tools,
+            dynamic_tools: &dynamic_tools,
+        };
+        context::update(&self.sections, &view, &self.conversation)
+    }
+
+    fn commit_context(
+        &mut self,
+        update: ContextUpdate<H::Source>,
+        emit: &mut impl FnMut(AgentEvent<H>),
+    ) -> Result<(), ConversationError> {
+        if update.is_empty() {
+            return Ok(());
+        }
+        let at = self.conversation.entries().len();
+        if let Some(entry) = update.entry {
+            self.append(entry, emit)?;
+        }
+        for (section, snapshot) in update.snapshots {
+            self.conversation.deliver(section, snapshot, at);
+        }
+        Ok(())
+    }
+
+    /// Commits a reservation: pending context notes first, then the inputs,
+    /// in one atomic append.
     fn deliver(
         &mut self,
-        delivery: agent_input::DeliveryId,
-        emit: &mut impl FnMut(AgentEvent<S>),
+        delivery: DeliveryId,
+        emit: &mut impl FnMut(AgentEvent<H>),
     ) -> Result<(), ConversationError> {
         self.phase(Phase::PreparingInput, emit);
+        let update = self.context_update();
+        let start = self.conversation.entries().len();
         let conversation = &mut self.conversation;
-        let batch = self
-            .inbox
+        let context_entry = update.entry.clone();
+        self.inbox
             .commit(delivery, |batch| {
-                conversation
-                    .append(
-                        batch
-                            .inputs
-                            .iter()
-                            .map(|input| input.payload.clone())
-                            .collect(),
-                    )
-                    .map(|_| ())
+                let entries = context_entry
+                    .into_iter()
+                    .chain(batch.inputs.iter().map(|input| Entry {
+                        message: Message::new(Role::User, input.payload.render()),
+                        origin: Origin::Input {
+                            id: input.id,
+                            source: input.source.clone(),
+                        },
+                    }))
+                    .collect();
+                conversation.append(entries).map(|_| ())
             })
             .expect("owned delivery")?;
-        let start = self.conversation.messages().len() - batch.inputs.len();
-        for (offset, input) in batch.inputs.into_iter().enumerate() {
+        for (section, snapshot) in update.snapshots {
+            self.conversation.deliver(section, snapshot, start);
+        }
+        let committed: Vec<_> = self.conversation.entries()[start..].to_vec();
+        for (offset, entry) in committed.into_iter().enumerate() {
             self.emit(
                 EventKind::MessageCommitted {
                     index: start + offset,
-                    message: input.payload,
-                    input: Some(InputOrigin {
-                        id: input.id,
-                        source: input.source,
-                    }),
+                    entry,
                 },
                 emit,
             );
@@ -801,7 +935,7 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
         Ok(())
     }
 
-    fn observe(&mut self, event: WorkEvent, emit: &mut impl FnMut(AgentEvent<S>)) {
+    fn observe(&mut self, event: WorkEvent<H::Access>, emit: &mut impl FnMut(AgentEvent<H>)) {
         match event {
             WorkEvent::Compaction(result) => self.complete_compaction(result, emit),
             WorkEvent::Preview { index, delta } => {
@@ -841,13 +975,22 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
                         _ => None,
                     })
                     .collect::<VecDeque<_>>();
-                let reply = message.clone();
-                if let Err(error) = self.append(message, emit) {
+                let revision = self
+                    .active
+                    .as_ref()
+                    .and_then(|active| active.step.as_ref())
+                    .expect("model reply belongs to a step")
+                    .revision;
+                let entry = Entry {
+                    message: message.clone(),
+                    origin: Origin::Model { revision },
+                };
+                if let Err(error) = self.append(entry, emit) {
                     self.finish(RunOutcome::Failed, Some(error.into()), emit);
                     return;
                 }
                 let active = self.active.as_mut().expect("model belongs to run");
-                active.reply = Some(reply);
+                active.reply = Some(message);
                 active.next = if calls.is_empty() {
                     Next::Complete
                 } else {
@@ -856,26 +999,39 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
                 active.calls = calls;
             }
             WorkEvent::Tool(event) => {
-                let call = self
-                    .active
-                    .as_ref()
-                    .and_then(|active| active.current.clone())
-                    .expect("tool belongs to run");
+                let active = self.active.as_mut().expect("tool belongs to run");
+                let call = active.current.clone().expect("tool belongs to run");
                 match event {
-                    ExecutionEvent::AwaitingApproval => self.phase(Phase::AwaitingApproval, emit),
-                    ExecutionEvent::WaitingForCapacity => self.phase(Phase::WaitingForTool, emit),
+                    ExecutionEvent::Resolved(tool) => active.current_tool = Some(tool),
+                    ExecutionEvent::AwaitingApproval { access, respond } => {
+                        active.approval = Some(PendingApproval {
+                            call: call.id.clone(),
+                            access: access.clone(),
+                            respond,
+                        });
+                        let tool = active
+                            .current_tool
+                            .clone()
+                            .expect("resolved before approval");
+                        self.phase(Phase::AwaitingApproval, emit);
+                        self.emit(EventKind::ApprovalRequested { call, tool, access }, emit);
+                    }
                     ExecutionEvent::Started => {
-                        self.active.as_mut().expect("active run").dispatched = true;
+                        active.dispatched = true;
+                        active.approval = None;
+                        let tool = active.current_tool.clone().expect("resolved before start");
                         self.phase(Phase::ExecutingTools, emit);
-                        self.emit(EventKind::ToolStarted(call), emit);
+                        self.emit(EventKind::ToolStarted { call, tool }, emit);
                     }
                     ExecutionEvent::Progress(progress) => {
                         self.emit(EventKind::ToolProgress { call, progress }, emit)
                     }
                     ExecutionEvent::Finished(result) => {
                         self.work = None;
-                        self.settle(call, result, emit);
-                        self.active.as_mut().expect("active run").current = None;
+                        let tool = active.current_tool.take();
+                        active.current = None;
+                        active.approval = None;
+                        self.settle(call, tool, result, emit);
                     }
                 }
             }
@@ -884,56 +1040,32 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
 
     fn append(
         &mut self,
-        message: Message,
-        emit: &mut impl FnMut(AgentEvent<S>),
+        entry: Entry<H::Source>,
+        emit: &mut impl FnMut(AgentEvent<H>),
     ) -> Result<(), ConversationError> {
-        let index = self.conversation.append(vec![message.clone()])?;
-        self.emit(
-            EventKind::MessageCommitted {
-                index,
-                message,
-                input: None,
-            },
-            emit,
-        );
+        let index = self.conversation.append(vec![entry.clone()])?;
+        self.emit(EventKind::MessageCommitted { index, entry }, emit);
         Ok(())
     }
 
     fn settle(
         &mut self,
         call: ToolCall,
+        tool: Option<String>,
         result: Result<TypedToolOutput, ToolError>,
-        emit: &mut impl FnMut(AgentEvent<S>),
+        emit: &mut impl FnMut(AgentEvent<H>),
     ) {
-        let (content, is_error) = match &result {
-            Ok(output) => (output.model_output.clone(), false),
-            Err(error) => (
-                vec![ToolResultContent::Json {
-                    value: serde_json::to_value(error).expect("tool error is serializable"),
-                }],
-                true,
-            ),
-        };
-        let message = Message::new(
-            Role::Tool,
-            vec![Content::ToolResult(ToolResult {
-                call: call.id.clone(),
-                provider_id: call.provider_id.clone(),
-                name: Some(call.name.clone()),
-                content,
-                is_error,
-            })],
-        );
-        self.append(message, emit)
+        let entry = result_entry(&call, &result);
+        self.append(entry, emit)
             .expect("owned outstanding tool call");
-        self.emit(EventKind::ToolFinished { call, result }, emit);
+        self.emit(EventKind::ToolFinished { call, tool, result }, emit);
     }
 
     fn finish(
         &mut self,
         outcome: RunOutcome,
         error: Option<RunError>,
-        emit: &mut impl FnMut(AgentEvent<S>),
+        emit: &mut impl FnMut(AgentEvent<H>),
     ) {
         let id = self.active.as_ref().expect("finishing active run").id;
         if outcome != RunOutcome::Completed {
@@ -945,14 +1077,22 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
                 .control
                 .cancellation
                 .cancel();
+            // Dropping the work drops a parked approval, so a late answer
+            // finds no call to resolve.
             self.work = None;
             for call in self.conversation.pending_calls() {
-                let active = self.active.as_ref().expect("active run");
-                let may_have_started = active.dispatched
-                    && active
-                        .current
-                        .as_ref()
-                        .is_some_and(|current| current.id == call.id);
+                let active = self.active.as_mut().expect("active run");
+                active.approval = None;
+                let current = active
+                    .current
+                    .as_ref()
+                    .is_some_and(|current| current.id == call.id);
+                let may_have_started = active.dispatched && current;
+                let tool = if current {
+                    active.current_tool.clone()
+                } else {
+                    None
+                };
                 let error = ToolError::new(
                     ToolErrorKind::Cancelled,
                     if may_have_started {
@@ -962,7 +1102,7 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
                     },
                 )
                 .with_details(serde_json::json!({"execution_may_have_started": may_have_started}));
-                self.settle(call, Err(error), emit);
+                self.settle(call, tool, Err(error), emit);
             }
         }
         let discarded = self
@@ -997,7 +1137,11 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
         self.active = None;
     }
 
-    fn discard(&mut self, inputs: Vec<Input<S, Message>>, emit: &mut impl FnMut(AgentEvent<S>)) {
+    fn discard(
+        &mut self,
+        inputs: Vec<Input<H::Source, H::Input>>,
+        emit: &mut impl FnMut(AgentEvent<H>),
+    ) {
         for input in &inputs {
             if let Some(response) = self.pending_completions.remove(&input.id) {
                 let _ = response.send(Err(PromptError::Discarded));
@@ -1013,7 +1157,7 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
         }
     }
 
-    fn phase(&mut self, phase: Phase, emit: &mut impl FnMut(AgentEvent<S>)) {
+    fn phase(&mut self, phase: Phase, emit: &mut impl FnMut(AgentEvent<H>)) {
         let active = self.active.as_mut().expect("phase has a run");
         if active.phase != phase {
             active.phase = phase;
@@ -1021,7 +1165,7 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
         }
     }
 
-    fn emit(&mut self, kind: EventKind<S>, emit: &mut impl FnMut(AgentEvent<S>)) {
+    fn emit(&mut self, kind: EventKind<H>, emit: &mut impl FnMut(AgentEvent<H>)) {
         let sequence = self.sequence;
         self.sequence += 1;
         emit(AgentEvent {
@@ -1032,18 +1176,45 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
     }
 }
 
+/// The correlated result entry for a call; errors become JSON the model reads.
+fn result_entry<S>(call: &ToolCall, result: &Result<TypedToolOutput, ToolError>) -> Entry<S> {
+    let (content, is_error) = match result {
+        Ok(output) => (output.model_output.clone(), false),
+        Err(error) => (
+            vec![ToolResultContent::Json {
+                value: serde_json::to_value(error).expect("tool error is serializable"),
+            }],
+            true,
+        ),
+    };
+    Entry {
+        message: Message::new(
+            Role::Tool,
+            vec![Content::ToolResult(ToolResult {
+                call: call.id.clone(),
+                provider_id: call.provider_id.clone(),
+                name: Some(call.name.clone()),
+                content,
+                is_error,
+            })],
+        ),
+        origin: Origin::Tool,
+    }
+}
+
+/// The model's reply may run its calls only when it finished normally and
+/// every call's arguments are a JSON object.
 fn usable(message: &Message) -> Result<(), RunError> {
     let reason = message
         .generation
         .as_ref()
-        .and_then(|metadata| metadata.finish_reason.as_deref());
-    if !matches!(
-        reason,
-        Some("stop" | "tool_calls" | "end_turn" | "tool_use")
-    ) {
+        .and_then(|metadata| metadata.finish_reason.as_ref());
+    if !matches!(reason, Some(FinishReason::Stop | FinishReason::ToolCalls)) {
         return Err(RunError::Completion(format!("finish reason {reason:?}")));
     }
-    if message.content.iter().any(|content| matches!(content, Content::ToolCall(call) if matches!(call.arguments, ToolArguments::Invalid { .. }))) {
+    if message.content.iter().any(|content| {
+        matches!(content, Content::ToolCall(call) if matches!(call.arguments, ToolArguments::Invalid { .. }))
+    }) {
         return Err(RunError::Completion("malformed tool arguments".into()));
     }
     Ok(())

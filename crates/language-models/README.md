@@ -2,23 +2,25 @@
 
 The new provider stack lives alongside Cowork's Rig integration. Cowork does not
 use these crates yet; its agent loop, database, and sharing protocol are unchanged.
-The examples exercise both individual providers and the new session runtime.
+The examples run the [agent runtime](../agent-runtime/README.md) on these
+providers.
 
 ## Examples
 
-Two minimal examples print text as it streams from local Ollama, using
-`qwen3.8:27b` with medium thinking. Both use the same shared request field:
-
-```rust
-thinking: Some(Thinking::Effort("medium".into())),
-```
+Both use local Ollama at `http://localhost:11434` with `gemma4:e4b`, thinking
+disabled:
 
 ```text
-cargo run -p language-models --example ollama
-cargo run -p language-models --example openai_compatible
+cargo run -p language-models --example prompt   # define an agent, prompt it
+cargo run -p language-models --example agent    # host, tools, approvals, dynamic tools
 ```
 
-Both use `http://localhost:11434`; the compatible example uses its `/v1` API.
+`prompt` is the managed API: an `AgentDefinition`, `Agent::builder`, `prompt`,
+and `close`. `agent` implements its own `AgentHost`: note tools reach an
+application service through their typed `Context`, writing needs approval
+(answered with a `ResolveApproval` request from a UI task), a `Configure`
+request changes the policy and the model is told in a context note, and a
+dynamic tool is added and found through `search_tools` and `call_tool`.
 
 | Crate | Responsibility |
 | --- | --- |
@@ -121,56 +123,26 @@ and compatible Ollama APIs. Run with a local server and installed model:
 cargo test -p language-models --test live_ollama -- --ignored --nocapture --test-threads=1
 ```
 
-They default to `qwen3.8:27b` with medium thinking. `OLLAMA_URL` and `OLLAMA_MODEL`
-can select another server/model; the model must support the chosen controls.
+`tests/live_agent.rs` runs an agent with a base tool and a dynamic tool reached
+through `call_tool`:
+
+```text
+cargo test -p language-models --test live_agent -- --ignored --nocapture
+```
+
+They default to `gemma4:e4b`. `OLLAMA_URL` and `OLLAMA_MODEL` select another
+server or model; the model must support tools and the chosen controls.
 
 
 ## Anthropic
 
 `Anthropic::new("https://api.anthropic.com/v1")?.with_api_key(key)?` supplies
 another implementation of the same provider trait. Set `max_output_tokens`
-explicitly. Run `cargo run -p language-models --example anthropic` with
-`ANTHROPIC_API_KEY` and `ANTHROPIC_MODEL` set. Shared thinking uses adaptive mode; legacy budgets and native cache
-controls are available through `anthropic-types::MessagesRequest`. Signed
+explicitly. Shared thinking uses adaptive mode; `CompletionRequest::cache`
+points become `cache_control` breakpoints, and legacy budgets are available
+through `anthropic-types::MessagesRequest`. Signed
 thinking replay survives the shared message envelope. See
 [the client documentation](../providers/anthropic/client/README.md) for the
 supported subset and transport behavior.
 
-## Minimal agent loop
 
-The new [agent-runtime](../agent-runtime/README.md) also provides a session driver
-with input queues, steering, run cancellation, host approval policy, conversation
-commitment, and ordered events. Its [session example](examples/agent_session.rs)
-uses the same providers and tool primitives:
-
-```text
-cargo run -p language-models --example agent_session
-```
-
-The session example uses the managed `Agent::builder`, `prompt`, `compact`, and
-`close` API, with a reusable `AgentDefinition` for its prompt, tool selection,
-permissions, and thinking settings. It hardcodes Ollama at `http://localhost:11434`, `qwen3.8:27b` with
-thinking disabled, and saved-session reuse at `/tmp/cowork-agent-session`; it
-reads no environment variables. It explicitly allows its `add` tool, saves JSONL
-transcript events, requests manual compaction, and asks a follow-up question.
-Compaction preserves the full transcript. Agent operations enqueue writes without
-waiting for a durable commit. Cowork still uses Rig; app integration remains
-separate work.
-
-[The agent loop example](examples/agent_loop.rs) registers an `add` tool, sends
-its definition with a request, dispatches completed tool calls through
-`ToolDispatch`, and sends correlated results back on the next model turn.
-The loop takes provider and dispatcher trait objects, so the same code can use
-another provider or a dispatcher wrapped with host permissions.
-
-```text
-OLLAMA_MODEL=<installed-model> cargo run -p language-models --example agent_loop
-```
-
-`OLLAMA_URL` optionally changes the default `http://localhost:11434`. The selected
-model needs tool-calling support. Calls run sequentially; errors become model
-feedback with `is_error: true`. Complete assistant messages are retained,
-including native thinking replay. The example stops before dispatch on malformed
-arguments or incomplete, truncated, refused, or unrecognized completion outcomes,
-and limits the conversation to eight model turns. It collects model and tool
-streams instead of displaying their progress.

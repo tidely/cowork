@@ -116,9 +116,8 @@ here introduce no new wire or storage format.
 
 ## Placement in the new stack
 
-The driver demonstrated by `language-models/examples/agent_session.rs` uses this
-layer above `LanguageModelProvider` and `ToolDispatch`. The integration boundaries
-are:
+The [agent-runtime](../agent-runtime/README.md) session uses this layer above
+`LanguageModelProvider` and `tool-runtime`. The integration boundaries are:
 
 - Commit the initial input before building `CompletionRequest.messages`.
 - Keep `CompletionEvent` deltas provisional. Steering does not modify a request
@@ -134,9 +133,9 @@ are:
   HTTP work does not prove remote computation stopped. The loop must resolve
   outstanding tool-call correlation before reusing that history.
 
-`Payload` can hold `language_model::Message`, a richer submitted message group,
-or an enum for model-visible context and synthetic wake prompts. Untrusted
-source text must not be converted to privileged system messages by default.
-Application history, permissions, formatting and event journaling remain with
-the host. Providers still execute one request; tool-runtime still executes one
-dispatch. This crate makes no tools or model requests itself.
+`Payload` is application data; agent-runtime uses its host's typed `Input` and
+renders it to user content only when it is committed, so untrusted source text
+never becomes a privileged message. Application history, permissions,
+formatting and event journaling remain with the host. Providers still execute
+one request; tool-runtime still executes one call. This crate makes no tools or
+model requests itself.

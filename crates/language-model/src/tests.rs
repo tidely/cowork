@@ -54,7 +54,7 @@ fn frozen_record_migrates_without_losing_content_or_provider_replay() {
     reply.generation = Some(GenerationMetadata {
         provider: "future-provider".into(),
         model: Some("m".into()),
-        finish_reason: Some("future-reason".into()),
+        finish_reason: Some(FinishReason::Other("future-reason".into())),
         usage: Some(Usage {
             output_tokens: Some(2),
             ..Usage::default()
@@ -200,6 +200,18 @@ fn request_validation_rejects_ambiguous_tools_and_out_of_range_controls() {
         },
         CompletionRequest {
             stop: vec![String::new()],
+            ..valid.clone()
+        },
+        CompletionRequest {
+            instructions: Some(" ".into()),
+            ..valid.clone()
+        },
+        CompletionRequest {
+            messages: vec![Message::new(Role::System, vec![Content::text("rules")])],
+            ..valid.clone()
+        },
+        CompletionRequest {
+            cache: vec![CachePoint::AfterMessage(MessageId::new())],
             ..valid.clone()
         },
     ] {

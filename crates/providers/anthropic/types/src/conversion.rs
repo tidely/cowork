@@ -3,13 +3,44 @@
 use crate as wire;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use language_model::{
-    CompletionRequest, Content, Error, Image, ImageSource, LanguageModel, Message, Reasoning, Role,
-    Thinking, ToolArguments, ToolCall, ToolCallId, ToolResultContent,
+    CachePoint, CompletionRequest, Content, Error, FinishReason, Image, ImageSource, LanguageModel,
+    Message, Reasoning, Role, Thinking, ToolArguments, ToolCall, ToolCallId, ToolResultContent,
 };
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 pub const REPLAY_FORMAT: &str = "anthropic.messages.content";
+
+/// Anthropic accepts at most this many `cache_control` breakpoints.
+const MAX_CACHE_BREAKPOINTS: usize = 4;
+
+impl wire::StopReason {
+    pub fn finish_reason(&self) -> FinishReason {
+        match self {
+            Self::EndTurn | Self::StopSequence => FinishReason::Stop,
+            Self::ToolUse => FinishReason::ToolCalls,
+            Self::MaxTokens | Self::ModelContextWindowExceeded => FinishReason::Length,
+            Self::Refusal => FinishReason::Refusal,
+            Self::PauseTurn | Self::Unknown(_) => FinishReason::Other(self.wire_str()),
+        }
+    }
+}
+
+/// Marks the last block that can carry a breakpoint. Thinking blocks can't.
+fn mark_cache(blocks: &mut [wire::ContentBlock]) {
+    for block in blocks.iter_mut().rev() {
+        match block {
+            wire::ContentBlock::Text { cache_control, .. }
+            | wire::ContentBlock::Image { cache_control, .. }
+            | wire::ContentBlock::ToolUse { cache_control, .. }
+            | wire::ContentBlock::ToolResult { cache_control, .. } => {
+                *cache_control = Some(wire::CacheControl::ephemeral());
+                return;
+            }
+            wire::ContentBlock::Thinking { .. } | wire::ContentBlock::RedactedThinking { .. } => {}
+        }
+    }
+}
 
 fn text(text: String) -> wire::ContentBlock {
     wire::ContentBlock::Text {
@@ -116,28 +147,9 @@ impl wire::MessagesRequest {
             ));
         }
         resolve_history(&mut request.messages)?;
-        let mut system = Vec::new();
+        let points = &request.cache[request.cache.len().saturating_sub(MAX_CACHE_BREAKPOINTS)..];
         for message in request.messages {
             message.validate()?;
-            if message.role == Role::System {
-                if !output.messages.is_empty() || !message.replay.is_empty() {
-                    return Err(Error::Unsupported(
-                        "system messages must precede the conversation and have no replay data"
-                            .into(),
-                    ));
-                }
-                for block in message.content {
-                    let Content::Text { text } = block else {
-                        return Err(invalid("system content must be text"));
-                    };
-                    system.push(wire::TextBlock {
-                        r#type: "text".into(),
-                        text,
-                        cache_control: None,
-                    });
-                }
-                continue;
-            }
             if message.role == Role::Developer {
                 return Err(Error::Unsupported("Anthropic has no developer role".into()));
             }
@@ -146,9 +158,13 @@ impl wire::MessagesRequest {
             } else {
                 wire::MessageRole::User
             };
-            let blocks = message_blocks(message, model)?;
+            let cached = points.contains(&CachePoint::AfterMessage(message.id.clone()));
+            let mut blocks = message_blocks(message, model)?;
             if blocks.is_empty() {
                 return Err(invalid("message content must not be empty"));
+            }
+            if cached {
+                mark_cache(&mut blocks);
             }
             // Consecutive tool messages must share the user turn immediately
             // after the assistant's calls. Merging also follows API role rules.
@@ -167,18 +183,29 @@ impl wire::MessagesRequest {
         if output.messages.is_empty() {
             return Err(invalid("request needs a conversation message"));
         }
-        if !system.is_empty() {
-            output.system = Some(wire::SystemParam::Blocks(system));
+        if let Some(text) = request.instructions {
+            let cache = points.contains(&CachePoint::AfterInstructions);
+            output.system = Some(wire::SystemParam::Blocks(vec![wire::TextBlock {
+                r#type: "text".into(),
+                text,
+                cache_control: cache.then(wire::CacheControl::ephemeral),
+            }]));
         }
-        let tools: Vec<_> = request
+        let mut tools: Vec<_> = request
             .tools
             .into_iter()
             .map(|tool| wire::ToolParam {
                 name: tool.name,
                 description: tool.description,
                 input_schema: Value::Object(tool.parameters),
+                cache_control: None,
             })
             .collect();
+        if points.contains(&CachePoint::AfterTools)
+            && let Some(last) = tools.last_mut()
+        {
+            last.cache_control = Some(wire::CacheControl::ephemeral());
+        }
         output.tools = (!tools.is_empty()).then_some(tools);
         Ok(output)
     }

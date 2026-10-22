@@ -52,7 +52,33 @@ matching_struct!(Usage {
     cached_input_tokens,
     reasoning_tokens
 });
-matching_struct!(GenerationMetadata { provider, model, finish_reason, usage => optional, extra });
+matching_struct!(GenerationMetadata { provider, model, finish_reason => optional, usage => optional, extra });
+
+impl From<v1::FinishReason> for latest::FinishReason {
+    fn from(value: v1::FinishReason) -> Self {
+        match value {
+            v1::FinishReason::Stop => Self::Stop,
+            v1::FinishReason::ToolCalls => Self::ToolCalls,
+            v1::FinishReason::Length => Self::Length,
+            v1::FinishReason::ContentFilter => Self::ContentFilter,
+            v1::FinishReason::Refusal => Self::Refusal,
+            v1::FinishReason::Other(reason) => Self::Other(reason),
+        }
+    }
+}
+
+impl From<latest::FinishReason> for v1::FinishReason {
+    fn from(value: latest::FinishReason) -> Self {
+        match value {
+            latest::FinishReason::Stop => Self::Stop,
+            latest::FinishReason::ToolCalls => Self::ToolCalls,
+            latest::FinishReason::Length => Self::Length,
+            latest::FinishReason::ContentFilter => Self::ContentFilter,
+            latest::FinishReason::Refusal => Self::Refusal,
+            latest::FinishReason::Other(reason) => Self::Other(reason),
+        }
+    }
+}
 matching_struct!(ReplayData {
     provider,
     model,

@@ -166,6 +166,8 @@ pub struct ToolParam {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub input_schema: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_control: Option<CacheControl>,
 }
 
 /// Tool choice (Anthropic Messages API format)
@@ -372,6 +374,8 @@ pub struct ModelInfo {
     pub id: String,
     pub display_name: Option<String>,
     pub max_input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u64>,
     #[serde(default, flatten)]
     pub extra: language_model::JsonObject,
 }

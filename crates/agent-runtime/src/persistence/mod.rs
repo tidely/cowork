@@ -8,14 +8,18 @@ use std::{
 };
 
 use language_model::Envelope;
-use serde::Serialize;
+use serde::{Serialize, de::DeserializeOwned};
 use tokio::{
     fs::{self, File, OpenOptions},
     io::{AsyncWriteExt, BufWriter},
     sync::{mpsc, oneshot},
 };
 
-use crate::{AgentEvent, CompactionError, Conversation, ConversationError};
+use crate::{AgentEvent, AgentHost, CompactionError, Conversation, ConversationError};
+
+/// What a stored source type needs: written with origins, read back on load.
+pub trait StoredSource: Clone + Serialize + DeserializeOwned + Send + Sync + 'static {}
+impl<S: Clone + Serialize + DeserializeOwned + Send + Sync + 'static> StoredSource for S {}
 
 pub mod record;
 use record::{RECORD_TYPE, Record, StoredEvent, StoredEventKind};
@@ -42,14 +46,35 @@ pub enum LogError {
     Task(String),
 }
 
-pub struct LoadedSession {
+/// A loaded session. Delivered context snapshots are not stored, so a
+/// resumed session renders every context section again.
+pub struct LoadedSession<S> {
     /// Seed for replaying updates in order (including provisional UI elements).
-    pub initial_conversation: Conversation,
-    pub conversation: Conversation,
+    pub initial_conversation: Conversation<S>,
+    pub conversation: Conversation<S>,
     /// Includes previews, tool progress and structured outputs, not just messages.
     pub updates: Vec<StoredEvent>,
     pub next_sequence: u64,
     pub ignored_torn_tail: bool,
+}
+
+impl<S> LoadedSession<S> {
+    /// Calls the log records as dispatched (`tool_started`). After a crash,
+    /// unsettled calls not in this set never ran; see
+    /// `AgentSession::with_interrupted_conversation`.
+    pub fn started_calls(&self) -> std::collections::HashSet<language_model::ToolCallId> {
+        self.updates
+            .iter()
+            .filter_map(|event| match &event.event {
+                StoredEventKind::Observation { name, data } if name == "tool_started" => {
+                    data["call"]["id"]
+                        .as_str()
+                        .map(|id| language_model::ToolCallId(id.to_owned()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
 }
 
 enum WriteCommand {
@@ -73,7 +98,10 @@ pub struct LogRecorder {
 }
 
 impl LogRecorder {
-    pub fn record<S: Serialize>(&self, event: &AgentEvent<S>) -> Result<(), LogError> {
+    pub fn record<H: AgentHost>(&self, event: &AgentEvent<H>) -> Result<(), LogError>
+    where
+        H::Source: Serialize,
+    {
         let event = StoredEvent::encode(event)?;
         self.record_encoded(event)
     }
@@ -91,9 +119,9 @@ impl JsonlLog {
             sender: self.sender.clone(),
         }
     }
-    pub async fn create(
+    pub async fn create<S: StoredSource>(
         directory: impl AsRef<Path>,
-        conversation: &Conversation,
+        conversation: &Conversation<S>,
         next_sequence: u64,
     ) -> Result<Self, LogError> {
         let directory = directory.as_ref().to_path_buf();
@@ -115,9 +143,11 @@ impl JsonlLog {
         ))
     }
 
-    pub async fn open(directory: impl AsRef<Path>) -> Result<(Self, LoadedSession), LogError> {
+    pub async fn open<S: StoredSource>(
+        directory: impl AsRef<Path>,
+    ) -> Result<(Self, LoadedSession<S>), LogError> {
         let directory = directory.as_ref().to_path_buf();
-        let loaded = load(&directory).await?;
+        let loaded = load::<S>(&directory).await?;
         let bytes = fs::read(directory.join("updates.jsonl")).await?;
         let file = OpenOptions::new()
             .append(true)
@@ -146,10 +176,10 @@ impl JsonlLog {
         Ok((log, loaded))
     }
 
-    fn spawn(
+    fn spawn<S: StoredSource>(
         directory: PathBuf,
         mut writer: BufWriter<File>,
-        mut conversation: Conversation,
+        mut conversation: Conversation<S>,
         mut next_sequence: u64,
     ) -> Self {
         let (sender, mut receiver) = mpsc::unbounded_channel();
@@ -167,8 +197,8 @@ impl JsonlLog {
                             .checked_add(1)
                             .ok_or_else(|| LogError::Invalid("event sequence overflow".into()))?;
                         let appended = match &event.event {
-                            StoredEventKind::MessageCommitted { message, .. } => {
-                                Some(message.clone())
+                            StoredEventKind::MessageCommitted { entry, .. } => {
+                                Some(entry.message.clone())
                             }
                             _ => None,
                         };
@@ -205,7 +235,10 @@ impl JsonlLog {
         Self { sender, task }
     }
 
-    pub fn record<S: Serialize>(&self, event: &AgentEvent<S>) -> Result<(), LogError> {
+    pub fn record<H: AgentHost>(&self, event: &AgentEvent<H>) -> Result<(), LogError>
+    where
+        H::Source: Serialize,
+    {
         let event = StoredEvent::encode(event)?;
         self.sender
             .send(WriteCommand::Event(Box::new(event)))
@@ -233,7 +266,9 @@ impl JsonlLog {
 /// Load the complete transcript and rebuild its independent model-context view.
 /// An invalid unterminated last JSON line is ignored as a torn append. Unknown
 /// schemas and corruption in complete lines are errors, never destructive repair.
-pub async fn load(directory: impl AsRef<Path>) -> Result<LoadedSession, LogError> {
+pub async fn load<S: StoredSource>(
+    directory: impl AsRef<Path>,
+) -> Result<LoadedSession<S>, LogError> {
     let bytes = fs::read(directory.as_ref().join("updates.jsonl")).await?;
     let mut conversation = None;
     let mut initial_conversation = None;
@@ -260,18 +295,19 @@ pub async fn load(directory: impl AsRef<Path>) -> Result<LoadedSession, LogError
         }
         match serde_json::from_value::<Record>(envelope.payload)? {
             Record::Initial {
-                messages,
+                entries,
                 compactions,
                 next_sequence: sequence,
             } => {
                 if conversation.is_some() {
                     return Err(LogError::Invalid("duplicate initial snapshot".into()));
                 }
-                let messages = messages
+                let entries = entries
                     .iter()
-                    .map(Envelope::decode_message)
+                    .map(record::StoredEntry::decode)
                     .collect::<Result<_, _>>()?;
-                let mut initial = Conversation::new(messages)?;
+                let mut initial = Conversation::new();
+                initial.append(entries)?;
                 for compaction in compactions {
                     initial.apply_compaction(compaction.decode()?)?;
                 }
@@ -316,7 +352,10 @@ async fn write_record(writer: &mut BufWriter<File>, record: &Record) -> Result<(
     Ok(())
 }
 
-async fn replace_context(directory: &Path, conversation: &Conversation) -> Result<(), LogError> {
+async fn replace_context<S: Clone>(
+    directory: &Path,
+    conversation: &Conversation<S>,
+) -> Result<(), LogError> {
     let temporary = directory.join("chat_history.jsonl.tmp");
     let mut file = BufWriter::new(File::create(&temporary).await?);
     for message in conversation.model_messages() {

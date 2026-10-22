@@ -4,14 +4,14 @@ use std::time::Duration;
 
 use futures::StreamExt as _;
 use language_models::{
-    CompletionRequest, Content, Envelope, LanguageModel, LanguageModelProvider, Message, Ollama,
-    OpenAiCompatible, StreamEvent, Thinking, reqwest,
+    CompletionRequest, Content, Envelope, FinishReason, LanguageModel, LanguageModelProvider,
+    Message, Ollama, OpenAiCompatible, StreamEvent, Thinking, reqwest,
 };
 
 async fn check_stream(native: bool) {
     let base = std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434".into());
     let model =
-        LanguageModel::new(std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen3.8:27b".into()));
+        LanguageModel::new(std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "gemma4:e4b".into()));
     let http = reqwest::Client::builder()
         .no_proxy()
         .timeout(Duration::from_secs(240))
@@ -34,8 +34,11 @@ async fn check_stream(native: bool) {
             .stream(
                 &model,
                 CompletionRequest {
-                    thinking: Some(Thinking::Effort("medium".into())),
-                    max_output_tokens: Some(1024),
+                    instructions: Some("Follow the user's instructions exactly.".into()),
+                    // Compatible endpoints need a configured effort to switch
+                    // thinking; they keep the model's default instead.
+                    thinking: native.then_some(Thinking::Disabled),
+                    max_output_tokens: Some(2048),
                     ..CompletionRequest::new(history.clone())
                 },
             )
@@ -52,6 +55,10 @@ async fn check_stream(native: bool) {
         }
         let reply = completion.expect("stream must finish").message;
         assert!(deltas > 0);
+        assert_eq!(
+            reply.generation.as_ref().unwrap().finish_reason,
+            Some(FinishReason::Stop)
+        );
         assert!(
             reply
                 .content

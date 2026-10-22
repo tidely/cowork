@@ -32,6 +32,13 @@ macro_rules! identity {
                 self.0.fmt(formatter)
             }
         }
+        /// Parses the `Display` form, for hosts that store identities as text.
+        impl std::str::FromStr for $name {
+            type Err = uuid::Error;
+            fn from_str(text: &str) -> Result<Self, Self::Err> {
+                text.parse().map(Self)
+            }
+        }
     };
 }
 

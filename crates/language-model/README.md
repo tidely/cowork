@@ -42,7 +42,10 @@ arrays, scalars, null, and broken JSON stay `Invalid`. Generic validation checks
 role/content combinations. Adapters additionally reject unsupported content,
 invalid correlation, and unrecognized replay data rather than dropping them.
 Local IDs are opaque strings generated as UUIDs; provider IDs are not local
-identities. Unknown token counts stay `None`; finish reasons stay raw strings.
+identities. Unknown token counts stay `None`. Adapters normalize finish reasons
+into `FinishReason` (`Stop`, `ToolCalls`, `Length`, `ContentFilter`, `Refusal`),
+keeping unrecognized ones as `Other(raw)`, so code above the provider never
+matches a provider's own vocabulary.
 
 Base64 images can be persisted inline. URL images retain a reference, not the
 remote bytes; offline durability requires the application to materialize them.
@@ -50,18 +53,35 @@ Replay data is bound by convention to unchanged original content and its
 provider/model. Editing content must clear/regenerate replay data. Exact native
 replay across providers is not promised by a generic message schema.
 
-`LanguageModel` is model information: its ID, display name, context window,
-capabilities, and metadata. Its ID is scoped to the provider connection that
-offers it. Discovery returns these records; `LanguageModel::new(id)` selects a
-known ID without discovery. Missing metadata stays unknown.
+`LanguageModel` is model information: its ID, display name, and the facts code
+above the provider acts on (`context_window`, `max_output_tokens`, `tool_calls`,
+`image_input`, thinking levels), plus everything else the provider reported in
+`metadata`. Its ID is scoped to the provider connection that offers it: the same
+weights served elsewhere can report different values. Discovery returns these
+records; `LanguageModel::new(id)` selects a known ID without discovery. Each
+typed field is `None` when unknown, which is not the same as unsupported.
+
+How a provider's protocol expresses things is not model metadata and has no
+shared capability type: system prompt placement, which roles exist, cache
+markers and their limits, finish strings. The request states intent and each
+adapter maps it (see below).
 
 `LanguageModelProvider` owns the provider connection. Call
 `provider.stream(&model, request)` to generate with a selected model. The model
-is borrowed during startup; the returned stream owns its work. Requests contain
-history, tools, typed controls, and adapter-specific options, without a
-duplicate model ID. `CompletionRequest::new(messages)` and `Message::user`,
-`system`, and `assistant` build the common cases.
-Implementations document accepted option names and refuse unsupported conversion.
+is borrowed during startup; the returned stream owns its work. A request is flat
+plain data, assembled once per model call: `instructions`, history, tools, cache
+points, typed controls, and adapter-specific options, without a duplicate model
+ID. `CompletionRequest::new(messages)` and `Message::user` and `assistant` build
+the common cases. Implementations document accepted option names and refuse
+unsupported conversion.
+
+`instructions` is the system prompt, in its own field rather than a leading
+`System` message, so a system message in the middle of a conversation can't be
+expressed; requests with `System` messages are invalid. Anthropic maps it to
+`system`; chat completions and Ollama prepend it as a system message. `cache`
+lists where the stable prefix ends (`AfterTools`, `AfterInstructions`,
+`AfterMessage(id)`); Anthropic places `cache_control` there (keeping the last
+four), and providers that cache automatically ignore it.
 
 Typed controls exist for what every supported provider adopts:
 `max_output_tokens`, `temperature`, `top_p`, `stop`, and `seed`. `None` (or an

@@ -3,8 +3,8 @@
 use std::time::Duration;
 
 use language_models::{
-    CompletionRequest, Content, Envelope, LanguageModel, LanguageModelProvider, Message, Ollama,
-    OpenAiCompatible, Role, Thinking, collect_completion, reqwest,
+    CompletionRequest, Content, Envelope, FinishReason, LanguageModel, LanguageModelProvider,
+    Message, Ollama, OpenAiCompatible, Role, Thinking, collect_completion, reqwest,
 };
 use serde_json::{Value, json};
 use tokio::{
@@ -107,6 +107,7 @@ async fn both_providers_return_messages_that_cross_the_storage_boundary() {
                 .stream(
                     &model,
                     CompletionRequest {
+                        instructions: Some("Be brief.".into()),
                         thinking: Some(Thinking::Effort("medium".into())),
                         ..CompletionRequest::new(vec![Message::user("Hi")])
                     },
@@ -120,6 +121,8 @@ async fn both_providers_return_messages_that_cross_the_storage_boundary() {
         let completion = collect_completion(stream).await.unwrap();
         assert_eq!(completion.message.role, Role::Assistant);
         assert_eq!(completion.message.content, vec![Content::text("Hello")]);
+        let generation = completion.message.generation.as_ref().unwrap();
+        assert_eq!(generation.finish_reason, Some(FinishReason::Stop));
         let saved = Envelope::encode_message(&completion.message).unwrap();
         let loaded: Envelope =
             serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
@@ -135,6 +138,8 @@ async fn both_providers_return_messages_that_cross_the_storage_boundary() {
         assert_eq!(body["stream"], true);
         let effort_key = if native { "think" } else { "reasoning_effort" };
         assert_eq!(body[effort_key], "medium");
-        assert_eq!(body["messages"][0]["content"], "Hi");
+        assert_eq!(body["messages"][0]["role"], "system");
+        assert_eq!(body["messages"][0]["content"], "Be brief.");
+        assert_eq!(body["messages"][1]["content"], "Hi");
     }
 }

@@ -9,11 +9,13 @@ pub(super) struct Compacting {
     previous_phase: Phase,
 }
 
-impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
+impl<H: AgentHost> AgentSession<H> {
+    /// Starts a summary when one was requested, or when `automatic` and the
+    /// context passed the trigger. Returns whether summarization started.
     pub(super) fn maybe_compact(
         &mut self,
         automatic: bool,
-        emit: &mut impl FnMut(AgentEvent<S>),
+        emit: &mut impl FnMut(AgentEvent<H>),
     ) -> bool {
         let manual = !self.compaction_requests.is_empty();
         // Steering admitted during summarization must not trigger another
@@ -26,20 +28,17 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
         {
             return false;
         }
-        let Some(policy) = self.compaction_policy.as_ref() else {
-            if manual {
-                self.reject_compaction(CompactionError::Disabled, emit);
-            }
-            return false;
-        };
+        let policy = &self.configuration.compaction;
         let stamp = (
-            self.conversation.messages().len(),
+            self.conversation.entries().len(),
             self.conversation.compactions().len(),
         );
         if !manual
             && (!automatic
                 || self.last_compaction_attempt == Some(stamp)
-                || self.conversation.context_bytes() < policy.trigger_bytes.get())
+                || policy
+                    .trigger_bytes
+                    .is_none_or(|trigger| self.conversation.context_bytes() < trigger.get()))
         {
             return false;
         }
@@ -56,7 +55,7 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
                 return false;
             }
         };
-        let request = summary_request(&plan, &self.request);
+        let request = summary_request(&plan, self.completion_request());
         if let Some(active) = &mut self.active {
             active.compaction_attempted = true;
         }
@@ -71,7 +70,7 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
         }
         self.emit(
             EventKind::CompactionStarted {
-                range: plan.range.clone(),
+                end: plan.end,
                 previous_revision: plan.previous_revision,
             },
             emit,
@@ -81,15 +80,19 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
             previous_phase,
         });
         self.work = Some(
-            model::sample(self.provider.clone(), self.model.clone(), request)
-                .filter_map(|event| {
-                    futures::future::ready(match event {
-                        WorkEvent::Model(result) => Some(WorkEvent::Compaction(result)),
-                        WorkEvent::Preview { .. } => None,
-                        _ => unreachable!("summary stream only samples"),
-                    })
+            model::sample::<H::Access>(
+                self.provider.clone(),
+                self.definition.model.clone(),
+                request,
+            )
+            .filter_map(|event| {
+                futures::future::ready(match event {
+                    WorkEvent::Model(result) => Some(WorkEvent::Compaction(result)),
+                    WorkEvent::Preview { .. } => None,
+                    _ => unreachable!("summary stream only samples"),
                 })
-                .boxed(),
+            })
+            .boxed(),
         );
         true
     }
@@ -97,7 +100,7 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
     pub(super) fn complete_compaction(
         &mut self,
         result: Result<Message, language_model::Error>,
-        emit: &mut impl FnMut(AgentEvent<S>),
+        emit: &mut impl FnMut(AgentEvent<H>),
     ) {
         self.work = None;
         let compacting = self
@@ -123,7 +126,7 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
             Ok(compaction) => {
                 self.emit(EventKind::Compacted(compaction.clone()), emit);
                 for response in self.compaction_requests.drain(..) {
-                    let _ = response.send(Ok(compaction.clone()));
+                    let _ = response.send(Ok(Response::Compacted(compaction.clone())));
                 }
             }
             Err(error) => self.reject_compaction(error, emit),
@@ -135,7 +138,7 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
         }
     }
 
-    pub(super) fn cancel_compaction(&mut self, emit: &mut impl FnMut(AgentEvent<S>)) {
+    pub(super) fn cancel_compaction(&mut self, emit: &mut impl FnMut(AgentEvent<H>)) {
         let running = self.compacting.take().is_some();
         if running {
             self.work = None;
@@ -145,10 +148,10 @@ impl<S: Clone + PartialEq + Send + 'static> AgentSession<S> {
         }
     }
 
-    fn reject_compaction(&mut self, error: CompactionError, emit: &mut impl FnMut(AgentEvent<S>)) {
+    fn reject_compaction(&mut self, error: CompactionError, emit: &mut impl FnMut(AgentEvent<H>)) {
         self.emit(EventKind::CompactionFailed(error.clone()), emit);
         for response in self.compaction_requests.drain(..) {
-            let _ = response.send(Err(error.clone()));
+            let _ = response.send(Err(RequestError::Compaction(error.clone())));
         }
     }
 }

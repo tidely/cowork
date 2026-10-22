@@ -7,6 +7,18 @@ use language_model::{
 use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
+/// Normalizes a chat-completions finish reason; servers may add their own.
+pub fn finish_reason(reason: &str) -> language_model::FinishReason {
+    use language_model::FinishReason;
+    match reason {
+        "stop" => FinishReason::Stop,
+        "tool_calls" | "function_call" => FinishReason::ToolCalls,
+        "length" => FinishReason::Length,
+        "content_filter" => FinishReason::ContentFilter,
+        other => FinishReason::Other(other.into()),
+    }
+}
+
 impl wire::ChatCompletionRequest {
     /// Builds the wire request for a model, validating the whole history and
     /// refusing anything chat completions can't represent. Streaming mode is
@@ -69,6 +81,13 @@ impl wire::ChatCompletionRequest {
         };
         resolve_history(&mut request.messages)?;
         let mut messages = Vec::new();
+        if let Some(text) = request.instructions {
+            messages.push(wire::Message {
+                role: "system".into(),
+                content: Some(wire::Content::Text(text)),
+                ..Default::default()
+            });
+        }
         for message in request.messages {
             messages.extend(self::messages(message)?);
         }

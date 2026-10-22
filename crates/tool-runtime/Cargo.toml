@@ -13,3 +13,5 @@ schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+# CancellationToken for cooperative per-call controls; no runtime features.
+tokio-util.workspace = true

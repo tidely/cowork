@@ -1,399 +1,288 @@
+//! The managed `Agent` with `BasicHost`: prompts, permissions, compaction,
+//! storage, and shutdown.
+
+use super::persistence::Directory;
+use super::state::Echo;
 use super::*;
 
-struct ReadOnlyDispatch(Dispatch);
-impl ToolDispatch for ReadOnlyDispatch {
-    fn descriptors(&self) -> Vec<ToolDescriptor> {
-        let mut descriptors = self.0.descriptors();
-        descriptors[0].capabilities.is_read_only = true;
-        descriptors
-    }
-    fn call<'a>(
-        &'a self,
-        name: &'a str,
-        args: serde_json::Value,
-        context: ToolCallContext,
-    ) -> BoxFuture<'a, ToolStream<TypedToolOutput>> {
-        self.0.call(name, args, context)
-    }
-}
-
-fn session_builder() -> (
-    AgentBuilder<&'static str>,
+fn agent_builder() -> (
+    AgentBuilder<BasicHost>,
     mpsc::UnboundedReceiver<SamplingRequest>,
-    mpsc::UnboundedReceiver<Invocation>,
-    Arc<AtomicUsize>,
 ) {
     let (provider, requests) = test_provider();
-    let (invocations, calls_rx) = mpsc::unbounded_channel();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let dispatch = Arc::new(ReadOnlyDispatch(Dispatch {
-        calls: calls.clone(),
-        invocations,
-    }));
-    (
-        AgentBuilder::new(provider, LanguageModel::new("scripted"), "local")
-            .tool_dispatch(dispatch),
-        requests,
-        calls_rx,
-        calls,
-    )
+    let definition = AgentDefinition::new(LanguageModel::new("scripted"))
+        .instructions("Use echo.")
+        .tool("echo");
+    let builder = AgentBuilder::new(Arc::new(BasicHost), provider, definition, "user".into())
+        .tool(Echo)
+        .unwrap();
+    (builder, requests)
+}
+
+async fn prompt_and_answer(
+    agent: &Agent,
+    requests: &mut mpsc::UnboundedReceiver<SamplingRequest>,
+    prompt: &str,
+    answer: &str,
+) -> Reply {
+    let model = async {
+        respond(recv(requests).await, text(answer));
+    };
+    let (reply, ()) =
+        tokio::time::timeout(WAIT, async { futures::join!(agent.prompt(prompt), model) })
+            .await
+            .unwrap();
+    reply.unwrap()
 }
 
 #[tokio::test]
-async fn reusable_definitions_keep_history_isolated_and_allow_instance_overrides() {
-    let definition = AgentDefinition {
-        name: "worker".into(),
-        system_prompt: "Use work.".into(),
-        tools: Some(vec!["work".into()]),
-        permissions: ToolPermissions::AllowListed(vec!["work".into()]),
-        max_output_tokens: 256,
-        thinking: Some(language_model::Thinking::Disabled),
-        ..Default::default()
-    };
-    for selected in [true, false] {
-        let (builder, mut requests, mut invocations, calls) = session_builder();
-        let builder = builder.definition(&definition);
-        let builder = if selected {
-            builder
+async fn tools_run_only_when_permitted_and_the_model_is_told_which() {
+    for allowed in [false, true] {
+        let (builder, mut requests) = agent_builder();
+        let builder = if allowed {
+            builder.permissions(ToolPermissions::allow(["echo"]))
         } else {
-            // Even allow-all cannot dispatch a tool excluded from this instance.
             builder
-                .tools(Vec::<String>::new())
-                .allow_all_tools()
-                .max_output_tokens(512)
         };
         let agent = builder.build().await.unwrap();
-        assert_eq!(agent.definition().name, "worker");
         let model = async move {
             let first = recv(&mut requests).await;
-            assert_eq!(first.request.messages.len(), 2);
-            assert_eq!(
-                first.request.messages[0].content,
-                vec![Content::text("Use work.")]
-            );
-            assert_eq!(
-                first.request.max_output_tokens,
-                Some(if selected { 256 } else { 512 })
-            );
-            assert_eq!(
-                first.request.thinking,
-                Some(language_model::Thinking::Disabled)
-            );
-            assert_eq!(first.request.tools.len(), usize::from(selected));
-            respond(first, reply(vec![Content::ToolCall(call())], "tool_calls"));
-            if selected {
-                assert!(
-                    recv(&mut invocations)
-                        .await
-                        .response
-                        .send(finished_only(Ok(output())))
-                        .is_ok()
-                );
-            }
-            let next = recv(&mut requests).await;
-            let Content::ToolResult(result) = &next.request.messages[3].content[0] else {
+            let Content::Text { text: note } = &first.request.messages[0].content[0] else {
                 panic!()
             };
-            assert_eq!(result.is_error, !selected);
-            if !selected {
-                assert!(
-                    matches!(&result.content[0], language_model::ToolResultContent::Json { value } if value["kind"] == "not_found")
-                );
-            }
-            respond(next, reply(vec![Content::text("done")], "stop"));
+            let expected = if allowed {
+                "All tools run without approval."
+            } else {
+                "Calls to any tool are refused."
+            };
+            assert!(note.contains(expected), "{note}");
+            respond(first, calls(vec![tool_call("echo", json!({"text": "hi"}))]));
+            let next = recv(&mut requests).await;
+            let result = result_of(next.request.messages.last().unwrap());
+            assert_eq!(result.is_error, !allowed);
+            respond(next, text("done"));
         };
-        let (reply, ()) =
-            tokio::time::timeout(WAIT, async { futures::join!(agent.prompt("work"), model) })
-                .await
-                .unwrap();
-        assert_eq!(reply.unwrap().text(), "done");
-        assert_eq!(calls.load(Ordering::SeqCst), usize::from(selected));
-        agent.close().await.unwrap();
-    }
-    assert_eq!(definition.max_output_tokens, 256);
-    let (builder, _, _, _) = session_builder();
-    assert!(matches!(
-        builder
-            .definition(&definition)
-            .tools(["missing"])
-            .build()
-            .await,
-        Err(AgentError::Tool(ToolError {
-            kind: ToolErrorKind::NotFound,
-            ..
-        }))
-    ));
-}
-
-#[tokio::test]
-async fn managed_prompts_bind_their_own_replies_without_event_watchers() {
-    let (builder, mut requests, _, _) = session_builder();
-    let session = builder.build().await.unwrap();
-    let prompts = async { futures::join!(session.prompt("first"), session.prompt("second")) };
-    let model = async move {
-        let first = recv(&mut requests).await;
-        assert_eq!(
-            first.request.messages.last().unwrap().content,
-            vec![Content::text("first")]
-        );
-        respond(first, reply(vec![Content::text("first answer")], "stop"));
-        let second = recv(&mut requests).await;
-        assert_eq!(
-            second.request.messages.last().unwrap().content,
-            vec![Content::text("second")]
-        );
-        respond(second, reply(vec![Content::text("second answer")], "stop"));
-    };
-    let ((first, second), ()) =
-        tokio::time::timeout(WAIT, async { futures::join!(prompts, model) })
-            .await
-            .unwrap();
-    let first = first.unwrap();
-    let second = second.unwrap();
-    assert_ne!(first.run, second.run);
-    assert_eq!(first.text(), "first answer");
-    assert_eq!(second.text(), "second answer");
-    assert_eq!(
-        session.close().await.unwrap().conversation.messages().len(),
-        4
-    );
-}
-
-#[tokio::test]
-async fn managed_tools_require_explicit_permission_even_when_read_only() {
-    for allow in [false, true] {
-        let (builder, mut requests, mut invocations, calls) = session_builder();
-        let session = if allow {
-            builder.allow_tools(["work"])
-        } else {
-            builder
-        }
-        .build()
+        let (reply, ()) = tokio::time::timeout(WAIT, async {
+            futures::join!(agent.prompt("echo hi"), model)
+        })
         .await
         .unwrap();
-        let prompt = session.prompt("work");
-        let model = async move {
-            respond(
-                recv(&mut requests).await,
-                reply(vec![Content::ToolCall(call())], "tool_calls"),
-            );
-            if allow {
-                let invocation = recv(&mut invocations).await;
-                assert!(
-                    invocation
-                        .response
-                        .send(finished_only(Ok(output())))
-                        .is_ok()
-                );
-            }
-            let next = recv(&mut requests).await;
-            let Content::ToolResult(result) = &next.request.messages[2].content[0] else {
-                panic!()
-            };
-            assert_eq!(result.is_error, !allow);
-            if !allow {
-                assert!(
-                    matches!(&result.content[0], language_model::ToolResultContent::Json { value } if value["kind"] == "permission_denied")
-                );
-            }
-            respond(next, reply(vec![Content::text("done")], "stop"));
-        };
-        let (result, ()) = tokio::time::timeout(WAIT, async { futures::join!(prompt, model) })
-            .await
-            .unwrap();
-        assert_eq!(result.unwrap().text(), "done");
-        assert_eq!(calls.load(Ordering::SeqCst), usize::from(allow));
-        session.close().await.unwrap();
+        assert_eq!(reply.unwrap().text(), "done");
+        agent.close().await.unwrap();
     }
 }
 
 #[tokio::test]
-async fn managed_prompt_returns_stop_and_rejects_a_paused_queue_until_resumed() {
-    let (builder, mut requests, _, _) = session_builder();
-    let session = builder.build().await.unwrap();
+async fn concurrent_prompts_each_receive_their_own_reply() {
+    let (builder, mut requests) = agent_builder();
+    let agent = builder.build().await.unwrap();
+    let model = async move {
+        respond(recv(&mut requests).await, text("first reply"));
+        respond(recv(&mut requests).await, text("second reply"));
+    };
+    let (first, second, ()) = tokio::time::timeout(WAIT, async {
+        futures::join!(agent.prompt("first"), agent.prompt("second"), model)
+    })
+    .await
+    .unwrap();
+    assert_eq!(first.unwrap().text(), "first reply");
+    assert_eq!(second.unwrap().text(), "second reply");
+    agent.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn stopped_prompts_pause_the_queue_until_resumed() {
+    let (builder, mut requests) = agent_builder();
+    let agent = builder.build().await.unwrap();
     {
-        let prompt = session.prompt("work");
+        let prompt = agent.prompt("work");
         futures::pin_mut!(prompt);
         assert!(prompt.as_mut().now_or_never().is_none());
         let request = recv(&mut requests).await;
-        let handle = session.handle();
-        let run = handle.snapshot().await.unwrap().run.unwrap();
-        handle.stop(run).await.unwrap();
-        assert!(
-            matches!(prompt.await, Err(AgentError::Prompt(PromptError::Stopped(id))) if id == run)
-        );
+        let run = agent.handle().snapshot().await.unwrap().run.unwrap();
+        agent.send(RequestKind::Stop { run }).await.unwrap();
+        assert!(matches!(
+            prompt.await,
+            Err(AgentError::Prompt(PromptError::Stopped(id))) if id == run
+        ));
         assert!(request.response.is_closed());
     }
     assert!(matches!(
-        session.prompt("paused").await,
-        Err(AgentError::Prompt(PromptError::Rejected(_)))
+        agent.prompt("paused").await,
+        Err(AgentError::Prompt(PromptError::Request(
+            RequestError::Rejected(_)
+        )))
     ));
-    session.handle().resume().unwrap();
-    let model = async move {
-        respond(
-            recv(&mut requests).await,
-            reply(vec![Content::text("resumed")], "stop"),
-        );
-    };
-    let (result, ()) = tokio::time::timeout(WAIT, async {
-        futures::join!(session.prompt("resume"), model)
-    })
-    .await
-    .unwrap();
-    assert_eq!(result.unwrap().text(), "resumed");
-    session.close().await.unwrap();
+    agent.send(RequestKind::Resume).await.unwrap();
+    let reply = prompt_and_answer(&agent, &mut requests, "resume", "resumed").await;
+    assert_eq!(reply.text(), "resumed");
+    agent.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn managed_compaction_distinguishes_unchanged_from_operational_failure() {
-    let (builder, _, _, _) = session_builder();
-    let session = builder.build().await.unwrap();
+async fn compaction_distinguishes_unchanged_from_operational_failure() {
+    let (builder, mut requests) = agent_builder();
+    let agent = builder.build().await.unwrap();
     assert!(matches!(
-        session.compact().await.unwrap(),
+        agent.compact().await.unwrap(),
         CompactionOutcome::Unchanged(CompactionError::NothingToCompact)
     ));
-    session.close().await.unwrap();
-
-    let (builder, mut requests, _, _) = session_builder();
-    let session = builder
-        .request(CompletionRequest::new(compaction::history()))
-        .build()
-        .await
-        .unwrap();
+    prompt_and_answer(&agent, &mut requests, "first", "answer").await;
     let model = async move {
         let request = recv(&mut requests).await;
-        assert!(
-            request
-                .response
-                .send(
-                    stream::iter([Err(language_model::Error::Transport("offline".into()))]).boxed()
-                )
-                .is_ok()
-        );
+        let error = Err(language_model::Error::Transport("offline".into()));
+        assert!(request.response.send(stream::iter([error]).boxed()).is_ok());
     };
-    let (result, ()) =
-        tokio::time::timeout(WAIT, async { futures::join!(session.compact(), model) })
-            .await
-            .unwrap();
+    let (result, ()) = tokio::time::timeout(WAIT, async { futures::join!(agent.compact(), model) })
+        .await
+        .unwrap();
     assert!(matches!(
         result,
-        Err(AgentError::Compaction(CompactionError::Model(_)))
+        Err(AgentError::Request(RequestError::Compaction(
+            CompactionError::Model(_)
+        )))
     ));
-    session.close().await.unwrap();
+    agent.close().await.unwrap();
 }
 
 #[tokio::test]
-async fn managed_storage_refuses_overwrite_or_instruction_drift_and_can_explicitly_resume() {
-    let directory = super::persistence::Directory::new();
-    let (builder, mut requests, _, _) = session_builder();
-    let observations = Arc::new(Mutex::new(Vec::new()));
-    let events = observations.clone();
-    let session = builder
-        .system_prompt("original instructions")
+async fn storage_refuses_overwrite_and_resumes_with_provenance() {
+    let directory = Directory::new();
+    let (builder, mut requests) = agent_builder();
+    let observed = Arc::new(Mutex::new(0));
+    let finished = observed.clone();
+    let agent = builder
         .create_at(&directory.0)
-        .on_event(move |event| events.lock().unwrap().push(event))
+        .on_event(move |event| {
+            if matches!(event.kind, EventKind::RunFinished { .. }) {
+                *finished.lock().unwrap() += 1;
+            }
+        })
         .build()
         .await
         .unwrap();
-    let model = async move {
-        respond(
-            recv(&mut requests).await,
-            reply(vec![Content::text("saved answer")], "stop"),
-        );
-    };
-    let (result, ()) = tokio::time::timeout(WAIT, async {
-        futures::join!(session.prompt("first"), model)
-    })
-    .await
-    .unwrap();
-    assert_eq!(result.unwrap().text(), "saved answer");
-    session.close().await.unwrap();
-    assert_eq!(
-        observations
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|event| matches!(event.kind, EventKind::RunFinished { .. }))
-            .count(),
-        1
-    );
+    prompt_and_answer(&agent, &mut requests, "first", "saved answer").await;
+    agent.close().await.unwrap();
+    assert_eq!(*observed.lock().unwrap(), 1);
     let path = directory.0.join("updates.jsonl");
     let before = tokio::fs::read(&path).await.unwrap();
-    let (builder, _, _, _) = session_builder();
+    let (builder, _) = agent_builder();
     assert!(matches!(
         builder.create_at(&directory.0).build().await,
         Err(AgentError::Log(_))
     ));
-    let (builder, _, _, _) = session_builder();
-    assert!(matches!(
-        builder
-            .system_prompt("changed instructions")
-            .resume_from(&directory.0)
-            .build()
-            .await,
-        Err(AgentError::Configuration(_))
-    ));
     assert_eq!(tokio::fs::read(&path).await.unwrap(), before);
 
-    let (builder, mut requests, _, _) = session_builder();
-    let session = builder
-        .system_prompt("changed instructions")
-        .use_saved_instructions()
-        .open_or_create(&directory.0)
-        .build()
-        .await
-        .unwrap();
+    let (builder, mut requests) = agent_builder();
+    let agent = builder.open_or_create(&directory.0).build().await.unwrap();
     let model = async move {
         let request = recv(&mut requests).await;
-        assert_eq!(
-            request.request.messages[0].content,
-            vec![Content::text("original instructions")]
-        );
         assert_eq!(
             request.request.messages[2].content,
             vec![Content::text("saved answer")]
         );
-        respond(
-            request,
-            reply(vec![Content::text("resumed answer")], "stop"),
-        );
+        respond(request, text("resumed answer"));
     };
-    let (result, ()) = tokio::time::timeout(WAIT, async {
-        futures::join!(session.prompt("second"), model)
+    let (reply, ()) = tokio::time::timeout(WAIT, async {
+        futures::join!(agent.prompt("second"), model)
     })
     .await
     .unwrap();
-    assert_eq!(result.unwrap().text(), "resumed answer");
-    let result = session.close().await.unwrap();
-    assert_eq!(
-        crate::persistence::load(&directory.0)
+    assert_eq!(reply.unwrap().text(), "resumed answer");
+    let result = agent.close().await.unwrap();
+    let loaded = crate::persistence::load::<String>(&directory.0)
+        .await
+        .unwrap();
+    assert_eq!(loaded.conversation.entries(), result.conversation.entries());
+    assert!(matches!(
+        &loaded.conversation.entries()[1].origin,
+        Origin::Input { source, .. } if source == "user"
+    ));
+}
+
+/// After a crash, a call the log never saw start (waiting for approval, or
+/// behind another call) had no effect: resuming settles it as not run. A call
+/// that may have started needs explicit recovery.
+#[tokio::test]
+async fn resuming_after_a_crash_settles_only_calls_that_never_started() {
+    for started in [false, true] {
+        let directory = Directory::new();
+        let log =
+            crate::persistence::JsonlLog::create(&directory.0, &Conversation::<String>::new(), 0)
+                .await
+                .unwrap();
+        let pending = tool_call("echo", json!({"text": "hi"}));
+        let entries = [
+            Entry {
+                message: Message::user("echo hi"),
+                origin: Origin::Input {
+                    id: InputId::new(),
+                    source: "user".to_owned(),
+                },
+            },
+            Entry {
+                message: calls(vec![pending.clone()]),
+                origin: Origin::Model {
+                    revision: DefinitionRevision(0),
+                },
+            },
+        ];
+        let mut events: Vec<EventKind<BasicHost>> = entries
+            .into_iter()
+            .enumerate()
+            .map(|(index, entry)| EventKind::MessageCommitted { index, entry })
+            .collect();
+        if started {
+            events.push(EventKind::ToolStarted {
+                call: pending.clone(),
+                tool: "echo".into(),
+            });
+        }
+        for (sequence, kind) in events.into_iter().enumerate() {
+            let event = AgentEvent::<BasicHost> {
+                sequence: sequence as u64,
+                run: None,
+                kind,
+            };
+            log.record(&event).unwrap();
+        }
+        log.finish().await.unwrap();
+
+        let (builder, mut requests) = agent_builder();
+        let built = builder.resume_from(&directory.0).build().await;
+        if started {
+            assert!(matches!(built, Err(AgentError::Session(_))));
+            continue;
+        }
+        let agent = built.unwrap();
+        let model = async move {
+            let request = recv(&mut requests).await;
+            assert_eq!(error_kind(&request.request.messages[2]), "cancelled");
+            respond(request, text("ok"));
+        };
+        let (reply, ()) =
+            tokio::time::timeout(WAIT, async { futures::join!(agent.prompt("again"), model) })
+                .await
+                .unwrap();
+        assert_eq!(reply.unwrap().text(), "ok");
+        let result = agent.close().await.unwrap();
+        // The settled result was logged like any other entry.
+        let loaded = crate::persistence::load::<String>(&directory.0)
             .await
-            .unwrap()
-            .conversation
-            .messages(),
-        result.conversation.messages()
-    );
+            .unwrap();
+        assert_eq!(loaded.conversation.entries(), result.conversation.entries());
+    }
 }
 
 #[tokio::test]
-async fn managed_close_reports_background_write_failure_without_blocking_agent_work() {
-    let directory = super::persistence::Directory::new();
-    let (builder, mut requests, _, _) = session_builder();
-    let session = builder.create_at(&directory.0).build().await.unwrap();
+async fn close_reports_background_write_failure_without_blocking_agent_work() {
+    let directory = Directory::new();
+    let (builder, mut requests) = agent_builder();
+    let agent = builder.create_at(&directory.0).build().await.unwrap();
     let path = directory.0.join("chat_history.jsonl");
     tokio::fs::remove_file(&path).await.unwrap();
     tokio::fs::create_dir(&path).await.unwrap();
-    let model = async move {
-        respond(
-            recv(&mut requests).await,
-            reply(vec![Content::text("still ran")], "stop"),
-        );
-    };
-    let (result, ()) = tokio::time::timeout(WAIT, async {
-        futures::join!(session.prompt("work"), model)
-    })
-    .await
-    .unwrap();
-    assert_eq!(result.unwrap().text(), "still ran");
-    assert!(matches!(session.close().await, Err(AgentError::Log(_))));
+    let reply = prompt_and_answer(&agent, &mut requests, "work", "still ran").await;
+    assert_eq!(reply.text(), "still ran");
+    assert!(matches!(agent.close().await, Err(AgentError::Log(_))));
 }

@@ -1,27 +1,35 @@
 use std::{future::Future, sync::Arc};
 
 use futures::{Stream, StreamExt as _, future::BoxFuture, stream, stream::BoxStream};
-use language_model::{ToolDefinition, ToolResultContent};
+use language_model::{ToolCallId, ToolDefinition, ToolResultContent};
 use schemars::JsonSchema;
-use serde::{Serialize, de::DeserializeOwned};
+use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::{
-    ToolCallContext, ToolCapabilities, ToolError, ToolErrorKind, ToolOutput, TypedToolOutput,
+    CallControl, Provides, ToolCall, ToolCapabilities, ToolError, ToolErrorKind, ToolOutput,
+    TypedToolOutput,
 };
 
-/// One typed tool. The host invokes `execute`; simple tools implement `run`,
-/// while streaming tools override `execute` to return progress and a final result.
-/// Associated types stay concrete until the blanket `ToolDyn` adapter is used.
-pub trait Tool: Send + Sync {
+/// One typed tool. Simple tools implement `run`; streaming tools override
+/// `execute` to return progress before their result. Associated types stay
+/// concrete until the blanket `ToolDyn` adapter erases them for a registry.
+pub trait Tool: Send + Sync + 'static {
     type Args: DeserializeOwned + JsonSchema + Send + 'static;
-    type Output: Serialize + ToolOutput + Send + 'static;
+    type Output: ToolOutput + Send + 'static;
+    /// Host services this tool needs; `()` when it needs none. A registry's
+    /// context must provide it (see [`Provides`]).
+    type Context: ?Sized + Send + Sync + 'static;
+    /// What one call needs to be allowed, in this tool's terms; `()` when
+    /// calls differ only by tool. A registry converts it into the host's
+    /// access type, and authorization decides on that.
+    type Access: Clone + Default + Send + Sync + 'static;
 
     fn name(&self) -> &str;
     fn description(&self) -> String;
 
-    /// Execution declarations retained by the registry at registration time.
-    /// These are host metadata and are not part of the model's definition.
+    /// Execution declarations captured when the tool is registered. These are
+    /// host metadata and are not part of the model's definition.
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities::default()
     }
@@ -41,9 +49,16 @@ pub trait Tool: Send + Sync {
         }
     }
 
+    /// What these arguments need. Computed once, before authorization; the
+    /// call then receives this exact value in [`ToolCall::access`].
+    fn access(&self, _args: &Self::Args, _context: &Self::Context) -> Self::Access {
+        Self::Access::default()
+    }
+
     fn run(
         &self,
-        _context: ToolCallContext,
+        _call: ToolCall<Self::Access>,
+        _context: Arc<Self::Context>,
         _args: Self::Args,
     ) -> impl Future<Output = Result<Self::Output, ToolError>> + Send {
         async {
@@ -56,10 +71,11 @@ pub trait Tool: Send + Sync {
 
     fn execute(
         &self,
-        context: ToolCallContext,
+        call: ToolCall<Self::Access>,
+        context: Arc<Self::Context>,
         args: Self::Args,
     ) -> impl Future<Output = ToolStream<Self::Output>> + Send {
-        async move { finished_only(self.run(context, args).await) }
+        async move { finished_only(self.run(call, context, args).await) }
     }
 }
 
@@ -130,25 +146,68 @@ pub async fn collect_output<T>(mut stream: ToolStream<T>) -> Result<T, ToolError
     })?
 }
 
-/// Object-safe surface for heterogeneous registries. Typed implementations gain
-/// this adapter automatically; input decoding failures are final tool errors.
-pub trait ToolDyn: Send + Sync {
+type Run = Box<
+    dyn FnOnce(ToolCallId, CallControl) -> BoxFuture<'static, ToolStream<TypedToolOutput>> + Send,
+>;
+
+/// A call whose arguments decoded and whose access is known, but which has
+/// not started. Authorization inspects `access`; only `execute` runs the tool.
+pub struct PreparedCall<A> {
+    access: A,
+    run: Run,
+}
+
+impl<A> PreparedCall<A> {
+    pub fn new(
+        access: A,
+        run: impl FnOnce(ToolCallId, CallControl) -> BoxFuture<'static, ToolStream<TypedToolOutput>>
+        + Send
+        + 'static,
+    ) -> Self {
+        Self {
+            access,
+            run: Box::new(run),
+        }
+    }
+
+    pub fn access(&self) -> &A {
+        &self.access
+    }
+
+    /// Awaiting the returned future may already run a simple tool.
+    pub fn execute(
+        self,
+        id: ToolCallId,
+        control: CallControl,
+    ) -> BoxFuture<'static, ToolStream<TypedToolOutput>> {
+        (self.run)(id, control)
+    }
+}
+
+/// Object-safe surface for heterogeneous registries, over a host context `C`
+/// and the host's access type `A`. Typed tools gain this automatically when
+/// `C` provides their context and `A` converts from their access.
+pub trait ToolDyn<C: ?Sized, A>: Send + Sync {
     fn definition(&self) -> ToolDefinition;
 
-    /// Manual dynamic implementations can declare capabilities too. The
-    /// blanket adapter forwards the concrete Tool implementation's metadata.
     fn capabilities(&self) -> ToolCapabilities {
         ToolCapabilities::default()
     }
 
-    fn execute(
-        &self,
-        context: ToolCallContext,
+    /// Decodes arguments and computes the call's access without running it.
+    fn prepare(
+        self: Arc<Self>,
         args: Value,
-    ) -> BoxFuture<'_, ToolStream<TypedToolOutput>>;
+        context: &Arc<C>,
+    ) -> Result<PreparedCall<A>, ToolError>;
 }
 
-impl<T: Tool> ToolDyn for T {
+impl<T, C, A> ToolDyn<C, A> for T
+where
+    T: Tool,
+    C: Provides<T::Context> + ?Sized,
+    A: From<T::Access>,
+{
     fn definition(&self) -> ToolDefinition {
         Tool::definition(self)
     }
@@ -157,33 +216,38 @@ impl<T: Tool> ToolDyn for T {
         Tool::capabilities(self)
     }
 
-    fn execute(
-        &self,
-        context: ToolCallContext,
+    fn prepare(
+        self: Arc<Self>,
         args: Value,
-    ) -> BoxFuture<'_, ToolStream<TypedToolOutput>> {
-        Box::pin(async move {
-            let args = match serde_json::from_value::<T::Args>(args) {
-                Ok(args) => args,
-                Err(error) => {
-                    return finished_only(Err(ToolError::new(
-                        ToolErrorKind::InvalidArguments,
-                        error.to_string(),
-                    )));
-                }
-            };
-            let name = self.name().to_owned();
-            Tool::execute(self, context, args)
-                .await
-                .map(move |item| match item {
-                    ToolStreamItem::Progress(progress) => ToolStreamItem::Progress(progress),
-                    ToolStreamItem::Finished(result) => ToolStreamItem::Finished(
-                        result.and_then(|output| TypedToolOutput::new(name.clone(), output)),
-                    ),
+        context: &Arc<C>,
+    ) -> Result<PreparedCall<A>, ToolError> {
+        let args = serde_json::from_value::<T::Args>(args)
+            .map_err(|error| ToolError::new(ToolErrorKind::InvalidArguments, error.to_string()))?;
+        let context = context.provide();
+        let access = self.access(&args, &context);
+        Ok(PreparedCall::new(
+            A::from(access.clone()),
+            move |id, control| {
+                Box::pin(async move {
+                    let name = self.name().to_owned();
+                    let call = ToolCall {
+                        id,
+                        access,
+                        control,
+                    };
+                    Tool::execute(&*self, call, context, args)
+                        .await
+                        .map(move |item| match item {
+                            ToolStreamItem::Progress(progress) => {
+                                ToolStreamItem::Progress(progress)
+                            }
+                            ToolStreamItem::Finished(result) => ToolStreamItem::Finished(
+                                result.and_then(|output| TypedToolOutput::new(&name, output)),
+                            ),
+                        })
+                        .boxed()
                 })
-                .boxed()
-        })
+            },
+        ))
     }
 }
-
-pub type ArcTool = Arc<dyn ToolDyn>;

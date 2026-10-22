@@ -258,7 +258,7 @@ impl Assembly {
         message.generation = Some(GenerationMetadata {
             provider: "openai-compatible".into(),
             model: self.model,
-            finish_reason: Some(finish_reason),
+            finish_reason: Some(openai_compatible_types::finish_reason(&finish_reason)),
             usage: self.usage.map(response::usage),
             extra: self.extra,
         });

@@ -22,11 +22,11 @@ struct Sampling {
 /// Relay deltas as previews, but withhold the accepted message until EOF has
 /// proved there is exactly one final and no trailing events/errors. This applies
 /// the same contract as collect_completion to arbitrary provider implementations.
-pub(crate) fn sample(
+pub(crate) fn sample<A: Send + 'static>(
     provider: Arc<dyn LanguageModelProvider>,
     model: LanguageModel,
     request: CompletionRequest,
-) -> BoxStream<'static, WorkEvent> {
+) -> BoxStream<'static, WorkEvent<A>> {
     let startup = Box::pin(async move { provider.stream(&model, request).await });
     let state = Sampling {
         startup: Some(startup),
