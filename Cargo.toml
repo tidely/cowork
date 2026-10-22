@@ -52,12 +52,24 @@ gpui = { package = "gpui-pre", version = "=0.3.9" }
 gpui-base = "0.7.3"
 gpui-component = "0.7.3"
 gpui-kit-assets = "0.7.3"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff"] }
-gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = ["font-kit", "wayland", "x11", "runtime_shaders"] }
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+    "gif",
+    "webp",
+    "bmp",
+    "tiff",
+] }
+gpui_platform = { package = "gpui-pre-platform", version = "=0.3.9", features = [
+    "font-kit",
+    "wayland",
+    "x11",
+    "runtime_shaders",
+] }
 futures = "0.3"
 # Parses HTTP-date `Retry-After` values in the provider clients.
 httpdate = "1"
-iroh = "1.4.0"
+iroh = "1.4.1"
 itertools = "0.14"
 libc = "0.2"
 # Contains the agent's commands with the operating system's own sandbox:
@@ -72,13 +84,19 @@ rig = "0.45.0"
 # What the `rig` facade doesn't re-export, such as `tool::feedback`; the same
 # version and features the facade uses, so upgrade it with `rig`.
 rig-core = { version = "0.45.0", default-features = false }
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls"] }
+reqwest = { version = "0.13", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls",
+] }
 # Evaluates scheduled tasks' custom RFC 5545 recurrence rules.
 rrule = "0.14"
 schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-syntect = { version = "5.3", default-features = false, features = ["default-fancy"] }
+syntect = { version = "5.3", default-features = false, features = [
+    "default-fancy",
+] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 tokio-util = { version = "0.7", features = ["codec"] }
