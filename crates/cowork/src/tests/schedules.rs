@@ -647,7 +647,11 @@ fn deleting_a_continued_thread_warns_and_can_delete_its_schedule(cx: &mut gpui::
         });
         threads.push(thread_id);
     }
-    cx.update(|window, cx| cowork.update(cx, |cowork, cx| cowork.open_archive(window, cx)));
+    cx.update(|window, cx| {
+        cowork.update(cx, |cowork, cx| {
+            cowork.open_settings(SettingsPage::Archive, window, cx)
+        })
+    });
     draw(cx);
 
     // Deleting only the thread: its task starts a new thread next time.

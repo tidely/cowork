@@ -8,7 +8,7 @@ use gpui::{
     linear_color_stop, linear_gradient, prelude::*, px, rems,
 };
 use gpui_component::{
-    ActiveTheme, Collapsible, Icon, Selectable as _, Sizable as _,
+    ActiveTheme, Collapsible, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
     sidebar::{Sidebar, SidebarCollapsible, SidebarItem, SidebarMenu, SidebarMenuItem},
@@ -458,43 +458,21 @@ impl Cowork {
                             .child("Cowork"),
                     )
                     .child(
-                        h_flex()
-                            .gap_1()
-                            .child(
-                                Button::new("archived-threads")
-                                    .icon(
-                                        Icon::new(AssetIconName::Archive)
-                                            .size_4()
-                                            .text_color(cx.theme().muted_foreground),
-                                    )
-                                    .ghost()
-                                    .small()
-                                    .size(px(28.))
-                                    .selected(self.main_stage == MainStage::Archive)
-                                    .debug_selector(|| "archived-threads".to_owned())
-                                    .accessibility_label("Archived threads")
-                                    .tooltip("Archived threads")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_archive(window, cx);
-                                    })),
+                        Button::new("search-chats")
+                            .icon(
+                                Icon::new(AssetIconName::Search)
+                                    .size_4()
+                                    .text_color(cx.theme().muted_foreground),
                             )
-                            .child(
-                                Button::new("search-chats")
-                                    .icon(
-                                        Icon::new(AssetIconName::Search)
-                                            .size_4()
-                                            .text_color(cx.theme().muted_foreground),
-                                    )
-                                    .ghost()
-                                    .small()
-                                    .size(px(28.))
-                                    .debug_selector(|| "search-chats".to_owned())
-                                    .accessibility_label("Search chats")
-                                    .tooltip("Search chats")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_search_palette(window, cx);
-                                    })),
-                            ),
+                            .ghost()
+                            .small()
+                            .size(px(28.))
+                            .debug_selector(|| "search-chats".to_owned())
+                            .accessibility_label("Search chats")
+                            .tooltip("Search chats")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                this.open_search_palette(window, cx);
+                            })),
                     ),
             )
             .child(actions);

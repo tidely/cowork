@@ -16,13 +16,6 @@ use uuid::Uuid;
 use crate::{Cowork, MainStage, thread::Thread};
 
 impl Cowork {
-    pub(crate) fn open_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.main_stage = MainStage::Archive;
-        // The composer is hidden, so it must not keep taking keystrokes.
-        window.blur(cx);
-        cx.notify();
-    }
-
     /// Moves one of the user's own threads to the archive, ending everything
     /// it was doing: its agent run, its sharing, and its sandbox. Joined
     /// threads belong to their host, so they can't be archived.

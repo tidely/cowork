@@ -31,14 +31,17 @@ pub(crate) enum SettingsPage {
     Providers,
     /// The default context window and when conversations are summarized.
     Context,
+    /// The user's archived threads, to restore or delete for good.
+    Archive,
 }
 
 impl SettingsPage {
     /// Every page, in the order the sidebar lists their tabs.
-    pub(crate) const ALL: [SettingsPage; 3] = [
+    pub(crate) const ALL: [SettingsPage; 4] = [
         SettingsPage::Profile,
         SettingsPage::Providers,
         SettingsPage::Context,
+        SettingsPage::Archive,
     ];
 
     pub(crate) fn label(self) -> &'static str {
@@ -46,6 +49,7 @@ impl SettingsPage {
             SettingsPage::Profile => "Profile",
             SettingsPage::Providers => "Providers",
             SettingsPage::Context => "Context",
+            SettingsPage::Archive => "Archived threads",
         }
     }
 
@@ -54,6 +58,7 @@ impl SettingsPage {
             SettingsPage::Profile => AssetIconName::CircleUser,
             SettingsPage::Providers => AssetIconName::Bot,
             SettingsPage::Context => AssetIconName::FileText,
+            SettingsPage::Archive => AssetIconName::Archive,
         }
     }
 }
@@ -75,7 +80,7 @@ impl Cowork {
         match page {
             SettingsPage::Profile => self.profile_error = None,
             SettingsPage::Providers => self.settings_provider_step = ProviderStep::Providers,
-            SettingsPage::Context => {}
+            SettingsPage::Context | SettingsPage::Archive => {}
         }
         // The composer is hidden, so it must not keep taking keystrokes.
         window.blur(cx);
@@ -103,6 +108,7 @@ impl Cowork {
             SettingsPage::Profile => self.render_profile_page(cx).into_any_element(),
             SettingsPage::Providers => self.render_providers_page(cx).into_any_element(),
             SettingsPage::Context => self.render_context_page(window, cx).into_any_element(),
+            SettingsPage::Archive => self.render_archive_page(cx).into_any_element(),
         }
     }
 

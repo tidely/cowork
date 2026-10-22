@@ -52,6 +52,16 @@ fn click(selector: &'static str, cx: &mut gpui::VisualTestContext) {
     draw(cx);
 }
 
+fn open_archive_settings(cowork: &Entity<Cowork>, cx: &mut gpui::VisualTestContext) {
+    click("identity-button", cx);
+    cx.update(|window, cx| {
+        cowork.update(cx, |cowork, cx| {
+            cowork.open_settings(SettingsPage::Archive, window, cx);
+        });
+    });
+    draw(cx);
+}
+
 /// The ids of the sidebar's threads, then of the archived ones, in order.
 fn thread_ids(cowork: &Entity<Cowork>, cx: &mut gpui::VisualTestContext) -> (Vec<Uuid>, Vec<Uuid>) {
     cowork.read_with(cx, |cowork, cx| {
@@ -249,10 +259,15 @@ fn archived_threads_are_restored_or_deleted_from_the_archive(cx: &mut gpui::Test
     // Archiving the open thread closes it.
     cowork.read_with(cx, |cowork, _| assert_eq!(cowork.active_thread_id, None));
 
-    click("archived-threads", cx);
+    assert!(cx.debug_bounds("archived-threads").is_none());
+    open_archive_settings(&cowork, cx);
     cowork.read_with(cx, |cowork, _| {
-        assert_eq!(cowork.main_stage, MainStage::Archive)
+        assert_eq!(
+            cowork.main_stage,
+            MainStage::Settings(SettingsPage::Archive)
+        )
     });
+    assert!(cx.debug_bounds("search-chats").is_none());
     assert!(
         cx.debug_bounds(selector("archived-thread", restored))
             .is_some()
@@ -277,7 +292,12 @@ fn archived_threads_are_restored_or_deleted_from_the_archive(cx: &mut gpui::Test
         assert_eq!(cowork.total_chats(cx), 3);
     });
 
-    // Opening a thread from the sidebar leaves the archive.
+    // Back to app returns to the thread stage and its sidebar.
+    click("settings-back", cx);
+    cowork.read_with(cx, |cowork, _| {
+        assert_eq!(cowork.main_stage, MainStage::Thread);
+        assert_eq!(cowork.active_thread_id, None);
+    });
     click(selector("sidebar-thread", open), cx);
     cowork.read_with(cx, |cowork, _| {
         assert_eq!(cowork.main_stage, MainStage::Thread);
@@ -293,15 +313,16 @@ fn the_archive_restores_or_deletes_everything_at_once(cx: &mut gpui::TestAppCont
     draw(cx);
     archive_from_sidebar(first, cx);
     archive_from_sidebar(second, cx);
-    click("archived-threads", cx);
+    open_archive_settings(&cowork, cx);
 
     // Restored in the archive's order, most recently archived first.
     click("restore-all-threads", cx);
     assert_eq!(thread_ids(&cowork, cx), (vec![second, first], vec![]));
 
+    click("settings-back", cx);
     archive_from_sidebar(first, cx);
     archive_from_sidebar(second, cx);
-    click("archived-threads", cx);
+    open_archive_settings(&cowork, cx);
 
     // Deleting everything asks first.
     click("delete-all-threads", cx);

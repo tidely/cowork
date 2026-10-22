@@ -117,8 +117,6 @@ enum MainStage {
     Thread,
     /// A settings page, with the sidebar showing settings; see `settings.rs`.
     Settings(SettingsPage),
-    /// The archived threads, to restore or delete for good.
-    Archive,
     /// The scheduled prompts.
     Schedules,
 }
@@ -682,7 +680,6 @@ impl Render for Cowork {
                                 MainStage::Settings(page) => {
                                     this.child(self.render_settings_page(page, window, cx))
                                 }
-                                MainStage::Archive => this.child(self.render_archive_page(cx)),
                                 MainStage::Schedules => this.child(self.render_schedules_page(cx)),
                                 MainStage::Welcome => this.child(self.render_welcome(cx)),
                                 MainStage::ProviderSetup(provider) => {
