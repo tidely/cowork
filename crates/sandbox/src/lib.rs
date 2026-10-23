@@ -36,7 +36,7 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, OnceLock,
+        Arc, OnceLock,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -47,6 +47,7 @@ use mxc_sdk::v1::{
     self, ContainerRequest, FilesystemPolicy, MxcProcess, NetworkAction, NetworkEgressPolicy,
     NetworkIngressPolicy, NetworkPolicy, StreamCloser,
 };
+use parking_lot::Mutex;
 
 pub use context::{Needs, ThreadSandbox};
 pub use environment::{EnvironmentSource, PRINT_ENV_FLAG, print_env};
@@ -145,7 +146,7 @@ impl Sandboxes {
     /// Sets the project `thread`'s commands see from its next command on.
     /// Commands already running keep the project they started with.
     pub fn set_project(&self, thread: &str, project: Project) {
-        let mut projects = lock(&self.projects);
+        let mut projects = self.projects.lock();
         if project == Project::default() {
             projects.remove(thread);
         } else {
@@ -155,7 +156,8 @@ impl Sandboxes {
 
     /// The project `thread`'s next command will see.
     pub fn project(&self, thread: &str) -> Project {
-        lock(&self.projects)
+        self.projects
+            .lock()
             .get(thread)
             .cloned()
             .unwrap_or_default()
@@ -164,7 +166,8 @@ impl Sandboxes {
     /// What `thread`'s current run has been granted so far: read access and
     /// no folders until `request_permissions` grants more.
     pub fn run_grant(&self, thread: &str) -> Grant {
-        lock(&self.run_grants)
+        self.run_grants
+            .lock()
             .get(thread)
             .cloned()
             .unwrap_or_default()
@@ -172,7 +175,8 @@ impl Sandboxes {
 
     /// Adds `grant` to what `thread`'s current run's later commands get.
     pub fn grant_for_run(&self, thread: &str, grant: &Grant) {
-        lock(&self.run_grants)
+        self.run_grants
+            .lock()
             .entry(thread.to_owned())
             .or_default()
             .extend(grant);
@@ -180,7 +184,7 @@ impl Sandboxes {
 
     /// Forgets what `thread`'s run was granted, as a run starts or ends.
     pub fn end_run(&self, thread: &str) {
-        lock(&self.run_grants).remove(thread);
+        self.run_grants.lock().remove(thread);
     }
 
     /// What the model is told about where `thread`'s commands run: the
@@ -298,8 +302,8 @@ impl Sandboxes {
     /// deleted. Its commands end with its run; its folder, scratch folder
     /// included, is its owner's to remove.
     pub fn forget(&self, thread: &str) {
-        lock(&self.projects).remove(thread);
-        lock(&self.run_grants).remove(thread);
+        self.projects.lock().remove(thread);
+        self.run_grants.lock().remove(thread);
     }
 
     /// `thread`'s scratch folder, which need not exist yet.
@@ -323,12 +327,6 @@ impl Sandboxes {
             })
             .clone()
     }
-}
-
-fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    mutex
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Tells a command's blocking task, when its run is stopped, to kill it.

@@ -5,7 +5,7 @@
 //!
 //! cargo test -p agent --test live_agent -- --ignored --nocapture
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use agent::tool::{Tool, ToolCall, ToolError};
 use agent::{Agent, AgentDefinition, DynamicToolChange, EventKind, RequestKind, ToolPermissions};
@@ -13,6 +13,7 @@ use agent::{
     Ollama,
     model::{LanguageModel, Thinking},
 };
+use parking_lot::Mutex;
 use schemars::JsonSchema;
 use serde::Deserialize;
 
@@ -90,7 +91,7 @@ async fn base_and_dynamic_tools_run_against_ollama() {
         .permissions(ToolPermissions::allow_all())
         .on_event(move |event| {
             if let EventKind::ToolStarted { tool, .. } = event.kind {
-                observed.lock().unwrap().push(tool);
+                observed.lock().push(tool);
             }
         })
         .build()
@@ -118,7 +119,7 @@ async fn base_and_dynamic_tools_run_against_ollama() {
     println!("multiply: {}", reply.text());
     assert!(reply.text().contains("408"), "{}", reply.text());
 
-    let started = started.lock().unwrap().clone();
+    let started = started.lock().clone();
     println!("tools started: {started:?}");
     assert!(started.iter().any(|tool| tool == "add"));
     assert!(started.iter().any(|tool| tool == "multiply"));

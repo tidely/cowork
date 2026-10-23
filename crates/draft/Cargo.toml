@@ -8,5 +8,6 @@ workspace = true
 
 [dependencies]
 anyhow.workspace = true
+parking_lot.workspace = true
 uuid.workspace = true
 yrs.workspace = true

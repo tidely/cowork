@@ -9,6 +9,7 @@ workspace = true
 [dependencies]
 mxc-sdk.workspace = true
 agent.workspace = true
+parking_lot.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

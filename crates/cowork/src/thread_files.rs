@@ -36,7 +36,7 @@ use std::{
     io::{Seek as _, SeekFrom, Write as _},
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, mpsc},
+    sync::{Arc, mpsc},
     time::{Duration, SystemTime},
 };
 
@@ -46,6 +46,7 @@ use base64::Engine as _;
 use draft::AttachmentId;
 use futures::channel::oneshot;
 use gpui::{App, AppContext, Context, Entity};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -739,11 +740,7 @@ impl ThreadFiles {
             return;
         }
         let id = thread.instance_id;
-        let failed = self
-            .failed
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(&id);
+        let failed = self.failed.lock().remove(&id);
         let rewrite = failed || !self.saved.contains_key(&id);
         let saved = self.saved.entry(id).or_default();
         if rewrite {
@@ -813,10 +810,7 @@ impl Writer {
                     if let Err(error) = self.write(*job) {
                         eprintln!("could not save thread {id}: {error:#}");
                         self.lengths.remove(&id);
-                        self.failed
-                            .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
-                            .insert(id);
+                        self.failed.lock().insert(id);
                     }
                 }
                 Job::Delete(id) => {

@@ -6,7 +6,7 @@
 //!
 //! cargo run -p agent --example agent
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use agent::tool::{Provides, Tool, ToolCall, ToolCapabilities, ToolDescriptor, ToolError};
 use agent::{
@@ -18,6 +18,7 @@ use agent::{
     Ollama,
     model::{LanguageModel, Thinking, ToolArguments},
 };
+use parking_lot::Mutex;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -116,7 +117,7 @@ impl Tool for ReadNotes {
         notebook: Arc<Notebook>,
         _: NoArgs,
     ) -> Result<Value, ToolError> {
-        Ok(json!({"notes": *notebook.notes.lock().unwrap()}))
+        Ok(json!({"notes": *notebook.notes.lock()}))
     }
 }
 
@@ -151,7 +152,7 @@ impl Tool for WriteNote {
     ) -> Result<Value, ToolError> {
         // The call carries exactly the access that was authorized.
         assert_eq!(call.access, Access::Write);
-        notebook.notes.lock().unwrap().push(args.text.clone());
+        notebook.notes.lock().push(args.text.clone());
         Ok(json!({"saved": args.text}))
     }
 }
@@ -277,7 +278,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    println!("\nNotebook: {:?}", notebook.notes.lock().unwrap());
+    println!("\nNotebook: {:?}", notebook.notes.lock());
     agent.close().await?;
     ui.await?;
     Ok(())

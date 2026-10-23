@@ -1,10 +1,7 @@
-use std::{
-    num::NonZeroUsize,
-    path::PathBuf,
-    sync::{Arc, Mutex},
-};
+use std::{num::NonZeroUsize, path::PathBuf, sync::Arc};
 
 use agent_input::{Delivery, Fallback, Lifetime, Policy, QueueAccess};
+use parking_lot::Mutex;
 use std::collections::HashSet;
 
 use futures::future::BoxFuture;
@@ -256,10 +253,7 @@ impl<H: AgentHost> AgentBuilder<H> {
             if let (Some(recorder), Some(encoder)) = (&recorder, encoder)
                 && let Err(error) = encoder(&event).and_then(|event| recorder.record_encoded(event))
             {
-                write_error
-                    .lock()
-                    .expect("log error lock")
-                    .get_or_insert(error);
+                write_error.lock().get_or_insert(error);
             }
             if let Some(observer) = &mut observer {
                 observer(event);
@@ -362,7 +356,7 @@ impl<H: AgentHost> Agent<H> {
         };
         let result = result?;
         written?;
-        if let Some(error) = self.log_error.lock().expect("log error lock").take() {
+        if let Some(error) = self.log_error.lock().take() {
             return Err(error.into());
         }
         Ok(result)

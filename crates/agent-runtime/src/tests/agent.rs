@@ -155,7 +155,7 @@ async fn storage_refuses_overwrite_and_resumes_with_provenance() {
         .create_at(&directory.0)
         .on_event(move |event| {
             if matches!(event.kind, EventKind::RunFinished { .. }) {
-                *finished.lock().unwrap() += 1;
+                *finished.lock() += 1;
             }
         })
         .build()
@@ -163,7 +163,7 @@ async fn storage_refuses_overwrite_and_resumes_with_provenance() {
         .unwrap();
     prompt_and_answer(&agent, &mut requests, "first", "saved answer").await;
     agent.close().await.unwrap();
-    assert_eq!(*observed.lock().unwrap(), 1);
+    assert_eq!(*observed.lock(), 1);
     let path = directory.0.join("updates.jsonl");
     let before = tokio::fs::read(&path).await.unwrap();
     let (builder, _) = agent_builder();

@@ -143,6 +143,7 @@ dependencies = [
  "language-model",
  "ollama",
  "openai-compatible",
+ "parking_lot",
  "reqwest",
  "schemars",
  "serde",
@@ -166,6 +167,7 @@ dependencies = [
  "agent-input",
  "futures",
  "language-model",
+ "parking_lot",
  "schemars",
  "serde",
  "serde_json",
@@ -1842,6 +1844,7 @@ name = "draft"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "parking_lot",
  "uuid",
  "yrs",
 ]
@@ -7308,6 +7311,7 @@ dependencies = [
  "agent",
  "libc",
  "mxc-sdk",
+ "parking_lot",
  "schemars",
  "serde",
  "serde_json",
@@ -8531,6 +8535,7 @@ name = "tools"
 version = "0.1.0"
 dependencies = [
  "agent",
+ "parking_lot",
  "schemars",
  "serde",
  "serde_json",

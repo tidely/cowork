@@ -1,7 +1,7 @@
 use std::{
     num::NonZeroUsize,
     sync::{
-        Arc, Mutex,
+        Arc,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -13,6 +13,7 @@ use language_model::{
     GenerationMetadata, LanguageModel, LanguageModelProvider, Message, ReplayData, Role,
     StreamEvent, ToolArguments, ToolCall, ToolCallId, ToolResultContent,
 };
+use parking_lot::Mutex;
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -275,7 +276,7 @@ impl Harness {
         let log = Arc::new(Mutex::new(Vec::new()));
         let records = log.clone();
         let task = tokio::spawn(session.run(move |event| {
-            records.lock().unwrap().push(event.clone());
+            records.lock().push(event.clone());
             let _ = sender.send(event);
         }));
         Self {
@@ -313,7 +314,7 @@ impl Harness {
             .await
             .unwrap()
             .unwrap();
-        let log = self.log.lock().unwrap().clone();
+        let log = self.log.lock().clone();
         (result, log)
     }
 }

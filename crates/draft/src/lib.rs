@@ -43,10 +43,11 @@ mod tests;
 
 use std::{
     collections::{BTreeSet, HashSet},
-    sync::{Arc, Mutex, MutexGuard, PoisonError},
+    sync::Arc,
 };
 
 use anyhow::{Context as _, Result};
+use parking_lot::Mutex;
 use uuid::Uuid;
 use yrs::{
     Any, Array, ArrayPrelim, ArrayRef, Doc, GetString, Map, MapPrelim, MapRef, OffsetKind, Options,
@@ -119,7 +120,7 @@ impl Draft {
                 .origin()
                 .is_some_and(|origin| origin.as_ref() == REMOTE_ORIGIN.as_bytes());
             if !remote {
-                lock(&recorder).push(event.update.clone());
+                recorder.lock().push(event.update.clone());
             }
         })
         .expect("a new document has no active transaction");
@@ -141,7 +142,7 @@ impl Draft {
     /// [`Self::remove_attachment`]). Changes merged in with [`Self::apply_update`] are never
     /// reported, though local changes made afterwards may depend on them.
     pub fn take_local_update(&self) -> Option<Vec<u8>> {
-        let updates = std::mem::take(&mut *lock(&self.local_updates));
+        let updates = std::mem::take(&mut *self.local_updates.lock());
         if updates.is_empty() {
             return None;
         }
@@ -449,11 +450,6 @@ fn get_string<T: ReadTxn>(txn: &T, map: &MapRef, key: &str) -> Option<String> {
         Out::Any(Any::String(s)) => Some(s.to_string()),
         _ => None,
     }
-}
-
-/// Locks `mutex`, ignoring poisoning: the guarded list of updates is valid after any panic.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 fn parse_order_entry(entry: &Out) -> Option<ItemId> {

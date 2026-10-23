@@ -1,10 +1,7 @@
-use std::{
-    collections::HashSet,
-    fmt,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashSet, fmt, sync::Arc};
 
 use agent::tool::{Tool, ToolCall, ToolError, ToolErrorKind, ToolOutput};
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 /// A stable, model-facing identifier for a comment in one agent turn.
@@ -71,32 +68,23 @@ impl TurnComments {
     }
 
     /// Returns a snapshot of responses in tool-call order.
-    pub fn responses(&self) -> Result<Vec<CommentResponse>, CommentToolError> {
-        Ok(self
-            .state
-            .lock()
-            .map_err(|_| CommentToolError::StoreUnavailable)?
-            .responses
-            .clone())
+    pub fn responses(&self) -> Vec<CommentResponse> {
+        self.state.lock().responses.clone()
     }
 
     /// Returns aliases that have not received a response, in comment order.
-    pub fn unanswered_comment_ids(&self) -> Result<Vec<CommentId>, CommentToolError> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| CommentToolError::StoreUnavailable)?;
-        Ok(self
-            .comment_ids
+    pub fn unanswered_comment_ids(&self) -> Vec<CommentId> {
+        let state = self.state.lock();
+        self.comment_ids
             .iter()
             .filter(|comment_id| !state.responded_to.contains(*comment_id))
             .cloned()
-            .collect())
+            .collect()
     }
 
     /// Whether every comment in this turn has received a response.
-    pub fn is_complete(&self) -> Result<bool, CommentToolError> {
-        Ok(self.unanswered_comment_ids()?.is_empty())
+    pub fn is_complete(&self) -> bool {
+        self.unanswered_comment_ids().is_empty()
     }
 
     fn has_comments(&self) -> bool {
@@ -112,10 +100,7 @@ impl TurnComments {
             return Err(CommentToolError::EmptyResponse);
         }
 
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| CommentToolError::StoreUnavailable)?;
+        let mut state = self.state.lock();
         let comment_id = self
             .comment_ids
             .iter()
@@ -140,7 +125,6 @@ pub enum CommentToolError {
     UnknownComment(String),
     AlreadyResponded(CommentId),
     EmptyResponse,
-    StoreUnavailable,
 }
 
 impl fmt::Display for CommentToolError {
@@ -156,9 +140,6 @@ impl fmt::Display for CommentToolError {
                 )
             }
             Self::EmptyResponse => formatter.write_str("the comment response cannot be empty"),
-            Self::StoreUnavailable => {
-                formatter.write_str("the comment response store is unavailable")
-            }
         }
     }
 }
@@ -196,17 +177,11 @@ impl Default for RunComments {
 impl RunComments {
     /// Makes `comments` the next run's.
     pub fn set(&self, comments: Arc<TurnComments>) {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = comments;
+        *self.0.lock() = comments;
     }
 
     pub fn current(&self) -> Arc<TurnComments> {
-        self.0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+        self.0.lock().clone()
     }
 }
 
@@ -243,7 +218,6 @@ impl From<CommentToolError> for ToolError {
             CommentToolError::AlreadyResponded(_) | CommentToolError::EmptyResponse => {
                 ToolErrorKind::InvalidArguments
             }
-            CommentToolError::StoreUnavailable => ToolErrorKind::Execution,
         };
         ToolError::new(kind, error.to_string())
     }
@@ -295,7 +269,7 @@ mod tests {
 
         assert!(!result.recorded);
         assert_eq!(result.comment_id, "comment_1");
-        assert!(comments.responses().unwrap().is_empty());
+        assert!(comments.responses().is_empty());
     }
 
     #[test]
@@ -310,7 +284,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            comments.responses().unwrap(),
+            comments.responses(),
             vec![
                 CommentResponse {
                     comment_id: CommentId::for_index(1),
@@ -331,9 +305,9 @@ mod tests {
             .record_response("comment_2", "Second response".into())
             .unwrap();
 
-        assert!(!comments.is_complete().unwrap());
+        assert!(!comments.is_complete());
         assert_eq!(
-            comments.unanswered_comment_ids().unwrap(),
+            comments.unanswered_comment_ids(),
             vec![CommentId::for_index(0), CommentId::for_index(2)]
         );
 
@@ -343,7 +317,7 @@ mod tests {
         comments
             .record_response("comment_3", "Third response".into())
             .unwrap();
-        assert!(comments.is_complete().unwrap());
+        assert!(comments.is_complete());
     }
 
     #[test]
