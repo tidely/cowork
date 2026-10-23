@@ -179,6 +179,10 @@ mod tests {
                 json!({ "path": "scratch://test.txt" }),
             ),
             (
+                crate::ViewImage::NAME,
+                json!({ "path": "scratch://test.png" }),
+            ),
+            (
                 crate::WriteFile::NAME,
                 json!({ "path": "scratch://test.txt", "content": "hello" }),
             ),
@@ -189,6 +193,7 @@ mod tests {
                 RunCommand::NAME => prepare(RunCommand, &sandbox, arguments),
                 crate::ListDirectory::NAME => prepare(crate::ListDirectory, &sandbox, arguments),
                 crate::ReadFile::NAME => prepare(crate::ReadFile, &sandbox, arguments),
+                crate::ViewImage::NAME => prepare(crate::ViewImage, &sandbox, arguments),
                 crate::WriteFile::NAME => prepare(crate::WriteFile, &sandbox, arguments),
                 _ => prepare(crate::RequestPermissions, &sandbox, arguments),
             };

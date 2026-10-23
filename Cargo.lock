@@ -7309,6 +7309,8 @@ name = "sandbox"
 version = "0.1.0"
 dependencies = [
  "agent",
+ "base64 0.22.1",
+ "image",
  "libc",
  "mxc-sdk",
  "parking_lot",

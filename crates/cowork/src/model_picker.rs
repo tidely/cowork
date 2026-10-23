@@ -194,6 +194,7 @@ impl Cowork {
                                     name,
                                     // Ollama's listing does not report a maximum.
                                     max_tokens: this.context_settings.window_tokens,
+                                    image_input: model.image_input,
                                 };
                                 (model.id, info)
                             }),

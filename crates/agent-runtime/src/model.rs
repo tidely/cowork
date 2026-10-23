@@ -6,8 +6,8 @@ use futures::{
     stream::{self, BoxStream},
 };
 use language_model::{
-    CompletionRequest, CompletionStream, Error, LanguageModel, LanguageModelProvider, Message,
-    Role, StreamEvent,
+    CompletionRequest, CompletionStream, Content, Error, LanguageModel, LanguageModelProvider,
+    Message, Role, StreamEvent, ToolResultContent,
 };
 
 use crate::session::WorkEvent;
@@ -27,6 +27,7 @@ pub(crate) fn sample<A: Send + 'static>(
     model: LanguageModel,
     request: CompletionRequest,
 ) -> BoxStream<'static, WorkEvent<A>> {
+    let request = for_model(&model, request);
     let startup = Box::pin(async move { provider.stream(&model, request).await });
     let state = Sampling {
         startup: Some(startup),
@@ -102,4 +103,100 @@ pub(crate) fn sample<A: Send + 'static>(
         }
     })
     .boxed()
+}
+
+/// What a model that doesn't accept images is sent in place of each image.
+const IMAGE_OMITTED: &str = "[Image omitted: the current model does not accept images.]";
+
+/// `request` as `model` can take it. A model known not to accept images gets
+/// a note in place of each one, so a conversation that holds images (an
+/// attachment, a tool's result, or what an earlier model saw) still runs,
+/// and the model learns something was there. The conversation keeps the
+/// images, for a later model that accepts them. Unknown support sends them
+/// as they are, for the provider to judge.
+fn for_model(model: &LanguageModel, mut request: CompletionRequest) -> CompletionRequest {
+    if model.image_input != Some(false) {
+        return request;
+    }
+    let note = || IMAGE_OMITTED.to_owned();
+    for message in &mut request.messages {
+        for content in &mut message.content {
+            match content {
+                Content::Image(_) => *content = Content::Text { text: note() },
+                Content::ToolResult(result) => {
+                    for part in &mut result.content {
+                        if matches!(part, ToolResultContent::Image(_)) {
+                            *part = ToolResultContent::Text { text: note() };
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    request
+}
+
+#[cfg(test)]
+mod tests {
+    use language_model::{Image, ImageSource, ToolCallId, ToolResult};
+
+    use super::*;
+
+    #[test]
+    fn images_become_notes_only_for_models_without_image_input() {
+        let image = || Image {
+            media_type: "image/png".into(),
+            source: ImageSource::Base64 {
+                data: "AA==".into(),
+            },
+        };
+        let request = CompletionRequest::new(vec![
+            Message::new(
+                Role::User,
+                vec![Content::text("look"), Content::Image(image())],
+            ),
+            Message::new(
+                Role::Tool,
+                vec![Content::ToolResult(ToolResult {
+                    call: ToolCallId::new(),
+                    provider_id: None,
+                    name: Some("view_image".into()),
+                    content: vec![
+                        ToolResultContent::Text {
+                            text: "plot.png".into(),
+                        },
+                        ToolResultContent::Image(image()),
+                    ],
+                    is_error: false,
+                })],
+            ),
+        ]);
+        let mut model = LanguageModel::new("model");
+        for image_input in [None, Some(true)] {
+            model.image_input = image_input;
+            assert_eq!(for_model(&model, request.clone()), request);
+        }
+
+        model.image_input = Some(false);
+        let sent = for_model(&model, request.clone());
+        let note = || IMAGE_OMITTED.to_owned();
+        assert_eq!(
+            sent.messages[0].content,
+            [Content::text("look"), Content::Text { text: note() }]
+        );
+        let Content::ToolResult(result) = &sent.messages[1].content[0] else {
+            panic!("expected the tool result");
+        };
+        assert_eq!(
+            result.content,
+            [
+                ToolResultContent::Text {
+                    text: "plot.png".into()
+                },
+                ToolResultContent::Text { text: note() },
+            ]
+        );
+        sent.validate().unwrap();
+    }
 }

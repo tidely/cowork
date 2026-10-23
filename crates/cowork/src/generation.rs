@@ -29,7 +29,9 @@ use agent::{
 };
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{App, Context, Entity};
-use sandbox::{ListDirectory, Needs, ReadFile, RequestPermissions, RunCommand, WriteFile};
+use sandbox::{
+    ListDirectory, Needs, ReadFile, RequestPermissions, RunCommand, ViewImage, WriteFile,
+};
 use tools::{Calculate, RespondToComment};
 use uuid::Uuid;
 
@@ -55,13 +57,14 @@ const OLLAMA_URL: &str = "http://localhost:11434";
 /// The tools every session offers, in this order. They are part of the
 /// prompt prefix, so they never change with the thread, its comments, or
 /// its project; what changes reaches the model in the environment note.
-const TOOLS: [&str; 7] = [
+const TOOLS: [&str; 8] = [
     RespondToComment::NAME,
     Calculate::NAME,
     RunCommand::NAME,
     RequestPermissions::NAME,
     ListDirectory::NAME,
     ReadFile::NAME,
+    ViewImage::NAME,
     WriteFile::NAME,
 ];
 
@@ -96,11 +99,14 @@ fn platform_prompt() -> String {
 
 /// What the prompt is made of for `model`: the system prompt, the tools,
 /// medium thinking, and Ollama's `num_ctx`, which is a model option only the
-/// native `/api/chat` accepts.
+/// native `/api/chat` accepts. Whether the model accepts images decides
+/// whether the runtime sends them or a note in their place; the tools stay
+/// the same either way, so switching models keeps the prompt prefix.
 fn definition(model: &ModelRef, info: &ModelInfo) -> AgentDefinition {
     let mut language_model = LanguageModel::new(model.id.clone());
     language_model.name = Some(info.name.clone());
     language_model.context_window = Some(info.max_tokens);
+    language_model.image_input = info.image_input;
     let mut options = JsonObject::new();
     options.insert(
         "options".into(),
@@ -125,6 +131,7 @@ fn registry() -> ToolRegistry<CoworkHost, Needs> {
         registry.register(RequestPermissions),
         registry.register(ListDirectory),
         registry.register(ReadFile),
+        registry.register(ViewImage),
         registry.register(WriteFile),
     ];
     for result in registered {
@@ -183,8 +190,9 @@ pub(crate) struct ThreadAgent {
     id: u64,
     handle: SessionHandle<CoworkHost>,
     host: Arc<CoworkHost>,
-    /// The model the session's definition names, and its window.
-    model: (ModelRef, u64),
+    /// The model the session's definition names, and what the catalog said
+    /// of it (its window and image input).
+    model: (ModelRef, ModelInfo),
 }
 
 impl Drop for ThreadAgent {
@@ -611,7 +619,7 @@ impl Cowork {
             .runnable_model()
             .map(|(model, info)| (model.clone(), info.clone()))
             .ok_or_else(|| anyhow::anyhow!("No available model selected"))?;
-        let key = (model.clone(), info.max_tokens);
+        let key = (model.clone(), info.clone());
         if let Some(agent) = self.agents.get_mut(&thread_id) {
             if agent.model != key {
                 agent.handle.post(Request::new(
@@ -1149,6 +1157,7 @@ mod tests {
         let info = ModelInfo {
             name: "Model".into(),
             max_tokens: 1_024,
+            image_input: None,
         };
         let (events, mut received) = mpsc::unbounded();
         let handle = start_session(
@@ -1345,6 +1354,7 @@ mod tests {
         let info = ModelInfo {
             name: "Model".into(),
             max_tokens: 1_024,
+            image_input: None,
         };
         for tool in definition(&model, &info).tools {
             assert!(registry.contains(&tool), "{tool}");
@@ -1365,6 +1375,7 @@ mod tests {
         let info = ModelInfo {
             name: model.id.clone(),
             max_tokens: 16_384,
+            image_input: None,
         };
         let host = Arc::new(CoworkHost::new(Arc::new(sandbox::ThreadSandbox::new(
             crate::test_support::unused_sandboxes(),

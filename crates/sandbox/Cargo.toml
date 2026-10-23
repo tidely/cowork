@@ -9,6 +9,8 @@ workspace = true
 [dependencies]
 mxc-sdk.workspace = true
 agent.workspace = true
+base64.workspace = true
+image.workspace = true
 parking_lot.workspace = true
 schemars.workspace = true
 serde.workspace = true

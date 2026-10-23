@@ -45,7 +45,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 35;
+pub(crate) const PROTOCOL_VERSION: u32 = 36;
 
 /// A request from a collaborator to the host.
 ///
@@ -744,6 +744,7 @@ mod tests {
                     ModelInfo {
                         name: "Qwen".into(),
                         max_tokens: 131_072,
+                        image_input: Some(true),
                     },
                 ),
                 (
@@ -751,6 +752,7 @@ mod tests {
                     ModelInfo {
                         name: "Llama".into(),
                         max_tokens: 8_192,
+                        image_input: None,
                     },
                 ),
             ],

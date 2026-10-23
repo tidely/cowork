@@ -51,7 +51,7 @@ use parking_lot::Mutex;
 
 pub use context::{Needs, ThreadSandbox};
 pub use environment::{EnvironmentSource, PRINT_ENV_FLAG, print_env};
-pub use files::{ListDirectory, ReadFile, WriteFile};
+pub use files::{ListDirectory, ReadFile, ViewImage, WriteFile};
 pub use grant::{Folders, Grant};
 pub use output::CommandOutput;
 pub use paths::FileError;

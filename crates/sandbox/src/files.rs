@@ -9,12 +9,16 @@
 use std::{
     fmt::Write as _,
     fs::File,
-    io::{BufRead as _, BufReader},
+    io::{BufRead as _, BufReader, Cursor, Read as _},
     sync::Arc,
 };
 
-use agent::tool::{Tool, ToolCall, ToolError, ToolErrorKind};
-use serde::Deserialize;
+use agent::{
+    model::{Image, ImageSource, ToolResultContent},
+    tool::{Tool, ToolCall, ToolError, ToolErrorKind, ToolOutput},
+};
+use base64::Engine as _;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     Needs, Sandboxes, ThreadSandbox,
@@ -198,6 +202,234 @@ pub(crate) fn list_directory(places: &Places, path: &str) -> Result<String, File
         );
     }
     Ok(output)
+}
+
+/// The largest image file `view_image` reads, as for image attachments:
+/// room for uncompressed screenshots (BMP, TIFF).
+const IMAGE_SOURCE_LIMIT: u64 = 64 * 1024 * 1024;
+
+/// The most pixels `view_image` decodes, checked from the header before
+/// decoding, so a small file claiming a huge image is refused rather than
+/// decoded. 50 megapixels covers 8K frames and 48 MP phone photos, and stays
+/// within the decoder's default allocation limit at any pixel format.
+const MAX_IMAGE_PIXELS: u64 = 50_000_000;
+
+/// The longest side of an image as the model is sent it; larger ones are
+/// scaled down to it. Vision models scale images to far less themselves, so
+/// this loses nothing they'd see, and it keeps the result small: the image
+/// stays in the conversation, which is saved, sent to every collaborator,
+/// and sent with every later request.
+const MAX_IMAGE_SIDE: u32 = 2048;
+
+/// The largest encoded image the model is sent. PNG and JPEG files within
+/// it and within [`MAX_IMAGE_SIDE`] go as they are; anything else is
+/// re-encoded, as JPEG when PNG would be larger than this.
+const IMAGE_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+
+const JPEG_QUALITY: u8 = 85;
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ViewImageArgs {
+    /// The image to view, such as `myproject/screenshot.png` or
+    /// `scratch://plot.png`.
+    pub path: String,
+}
+
+/// Views a host image using the same path checks as the other file tools.
+pub struct ViewImage;
+
+impl ViewImage {
+    pub const NAME: &'static str = "view_image";
+}
+
+/// The image goes only in the model's content; the structured result keeps
+/// what it was rather than a second copy of its bytes.
+#[derive(Debug, Serialize)]
+pub struct ViewImageOutput {
+    pub path: String,
+    /// The image's size upright, before any scaling.
+    pub width: u32,
+    pub height: u32,
+    /// The size the model is sent, when the image was scaled down.
+    pub scaled_to: Option<(u32, u32)>,
+    #[serde(skip)]
+    image: Image,
+}
+
+impl ToolOutput for ViewImageOutput {
+    /// Says what the image is before showing it, so a model that is sent a
+    /// note in place of the image still learns its size, and coordinates in
+    /// a scaled image can be mapped back.
+    fn model_output(&self) -> Option<Vec<ToolResultContent>> {
+        let mut text = format!("{} ({} × {} pixels", self.path, self.width, self.height);
+        if let Some((width, height)) = self.scaled_to {
+            _ = write!(text, ", shown scaled to {width} × {height}");
+        }
+        text.push(')');
+        Some(vec![
+            ToolResultContent::Text { text },
+            ToolResultContent::Image(self.image.clone()),
+        ])
+    }
+}
+
+impl Tool for ViewImage {
+    type Args = ViewImageArgs;
+    type Output = ViewImageOutput;
+    type Context = ThreadSandbox;
+    type Access = Needs;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "View an image on the user's computer or in scratch: the result shows you the \
+             image itself, after its size. Use it to look at screenshots, plots, diagrams, and \
+             other images, including ones your commands create. Supports PNG, JPEG, GIF, WebP, \
+             BMP, and TIFF; animations show their first frame. Images larger than \
+             {MAX_IMAGE_SIDE} pixels on a side are scaled down to fit. If the current model \
+             can't see images, the result says so in its place. Only view paths you have seen \
+             in a listing, a command's output, or the conversation. {PATHS}"
+        )
+    }
+
+    async fn run(
+        &self,
+        _call: ToolCall<Needs>,
+        sandbox: Arc<ThreadSandbox>,
+        args: Self::Args,
+    ) -> Result<Self::Output, ToolError> {
+        Ok(with_places(sandbox, move |_, places| view_image(places, &args.path)).await?)
+    }
+}
+
+/// The image at `path` as the model is sent it: a PNG or JPEG file that is
+/// upright and within the size limits as it is, so nothing is lost or
+/// re-encoded; anything else decoded (the first frame of an animation),
+/// turned upright by its EXIF orientation, scaled down to
+/// [`MAX_IMAGE_SIDE`], and encoded again.
+fn view_image(places: &Places, path: &str) -> Result<ViewImageOutput, FileError> {
+    use image::{ImageDecoder as _, ImageFormat, metadata::Orientation};
+
+    let location = location(places, path, "an image file")?;
+    let display = location.display();
+    if location.real.is_dir() {
+        return Err(FileError::Invalid(format!(
+            "{display} is a folder, not an image file. Use list_directory to see what it holds."
+        )));
+    }
+    let too_large = |what: String| {
+        FileError::Invalid(format!(
+            "{display} is {what}, too large to view. Use run_command to make a smaller copy \
+             in scratch, then view that."
+        ))
+    };
+    let file = File::open(&location.real).map_err(|error| io_error(error, &location))?;
+    let mut bytes = Vec::new();
+    file.take(IMAGE_SOURCE_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| io_error(error, &location))?;
+    if bytes.len() as u64 > IMAGE_SOURCE_LIMIT {
+        return Err(too_large("larger than 64 MiB".into()));
+    }
+
+    let format = match image::guess_format(&bytes) {
+        Ok(
+            format @ (ImageFormat::Png
+            | ImageFormat::Jpeg
+            | ImageFormat::Gif
+            | ImageFormat::WebP
+            | ImageFormat::Bmp
+            | ImageFormat::Tiff),
+        ) => format,
+        _ => {
+            return Err(FileError::Invalid(format!(
+                "{display} is not a PNG, JPEG, GIF, WebP, BMP, or TIFF image."
+            )));
+        }
+    };
+    let invalid = |error: image::ImageError| match error {
+        image::ImageError::Limits(_) => too_large("an image".into()),
+        error => FileError::Invalid(format!("{display} can't be decoded as an image: {error}")),
+    };
+    let mut decoder = image::ImageReader::with_format(Cursor::new(bytes.as_slice()), format)
+        .into_decoder()
+        .map_err(invalid)?;
+    let (mut width, mut height) = decoder.dimensions();
+    if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
+        return Err(too_large(format!("{width} × {height} pixels")));
+    }
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    let as_is = matches!(format, ImageFormat::Png | ImageFormat::Jpeg)
+        && orientation == Orientation::NoTransforms
+        && width.max(height) <= MAX_IMAGE_SIDE
+        && bytes.len() <= IMAGE_OUTPUT_LIMIT;
+    let (media_type, data, scaled_to) = if as_is {
+        drop(decoder);
+        (format.to_mime_type(), bytes, None)
+    } else {
+        let mut image = image::DynamicImage::from_decoder(decoder).map_err(invalid)?;
+        image.apply_orientation(orientation);
+        (width, height) = (image.width(), image.height());
+        let mut scaled_to = None;
+        if width.max(height) > MAX_IMAGE_SIDE {
+            image = image.resize(
+                MAX_IMAGE_SIDE,
+                MAX_IMAGE_SIDE,
+                image::imageops::FilterType::CatmullRom,
+            );
+            scaled_to = Some((image.width(), image.height()));
+        }
+        // Photos stay JPEG; PNG would make them several times larger.
+        let (media_type, data) = encode_image(&image, format == ImageFormat::Jpeg)?;
+        (media_type, data, scaled_to)
+    };
+    if data.len() > IMAGE_OUTPUT_LIMIT {
+        return Err(too_large("still larger than 4 MiB once scaled down".into()));
+    }
+    Ok(ViewImageOutput {
+        path: display,
+        width,
+        height,
+        scaled_to,
+        image: Image {
+            media_type: media_type.into(),
+            source: ImageSource::Base64 {
+                data: base64::engine::general_purpose::STANDARD.encode(data),
+            },
+        },
+    })
+}
+
+/// `image` as PNG, which keeps it exact, unless it is a photo or the PNG
+/// would be over [`IMAGE_OUTPUT_LIMIT`]; then as JPEG, without transparency.
+fn encode_image(
+    image: &image::DynamicImage,
+    photo: bool,
+) -> Result<(&'static str, Vec<u8>), FileError> {
+    let failed =
+        |error: image::ImageError| FileError::Failed(format!("Can't encode the image: {error}"));
+    if !photo {
+        let mut png = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+            .map_err(failed)?;
+        if png.len() <= IMAGE_OUTPUT_LIMIT {
+            return Ok(("image/png", png));
+        }
+    }
+    let mut jpeg = Vec::new();
+    image
+        .to_rgb8()
+        .write_with_encoder(image::codecs::jpeg::JpegEncoder::new_with_quality(
+            &mut jpeg,
+            JPEG_QUALITY,
+        ))
+        .map_err(failed)?;
+    Ok(("image/jpeg", jpeg))
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -534,6 +766,141 @@ mod tests {
         assert!(matches!(
             list_directory(&places, "zed/missing"),
             Err(FileError::NotFound(_))
+        ));
+    }
+
+    /// The text, media type, and bytes `view_image` sends the model.
+    fn viewed(places: &Places, path: &str) -> (String, String, Vec<u8>) {
+        let output = view_image(places, path).unwrap();
+        let typed = agent::tool::TypedToolOutput::new(ViewImage::NAME, output).unwrap();
+        let [
+            ToolResultContent::Text { text },
+            ToolResultContent::Image(image),
+        ] = typed.model_output.as_slice()
+        else {
+            panic!("expected text and image content");
+        };
+        let ImageSource::Base64 { data } = &image.source else {
+            panic!("expected the image's bytes");
+        };
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(data)
+            .unwrap();
+        (text.clone(), image.media_type.clone(), bytes)
+    }
+
+    fn encoded(image: &image::RgbImage, format: image::ImageFormat) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        image
+            .write_to(&mut Cursor::new(&mut bytes), format)
+            .unwrap();
+        bytes
+    }
+
+    #[test]
+    fn images_go_as_they_are_when_they_can_and_are_converted_or_scaled_otherwise() {
+        let root = TestRoot::new();
+        let places = places(&root, false);
+        let small = image::RgbImage::from_pixel(3, 2, image::Rgb([200, 100, 50]));
+
+        // Formats are detected by content, not extension.
+        for (format, media_type) in [
+            (image::ImageFormat::Png, "image/png"),
+            (image::ImageFormat::Jpeg, "image/jpeg"),
+        ] {
+            let bytes = encoded(&small, format);
+            std::fs::write(root.0.join("zed/image.data"), &bytes).unwrap();
+            assert_eq!(
+                viewed(&places, "zed/image.data"),
+                (
+                    "zed/image.data (3 × 2 pixels)".into(),
+                    media_type.into(),
+                    bytes
+                ),
+            );
+        }
+
+        std::fs::write(
+            root.0.join("zed/image.bmp"),
+            encoded(&small, image::ImageFormat::Bmp),
+        )
+        .unwrap();
+        let (_, media_type, png) = viewed(&places, "zed/image.bmp");
+        assert_eq!(media_type, "image/png");
+        assert_eq!(image::load_from_memory(&png).unwrap().to_rgb8(), small);
+
+        let wide = image::RgbImage::from_pixel(3 * MAX_IMAGE_SIDE / 2, 4, image::Rgb([0, 0, 255]));
+        std::fs::create_dir_all(root.0.join("scratch")).unwrap();
+        std::fs::write(
+            root.0.join("scratch/wide.png"),
+            encoded(&wide, image::ImageFormat::Png),
+        )
+        .unwrap();
+        let (text, media_type, png) = viewed(&places, "scratch://wide.png");
+        let shown = image::load_from_memory(&png).unwrap();
+        assert_eq!(
+            (media_type.as_str(), shown.width()),
+            ("image/png", MAX_IMAGE_SIDE)
+        );
+        assert_eq!(
+            text,
+            format!(
+                "scratch://wide.png ({} × 4 pixels, shown scaled to {} × {})",
+                wide.width(),
+                shown.width(),
+                shown.height()
+            )
+        );
+        view_image(&places, root.0.join("scratch/wide.png").to_str().unwrap()).unwrap();
+
+        // Photos stay JPEG when they have to be scaled.
+        std::fs::write(
+            root.0.join("scratch/wide.jpg"),
+            encoded(&wide, image::ImageFormat::Jpeg),
+        )
+        .unwrap();
+        let (_, media_type, jpeg) = viewed(&places, "scratch://wide.jpg");
+        assert_eq!(
+            (
+                media_type.as_str(),
+                image::load_from_memory(&jpeg).unwrap().width()
+            ),
+            ("image/jpeg", MAX_IMAGE_SIDE)
+        );
+    }
+
+    #[test]
+    fn invalid_or_oversized_images_and_unreadable_paths_are_errors() {
+        let root = TestRoot::new();
+        let places = places(&root, false);
+        std::fs::write(root.0.join("zed/not.png"), b"not an image").unwrap();
+        for path in ["zed/not.png", "zed/src", ".", "zed/../outside.png"] {
+            assert!(
+                matches!(view_image(&places, path), Err(FileError::Invalid(_))),
+                "{path}"
+            );
+        }
+        assert!(matches!(
+            view_image(&places, "zed/missing.png"),
+            Err(FileError::NotFound(_))
+        ));
+
+        let file = File::create(root.0.join("zed/huge.png")).unwrap();
+        file.set_len(IMAGE_SOURCE_LIMIT + 1).unwrap();
+        assert!(matches!(
+            view_image(&places, "zed/huge.png"),
+            Err(FileError::Invalid(message)) if message.contains("64 MiB")
+        ));
+
+        // A tiny file whose header claims 10000 × 10000 pixels is refused
+        // before anything is decoded.
+        let mut bomb = encoded(&image::RgbImage::new(1, 1), image::ImageFormat::Bmp);
+        bomb[18..22].copy_from_slice(&10_000i32.to_le_bytes());
+        bomb[22..26].copy_from_slice(&10_000i32.to_le_bytes());
+        std::fs::write(root.0.join("zed/bomb.bmp"), bomb).unwrap();
+        assert!(matches!(
+            view_image(&places, "zed/bomb.bmp"),
+            Err(FileError::Invalid(message)) if message.contains("10000 × 10000 pixels")
         ));
     }
 

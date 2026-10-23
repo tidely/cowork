@@ -159,6 +159,7 @@ fn catalog_of(models: &[ModelRef]) -> ModelCatalog {
                         name: model.id.clone(),
                         max_tokens: crate::context_settings::ContextSettings::default()
                             .window_tokens,
+                        image_input: None,
                     };
                     (model.id.clone(), info)
                 }),

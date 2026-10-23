@@ -38,6 +38,10 @@ pub(crate) struct ModelInfo {
     pub(crate) name: String,
     /// The context window the model is run with.
     pub(crate) max_tokens: u64,
+    /// Whether the model accepts images, as discovery reported it; `None`
+    /// when it didn't say. A model known not to is sent a note in place of
+    /// each image (see the agent runtime's model metadata).
+    pub(crate) image_input: Option<bool>,
 }
 
 /// The models a thread can run, grouped by provider.
@@ -103,6 +107,7 @@ mod tests {
         ModelInfo {
             name: name.into(),
             max_tokens: 1_024,
+            image_input: None,
         }
     }
 

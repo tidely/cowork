@@ -735,6 +735,10 @@ make or that already returned.
   `Welcome` snapshot and is replaced by `ModelCatalogChanged` after each
   successful discovery (including with an empty catalog). Failed discovery
   leaves the previous catalog in place.
+- Each catalog entry has the model's name, the context window it is run
+  with, and whether it accepts images, as discovery reported it (unknown
+  when the provider didn't say). The host's session sends a model that
+  doesn't accept images a note in place of each image.
 - Providers are a fixed enum known at compile time, and the provider is part
   of a model's identity (`ModelRef` is a provider and the provider's model
   ID). The catalog is keyed by provider and then by model ID, so neither can

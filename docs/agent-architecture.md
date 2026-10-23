@@ -139,6 +139,12 @@ pub struct LanguageModel {
 }
 ```
 
+The runtime acts on `image_input` when it samples: a model known not to accept
+images (`Some(false)`) is sent a text note in place of each image, in user
+content and in tool results alike, while the conversation keeps the images for
+a later model that accepts them. Unknown support (`None`) sends them as they
+are, for the provider to judge.
+
 Provider behavior gets no shared capability struct. The runtime never needs to
 branch on it, because the request expresses intent and each adapter maps that
 intent:
