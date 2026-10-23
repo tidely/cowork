@@ -619,9 +619,59 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
         let at = |seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
         let took = Duration::from_secs;
         cowork.record_turn_usage(&local, turn(100), at(10), took(3), cx);
+        let now = chrono::Local::now();
+        cowork.prepare_profile_statistics(now, cx);
+        assert_eq!(
+            cowork
+                .profile_statistics
+                .as_ref()
+                .unwrap()
+                .totals
+                .tokens_used,
+            100
+        );
+        let snapshot = cowork.profile_statistics.as_ref().unwrap();
+        let activity = snapshot.totals.token_activity.as_ptr();
+        let buckets = snapshot.chart.chart.buckets.as_ptr();
+        // Streaming invalidates the view, not the statistics snapshot or chart.
+        cowork.thread_updated(local.read(cx).instance_id, cx);
+        cowork.prepare_profile_statistics(now, cx);
+        let snapshot = cowork.profile_statistics.as_ref().unwrap();
+        assert_eq!(snapshot.totals.token_activity.as_ptr(), activity);
+        assert_eq!(snapshot.chart.chart.buckets.as_ptr(), buckets);
+
         cowork.record_turn_usage(&local, turn(0), at(15), took(1), cx);
+        assert!(
+            cowork.profile_statistics.is_none(),
+            "zero-token runs can change duration"
+        );
         cowork.record_turn_usage(&local, turn(50), at(20), took(2), cx);
+        cowork.prepare_profile_statistics(now, cx);
         cowork.record_turn_usage(&joined, turn(30), at(30), took(4), cx);
+        assert!(
+            cowork.profile_statistics.is_some(),
+            "joined usage does not affect the profile"
+        );
+        let totals = &cowork.profile_statistics.as_ref().unwrap().totals;
+        assert_eq!(totals.tokens_used, cowork.tokens_used(cx));
+        assert_eq!(totals.chats, cowork.total_chats(cx));
+        assert_eq!(totals.longest_chat, cowork.longest_chat(cx));
+        assert_eq!(totals.token_activity, cowork.token_activity(cx));
+
+        let activity = totals.token_activity.as_ptr();
+        cowork.activity_range = ActivityRange::Day;
+        let later = now + chrono::TimeDelta::hours(2);
+        cowork.prepare_profile_statistics(later, cx);
+        let snapshot = cowork.profile_statistics.as_ref().unwrap();
+        assert_eq!(snapshot.totals.token_activity.as_ptr(), activity);
+        assert_eq!(
+            snapshot.chart.chart,
+            crate::usage::token_activity_chart(
+                &snapshot.totals.token_activity,
+                ActivityRange::Day,
+                later,
+            )
+        );
 
         assert_eq!(local.read(cx).tokens_used, 150);
         assert_eq!(joined.read(cx).tokens_used, 30);

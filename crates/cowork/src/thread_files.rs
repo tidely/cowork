@@ -908,6 +908,7 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) {
         saved.sort_by_key(SavedThread::position);
+        self.profile_statistics = None;
         for thread in saved {
             let id = thread.id();
             let archived = thread.archived();

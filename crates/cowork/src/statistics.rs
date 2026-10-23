@@ -1,19 +1,31 @@
 //! Saving what the profile page's statistics count of deleted threads, so
 //! they outlast them. The rest they count from the user's own threads, which
-//! are saved themselves (see `thread_files.rs`), adding them up when Cowork
-//! starts; see [`Cowork::tokens_used`], [`Cowork::total_chats`], and
-//! [`Cowork::longest_chat`]. A thread whose folder is removed by hand is no
-//! longer counted.
+//! are saved themselves (see `thread_files.rs`). The profile lazily caches
+//! their totals and activity, rebuilding after counted data changes; chart
+//! range and calendar-bucket changes rebuild only the chart. A thread whose
+//! folder is removed by hand is no longer counted after restarting.
 
 use std::{
     path::{Path, PathBuf},
     time::Duration,
 };
 
+use chrono::{DateTime, Local};
 use gpui::App;
 use serde::{Deserialize, Serialize};
 
-use crate::{Cowork, thread::Thread, usage::TokenActivity};
+use crate::{
+    Cowork,
+    thread::Thread,
+    usage::{CachedActivityChart, TokenActivity},
+};
+
+/// A snapshot of owned threads and deleted usage. Rendering only reads this;
+/// mutations that change counted data discard it, and rebuilding stays lazy.
+pub(crate) struct ProfileStatistics {
+    pub(crate) totals: Statistics,
+    pub(crate) chart: CachedActivityChart,
+}
 
 /// The saved file's format. Older or newer files aren't read, nor
 /// overwritten.
@@ -118,10 +130,31 @@ impl Cowork {
     /// Loads what the statistics saved at `file` count of deleted threads,
     /// and saves it there from now on.
     pub(crate) fn start_statistics(&mut self, file: Option<PathBuf>) {
+        self.profile_statistics = None;
         if let Some(path) = &file {
             self.deleted = load_statistics(path);
         }
         self.statistics_file = file;
+    }
+
+    pub(crate) fn prepare_profile_statistics(&mut self, now: DateTime<Local>, cx: &App) {
+        if self.profile_statistics.is_none() {
+            let totals = Statistics {
+                tokens_used: self.tokens_used(cx),
+                chats: self.total_chats(cx),
+                longest_chat: self.longest_chat(cx),
+                token_activity: self.token_activity(cx),
+            };
+            self.profile_statistics = Some(ProfileStatistics {
+                chart: CachedActivityChart::new(&totals.token_activity, self.activity_range, now),
+                totals,
+            });
+        }
+        let cached = self.profile_statistics.as_mut().unwrap();
+        if !cached.chart.is_current(self.activity_range, now) {
+            cached.chart =
+                CachedActivityChart::new(&cached.totals.token_activity, self.activity_range, now);
+        }
     }
 
     /// Tokens used across the user's own threads, deleted ones included,

@@ -190,6 +190,35 @@ pub(crate) struct ActivityChart {
     pub(crate) axis: Vec<AxisLabel>,
 }
 
+/// Reuse aggregation until the selected range or its current calendar bucket
+/// changes. In particular, checking an all-time chart does not scan its history.
+pub(crate) struct CachedActivityChart {
+    range: ActivityRange,
+    unit: BucketUnit,
+    current: DateTime<Local>,
+    pub(crate) chart: ActivityChart,
+}
+
+impl CachedActivityChart {
+    pub(crate) fn new(
+        activity: &[TokenActivity],
+        range: ActivityRange,
+        now: DateTime<Local>,
+    ) -> Self {
+        let layout = BucketLayout::of(range, activity, now);
+        Self {
+            range,
+            unit: layout.unit,
+            current: layout.unit.floor(now),
+            chart: token_activity_chart(activity, range, now),
+        }
+    }
+
+    pub(crate) fn is_current(&self, range: ActivityRange, now: DateTime<Local>) -> bool {
+        self.range == range && self.current == self.unit.floor(now)
+    }
+}
+
 impl ActivityChart {
     /// The bucket with the most tokens, the latest of equals, unless no
     /// bucket has any.
@@ -499,6 +528,37 @@ mod tests {
         ] {
             assert_eq!(format_stat_count(count), text, "{count}");
         }
+    }
+
+    #[test]
+    fn activity_chart_cache_tracks_range_and_calendar_bucket() {
+        use chrono::TimeZone as _;
+
+        let now = Local
+            .with_ymd_and_hms(2026, 5, 20, 14, 37, 12)
+            .single()
+            .unwrap();
+        let activity = [TokenActivity {
+            at: (now - TimeDelta::minutes(5)).into(),
+            duration: Duration::from_secs(90),
+            tokens: 100,
+        }];
+        let hour = CachedActivityChart::new(&activity, ActivityRange::Hour, now);
+        assert!(hour.is_current(ActivityRange::Hour, now + TimeDelta::seconds(47)));
+        assert!(!hour.is_current(ActivityRange::Hour, now + TimeDelta::seconds(48)));
+        assert!(!hour.is_current(ActivityRange::Day, now));
+        assert!(!hour.is_current(ActivityRange::Hour, now - TimeDelta::minutes(1)));
+        assert_eq!(
+            hour.chart,
+            token_activity_chart(&activity, ActivityRange::Hour, now)
+        );
+
+        let year = CachedActivityChart::new(&activity, ActivityRange::Year, now);
+        assert!(year.is_current(ActivityRange::Year, now + TimeDelta::days(1)));
+        assert!(!year.is_current(ActivityRange::Year, now + TimeDelta::days(12)));
+        let lifetime = CachedActivityChart::new(&activity, ActivityRange::Lifetime, now);
+        assert!(lifetime.is_current(ActivityRange::Lifetime, now + TimeDelta::seconds(47)));
+        assert!(!lifetime.is_current(ActivityRange::Lifetime, now + TimeDelta::minutes(1)));
     }
 
     #[test]

@@ -808,6 +808,10 @@ impl Cowork {
             thread.token_activity.extend(activity);
             (thread.instance_id, thread.ownership())
         });
+        // Duration can change even when the provider reports zero tokens.
+        if ownership == ThreadOwnership::Local {
+            self.profile_statistics = None;
+        }
         let store = self.thread_store.read(cx);
         let deleted =
             store.thread(thread_id, cx).is_none() && store.archived_thread(thread_id, cx).is_none();

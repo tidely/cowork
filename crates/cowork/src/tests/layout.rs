@@ -525,6 +525,7 @@ fn the_profile_button_opens_the_profile_page(cx: &mut gpui::TestAppContext) {
             duration: Duration::ZERO,
             tokens: 1_200,
         });
+        cowork.profile_statistics = None;
         cx.notify();
     });
     cx.run_until_parked();

@@ -168,6 +168,8 @@ struct Cowork {
     /// threads; the rest they count from the threads themselves. See
     /// [`Cowork::delete_archived_thread`] and `statistics.rs`.
     deleted: statistics::Statistics,
+    /// Lazily rebuilt on Profile, not on unrelated streaming redraws.
+    profile_statistics: Option<statistics::ProfileStatistics>,
     /// Where the profile's statistics are saved; `None` keeps them in
     /// memory, as in tests.
     statistics_file: Option<std::path::PathBuf>,
@@ -803,6 +805,7 @@ pub fn run() -> anyhow::Result<()> {
                         active_generations: HashMap::new(),
                         agents: HashMap::new(),
                         deleted: Default::default(),
+                        profile_statistics: None,
                         statistics_file: None,
                         thread_files: None,
                         scheduler: Default::default(),

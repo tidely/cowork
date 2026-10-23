@@ -94,7 +94,7 @@ impl Cowork {
     }
 
     pub(crate) fn render_settings_page(
-        &self,
+        &mut self,
         page: SettingsPage,
         window: &mut Window,
         cx: &mut Context<Self>,

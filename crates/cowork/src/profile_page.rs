@@ -23,10 +23,7 @@ use crate::{
     Cowork,
     profile::{Profile, display_name_error, load_profile_picture, participant_name},
     thread::{Thread, ThreadOwnership},
-    usage::{
-        ActivityBucket, ActivityRange, format_stat_count, format_stat_duration,
-        token_activity_chart,
-    },
+    usage::{ActivityBucket, ActivityRange, format_stat_count, format_stat_duration},
 };
 
 impl Cowork {
@@ -39,9 +36,10 @@ impl Cowork {
         Self::render_avatar_for(self.local_participant_id, Some(&self.profile), size)
     }
 
-    pub(crate) fn render_profile_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_profile_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         const PICTURE_SIZE: gpui::Pixels = px(96.);
 
+        self.prepare_profile_statistics(Local::now(), cx);
         let picture = div()
             .id("profile-picture")
             .group("profile-picture")
@@ -160,10 +158,11 @@ impl Cowork {
 
     /// A row of the user's usage statistics, each a value over its label.
     fn render_usage_stats(&self, cx: &App) -> impl IntoElement {
+        let totals = &self.profile_statistics.as_ref().unwrap().totals;
         let stats = [
-            (format_stat_count(self.tokens_used(cx)), "Lifetime tokens"),
-            (self.total_chats(cx).to_string(), "Total chats"),
-            (format_stat_duration(self.longest_chat(cx)), "Longest chat"),
+            (format_stat_count(totals.tokens_used), "Lifetime tokens"),
+            (totals.chats.to_string(), "Total chats"),
+            (format_stat_duration(totals.longest_chat), "Longest chat"),
         ];
         let divider = || div().flex_none().w(px(1.)).h(px(36.)).bg(cx.theme().muted);
         let stat = |(value, label): (String, &'static str)| {
@@ -222,8 +221,7 @@ impl Cowork {
         /// Room above the plot, so that its highest value meets the line.
         const PEAK_LABEL_ROOM: f32 = PEAK_LINE_TOP - PLOT_TOP_INSET;
 
-        let chart =
-            token_activity_chart(&self.token_activity(cx), self.activity_range, Local::now());
+        let chart = &self.profile_statistics.as_ref().unwrap().chart.chart;
         let last_index = chart.buckets.len().saturating_sub(1);
         let peak = chart.peak().map(|(index, bucket)| {
             let text = format!(
@@ -332,7 +330,7 @@ impl Cowork {
                             .w_full()
                             .h(px(PLOT_HEIGHT))
                             .child(
-                                LineChart::new(chart.buckets)
+                                LineChart::new(chart.buckets.clone())
                                     .x(|bucket: &ActivityBucket| bucket.label.clone())
                                     .y(|bucket: &ActivityBucket| bucket.tokens)
                                     .stroke(cx.theme().chart_1)

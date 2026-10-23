@@ -86,6 +86,7 @@ impl Cowork {
         self.thread_store.update(cx, |store, _| {
             store.threads.push_front(thread.clone());
         });
+        self.profile_statistics = None;
         thread
     }
 

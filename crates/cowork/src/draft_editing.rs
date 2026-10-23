@@ -942,6 +942,7 @@ pub(crate) mod tests {
                         active_generations: HashMap::new(),
                         agents: HashMap::new(),
                         deleted: Default::default(),
+                        profile_statistics: None,
                         statistics_file: None,
                         thread_files: None,
                         scheduler: Default::default(),

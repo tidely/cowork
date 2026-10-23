@@ -305,6 +305,7 @@ impl Cowork {
             return;
         }
         self.deleted.longest_chat = self.deleted.longest_chat.max(thread.generation_time());
+        self.profile_statistics = None;
         self.sandboxes.forget(&thread_id.to_string());
         self.delete_thread_files(thread_id);
     }
