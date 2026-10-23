@@ -584,7 +584,7 @@ fn only_the_users_own_threads_are_saved(cx: &mut gpui::TestAppContext) {
         cowork
             .thread_store
             .update(cx, |store, _| store.threads.push_back(joined));
-        let (files, saved) = crate::thread_files::ThreadFiles::open(Some(root.clone()));
+        let (files, saved) = crate::thread_files::ThreadFiles::open(Some(root.clone())).unwrap();
         assert!(saved.is_empty());
         cowork.thread_files = Some(files);
         cowork.save_all_threads(cx);

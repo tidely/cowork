@@ -19,7 +19,9 @@ snapshots carry the whole transcript as one `Json<TranscriptRecord>` value, its
 entries and compactions in the agent's versioned records, plus the run records
 and their pending previews. All history and local views remain
 in memory; there is no transcript offloading or history paging. The host saves
-its own threads at turn boundaries and reads them back when it starts; see
+its own threads at turn boundaries and reads them back when it starts, unless
+launched with `--ephemeral`. Normal launches require exclusive ownership of
+the saved state; see
 [Saved threads](#saved-threads).
 
 The visible timeline is a local, pure projection of these records, pending
@@ -818,8 +820,13 @@ folder). `crates/cowork/src/thread_files.rs` has the format.
   own format version, independent of `PROTOCOL_VERSION`; a file of another
   version is neither read nor overwritten.
 - One app instance keeps the threads, holding `~/.cowork/threads/.lock`.
-  Another running at the same time saves nothing and keeps its threads'
-  folders in a temporary folder removed when it quits.
+  Another normal launch exits with an already-running error before loading
+  saved state. There is no automatic activation of the first instance.
+  `--ephemeral` opens an independent instance without reading or writing
+  `~/.cowork` or acquiring its lock: threads, statistics, and schedules are
+  not persisted. Scratch files use a unique temporary folder removed on
+  orderly shutdown (a crash may leave it behind). Ephemeral mode does not
+  restrict otherwise permitted agent changes to project files.
 - Deleting a thread from the archive removes its folder.
 
 ## Document layout

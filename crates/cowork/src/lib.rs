@@ -699,6 +699,23 @@ pub fn run() -> anyhow::Result<()> {
         sandbox::print_env();
         return Ok(());
     }
+    let ephemeral = std::env::args_os().skip(1).any(|arg| arg == "--ephemeral");
+    // Own the persistent store before starting any services or reading other
+    // saved state. Only an explicit --ephemeral launch may skip the lock.
+    let (root, mut statistics_file, mut schedule_file) = if ephemeral {
+        (None, None, None)
+    } else {
+        (
+            Some(thread_files::threads_dir().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "Cannot find the home directory. Use --ephemeral to run without saving."
+                )
+            })?),
+            statistics::statistics_file(),
+            scheduler::schedule_file(),
+        )
+    };
+    let (thread_files, saved_threads) = thread_files::ThreadFiles::open(root)?;
     let worker_threads = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(4)
@@ -713,10 +730,6 @@ pub fn run() -> anyhow::Result<()> {
         TOKIO_RUNTIME.set(runtime).is_ok(),
         "the agent runtime was already initialized",
     );
-    // Read before the window opens, so the scheduler finds the threads its
-    // tasks continue.
-    let (thread_files, saved_threads) =
-        thread_files::ThreadFiles::open(thread_files::threads_dir());
     let sandboxes = Arc::new(sandbox::Sandboxes::new(
         thread_files.root().to_owned(),
         command_environment(),
@@ -815,8 +828,8 @@ pub fn run() -> anyhow::Result<()> {
                     if let Some((files, saved)) = thread_files.take() {
                         cowork.start_thread_files(files, saved, cx);
                     }
-                    cowork.start_statistics(statistics::statistics_file());
-                    cowork.start_scheduler(scheduler::schedule_file(), Some(window_handle), cx);
+                    cowork.start_statistics(statistics_file.take());
+                    cowork.start_scheduler(schedule_file.take(), Some(window_handle), cx);
                 });
                 cx.new(|cx| Root::new(cowork, window, cx))
             }) {

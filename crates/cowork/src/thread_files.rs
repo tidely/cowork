@@ -25,9 +25,10 @@
 //! written, and records how much of the message log it holds, so a save
 //! cut short leaves the thread as it was saved before.
 //!
-//! One Cowork instance keeps the threads, holding `.lock`. Another running
-//! at the same time saves nothing, and keeps its threads' folders in a
-//! temporary folder it removes when it quits.
+//! One Cowork instance keeps the threads, holding `.lock`. Another normal
+//! launch fails rather than opening unsaved threads. An explicitly ephemeral
+//! instance skips the lock and keeps its threads' folders in a temporary
+//! folder it removes when it quits.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -631,8 +632,7 @@ fn read_threads(root: &Path) -> (Vec<SavedThread>, HashMap<Uuid, u64>) {
 /// The saved threads' folders, and the writer saving them.
 pub(crate) struct ThreadFiles {
     root: PathBuf,
-    /// Whether threads are saved: not when another instance keeps them, and
-    /// this one's folders are temporary.
+    /// Whether threads are saved; false for an ephemeral instance.
     persistent: bool,
     jobs: mpsc::Sender<Job>,
     /// What of each thread is saved, so the next save adds only what is new.
@@ -668,29 +668,21 @@ struct SaveJob {
 }
 
 impl ThreadFiles {
-    /// Keeps threads in `root`, reading those saved there, unless another
-    /// instance already keeps them: then threads live in a temporary folder
-    /// for this run, and none are read.
-    pub(crate) fn open(root: Option<PathBuf>) -> (Self, Vec<SavedThread>) {
-        let locked = root.and_then(|root| match lock(&root) {
-            Ok(Some(file)) => Some((root, file)),
-            Ok(None) => {
-                eprintln!(
-                    "another Cowork keeps the threads in {}; this one's threads won't be saved",
-                    root.display()
-                );
-                None
+    /// Keeps threads in `root`, or fails if it cannot exclusively own them.
+    /// `None` explicitly selects an ephemeral instance: no lock or saved
+    /// threads, and temporary folders for this run only.
+    pub(crate) fn open(root: Option<PathBuf>) -> anyhow::Result<(Self, Vec<SavedThread>)> {
+        let (root, lock, persistent) = match root {
+            Some(root) => {
+                let file = lock(&root)
+                    .with_context(|| format!("could not lock threads in {}", root.display()))?
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Cowork is already running. Use --ephemeral to open a separate instance."
+                        )
+                    })?;
+                (root, Some(file), true)
             }
-            Err(error) => {
-                eprintln!(
-                    "could not keep threads in {}: {error:#}; they won't be saved",
-                    root.display()
-                );
-                None
-            }
-        });
-        let (root, lock, persistent) = match locked {
-            Some((root, lock)) => (root, Some(lock), true),
             None => (
                 std::env::temp_dir().join(format!("cowork-threads-{}", Uuid::new_v4().simple())),
                 None,
@@ -732,7 +724,7 @@ impl ThreadFiles {
             failed,
             _lock: lock,
         };
-        (files, threads)
+        Ok((files, threads))
     }
 
     /// The threads' folders, each with its commands' scratch folder.
@@ -1037,6 +1029,51 @@ mod tests {
         }
     }
 
+    #[test]
+    fn persistent_instances_require_exclusive_ownership() {
+        let root = Root::new();
+        let (files, _) = ThreadFiles::open(Some(root.0.clone())).unwrap();
+        let error = ThreadFiles::open(Some(root.0.clone())).err().unwrap();
+        assert!(error.to_string().contains("already running"));
+        futures::executor::block_on(files.quit()).unwrap();
+        drop(files);
+        let (files, _) = ThreadFiles::open(Some(root.0.clone())).unwrap();
+        futures::executor::block_on(files.quit()).unwrap();
+
+        let invalid = Root::new();
+        std::fs::write(&invalid.0, b"not a directory").unwrap();
+        assert!(ThreadFiles::open(Some(invalid.0.clone())).is_err());
+        std::fs::remove_file(&invalid.0).unwrap();
+    }
+
+    #[gpui::test]
+    fn ephemeral_instances_are_independent_and_do_not_save(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            let root = Root::new();
+            let (persistent, _) = ThreadFiles::open(Some(root.0.clone())).unwrap();
+            let (mut first, saved) = ThreadFiles::open(None).unwrap();
+            let (second, other_saved) = ThreadFiles::open(None).unwrap();
+            assert!(saved.is_empty() && other_saved.is_empty());
+            assert_ne!(first.root(), second.root());
+            assert_ne!(first.root(), persistent.root());
+            let mut host = ScriptedHost::default();
+            let (thread, _) = thread_with_history(&mut host, &std::env::temp_dir(), cx);
+            let temporary = first.root().to_owned();
+            std::fs::create_dir_all(&temporary).unwrap();
+            std::fs::write(temporary.join("scratch-marker"), b"scratch").unwrap();
+            first.save(&thread, false, 0);
+            assert!(first.saved.is_empty(), "ephemeral saves are ignored");
+            // Quit drains the writer queue and removes temporary scratch,
+            // but no saved thread or lock should ever have been created.
+            assert!(!temporary.join(LOCK_FILE).exists());
+            assert!(!temporary.join(thread.instance_id.to_string()).exists());
+            futures::executor::block_on(first.quit()).unwrap();
+            assert!(!temporary.exists());
+            futures::executor::block_on(second.quit()).unwrap();
+            futures::executor::block_on(persistent.quit()).unwrap();
+        });
+    }
+
     /// What a thread shows and runs on: its snapshot, with each unfinished
     /// reply as the reply it shows rather than the previews that made it.
     fn shown(thread: &Thread) -> protocol::ThreadSnapshot {
@@ -1138,7 +1175,7 @@ mod tests {
 
     /// The threads in `root`, as Cowork reads them when it starts.
     fn reopen(root: &Root, cx: &mut gpui::App) -> (ThreadFiles, Vec<Thread>) {
-        let (files, saved) = ThreadFiles::open(Some(root.0.clone()));
+        let (files, saved) = ThreadFiles::open(Some(root.0.clone())).unwrap();
         let threads = saved
             .into_iter()
             .map(|thread| thread.into_thread(ModelCatalog::default(), cx).unwrap())
@@ -1154,7 +1191,7 @@ mod tests {
             let mut host = ScriptedHost::default();
             let (mut thread, attachment) = thread_with_history(&mut host, &folder, cx);
             {
-                let (mut files, saved) = ThreadFiles::open(Some(root.0.clone()));
+                let (mut files, saved) = ThreadFiles::open(Some(root.0.clone())).unwrap();
                 assert!(saved.is_empty());
                 save(&mut files, &thread);
             }
