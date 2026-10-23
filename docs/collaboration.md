@@ -24,6 +24,17 @@ launched with `--ephemeral`. Normal launches require exclusive ownership of
 the saved state; see
 [Saved threads](#saved-threads).
 
+After first-time model setup, the host creates a “Welcome to Cowork” thread
+with a canned assistant greeting and a host-authored onboarding prompt.
+They are ordinary transcript entries in a completed run, saved and shared
+like other history; only the greeting is shown in the timeline. The greeting
+streams in as previews for well under a second, as a reply would, and can't
+be stopped. No model request runs until the user replies, and a reply
+sent while the greeting streams waits for it as a pending submission. The
+tour is one step: the agent asks a few easy questions and the user answers
+one with a comment; then it points them at new chats and project folders.
+Sharing and scheduled tasks are only described.
+
 The visible timeline is a local, pure projection of these records, pending
 submissions, and active run activity. Compactions fold into output steps in the
 same traversal as messages; there is no separate boundary-to-step translation.
@@ -468,6 +479,14 @@ Presence
 ## Thread controls
 
 ### Submission
+
+The onboarding chat begins without a participant submission: the host seeds
+one run through `AgentStarted`, the committed prompt, text `Preview`s of the
+greeting, its committed reply entry, and `AgentEnded`, with no usage or
+generation duration. The thread is first saved once that run has ended. Its
+input has `Host` provenance and no user group in the timeline. Later replies and comments use
+the ordinary submission path below, and the session resumes the seeded
+transcript. This needs no tutorial-specific draft or wire state.
 
 Pressing Ctrl-Enter (Cmd-Enter on macOS) in any composer editor or at the
 draft position, or clicking Send, submits the whole draft for everyone,

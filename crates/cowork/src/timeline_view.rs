@@ -29,12 +29,13 @@ use crate::{
     caret::{paint_caret_label, selection_rects},
     composer_attachments::AttachmentCard,
     highlight::highlight_code_block_in_mode,
+    inline_icons::InlineIcons,
     participant::ParticipantId,
     protocol::RunOutcome,
     thread_draft::{CARET_LABEL_DURATION, EditorSlot, RemoteCaret},
     timeline::{
-        AgentMessage, AgentStep, AgentToolCall, MessageAuthor, StepView, ThreadMessageId,
-        TimelineMessage, UserComment, UserCommentBody,
+        AgentCommentResponse, AgentMessage, AgentStep, AgentToolCall, MessageAuthor, StepView,
+        ThreadMessageId, TimelineMessage, UserComment, UserCommentBody,
     },
     timeline_projection::{RunItem, RunProjection},
     tool_approval::{self, ApprovalRights},
@@ -387,6 +388,15 @@ impl Cowork {
             .with_dark(cx.theme().is_dark())
     }
 
+    /// Markdown as the timeline shows it: selected as plain text, in the
+    /// timeline's style, with the app's inline icons.
+    fn markdown_view(state: &Entity<TextViewState>, cx: &App) -> TextView {
+        TextView::new(state)
+            .selection_format(SelectionFormat::Plain)
+            .style(Self::markdown_style(cx))
+            .plugin(InlineIcons)
+    }
+
     /// The background of the text a comment by `author` is on.
     fn comment_highlight(&self, author: ParticipantId) -> gpui::Hsla {
         gpui::Hsla::from(rgb(self.color_of(author))).opacity(0.3)
@@ -451,9 +461,7 @@ impl Cowork {
     }
 
     fn render_message_segment(segment: &MessageSegment, cx: &App) -> gpui::AnyElement {
-        TextView::new(&segment.state)
-            .selection_format(SelectionFormat::Plain)
-            .style(Self::markdown_style(cx))
+        Self::markdown_view(&segment.state, cx)
             .w_full()
             .into_any_element()
     }
@@ -826,12 +834,7 @@ impl Cowork {
                         .border_l_1()
                         .border_color(cx.theme().border)
                         .opacity(0.7)
-                        .child(
-                            TextView::new(view)
-                                .selection_format(SelectionFormat::Plain)
-                                .style(Self::markdown_style(cx))
-                                .w_full(),
-                        ),
+                        .child(Self::markdown_view(view, cx).w_full()),
                 )
             })
             .into_any_element()
@@ -1131,9 +1134,7 @@ impl Cowork {
 
         let whole = |cx: &App| {
             (!text.is_empty()).then(|| {
-                TextView::new(text_view)
-                    .selection_format(SelectionFormat::Plain)
-                    .style(Self::markdown_style(cx))
+                Self::markdown_view(text_view, cx)
                     .w_full()
                     .into_any_element()
             })
@@ -1252,6 +1253,68 @@ impl Cowork {
         }
     }
 
+    /// The agent's reply to a comment: plain text under the comment, marked
+    /// by a reply icon rather than a box of its own.
+    fn render_comment_response(
+        &mut self,
+        thread_id: Uuid,
+        response: &AgentCommentResponse,
+        comments: &[UserComment],
+        wrap_width: gpui::Pixels,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let response_id = response.id;
+        let content = self.render_agent_text(
+            ThreadMessageId {
+                thread_id,
+                message_id: response_id,
+            },
+            &response.response,
+            &response.response_view,
+            comments,
+            wrap_width,
+            window,
+            cx,
+        );
+        div()
+            .id(format!("comment-response-{response_id}"))
+            .w_full()
+            .flex()
+            .items_start()
+            .gap_2()
+            .px_2()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, _| {
+                    this.selection_message_id = Some(response_id);
+                }),
+            )
+            .child(
+                // As tall as the first line, so the icon centers on it.
+                div()
+                    .h(window.line_height())
+                    .flex_none()
+                    .flex()
+                    .items_center()
+                    .child(
+                        Icon::new(AssetIconName::Reply)
+                            .size_3p5()
+                            .text_color(cx.theme().muted_foreground),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .children(content),
+            )
+            .into_any_element()
+    }
+
     /// An agent message: the comments it was asked about, a summary of its
     /// work and, while that is open, the work itself, then its response.
     #[allow(clippy::too_many_arguments)]
@@ -1283,47 +1346,28 @@ impl Cowork {
             .collect::<Vec<_>>();
         let mut submitted_comment_content = Vec::new();
         for comment in &submitted_comments {
-            submitted_comment_content.push(self.render_composer_comment(comment, cx));
-            if let Some(response) = message
+            let response = message
                 .ui
                 .comment_responses
                 .iter()
                 .find(|response| response.comment_id == comment.id)
-            {
-                let response_id = response.id;
-                let response_content = self.render_agent_text(
-                    ThreadMessageId {
-                        thread_id,
-                        message_id: response.id,
-                    },
-                    &response.response,
-                    &response.response_view,
-                    comments,
-                    wrap_width,
-                    window,
-                    cx,
-                );
-                submitted_comment_content.push(
-                    div()
-                        .id(format!("comment-response-{response_id}"))
-                        .w_full()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(cx.theme().muted)
-                        .flex()
-                        .flex_col()
-                        .gap_3()
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, _, _| {
-                                this.selection_message_id = Some(response_id);
-                            }),
-                        )
-                        .children(response_content)
-                        .into_any_element(),
-                );
-            }
+                .map(|response| {
+                    self.render_comment_response(
+                        thread_id, response, comments, wrap_width, window, cx,
+                    )
+                });
+            // A comment and its reply read as one item, closer together than
+            // the run's other content.
+            submitted_comment_content.push(
+                div()
+                    .w_full()
+                    .flex()
+                    .flex_col()
+                    .gap_1p5()
+                    .child(self.render_composer_comment(comment, cx))
+                    .children(response)
+                    .into_any_element(),
+            );
         }
 
         let message_content = self.render_agent_text(
@@ -1351,10 +1395,12 @@ impl Cowork {
                     .text_color(cx.theme().danger)
                     .child(failure.to_owned())
             });
-        // A plain reply that completed needs no summary.
-        let summarized = message.is_generating()
-            || message.ui.output.work().next().is_some()
-            || !matches!(message.record.run.outcome(), Some(RunOutcome::Completed));
+        // A plain reply that completed needs no summary, nor does the
+        // onboarding greeting while it streams in.
+        let summarized = !self.streaming_intro(message_id)
+            && (message.is_generating()
+                || message.ui.output.work().next().is_some()
+                || !matches!(message.record.run.outcome(), Some(RunOutcome::Completed)));
         let summary = summarized.then(|| Self::render_work_summary(thread_id, message, cx));
         let rights = self
             .thread_store
@@ -1409,11 +1455,9 @@ impl Cowork {
                             (AgentStep::Thinking(_), StepView::Thinking { view, .. }) => {
                                 Self::render_thinking(thread_id, message, step_index, view, cx)
                             }
-                            (AgentStep::Text(_), StepView::Text { view }) => TextView::new(view)
-                                .selection_format(SelectionFormat::Plain)
-                                .style(Self::markdown_style(cx))
-                                .w_full()
-                                .into_any_element(),
+                            (AgentStep::Text(_), StepView::Text { view }) => {
+                                Self::markdown_view(view, cx).w_full().into_any_element()
+                            }
                             _ => unreachable!("reconciled content and view variants agree"),
                         });
                     }
@@ -1435,17 +1479,8 @@ impl Cowork {
                                         .iter()
                                         .any(|comment| comment.id == response.comment_id)
                                     {
-                                        content.extend(self.render_agent_text(
-                                            ThreadMessageId {
-                                                thread_id,
-                                                message_id: response.id,
-                                            },
-                                            &response.response,
-                                            &response.response_view,
-                                            comments,
-                                            wrap_width,
-                                            window,
-                                            cx,
+                                        content.push(self.render_comment_response(
+                                            thread_id, response, comments, wrap_width, window, cx,
                                         ));
                                     }
                                 }

@@ -19,6 +19,7 @@ gpui_kit_assets::icon_assets!(
         Search,
         SendHorizontal,
         CornerDownLeft,
+        Reply,
         Square,
         SquarePen,
         UsersRound,

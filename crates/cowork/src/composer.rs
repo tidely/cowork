@@ -224,28 +224,29 @@ impl Cowork {
             .flex()
             .flex_col()
             .overflow_hidden()
-            .rounded_lg()
+            .gap_1()
+            .p_1()
+            .rounded_md()
             .border_1()
             .border_color(cx.theme().border)
             .bg(cx.theme().secondary)
             .child(
                 div()
                     .w_full()
-                    .px_3()
-                    .pt_3()
-                    .pb_2()
-                    .text_color(cx.theme().foreground)
+                    .px_1p5()
+                    .text_sm()
+                    .text_color(cx.theme().muted_foreground)
                     .line_clamp(2)
                     .child(comment.reference.quote.clone()),
             )
             .child(
-                div().w_full().px_3().pb_3().child(
+                div().w_full().child(
                     div()
                         .w_full()
                         .overflow_hidden()
                         .border_1()
                         .border_color(cx.theme().border)
-                        .rounded_md()
+                        .rounded_sm()
                         .bg(cx.theme().popover)
                         .child(
                             div()
@@ -253,8 +254,8 @@ impl Cowork {
                                 .flex()
                                 .items_center()
                                 .gap_2()
-                                .px_3()
-                                .py_2()
+                                .px_1p5()
+                                .py_1()
                                 .border_l_2()
                                 .border_color(rgb(self.color_of(comment.author)))
                                 .child(self.render_layered_avatars(

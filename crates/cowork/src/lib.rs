@@ -55,6 +55,7 @@ mod composer_attachments;
 mod draft_editing;
 
 mod highlight;
+mod inline_icons;
 
 mod context_settings;
 mod model_picker;
@@ -166,6 +167,9 @@ struct Cowork {
     /// each hosted thread's project and scratch folder.
     sandboxes: Arc<sandbox::Sandboxes>,
     active_generations: HashMap<Uuid, ActiveGeneration>,
+    /// The first chat's greeting while it streams in; see
+    /// `thread/onboarding.rs`.
+    onboarding_intro: Option<thread::OnboardingIntro>,
     /// The agent session of each local or hosted thread that has run.
     agents: HashMap<Uuid, ThreadAgent>,
     /// What the profile's statistics still count of the user's deleted
@@ -856,6 +860,7 @@ pub fn run() -> anyhow::Result<()> {
                         tokio_handle,
                         sandboxes,
                         active_generations: HashMap::new(),
+                        onboarding_intro: None,
                         agents: HashMap::new(),
                         deleted: Default::default(),
                         profile_statistics: None,

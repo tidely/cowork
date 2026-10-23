@@ -122,7 +122,7 @@ fn context_window_changes_reach_peers_and_respect_their_host(cx: &mut gpui::Test
 }
 
 #[gpui::test]
-fn provider_setup_selects_the_new_threads_model(cx: &mut gpui::TestAppContext) {
+fn provider_setup_starts_onboarding_with_the_selected_model(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     cx.update(|_, cx| {
         cowork.update(cx, |cowork, cx| {
@@ -172,13 +172,88 @@ fn provider_setup_selects_the_new_threads_model(cx: &mut gpui::TestAppContext) {
     cx.simulate_click(continue_button.center(), gpui::Modifiers::default());
     cx.run_until_parked();
 
+    // The greeting streams in as previews of the seeded run, and ends it,
+    // with no "Working for" line to vanish when it does.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_millis(100));
+    cx.run_until_parked();
+    let greeting_id = cowork.read_with(cx, |cowork, cx| {
+        let thread = cowork.active_thread(cx).expect("setup starts a chat");
+        let thread = thread.read(cx);
+        assert!(thread.is_generating());
+        let TimelineMessage::Agent(message) = &thread.timeline[0] else {
+            panic!("the greeting is an agent message");
+        };
+        assert!(!message.ui.output.text.is_empty());
+        assert!(!message.ui.output.text.contains("quick tour"));
+        message.record.id
+    });
+    let work_line = format!("toggle-work-{greeting_id}").leak();
+    assert!(cx.debug_bounds(work_line).is_none());
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(1));
+    cx.run_until_parked();
+
     cowork.read_with(cx, |cowork, cx| {
         assert_eq!(cowork.main_stage, MainStage::Thread);
-        assert_eq!(cowork.active_thread_id, None);
         assert_eq!(cowork.active_model(cx), Some(recommended_qwen()));
+        let thread = cowork.active_thread(cx).expect("setup starts a chat");
+        let thread = thread.read(cx);
+        assert_eq!(thread.summary.title, "Welcome to Cowork");
+        assert!(!thread.is_generating());
+        assert!(cowork.agents.is_empty());
+        assert!(cowork.active_generations.is_empty());
+        assert!(thread.project_folders().is_empty());
+        assert_eq!(thread.submission_sequence, 0);
+        assert_eq!(thread.tokens_used, 0);
+        assert_eq!(thread.timeline.len(), 1);
+        assert_eq!(thread.transcript.len(), 2);
+        assert!(matches!(
+            thread.transcript.entries()[0].origin,
+            agent::Origin::Input {
+                source: crate::transcript::RunSource::Host,
+                ..
+            }
+        ));
+        assert!(matches!(&thread.timeline[0], TimelineMessage::Agent(_)));
+        let welcome = thread.welcome_for_test();
+        Thread::validate_welcome(&welcome).expect("onboarding can be saved and shared");
+    });
+    cx.update(|_, cx| {
+        let thread = cowork.read(cx).active_thread(cx).unwrap();
+        let welcome = thread.read(cx).welcome_for_test();
+        let restored = Thread::join_for_test(welcome, cx);
+        assert_eq!(restored.transcript, thread.read(cx).transcript);
+        let TimelineMessage::Agent(message) = &restored.timeline[0] else {
+            panic!("the greeting remains an agent message after replay");
+        };
+        assert!(message.ui.output.text.contains("Welcome to Cowork!"));
     });
     assert!(cx.debug_bounds("welcome-stage").is_none());
     assert!(cx.debug_bounds("bottom-bar").is_some());
+
+    // The first reply uses this thread's seeded conversation, not a new chat.
+    // The Tokio runtime is deliberately not driven: no live model is needed.
+    cx.simulate_input("hi");
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-enter"
+    } else {
+        "ctrl-enter"
+    });
+    cx.run_until_parked();
+    cowork.read_with(cx, |cowork, cx| {
+        let thread = cowork.active_thread(cx).unwrap();
+        let thread = thread.read(cx);
+        assert_eq!(cowork.thread_store.read(cx).threads.len(), 1);
+        assert!(cowork.agents.contains_key(&thread.instance_id));
+        assert!(thread.is_generating());
+        assert_eq!(thread.timeline.len(), 3);
+        assert_eq!(thread.transcript.len(), 2);
+        let TimelineMessage::User(message) = &thread.timeline[1] else {
+            panic!("the first reply follows the greeting");
+        };
+        assert_eq!(message.record.blocks[0].text, "hi");
+    });
 }
 
 #[gpui::test]

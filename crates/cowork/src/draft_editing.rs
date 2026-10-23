@@ -940,6 +940,7 @@ pub(crate) mod tests {
                         tokio_handle,
                         sandboxes: crate::test_support::unused_sandboxes(),
                         active_generations: HashMap::new(),
+                        onboarding_intro: None,
                         agents: HashMap::new(),
                         deleted: Default::default(),
                         profile_statistics: None,

@@ -1,5 +1,5 @@
 //! The welcome screen before the first chat: setting up a provider (see
-//! `provider_setup.rs`) with a greeting, then starting the chat.
+//! `provider_setup.rs`) with a greeting, then starting an onboarding chat.
 
 use gpui::{Context, IntoElement, prelude::*};
 use gpui_component::{
@@ -8,7 +8,7 @@ use gpui_component::{
 };
 
 use crate::{
-    Cowork, MainStage,
+    Cowork,
     models::ModelProvider,
     provider_setup::{ProviderSetupPlace, ProviderStep, provider_setup_intro},
 };
@@ -36,8 +36,7 @@ impl Cowork {
         )
     }
 
-    /// Shows the selected provider's models, and starts the first chat once
-    /// one is picked.
+    /// Shows the selected provider's models, then starts the onboarding chat.
     pub(crate) fn render_welcome_models(
         &self,
         provider: ModelProvider,
@@ -58,11 +57,7 @@ impl Cowork {
             .h_11()
             .rounded_lg()
             .on_click(cx.listener(|this, _, window, cx| {
-                if this.active_model_is_runnable(cx) {
-                    this.main_stage = MainStage::Thread;
-                    this.focus_composer(window, cx);
-                    cx.notify();
-                }
+                this.start_onboarding(window, cx);
             }));
         self.render_provider_setup(
             ProviderSetupPlace::Welcome,

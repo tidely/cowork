@@ -13,11 +13,13 @@ use anyhow::Context as _;
 
 #[path = "thread_draft.rs"]
 pub(crate) mod draft;
+mod onboarding;
 mod permissions;
 #[path = "sharing.rs"]
 pub(crate) mod sharing;
 #[path = "submission.rs"]
 pub(crate) mod submission;
+pub(crate) use onboarding::OnboardingIntro;
 pub(crate) use permissions::{
     ApproveTools, ChangeModel, ControlGeneration, DenialReason, EditDraft, ManageAccess, PeerMode,
     PeerPermissions, PermissionDenied, PermissionOperation,
