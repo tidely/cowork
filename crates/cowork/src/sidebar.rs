@@ -19,7 +19,6 @@ use uuid::Uuid;
 
 use crate::{
     Cowork, MainStage,
-    native_tooltip::NativeTooltip as _,
     settings::SettingsPage,
     thread::{ThreadSharing, ThreadSummary},
     thread_draft::ThreadDraft,
@@ -153,7 +152,7 @@ impl ThreadRow {
                                     .xsmall()
                                     .debug_selector(move || format!("archive-thread-{thread_id}"))
                                     .accessibility_label("Archive thread")
-                                    .native_tooltip("Archive thread")
+                                    .tooltip("Archive thread")
                                     .on_click(move |event, window, cx| {
                                         // Archiving must not also open the thread.
                                         cx.stop_propagation();
@@ -474,7 +473,7 @@ impl Cowork {
                                     .selected(self.main_stage == MainStage::Archive)
                                     .debug_selector(|| "archived-threads".to_owned())
                                     .accessibility_label("Archived threads")
-                                    .native_tooltip("Archived threads")
+                                    .tooltip("Archived threads")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.open_archive(window, cx);
                                     })),
@@ -491,7 +490,7 @@ impl Cowork {
                                     .size(px(28.))
                                     .debug_selector(|| "search-chats".to_owned())
                                     .accessibility_label("Search chats")
-                                    .native_tooltip("Search chats")
+                                    .tooltip("Search chats")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.open_search_palette(window, cx);
                                     })),

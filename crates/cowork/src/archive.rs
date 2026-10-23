@@ -13,7 +13,7 @@ use gpui_component::{
 use gpui_kit_assets::IconName as AssetIconName;
 use uuid::Uuid;
 
-use crate::{Cowork, MainStage, native_tooltip::NativeTooltip as _, thread::Thread};
+use crate::{Cowork, MainStage, thread::Thread};
 
 impl Cowork {
     pub(crate) fn open_archive(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -494,7 +494,7 @@ impl Cowork {
                     )
                     .debug_selector(move || format!("delete-thread-{thread_id}"))
                     .accessibility_label(format!("Delete {title} permanently"))
-                    .native_tooltip("Delete permanently")
+                    .tooltip("Delete permanently")
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.request_delete_archived_thread(thread_id, window, cx);
                     })),

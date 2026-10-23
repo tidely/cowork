@@ -20,7 +20,7 @@ use gpui_component::{
 use gpui_kit_assets::IconName;
 use serde::{Deserialize, Serialize};
 
-use crate::{Cowork, native_tooltip::NativeTooltip as _, thread::Thread};
+use crate::{Cowork, thread::Thread};
 
 /// Shown while hovering the Write option.
 pub(crate) const WRITE_WARNING: &str = "The agent can edit files in your project folders. \
@@ -118,7 +118,7 @@ impl Cowork {
         if !editable {
             return trigger
                 .disabled(true)
-                .native_tooltip("Only the host can change auto-approval")
+                .tooltip("Only the host can change auto-approval")
                 .into_any_element();
         }
         // Applies to the thread the menu was opened for, even if another one

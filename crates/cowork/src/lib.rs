@@ -59,7 +59,6 @@ mod highlight;
 mod context_settings;
 mod model_picker;
 mod models;
-mod native_tooltip;
 mod participant;
 mod peer_access;
 mod pending_view;

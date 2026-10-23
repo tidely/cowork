@@ -24,9 +24,7 @@ use gpui_component::{
 };
 use gpui_kit_assets::IconName;
 
-use crate::{
-    Cowork, native_tooltip::NativeTooltip as _, project_mode::ProjectMode, thread::Thread,
-};
+use crate::{Cowork, project_mode::ProjectMode, thread::Thread};
 
 /// One folder of a project.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -216,7 +214,7 @@ impl ProjectFolders {
             .small()
             .min_w_0()
             .max_w(px(200.))
-            .native_tooltip(SharedString::from(path.display().to_string()))
+            .tooltip(SharedString::from(path.display().to_string()))
             .dropdown_menu_with_anchor(Anchor::BottomLeft, move |menu, _, _| {
                 let (open, remove) = (on_open.clone(), on_remove.clone());
                 let (open_path, remove_path) = (path.clone(), path.clone());
@@ -253,7 +251,7 @@ impl RenderOnce for ProjectFolders {
                 .ghost()
                 .small()
                 .accessibility_label("Add a folder to the project")
-                .native_tooltip("Add a folder to the project")
+                .tooltip("Add a folder to the project")
                 .on_click(move |event, window, cx| on_add(event, window, cx))
                 .into_any_element()
         });
