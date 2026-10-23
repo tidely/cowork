@@ -705,8 +705,8 @@ mod tests {
     use super::*;
 
     /// Exercise native denied-path enforcement with synthetic content even on
-    /// hosts without credential folders. Metadata visibility is backend-specific;
-    /// content reads, directory entries, and writes must still be protected.
+    /// hosts without credential folders: content reads, directory entries,
+    /// file metadata (a known file's existence), and writes are protected.
     #[cfg(unix)]
     #[test]
     fn denied_paths_protect_contents_inside_a_writable_project() {
@@ -726,9 +726,11 @@ mod tests {
             "/bin/cat {} >/dev/null 2>/dev/null && echo read-allowed || echo read-denied; \
              /bin/ls -A {} >\"$TMPDIR/listing\" 2>/dev/null; \
              test ! -s \"$TMPDIR/listing\" && echo listing-hidden; \
+             test -e {} && echo metadata-visible || echo metadata-hidden; \
              {{ printf changed >> {}; }} 2>/dev/null && echo write-allowed || echo write-denied",
             quote(&secret),
             quote(&denied),
+            quote(&secret),
             quote(&secret),
         );
         let project = Project {
@@ -755,7 +757,7 @@ mod tests {
         let output = execute(request, &AtomicBool::new(false), None).unwrap();
         assert_eq!(output.exit_code, 0, "{output:?}");
         assert_eq!(
-            output.stdout, "read-denied\nlisting-hidden\nwrite-denied\n",
+            output.stdout, "read-denied\nlisting-hidden\nmetadata-hidden\nwrite-denied\n",
             "{output:?}"
         );
         assert_eq!(

@@ -74,7 +74,7 @@ libc = "0.2"
 # Contains the agent's commands with the operating system's own sandbox:
 # Seatbelt on macOS, Bubblewrap on Linux, a process container on Windows. No
 # optional backends; telemetry stays off as no request opts in.
-mxc-sdk = "1.0.0"
+mxc-sdk = "1.0.1"
 mime = "0.3"
 nucleo-matcher = "0.3"
 parking_lot = "0.12"

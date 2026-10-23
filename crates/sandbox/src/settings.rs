@@ -43,8 +43,8 @@ pub const WRITABLE_DEVICES: &[&str] = &[];
 /// Credentials commands may not read even where a granted folder holds
 /// them, relative to the user's home. Only paths that exist are passed on, as
 /// some backends cannot deny a path that is not there.
-/// mxc's macOS profile blocks contents and directory listings but permits file
-/// metadata: a known path's existence may remain visible. Linux masks entries.
+/// Contents, listings, and file metadata are all denied: macOS refuses them
+/// (metadata since mxc-sdk 1.0.1), and Linux masks the entries.
 pub const DENIED_PATHS: &[&str] = &[
     ".ssh",
     ".gnupg",
