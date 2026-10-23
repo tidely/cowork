@@ -607,6 +607,7 @@ fn unauthorized_wire_controls_do_not_mutate_state_or_disconnect_the_peer(
     mirror.read_with(session.cx, |thread, _| {
         for request in [
             protocol::CollaboratorMessage::Submit { sequence: 0 },
+            protocol::CollaboratorMessage::Queue { sequence: 0 },
             protocol::CollaboratorMessage::SelectModel(recommended_qwen()),
             protocol::CollaboratorMessage::Stop {
                 message_id: message_id.into_bytes(),

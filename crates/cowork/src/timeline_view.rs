@@ -2,7 +2,7 @@
 //! their inline comments, the agent's reasoning, and comment groups.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ops::Range,
     time::{Duration, Instant},
 };
@@ -1260,6 +1260,8 @@ impl Cowork {
         thread_id: Uuid,
         index: usize,
         message: &AgentMessage,
+        timeline: &[TimelineMessage],
+        steering_groups: &HashMap<Uuid, usize>,
         comments: &[UserComment],
         submitted_comments: &[crate::timeline::SubmittedComment],
         wrap_width: gpui::Pixels,
@@ -1419,6 +1421,36 @@ impl Cowork {
                 item => {
                     flush(&mut calls, &mut content);
                     match item {
+                        RunItem::Steering(id) => {
+                            if let Some(&index) = steering_groups.get(&id)
+                                && let TimelineMessage::User(group) = &timeline[index]
+                            {
+                                let cards = self.user_group_cards(thread_id, group, cx);
+                                content
+                                    .push(self.render_user_message_group(index, group, cards, cx));
+                                for response in &message.ui.comment_responses {
+                                    if group
+                                        .record
+                                        .comments
+                                        .iter()
+                                        .any(|comment| comment.id == response.comment_id)
+                                    {
+                                        content.extend(self.render_agent_text(
+                                            ThreadMessageId {
+                                                thread_id,
+                                                message_id: response.id,
+                                            },
+                                            &response.response,
+                                            &response.response_view,
+                                            comments,
+                                            wrap_width,
+                                            window,
+                                            cx,
+                                        ));
+                                    }
+                                }
+                            }
+                        }
                         RunItem::Compaction(step_index) => {
                             content.push(Self::render_compaction_marker(
                                 format!("{message_id}-{step_index}"),
@@ -1504,13 +1536,15 @@ impl Cowork {
             .unwrap_or_default()
     }
 
-    /// Timeline entry `index`.
+    /// Timeline entry `index`. `steering_groups` has the index of each user
+    /// group a run draws where its steer joined.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_timeline_message(
         &mut self,
         thread_id: Uuid,
         index: usize,
         timeline: &[TimelineMessage],
+        steering_groups: &HashMap<Uuid, usize>,
         comments: &[UserComment],
         submitted_comments: &[crate::timeline::SubmittedComment],
         wrap_width: gpui::Pixels,
@@ -1526,6 +1560,8 @@ impl Cowork {
                 thread_id,
                 index,
                 message,
+                timeline,
+                steering_groups,
                 comments,
                 submitted_comments,
                 wrap_width,

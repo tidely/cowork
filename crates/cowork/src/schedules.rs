@@ -32,6 +32,7 @@ use std::path::{Path, PathBuf};
 use crate::{
     Cowork, MainStage,
     models::ModelRef,
+    native_tooltip::NativeTooltip as _,
     project_folders::{ProjectFolder, ProjectFolders, add_folders, remove_folder},
     project_mode::{NETWORK_WARNING, ProjectMode, WRITE_WARNING},
     scheduled_task::{
@@ -472,7 +473,7 @@ impl Cowork {
                             .disabled(open_thread.is_none())
                             .debug_selector(move || format!("open-scheduled-thread-{task_id}"))
                             .accessibility_label("Open its thread")
-                            .tooltip(open_tooltip)
+                            .native_tooltip(open_tooltip)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
                                 if let Some(thread_id) = open_thread {
@@ -492,7 +493,7 @@ impl Cowork {
                             .disabled(queued)
                             .debug_selector(move || format!("run-scheduled-task-{task_id}"))
                             .accessibility_label("Run now")
-                            .tooltip(if queued { "Already queued" } else { "Run now" })
+                            .native_tooltip(if queued { "Already queued" } else { "Run now" })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.run_scheduled_task_now(task_id, cx);
@@ -506,11 +507,13 @@ impl Cowork {
                             .debug_selector(move || format!("toggle-scheduled-task-{task_id}"))
                             .px_1()
                             .on_click(|_, _, cx| cx.stop_propagation())
+                            // `Switch` has no `InteractiveElement`, so its
+                            // wrapper carries the tooltip.
+                            .native_tooltip(if task.is_active() { "Pause" } else { "Resume" })
                             .child(
                                 Switch::new("toggle-scheduled-task")
                                     .small()
                                     .checked(task.is_active())
-                                    .tooltip(if task.is_active() { "Pause" } else { "Resume" })
                                     .on_click(cx.listener(move |this, checked: &bool, _, cx| {
                                         this.set_scheduled_task_active(task_id, *checked, cx);
                                     })),
@@ -523,7 +526,7 @@ impl Cowork {
                             .icon(Icon::new(AssetIconName::Trash).size_4().text_color(muted))
                             .debug_selector(move || format!("delete-scheduled-task-{task_id}"))
                             .accessibility_label("Delete schedule")
-                            .tooltip("Delete schedule")
+                            .native_tooltip("Delete schedule")
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 cx.stop_propagation();
                                 this.delete_scheduled_task(task_id, cx);

@@ -161,29 +161,39 @@ impl StoredEvent {
                     language_model::ContentDelta::Reasoning(text) => {
                         json!({"kind":"reasoning", "text":text})
                     }
-                    language_model::ContentDelta::ToolCall { id, name, arguments } => {
+                    language_model::ContentDelta::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => {
                         json!({"kind":"tool_call", "id":id, "name":name, "arguments":arguments})
                     }
                 };
                 observation("preview", json!({"index":index, "delta":delta}))
             }
-            EventKind::InputAdmitted { id, source, delivery, location } => observation(
+            EventKind::InputAdmitted {
+                id,
+                source,
+                delivery,
+                location,
+            } => observation(
                 "input_admitted",
                 json!({
                     "id": id.to_string(), "source": serde_json::to_value(source)?,
                     "delivery": format!("{delivery:?}"), "location": format!("{location:?}"),
                 }),
             ),
-            EventKind::InputsDiscarded { inputs } => observation(
+            EventKind::InputsDiscarded { inputs, reason } => observation(
                 "inputs_discarded",
-                Value::Array(
-                    inputs
+                json!({
+                    "reason": format!("{reason:?}"),
+                    "inputs": inputs
                         .iter()
                         .map(|input| {
                             Ok(json!({"id": input.id.to_string(), "source": serde_json::to_value(&input.source)?}))
                         })
-                        .collect::<Result<_, LogError>>()?,
-                ),
+                        .collect::<Result<Vec<_>, LogError>>()?,
+                }),
             ),
             EventKind::RunStarted => observation("run_started", Value::Null),
             EventKind::PhaseChanged(phase) => {
@@ -193,16 +203,25 @@ impl StoredEvent {
                 "usage_reported",
                 serde_json::to_value(v1::Usage::from(usage.clone()))?,
             ),
-            EventKind::ApprovalRequested { call: value, tool, access } => observation(
+            EventKind::ApprovalRequested {
+                call: value,
+                tool,
+                access,
+            } => observation(
                 "approval_requested",
                 json!({"call": call(value), "tool": tool, "access": format!("{access:?}")}),
             ),
             EventKind::ToolStarted { call: value, tool } => {
                 observation("tool_started", json!({"call": call(value), "tool": tool}))
             }
-            EventKind::ToolProgress { call: value, progress } => {
+            EventKind::ToolProgress {
+                call: value,
+                progress,
+            } => {
                 let progress = match progress {
-                    tool_runtime::ToolProgress::Text { text } => json!({"kind":"text", "text":text}),
+                    tool_runtime::ToolProgress::Text { text } => {
+                        json!({"kind":"text", "text":text})
+                    }
                     tool_runtime::ToolProgress::Content { content } => json!({
                         "kind":"content",
                         "content": content.iter().cloned().map(v1::ToolResultContent::from).collect::<Vec<_>>(),
@@ -211,9 +230,16 @@ impl StoredEvent {
                         json!({"kind":"custom", "type":kind, "value":value})
                     }
                 };
-                observation("tool_progress", json!({"call": call(value), "progress": progress}))
+                observation(
+                    "tool_progress",
+                    json!({"call": call(value), "progress": progress}),
+                )
             }
-            EventKind::ToolFinished { call: value, tool, result } => {
+            EventKind::ToolFinished {
+                call: value,
+                tool,
+                result,
+            } => {
                 let result = match result {
                     Ok(output) => json!({
                         "ok": true, "tool_name": output.tool_name, "output": output.output,
@@ -229,10 +255,13 @@ impl StoredEvent {
             EventKind::DefinitionReplaced { revision } => {
                 observation("definition_replaced", json!({"revision": revision.0}))
             }
-            EventKind::ConfigurationChanged(change) => {
-                observation("configuration_changed", json!({"change": format!("{change:?}")}))
+            EventKind::ConfigurationChanged(change) => observation(
+                "configuration_changed",
+                json!({"change": format!("{change:?}")}),
+            ),
+            EventKind::DynamicToolAdded(name) => {
+                observation("dynamic_tool_added", json!({"name": name}))
             }
-            EventKind::DynamicToolAdded(name) => observation("dynamic_tool_added", json!({"name": name})),
             EventKind::DynamicToolRemoved(name) => {
                 observation("dynamic_tool_removed", json!({"name": name}))
             }
@@ -240,7 +269,10 @@ impl StoredEvent {
                 "run_finished",
                 json!({"outcome": format!("{outcome:?}"), "error": error.as_ref().map(ToString::to_string)}),
             ),
-            EventKind::CompactionStarted { end, previous_revision } => observation(
+            EventKind::CompactionStarted {
+                end,
+                previous_revision,
+            } => observation(
                 "compaction_started",
                 json!({"end": end, "previous_revision": previous_revision}),
             ),

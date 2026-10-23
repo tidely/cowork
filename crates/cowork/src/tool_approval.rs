@@ -15,7 +15,7 @@ use std::sync::{
 };
 
 use agent::{
-    AgentHost, CallAuthorization, Decision,
+    AgentHost, CallAuthorization, Decision, Input, RenderInput,
     model::{Content, ToolCallId},
     tool::Provides,
 };
@@ -24,7 +24,7 @@ use parking_lot::Mutex;
 use sandbox::{
     ListDirectory, Needs, ReadFile, RequestPermissions, RunCommand, ThreadSandbox, WriteFile,
 };
-use tools::{Calculate, RespondToComment, RunComments};
+use tools::{Calculate, CommentId, RespondToComment, RunComments};
 use uuid::Uuid;
 
 use crate::{
@@ -92,6 +92,31 @@ impl ApprovalRights {
 
     pub(crate) fn may_decide(self, tool: &str) -> bool {
         self.approves_tools && (self.is_host || !host_only(tool))
+    }
+}
+
+/// A prompt as the session holds it until committed: its content, and the
+/// comment aliases it introduces. A steering prompt's aliases join its run's
+/// comments only once it commits, so a withdrawn steer names nothing the
+/// model could answer.
+#[derive(Clone, Debug)]
+pub(crate) struct CoworkInput {
+    pub(crate) content: Vec<Content>,
+    pub(crate) comments: Vec<CommentId>,
+}
+
+impl From<Vec<Content>> for CoworkInput {
+    fn from(content: Vec<Content>) -> Self {
+        Self {
+            content,
+            comments: Vec::new(),
+        }
+    }
+}
+
+impl RenderInput for CoworkInput {
+    fn render(&self) -> Vec<Content> {
+        self.content.clone()
     }
 }
 
@@ -184,7 +209,7 @@ impl std::fmt::Debug for CoworkHost {
 
 impl AgentHost for CoworkHost {
     type Source = RunSource;
-    type Input = Vec<Content>;
+    type Input = CoworkInput;
     type Access = Needs;
     /// The project's mode and folders are the sandbox's, which the tools
     /// and authorization read as they are when a call starts.
@@ -208,6 +233,15 @@ impl AgentHost for CoworkHost {
             return Decision::Deny(UNATTENDED.into());
         }
         Decision::Ask
+    }
+
+    /// A run's own prompt names its comments when the run starts; a steer's
+    /// are added here, before the model's next reply could answer them.
+    fn inputs_committed(&self, inputs: &[Input<RunSource, CoworkInput>]) {
+        let comments = self.comments.current();
+        for input in inputs {
+            comments.extend(&input.payload.comments);
+        }
     }
 }
 

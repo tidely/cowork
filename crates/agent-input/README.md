@@ -2,9 +2,10 @@
 
 A reusable input lifecycle for the provider-independent agent loop. The
 [agent-runtime](../agent-runtime/README.md) driver uses this layer; Cowork still
-keeps its own pending-submission queue and hands its session one input at a
-time. This crate owns pending work and the handoff into a conversation; it has
-no GPUI, provider, tool, async-runtime, or persistence dependency.
+keeps its own pending-submission queue, hands its session one queued input at a
+time, and uses native steering for current-run follow-ups. This crate owns
+pending work and the handoff into a conversation; it has no GPUI, provider,
+tool, async-runtime, or persistence dependency.
 
 `Inbox<Source, Payload>` is owned by the session actor. Source and payload are
 application types: adding a scheduler, parent agent, collaborator, background
@@ -46,8 +47,8 @@ expand skills/files, generate prompt envelopes, or infer policy from ID prefixes
 | Intent      | While running                                | While idle                       |
 | ----------- | -------------------------------------------- | -------------------------------- |
 | Queue       | Ordinary FIFO for later runs                 | Starts on the next `begin_next`  |
-| Steer       | Joins the next safe-point batch              | Queued or returned, per fallback |
-| Interject   | Like Steer, with a `YieldWait(run)` signal   | Queued or returned, per fallback |
+| Steer       | Joins the next safe-point batch              | Joins the run about to start, else queued or returned per fallback |
+| Interject   | Like Steer, with a `YieldWait(run)` signal   | Like Steer                       |
 | Interrupt   | `Cancel(run)` plus a priority FIFO follow-up | Priority FIFO follow-up          |
 | `stop(run)` | `Cancel(run)` and pause accepted work        | Stale run error                  |
 
@@ -58,6 +59,17 @@ FIFO. Ordinary Queue work never automatically becomes steering; a host's live
 follow-up setting can select Steer on admission, or `redirect` an editable queued
 row atomically. `move_before` reorders the ordinary lane. There is no implicit
 prompt combining or source-dependent priority.
+
+"About to start" means queued work starts a run on the next `begin_next`: the
+session is unpaused and nothing is running or preparing. Such a steer
+(`Admission::Next`) joins that run's first safe point, right after its prompt
+commits and before its first request, so a follow-up sent together with a
+prompt is delivered with it. If the queued work is removed or withdrawn
+first, `release_waiting` settles the waiting steers by their fallback.
+
+Editable steering and interjections can be removed until reserved by
+`begin_safe_point`. Editing their payload remains limited to future-run queues;
+neither operation can mutate a reserved batch.
 
 Stop is separate control with no model-visible payload. It pauses the queue;
 `resume` allows future work, and a newer explicit Interrupt also resumes handoff.

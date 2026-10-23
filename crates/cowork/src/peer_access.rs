@@ -11,6 +11,7 @@ use uuid::Uuid;
 
 use crate::{
     Cowork,
+    native_tooltip::NativeTooltip as _,
     participant::ParticipantId,
     thread::{
         DenialReason, ManageAccess, PeerMode, PermissionDenied, PermissionOperation, SharingStatus,
@@ -52,7 +53,7 @@ impl Cowork {
                 .small()
                 .size(px(28.))
                 .accessibility_label("Sharing and access")
-                .tooltip("Sharing and access")
+                .native_tooltip("Sharing and access")
                 .when(
                     matches!(status, SharingStatus::Shared | SharingStatus::Connected),
                     |button| button.text_color(cx.theme().primary),
@@ -109,7 +110,7 @@ impl Cowork {
                                 } else {
                                     "Copy link"
                                 })
-                                .tooltip(if copied { "Copied" } else { "Copy link" })
+                                .native_tooltip(if copied { "Copied" } else { "Copy link" })
                                 .on_click({
                                     let cowork = cowork.clone();
                                     let popover = popover.clone();
@@ -198,7 +199,7 @@ impl Cowork {
                                     .small()
                                     .size(px(28.))
                                     .accessibility_label(mode.label())
-                                    .tooltip(mode_tooltip(mode)),
+                                    .native_tooltip(mode_tooltip(mode)),
                             ),
                     )
                     .child(div().h(px(1.)).bg(cx.theme().border));
@@ -341,7 +342,7 @@ fn access_row(
                 .size(px(24.))
                 .disabled(override_mode.is_none())
                 .accessibility_label("Use default access")
-                .tooltip(if override_mode.is_none() {
+                .native_tooltip(if override_mode.is_none() {
                     "Using default access"
                 } else {
                     "Reset to default access"
@@ -372,7 +373,7 @@ fn mode_button(
         .selected(selected)
         .when(selected, |button| button.primary())
         .accessibility_label(mode.label())
-        .tooltip(mode_tooltip(mode))
+        .native_tooltip(mode_tooltip(mode))
         .on_click(move |_, window, cx| set_mode(&target, participant, Some(mode), window, cx))
 }
 

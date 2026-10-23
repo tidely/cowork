@@ -1329,6 +1329,7 @@ impl Thread {
                 Some(PermissionOperation::EditDraft)
             }
             protocol::CollaboratorMessage::Submit { .. }
+            | protocol::CollaboratorMessage::Queue { .. }
             | protocol::CollaboratorMessage::CancelPending { .. }
             | protocol::CollaboratorMessage::Stop { .. } => {
                 Some(PermissionOperation::ControlGeneration)

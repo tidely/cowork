@@ -8,7 +8,7 @@ use gpui_component::{
 };
 use uuid::Uuid;
 
-use crate::{Cowork, composer_attachments::AttachmentCard};
+use crate::{Cowork, composer_attachments::AttachmentCard, native_tooltip::NativeTooltip as _};
 
 /// Paint at the measured width so resizing keeps the dash rhythm independent
 /// of font metrics. The solid draft boundary shares the work summary's color.
@@ -78,8 +78,8 @@ impl Cowork {
                                 .label("×")
                                 .debug_selector(move || format!("cancel-pending-{pending_id}"))
                                 .text_color(cx.theme().muted_foreground)
-                                .accessibility_label("Cancel queued message")
-                                .tooltip("Cancel this queued message")
+                                .accessibility_label("Cancel pending message")
+                                .native_tooltip("Cancel this pending message")
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.cancel_pending_submission(thread_id, pending_id, cx);
                                 })),
@@ -134,7 +134,10 @@ impl Cowork {
                     .flex_col()
                     .gap_4()
                     .child(self.pending_separator(
-                        "Queued",
+                        match pending.mode {
+                            crate::protocol::SubmissionMode::Steering => "Steering",
+                            crate::protocol::SubmissionMode::Queue => "Queued",
+                        },
                         true,
                         can_cancel.then_some((thread_id, pending.id)),
                         cx,

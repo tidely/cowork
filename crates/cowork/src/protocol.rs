@@ -45,7 +45,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 34;
+pub(crate) const PROTOCOL_VERSION: u32 = 35;
 
 /// A request from a collaborator to the host.
 ///
@@ -75,8 +75,10 @@ pub(crate) enum CollaboratorMessage {
     /// Submits the draft. `sequence` is the number of accepted submissions the
     /// collaborator has seen, including pending drafts, so a submission that raced another one is
     /// ignored instead of submitting whatever was typed in between. While a
-    /// run is going, the submission waits as a [`PendingSubmission`].
+    /// run is going, the submission steers it at its next safe boundary.
     Submit { sequence: u64 },
+    /// Explicit queueing instead of the default steering delivery.
+    Queue { sequence: u64 },
     /// Cancels the pending submission `id`, if it has not started a run.
     CancelPending { id: uuid::Bytes },
     /// Replaces the collaborator's presence.
@@ -238,9 +240,9 @@ pub(crate) enum HostMessage {
         sequence: u64,
         pending: Vec<PendingSubmission>,
     },
-    /// The oldest pending submission starts a run: it leaves the pending
-    /// list and `group` is appended to the timeline. The run's
-    /// `AgentStarted` follows.
+    /// A pending submission is delivered: it leaves the pending list and
+    /// `group` is appended to the timeline. Its committed steering input or
+    /// a new run's `AgentStarted` follows.
     PendingDelivered {
         id: uuid::Bytes,
         group: UserMessage,
@@ -418,11 +420,20 @@ pub(crate) struct Welcome {
     pub(crate) stored_attachments: Vec<uuid::Bytes>,
 }
 
-/// A submission accepted while a run was going. Pending submissions start
-/// later runs one at a time, oldest first.
+/// Delivery choice, independent of permission to submit the shared draft.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum SubmissionMode {
+    Steering,
+    Queue,
+}
+
+/// An immutable accepted group awaiting steering commitment or a later run.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PendingSubmission {
     pub(crate) id: uuid::Bytes,
+    pub(crate) mode: SubmissionMode,
+    /// The participant whose submission it is, the source of its input.
+    pub(crate) submitted_by: uuid::Bytes,
     pub(crate) group: UserMessage,
 }
 
@@ -1031,6 +1042,8 @@ mod tests {
                 sequence: 42,
                 pending: vec![PendingSubmission {
                     id: [9; 16],
+                    mode: SubmissionMode::Steering,
+                    submitted_by: [8; 16],
                     group: group.clone(),
                 }],
             },
@@ -1105,6 +1118,7 @@ mod tests {
                 update: vec![7, 8],
             },
             CollaboratorMessage::Submit { sequence: 3 },
+            CollaboratorMessage::Queue { sequence: 4 },
             CollaboratorMessage::CancelPending { id: [4; 16] },
             CollaboratorMessage::Presence(sample_presence()),
             CollaboratorMessage::AttachmentData(sample_chunk()),

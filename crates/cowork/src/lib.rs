@@ -4,7 +4,7 @@
 
 use std::{
     cell::Cell,
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     rc::Rc,
     sync::{Arc, OnceLock},
 };
@@ -59,6 +59,7 @@ mod highlight;
 mod context_settings;
 mod model_picker;
 mod models;
+mod native_tooltip;
 mod participant;
 mod peer_access;
 mod pending_view;
@@ -99,7 +100,13 @@ static TOKIO_RUNTIME: OnceLock<Runtime> = OnceLock::new();
 
 actions!(
     cowork,
-    [Quit, SubmitComposer, StopGeneration, OpenSearchPalette]
+    [
+        Quit,
+        SubmitComposer,
+        QueueComposer,
+        StopGeneration,
+        OpenSearchPalette
+    ]
 );
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -325,6 +332,32 @@ impl Cowork {
             && !gpui_base::TextSelection::has_selection(window, cx);
         let messages = Rc::new(messages);
         let comments = Rc::new(comments);
+        // The timeline index of each user group drawn inside a run, where its
+        // steer joined it, found once per frame.
+        let steered = messages
+            .iter()
+            .filter_map(|entry| match entry {
+                TimelineMessage::Agent(message) => Some(message.ui.output.steps()),
+                TimelineMessage::User(_) => None,
+            })
+            .flatten()
+            .filter_map(|step| match step {
+                timeline::AgentStep::Steering(id) => Some(*id),
+                _ => None,
+            })
+            .collect::<HashSet<_>>();
+        let steering_groups = Rc::new(
+            messages
+                .iter()
+                .enumerate()
+                .filter_map(|(index, entry)| match entry {
+                    TimelineMessage::User(group) if steered.contains(&group.record.id) => {
+                        Some((group.record.id, index))
+                    }
+                    _ => None,
+                })
+                .collect::<HashMap<_, _>>(),
+        );
         let mut timeline_messages = Vec::new();
         if let Some(thread_id) = active_thread_id {
             let user_stable = |group: &timeline::UserMessage| {
@@ -337,6 +370,13 @@ impl Cowork {
             };
             for index in 0..messages.len() {
                 let message = &messages[index];
+                // A steering group is a canonical timeline entry, but is
+                // drawn only where its input joined the run.
+                if let TimelineMessage::User(group) = message
+                    && steering_groups.contains_key(&group.record.id)
+                {
+                    continue;
+                }
                 let submitted_comments = match message {
                     TimelineMessage::Agent(message) => message
                         .record
@@ -355,7 +395,18 @@ impl Cowork {
                 let stable = match message {
                     TimelineMessage::User(group) => user_stable(group),
                     TimelineMessage::Agent(message) => {
+                        // A finished run's steers can't change, so it is
+                        // stable when the groups it draws are.
+                        let steers_stable = message.ui.output.steps().iter().all(|step| {
+                            let timeline::AgentStep::Steering(id) = step else {
+                                return true;
+                            };
+                            steering_groups.get(id).is_none_or(|&group| {
+                                matches!(&messages[group], TimelineMessage::User(group) if user_stable(group))
+                            })
+                        });
                         !message.is_generating()
+                            && steers_stable
                             && !message.ui.work_expanded
                             && message.record.awaiting_approval.is_none()
                             && message.record.comment_group_id.is_none()
@@ -380,6 +431,7 @@ impl Cowork {
                     let render_owner = owner.clone();
                     let messages = messages.clone();
                     let comments = comments.clone();
+                    let steering_groups = steering_groups.clone();
                     timeline_messages.push(
                         DeferredTimelineRow::new(
                             row_id,
@@ -394,6 +446,7 @@ impl Cowork {
                                             thread_id,
                                             index,
                                             &messages,
+                                            &steering_groups,
                                             &comments,
                                             &[],
                                             wrap_width,
@@ -415,6 +468,7 @@ impl Cowork {
                         thread_id,
                         index,
                         &messages,
+                        &steering_groups,
                         &comments,
                         submitted_comments,
                         wrap_width,
@@ -571,6 +625,7 @@ impl Render for Cowork {
             .bg(cx.theme().sidebar)
             .text_color(cx.theme().foreground)
             .on_action(cx.listener(Self::submit_composer_action))
+            .on_action(cx.listener(Self::queue_composer_action))
             .on_action(cx.listener(|this, _: &StopGeneration, _, cx| this.stop_generation(cx)))
             .on_action(cx.listener(|this, _: &OpenSearchPalette, window, cx| {
                 this.open_search_palette(window, cx);
@@ -662,6 +717,8 @@ fn bind_app_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new(&format!("{alternate}-enter"), SubmitComposer, None),
         KeyBinding::new(&format!("{native}-enter"), SubmitComposer, None),
+        KeyBinding::new(&format!("{alternate}-shift-enter"), QueueComposer, None),
+        KeyBinding::new(&format!("{native}-shift-enter"), QueueComposer, None),
         KeyBinding::new(
             cfg_select! {
                 target_os = "macos" => "cmd-.",

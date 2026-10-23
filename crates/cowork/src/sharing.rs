@@ -477,7 +477,13 @@ impl Cowork {
                     .with_context(|| format!("Invalid draft update from {participant:?}."))?;
                 cx.notify();
             }
-            protocol::CollaboratorMessage::Submit { sequence } => {
+            protocol::CollaboratorMessage::Submit { sequence }
+            | protocol::CollaboratorMessage::Queue { sequence } => {
+                let mode = if matches!(request, protocol::CollaboratorMessage::Queue { .. }) {
+                    protocol::SubmissionMode::Queue
+                } else {
+                    protocol::SubmissionMode::Steering
+                };
                 thread.update(cx, |thread, _| {
                     thread.with_authorized::<ControlGeneration, _>(participant, |_| ())
                 })?;
@@ -498,6 +504,7 @@ impl Cowork {
                         crate::thread::submission::SubmissionRequest {
                             actor: participant,
                             submitted_locally: false,
+                            mode,
                         },
                         cx,
                     );

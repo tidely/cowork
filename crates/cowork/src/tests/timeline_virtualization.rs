@@ -231,6 +231,29 @@ fn settled_history_culls_rows_and_keeps_its_geometry(cx: &mut gpui::TestAppConte
     assert_same_geometry(fixture.geometry(cx), before);
 }
 
+/// A finished run that a steer joined is as stable as the group it draws
+/// there, so it culls offscreen like any settled row.
+#[gpui::test]
+fn settled_runs_with_steers_cull_offscreen(cx: &mut gpui::TestAppContext) {
+    let (fixture, _runtime, cx) = Fixture::new(cx, timeline_bench::SHORT);
+    let (group_index, _) = fixture.users[fixture.users.len() / 2];
+    fixture.thread.update(cx, |thread, cx| {
+        let TimelineMessage::User(group) = &thread.timeline[group_index] else {
+            unreachable!("users are user groups");
+        };
+        let id = group.record.id;
+        let TimelineMessage::Agent(message) = &mut thread.timeline[group_index - 1] else {
+            unreachable!("agent messages alternate with users");
+        };
+        message.ui.steered(id, cx);
+    });
+    fixture.redraw(cx);
+    fixture.assert_culled(cx);
+    let before = fixture.geometry(cx);
+    fixture.redraw(cx);
+    assert_same_geometry(fixture.geometry(cx), before);
+}
+
 #[gpui::test]
 fn width_changes_remeasure_offscreen_rows_and_match_native_selection_layout(
     cx: &mut gpui::TestAppContext,

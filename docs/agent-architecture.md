@@ -293,6 +293,9 @@ pub trait AgentHost: Send + Sync + Sized + 'static {
 
     fn admit(&self, request: &Request<Self>) -> Result<(), String> { Ok(()) }
     fn authorize(&self, call: &CallAuthorization<'_, Self>) -> Decision;
+    /// Called on the session owner as inputs commit, before their events and
+    /// any later step.
+    fn inputs_committed(&self, inputs: &[Input<Self::Source, Self::Input>]) {}
     fn describe_permissions(&self, permissions: &Self::Permissions, tools: &[ToolDescriptor])
         -> Option<String> { None }
 }
@@ -303,6 +306,13 @@ pub trait RenderInput {
     fn render(&self) -> Vec<Content>;
 }
 ```
+
+`inputs_committed` lets the host update state the next tool calls rely on,
+such as names an input introduced, without racing the event stream. Inputs
+that leave uncommitted are reported by `InputsDiscarded` with a reason
+(`Removed`, `Fallback`, `SourceClosed`, `Shutdown`); with `InputAdmitted` and
+the committed `Origin::Input` entries, the events mirror the inbox. A refused
+`RemoveInput` emits nothing, as the input's commit or discard came first.
 
 The host checks authority in `admit`, using the source, before the session
 acts on a request. For example, only the thread's host may resolve an approval,

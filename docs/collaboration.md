@@ -77,8 +77,8 @@ from the host's catalog (grouped by provider), shared stopping,
 Yrs drafts with prompt blocks, comments as items, per-block attachments,
 navigation, and empty-item removal, the draft
 synced through the host with host-coordinated submission, presence, and
-attachment transfer. Submissions made while a run is going are queued: the
-queue is host-owned, mirrored in snapshots, and individually cancellable; queued
+attachment transfer. Submissions made while a run is going steer it by default,
+joining at the agent session's next safe boundary. Explicitly queued
 submissions start runs one at a time, oldest first, after normal completion. Stop pauses pending delivery, including
 when completion races Stop; an idle composer with an empty draft offers an
 explicit Resume messages button. Peer permissions are also implemented: `ReadOnly`, `Write`,
@@ -480,7 +480,7 @@ Send is available only to the host and `Admin` peers, and requires:
 
 The host accepts a submission as follows:
 
-1. The submitter sends `Submit` with the submission sequence it has seen. It
+1. The submitter sends `Submit` (steering) or `Queue` with the submission sequence it has seen. It
    sends all its pending draft updates first, on the same ordered stream, so
    its own accepted edits are included. The host checks `ControlGeneration`
    before considering the submission.
@@ -494,7 +494,7 @@ The host accepts a submission as follows:
    typing yet.
 5. The host broadcasts that draft update and advances the explicit submission
    sequence. While idle it publishes the user message and starts the agent.
-   While generating it queues the submission as a pending one, without adding
+   While generating it accepts the submission as a pending one, without adding
    it to the timeline or transcript yet.
 6. Edits that arrive for removed items are discarded. Participants whose
    focused item was submitted move to the draft position.
@@ -505,36 +505,67 @@ draft, not the currently active thread, including after switching threads.
 Other refusals (empty, unavailable model, attachments not stored,
 size limit) still lack collaborator feedback, as noted in Status.
 
-**Pending delivery**: each accepted draft is immutable and receives an ID.
+**Pending delivery**: each accepted draft is immutable and receives an ID,
+and records who submitted it, the source of its input. The pending list is
+host-owned, mirrored in snapshots, and individually cancellable, steering and
+queued alike. Steering uses the agent session's native `Steer` delivery: it
+joins after the current reply and its tool results, before the next request.
+It does not interrupt sampling or bypass a waiting approval. The host hands a
+steer to the run as it is accepted, and every pending steer to a new run
+right after its prompt, never to a stopping run. Steers left from a stopped
+run therefore join the next run (whether started by a new draft or by Resume)
+at its first safe point, right after its prompt and before its first request. The canonical group remains
+pending until its input commits; then `PendingDelivered` publishes it before
+the committed entry. The input ID is the user group's ID: an input in a run's
+output whose ID names a user group of the timeline is that group's steer, the
+one rule both live folding and replay use, so the group shows inline in the
+run's progress without another saved index. Steering comments use
+submission-namespaced aliases, `comment_<first 8 hex digits of the group
+ID>_<n>`, preserving earlier comment replies without renumbering after
+cancellation; they join the run's comments only when the
+steer commits, so a withdrawn steer names nothing the model can answer.
+
 Queued drafts remain separate and start one run each in FIFO order, using the
 selected model and project settings when each run starts. Accepted user queues
 take precedence over the scheduler trying to reuse that thread. Nothing reaches
-a running agent: each queued draft is the prompt of a run of its own.
+a running agent from the ordinary queue: each queued draft is the prompt of a
+run of its own.
 
 Cancellation (`CancelPending`) requires current `ControlGeneration` permission
-and removes one queued draft by its ID. A draft that already started its run
-has left the queue, so a late cancel changes nothing. `PendingDelivered`
-removes the oldest queued draft as its run starts and appends its user group to
+and removes one pending draft by its ID. A queued draft, or a steer the run
+doesn't have, is removed at once. A steer the run has is withdrawn through the
+session, with the canceller as the request's source, until it joins the run;
+only the session's `Removed` receipt takes it off the mirrored list. The
+session commits a safe point's steers as it takes them, so a cancel that loses
+that race is answered by the commit: the steer shows inline in the run as
+sent. A late cancel changes nothing.
+`PendingDelivered` removes a queued draft as its run starts and appends its user group to
 the timeline, followed by the run's `AgentStarted`. Queued comments are named
 in that run's prompt like any submission's. Queued attachment bytes stay stored
 and are included in late-join transfers. The 32 MB message attachment limit
 applies to each submission, as each becomes a message of its own.
 
-Normally completed runs automatically start the next queued run. Stopping or
+Normally completed runs automatically start the next pending run, with
+undelivered steering before the ordinary FIFO. A steer that finds no run to
+join (one racing completion, or a run stopping) is discarded by the session's
+fallback but stays in Cowork's pending list, so it starts a run of its own
+rather than an untracked one. Stopping keeps steers. Stopping or
 failure keeps queued submissions visible and cancellable. Stop also wins over a
 completion already on its way to the UI, preventing automatic queue advancement.
 An idle composer with an empty draft shows a labelled **Resume messages** button
 with a play icon. Clicking it (or pressing the submit shortcut) resumes the
-queue in FIFO order, without creating a new submission. Sending a new draft
+pending work (steering first, then FIFO), without creating a new submission. Sending a new draft
 while idle starts its run at once; the queue continues after it completes.
 Archived threads do not start queued runs. Queues are session state, and are
 not saved across app restarts, though the host's threads are (see
 [Saved threads](#saved-threads)).
 
 The composer shows the red Stop control while generating with an empty draft.
-With any non-empty block, comment, or attachment it shows the blue Queue
-control, whose tooltip also names the Stop shortcut. Idle Send uses the same
-blue enabled accent. Queued blocks have muted centered Queued labels in dashed
+With any non-empty block, comment, or attachment it shows the blue Steer
+control. Cmd/Ctrl+Enter steers; Cmd/Ctrl+Shift+Enter queues. Clicking steers,
+and Shift-clicking queues. The tooltip names both choices and the Stop shortcut.
+Idle Send uses the same blue enabled accent. Pending blocks have muted centered
+Steering or Queued labels in dashed
 dividers, cancellation at the right, and a solid Draft divider before the
 editable draft.
 
@@ -643,7 +674,7 @@ Also check the attached log.
 The host titles a new thread from the first prompt block, or from the first
 comment when a submission has only comments.
 
-Submitting while the agent is generating is rejected. `Write` and `Admin`
+Submitting while the agent is generating steers or queues as described above. `Write` and `Admin`
 participants can keep editing the draft during generation.
 
 ### Stopping
@@ -932,8 +963,9 @@ can still be reported. Runtime permission denials use the separate
 | `Presence`            | Replaces this participant's presence; host sanitizes readers to empty                                  |
 | `AttachmentData`      | Upload chunks; requires draft-write access or an already accepted record                               |
 | `AttachmentCancelled` | Cancels this peer's upload, including after revocation                                                 |
-| `Submit`              | Requests a submission at the given sequence, queued while a run is going; requires `Admin`             |
-| `CancelPending`       | Cancels the named queued submission; same permission as `Submit`                                       |
+| `Submit`              | Requests a submission at the given sequence, steering while a run is going; requires `Admin`           |
+| `Queue`               | Requests a submission at the given sequence for a later run; same permission as `Submit`               |
+| `CancelPending`       | Cancels the named pending submission; same permission as `Submit`                                      |
 | `Stop`                | Stops the named agent run; same permission as `Submit`                                                 |
 | `SelectModel`         | Selects a model by provider and model ID; requires `Admin`                                             |
 | `DecideToolCall`      | Allows or denies the named run's waiting tool call; requires `Admin`; ignored once decided             |
@@ -959,7 +991,7 @@ can still be reported. Runtime permission denials use the separate
 | `ProjectFoldersChanged`                      | Replaces the names of the project's folders, in order; paths are never sent                                                                                                                                                                                                                                                                                  |
 | `ProjectModeChanged`                         | The project's mode is now `Read`, `Write`, or `Write + Network`                                                                                                                                                                                                                                                                                              |
 | `PendingSubmissions`                         | Full accepted pending groups and current submission sequence; IDs fence cancellation                                                                                                                                                                                                                                                                         |
-| `PendingDelivered`                           | Removes the oldest pending ID as its run starts and publishes its user group; `AgentStarted` follows                                                                                                                                                                                                                                                         |
+| `PendingDelivered`                           | Removes a pending ID and publishes its user group; followed by its steering input commit or a new run's `AgentStarted` |
 | `UserMessage`                                | A delivered immediate submission with creators and attachment references instead of bytes; advances the submission sequence                                                                                                                                                                                                                                  |
 | `ThreadTitled`, `AgentStarted`, `AgentEnded` | The title; a run starting, whose prompt follows as its first committed input; and ending, with its duration and whether it completed, was stopped, or failed (with a message)                                                                                                                                                                                                                  |
 | `AgentEvent`                                 | A `RunEvent` of the host's session during a run (a preview, a committed entry, usage, or a compaction starting, accepted, or failing), which everyone folds into the agent message and transcript |

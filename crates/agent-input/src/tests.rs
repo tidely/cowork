@@ -39,6 +39,32 @@ fn start(inbox: &mut TestInbox) -> RunId {
     inbox.run().unwrap()
 }
 
+/// A steer sent with the prompt that starts a run joins that run before its
+/// first request; once nothing would start a run, it follows its fallback.
+#[test]
+fn steers_sent_with_a_starting_prompt_join_its_run() {
+    let mut inbox = TestInbox::default();
+    admit(&mut inbox, "prompt", Delivery::Queue);
+    let steer = input("human", "also this");
+    let location = inbox.admit(steer, Delivery::Steer).unwrap().location;
+    assert_eq!(location, Admission::Next);
+    let run = start(&mut inbox);
+    let batch = inbox.begin_safe_point(run).unwrap().unwrap();
+    assert_eq!(commit(&mut inbox, batch), ["also this"]);
+
+    // The prompt removed: the waiting steer no longer has a run to join.
+    inbox.finish_run(run, RunOutcome::Completed).unwrap();
+    let prompt = admit(&mut inbox, "removed prompt", Delivery::Queue);
+    let mut stranded = input("human", "stranded");
+    stranded.policy.fallback = Fallback::Discard;
+    inbox.admit(stranded, Delivery::Steer).unwrap();
+    inbox.remove(prompt).unwrap();
+    let released = inbox.release_waiting();
+    assert_eq!(released.len(), 1);
+    assert_eq!(released[0].payload, "stranded");
+    assert!(inbox.pending().next().is_none());
+}
+
 #[test]
 fn sources_share_lanes_without_losing_provenance_or_priority() {
     let mut inbox = TestInbox::default();
@@ -236,12 +262,18 @@ fn redirect_is_atomic_and_protected_or_reserved_rows_cannot_be_edited() {
         1
     );
     assert_eq!(inbox.edit(queued, "too late"), Err(StateError::NotEditable));
+    let withdrawn = admit(&mut inbox, "cancel before safe point", Delivery::Steer);
+    assert_eq!(
+        inbox.remove(withdrawn).unwrap().payload,
+        "cancel before safe point"
+    );
     let mut protected = input("parent", "protected");
     protected.policy.access = QueueAccess::Protected;
     let id = protected.id;
     inbox.admit(protected, Delivery::Queue).unwrap();
     assert_eq!(inbox.remove(id).unwrap_err(), StateError::NotEditable);
     let batch = inbox.begin_safe_point(run).unwrap().unwrap();
+    assert_eq!(inbox.remove(queued).unwrap_err(), StateError::NotEditable);
     assert_eq!(commit(&mut inbox, batch), ["edited"]);
 }
 

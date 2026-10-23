@@ -21,6 +21,17 @@ macro_rules! identity {
             pub fn new() -> Self {
                 Self(Uuid::new_v4())
             }
+
+            pub fn as_uuid(&self) -> Uuid {
+                self.0
+            }
+        }
+        /// For hosts whose records already have UUIDs, so one identity can
+        /// name both the record and its input.
+        impl From<Uuid> for $name {
+            fn from(id: Uuid) -> Self {
+                Self(id)
+            }
         }
         impl Default for $name {
             fn default() -> Self {
@@ -110,6 +121,9 @@ pub struct Input<S, P> {
 pub enum Admission {
     Queued,
     Active(RunId),
+    /// A steer or interjection waiting for the run that queued work is about
+    /// to start, joining it at its first safe point, before its first request.
+    Next,
     /// The input was not accepted; ownership is returned to the host.
     Discarded,
 }
@@ -237,6 +251,44 @@ impl<S, P> Inbox<S, P> {
         self.paused = false;
     }
 
+    /// Steers and interjections waiting for the next safe point, of the
+    /// active run or the run about to start.
+    pub fn waiting(&self) -> impl Iterator<Item = &Input<S, P>> {
+        self.interjections.iter().chain(&self.steering)
+    }
+
+    /// Whether queued work starts a run on the next `begin_next`.
+    fn starts_next_run(&self) -> bool {
+        self.running.is_none()
+            && self.preparing.is_none()
+            && !self.paused
+            && !(self.interrupts.is_empty() && self.queued.is_empty())
+    }
+
+    /// Settles steers left waiting for a run that will no longer start, as
+    /// the queued work they waited behind was removed or withdrawn: each
+    /// follows its fallback, and the discarded ones are returned. Call after
+    /// any change that can empty the queue while idle.
+    pub fn release_waiting(&mut self) -> Vec<Input<S, P>> {
+        if self.running.is_some() || self.starts_next_run() {
+            return Vec::new();
+        }
+        let mut discarded = Vec::new();
+        let waiting: Vec<_> = self
+            .interjections
+            .drain(..)
+            .chain(self.steering.drain(..))
+            .collect();
+        for input in waiting {
+            if input.policy.fallback == Fallback::Queue {
+                self.queued.push_back(input);
+            } else {
+                discarded.push(input);
+            }
+        }
+        discarded
+    }
+
     pub fn admit(
         &mut self,
         input: Input<S, P>,
@@ -270,6 +322,14 @@ impl<S, P> Inbox<S, P> {
                         _ => self.steering.push_back(input),
                     }
                     Admission::Active(id)
+                } else if self.starts_next_run() {
+                    // A follow-up sent with the prompt that starts a run
+                    // belongs to that run, not to a run of its own.
+                    match delivery {
+                        Delivery::Interject => self.interjections.push_back(input),
+                        _ => self.steering.push_back(input),
+                    }
+                    Admission::Next
                 } else if input.policy.fallback == Fallback::Queue {
                     self.queued.push_back(input);
                     Admission::Queued
@@ -432,7 +492,7 @@ impl<S, P> Inbox<S, P> {
     }
 
     /// Owner-authorized queue edit. Source permissions/version checks belong to
-    /// the host; reserved and run-bound inputs cannot be edited or removed here.
+    /// the host; reserved and run-bound inputs cannot have their payload edited.
     pub fn edit(&mut self, id: InputId, payload: P) -> Result<(), StateError> {
         let input = self
             .interrupts
@@ -445,7 +505,14 @@ impl<S, P> Inbox<S, P> {
     }
 
     pub fn remove(&mut self, id: InputId) -> Result<Input<S, P>, StateError> {
-        for lane in [&mut self.interrupts, &mut self.queued] {
+        // A safe-point reservation is the ownership boundary. Before that,
+        // editable steering can still be withdrawn, just like queued work.
+        for lane in [
+            &mut self.interrupts,
+            &mut self.queued,
+            &mut self.interjections,
+            &mut self.steering,
+        ] {
             if let Some(index) = lane
                 .iter()
                 .position(|input| input.id == id && input.policy.access == QueueAccess::Editable)

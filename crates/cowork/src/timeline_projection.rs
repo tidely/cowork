@@ -8,6 +8,7 @@ use crate::timeline::{AgentMessage, RunActivity};
 pub(crate) enum RunItem {
     Content(usize),
     Compaction(usize),
+    Steering(uuid::Uuid),
     Activity(RunActivity),
 }
 
@@ -30,13 +31,11 @@ impl RunProjection {
         }
         let expanded = message.ui.work_expanded || message.record.awaiting_approval.is_some();
         for step in message.ui.output.work() {
-            if matches!(
-                message.ui.output.steps()[step],
-                crate::timeline::AgentStep::Compaction
-            ) {
-                items.push(RunItem::Compaction(step));
-            } else if expanded {
-                items.push(RunItem::Content(step));
+            match message.ui.output.steps()[step] {
+                crate::timeline::AgentStep::Compaction => items.push(RunItem::Compaction(step)),
+                crate::timeline::AgentStep::Steering(id) => items.push(RunItem::Steering(id)),
+                _ if expanded => items.push(RunItem::Content(step)),
+                _ => {}
             }
         }
         if activity == Some(RunActivity::Compacting) {

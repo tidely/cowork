@@ -300,10 +300,19 @@ impl Authorized<'_, ControlGeneration> {
         Ok(result)
     }
 
+    #[cfg(test)]
     pub(crate) fn request_submit(self) -> bool {
+        self.request_submit_mode(protocol::SubmissionMode::Steering)
+    }
+
+    pub(crate) fn request_submit_mode(self, mode: protocol::SubmissionMode) -> bool {
         self.thread.flush_draft();
-        self.thread.request(protocol::CollaboratorMessage::Submit {
-            sequence: self.thread.submission_count(),
+        let sequence = self.thread.submission_count();
+        self.thread.request(match mode {
+            protocol::SubmissionMode::Steering => {
+                protocol::CollaboratorMessage::Submit { sequence }
+            }
+            protocol::SubmissionMode::Queue => protocol::CollaboratorMessage::Queue { sequence },
         })
     }
 

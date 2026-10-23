@@ -3,6 +3,7 @@
 
 use std::{collections::BTreeSet, fmt::Debug};
 
+use agent_input::Input;
 use language_model::Content;
 use tool_runtime::ToolDescriptor;
 
@@ -83,6 +84,12 @@ pub trait AgentHost: Send + Sync + Sized + 'static {
 
     /// Whether one call may run now.
     fn authorize(&self, call: &CallAuthorization<'_, Self>) -> Decision;
+
+    /// Inputs the conversation has just committed, in order. Called on the
+    /// session owner before their `MessageCommitted` events and before any
+    /// later step, so state the next tool calls rely on (such as the names
+    /// the inputs introduced) is in place without racing the event stream.
+    fn inputs_committed(&self, _inputs: &[Input<Self::Source, Self::Input>]) {}
 
     /// The tool policy as the model should read it, so it can avoid calls it
     /// knows would ask or be refused. `None` says nothing.

@@ -17,7 +17,7 @@ use tools::TurnComments;
 use uuid::Uuid;
 
 use crate::{
-    Cowork, SubmitComposer,
+    Cowork, QueueComposer, SubmitComposer,
     attachments::{MAX_MESSAGE_ATTACHMENT_BYTES, format_bytes},
     composer_attachments::AttachmentError,
     models::ModelRef,
@@ -38,13 +38,16 @@ use crate::{
 pub(crate) struct SubmissionRequest {
     pub(crate) actor: ParticipantId,
     pub(crate) submitted_locally: bool,
+    pub(crate) mode: protocol::SubmissionMode,
 }
 
-/// A submission accepted while a run was going, waiting to start a later
-/// run; see [`protocol::PendingSubmission`].
+/// An accepted submission awaiting a safe-point commit or a later run.
 #[derive(Clone)]
 pub(crate) struct PendingSubmission {
     pub(crate) id: Uuid,
+    pub(crate) mode: protocol::SubmissionMode,
+    /// The source of its input, whenever the session gets it.
+    pub(crate) submitted_by: ParticipantId,
     pub(crate) group: UserMessageGroup,
 }
 
@@ -52,12 +55,16 @@ impl PendingSubmission {
     pub(crate) fn to_protocol(&self) -> protocol::PendingSubmission {
         protocol::PendingSubmission {
             id: self.id.into_bytes(),
+            mode: self.mode,
+            submitted_by: self.submitted_by.into_bytes(),
             group: self.group.to_protocol(),
         }
     }
     pub(crate) fn from_protocol(pending: protocol::PendingSubmission) -> Self {
         Self {
             id: Uuid::from_bytes(pending.id),
+            mode: pending.mode,
+            submitted_by: ParticipantId::from_bytes(pending.submitted_by),
             group: pending.group.into_native(),
         }
     }
@@ -109,7 +116,7 @@ struct GenerationPlan {
 impl Cowork {
     pub(crate) fn composer_button_clicked(
         &mut self,
-        _: &gpui::ClickEvent,
+        event: &gpui::ClickEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -127,6 +134,8 @@ impl Cowork {
         });
         if generating && empty {
             self.stop_generation(cx);
+        } else if event.modifiers().shift {
+            self.submit_composer_mode(protocol::SubmissionMode::Queue, window, cx);
         } else {
             self.submit_composer(window, cx);
         }
@@ -141,10 +150,26 @@ impl Cowork {
         self.submit_composer(window, cx);
     }
 
-    /// Submits the active draft. While the thread's agent is running, the
-    /// submission waits for the runs before it; see
-    /// [`Cowork::start_next_pending`].
+    pub(crate) fn queue_composer_action(
+        &mut self,
+        _: &QueueComposer,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.submit_composer_mode(protocol::SubmissionMode::Queue, window, cx);
+    }
+
+    /// Submits the active draft, steering the running agent by default.
     pub(crate) fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.submit_composer_mode(protocol::SubmissionMode::Steering, window, cx);
+    }
+
+    fn submit_composer_mode(
+        &mut self,
+        mode: protocol::SubmissionMode,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let active_thread = self.active_thread(cx);
         if active_thread
             .as_ref()
@@ -176,7 +201,7 @@ impl Cowork {
                 }
                 thread
                     .with_authorized::<ControlGeneration, _>(thread.participant_id(), |auth| {
-                        auth.request_submit()
+                        auth.request_submit_mode(mode)
                     })
                     .unwrap_or(false)
             });
@@ -198,6 +223,7 @@ impl Cowork {
             SubmissionRequest {
                 actor,
                 submitted_locally: true,
+                mode,
             },
             cx,
         ) {
@@ -229,6 +255,7 @@ impl Cowork {
         let SubmissionRequest {
             actor,
             submitted_locally,
+            mode,
         } = request;
         // An actor is the requester, not the host's local viewer. In particular,
         // Write may edit the draft but cannot consume it on someone else's behalf.
@@ -337,7 +364,7 @@ impl Cowork {
                 blocks,
                 comments_folded,
             };
-            self.defer_submission(thread, group, prompt_names, cx);
+            self.defer_submission(thread, actor, mode, group, prompt_names, cx);
             return true;
         }
         let turn_comments = Arc::new(TurnComments::new(comments.len()));
@@ -416,6 +443,8 @@ impl Cowork {
     fn defer_submission(
         &mut self,
         thread: &Entity<Thread>,
+        actor: ParticipantId,
+        mode: protocol::SubmissionMode,
         group: UserMessageGroup,
         names: HashMap<ParticipantId, SharedString>,
         cx: &mut Context<Self>,
@@ -424,12 +453,17 @@ impl Cowork {
         thread.update(cx, |thread, cx| {
             thread.pending.push(PendingSubmission {
                 id: group.id,
+                mode,
+                submitted_by: actor,
                 group,
             });
             thread.submission_sequence += 1;
             thread.name_in_prompts(names, cx);
             thread.publish_pending(cx);
         });
+        if mode == protocol::SubmissionMode::Steering {
+            self.offer_steering(thread, cx);
+        }
         self.thread_updated(thread_id, cx);
     }
 
@@ -455,8 +489,10 @@ impl Cowork {
     }
 
     /// Removes the pending submission `id` for `actor`. One that already
-    /// started its run is gone from the list, so a late cancel changes
-    /// nothing.
+    /// started its run, or joined one, is gone from the list, so a late
+    /// cancel changes nothing. A steer the run has is withdrawn through the
+    /// session, which may have committed it first; see
+    /// [`Cowork::cancel_steering`].
     pub(crate) fn cancel_pending_for(
         &mut self,
         thread: &Entity<Thread>,
@@ -481,6 +517,9 @@ impl Cowork {
         {
             return;
         }
+        if self.cancel_steering(thread, actor, id, cx) {
+            return;
+        }
         thread.update(cx, |thread, cx| {
             thread.pending.retain(|pending| pending.id != id);
             thread.publish_pending(cx);
@@ -488,7 +527,7 @@ impl Cowork {
         self.thread_updated(thread_id, cx);
     }
 
-    /// Starts a run on the oldest pending submission. Only normally
+    /// Starts undelivered steering before the ordinary FIFO. Only normally
     /// completed runs continue the queue on their own. Stopping or failure
     /// leaves accepted drafts visible and cancellable until the user resumes.
     pub(super) fn start_next_pending(&mut self, thread: &Entity<Thread>, cx: &mut Context<Self>) {
@@ -503,7 +542,13 @@ impl Cowork {
         {
             return;
         }
-        let Some(pending) = state.pending.first().cloned() else {
+        let Some(pending) = state
+            .pending
+            .iter()
+            .find(|pending| pending.mode == protocol::SubmissionMode::Steering)
+            .or_else(|| state.pending.first())
+            .cloned()
+        else {
             return;
         };
         let group = pending.group;
@@ -525,7 +570,7 @@ impl Cowork {
             prompt,
             comment_group_id: (!group.comments.is_empty()).then_some(group.id),
             turn_comments,
-            source: RunSource::Participant(state.participant_id().into_bytes()),
+            source: RunSource::Participant(pending.submitted_by.into_bytes()),
         };
         thread.update(cx, |thread, cx| {
             thread.emit(

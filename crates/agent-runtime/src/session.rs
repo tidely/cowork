@@ -58,6 +58,22 @@ pub enum RunError {
     StepLimit,
 }
 
+/// Why inputs left the inbox without being committed. With admissions and
+/// committed `Origin::Input` entries, this lets an observer mirror the inbox
+/// from events alone. A refused `RemoveInput` emits nothing: the input was
+/// already committed or discarded, and that event came first.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DiscardReason {
+    /// A `RemoveInput` request withdrew it.
+    Removed,
+    /// It had no run to join, and its policy's fallback discards it.
+    Fallback,
+    /// Its producer-bound or ephemeral source closed.
+    SourceClosed,
+    /// The session shut down.
+    Shutdown,
+}
+
 /// The session could not be built as configured.
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 #[error("invalid session configuration: {0}")]
@@ -84,6 +100,7 @@ pub enum EventKind<H: AgentHost> {
     /// Inputs leaving the inbox without being committed, for producer receipts.
     InputsDiscarded {
         inputs: Vec<Input<H::Source, H::Input>>,
+        reason: DiscardReason,
     },
     RunStarted,
     PhaseChanged(Phase),
@@ -510,7 +527,7 @@ impl<H: AgentHost> AgentSession<H> {
                 );
                 self.wake_waits();
                 if let Some(discarded) = &admitted.discarded {
-                    self.discard(vec![discarded.clone()], emit);
+                    self.discard(vec![discarded.clone()], DiscardReason::Fallback, emit);
                 }
                 Ok(Response::Admitted(admitted))
             }
@@ -520,7 +537,8 @@ impl<H: AgentHost> AgentSession<H> {
             }
             RequestKind::RemoveInput { id } => {
                 let input = self.inbox.remove(id)?;
-                self.discard(vec![input.clone()], emit);
+                self.discard(vec![input.clone()], DiscardReason::Removed, emit);
+                self.release_waiting(emit);
                 Ok(Response::Removed(input))
             }
             RequestKind::RedirectInput { id, delivery } => {
@@ -530,8 +548,9 @@ impl<H: AgentHost> AgentSession<H> {
                 }
                 self.wake_waits();
                 if let Some(discarded) = &admitted.discarded {
-                    self.discard(vec![discarded.clone()], emit);
+                    self.discard(vec![discarded.clone()], DiscardReason::Fallback, emit);
                 }
+                self.release_waiting(emit);
                 Ok(Response::Admitted(admitted))
             }
             RequestKind::MoveInput { id, before } => {
@@ -540,7 +559,8 @@ impl<H: AgentHost> AgentSession<H> {
             }
             RequestKind::SourceClosed => {
                 let withdrawn = self.inbox.producer_closed(&source);
-                self.discard(withdrawn.inputs.clone(), emit);
+                self.discard(withdrawn.inputs.clone(), DiscardReason::SourceClosed, emit);
+                self.release_waiting(emit);
                 Ok(Response::Withdrawn(withdrawn))
             }
             RequestKind::Stop { run } => {
@@ -557,7 +577,7 @@ impl<H: AgentHost> AgentSession<H> {
                 self.commands.close();
                 self.cancel_compaction(emit);
                 let withdrawn = self.inbox.shutdown();
-                self.discard(withdrawn.inputs, emit);
+                self.discard(withdrawn.inputs, DiscardReason::Shutdown, emit);
                 Ok(Response::Done)
             }
             RequestKind::ReplaceDefinition {
@@ -661,7 +681,8 @@ impl<H: AgentHost> AgentSession<H> {
         completion: CompletionResponder,
     ) {
         match location {
-            Admission::Queued => {
+            // A steer waiting for the next run moves into it as it starts.
+            Admission::Queued | Admission::Next => {
                 self.pending_completions.insert(id, completion);
             }
             Admission::Active(_) => {
@@ -705,11 +726,16 @@ impl<H: AgentHost> AgentSession<H> {
                 .expect("initial reservation")
                 .inputs[0];
             let (input_id, origin) = (first.id, first.source.clone());
-            let completions = self
-                .pending_completions
-                .remove(&input_id)
-                .map(|response| (input_id, response))
+            let joining: Vec<_> = std::iter::once(input_id)
+                .chain(self.inbox.waiting().map(|input| input.id))
+                .collect();
+            let completions = joining
                 .into_iter()
+                .filter_map(|id| {
+                    self.pending_completions
+                        .remove(&id)
+                        .map(|response| (id, response))
+                })
                 .collect();
             self.active = Some(Active {
                 id,
@@ -904,7 +930,8 @@ impl<H: AgentHost> AgentSession<H> {
         let start = self.conversation.entries().len();
         let conversation = &mut self.conversation;
         let context_entry = update.entry.clone();
-        self.inbox
+        let batch = self
+            .inbox
             .commit(delivery, |batch| {
                 let entries = context_entry
                     .into_iter()
@@ -919,6 +946,9 @@ impl<H: AgentHost> AgentSession<H> {
                 conversation.append(entries).map(|_| ())
             })
             .expect("owned delivery")?;
+        // Before anything else can run, so tools in the next step see the
+        // host's records of what the model now has.
+        self.host.inputs_committed(&batch.inputs);
         for (section, snapshot) in update.snapshots {
             self.conversation.deliver(section, snapshot, start);
         }
@@ -1109,7 +1139,7 @@ impl<H: AgentHost> AgentSession<H> {
             .inbox
             .finish_run(id, outcome)
             .expect("completion checked at serialized safe point");
-        self.discard(discarded, emit);
+        self.discard(discarded, DiscardReason::Fallback, emit);
         let response = match outcome {
             RunOutcome::Completed => Ok(Reply {
                 run: id,
@@ -1137,9 +1167,17 @@ impl<H: AgentHost> AgentSession<H> {
         self.active = None;
     }
 
+    /// Steers that waited behind queued work no longer starting a run follow
+    /// their fallback; see [`Inbox::release_waiting`].
+    fn release_waiting(&mut self, emit: &mut impl FnMut(AgentEvent<H>)) {
+        let released = self.inbox.release_waiting();
+        self.discard(released, DiscardReason::Fallback, emit);
+    }
+
     fn discard(
         &mut self,
         inputs: Vec<Input<H::Source, H::Input>>,
+        reason: DiscardReason,
         emit: &mut impl FnMut(AgentEvent<H>),
     ) {
         for input in &inputs {
@@ -1153,7 +1191,7 @@ impl<H: AgentHost> AgentSession<H> {
             }
         }
         if !inputs.is_empty() {
-            self.emit(EventKind::InputsDiscarded { inputs }, emit);
+            self.emit(EventKind::InputsDiscarded { inputs, reason }, emit);
         }
     }
 

@@ -40,6 +40,7 @@ pub struct CommentResponse {
 struct TurnCommentsState {
     responses: Vec<CommentResponse>,
     responded_to: HashSet<CommentId>,
+    additional_ids: Vec<CommentId>,
 }
 
 /// Shared state for the comments attached to one agent turn.
@@ -67,6 +68,25 @@ impl TurnComments {
         &self.comment_ids
     }
 
+    /// Stable aliases for a later submission in this run. A host-owned
+    /// namespace keeps cancellation from renumbering other submissions.
+    pub fn group_ids(namespace: &str, count: usize) -> Vec<CommentId> {
+        (0..count)
+            .map(|index| CommentId(format!("comment_{namespace}_{}", index + 1)))
+            .collect()
+    }
+
+    /// Registers the aliases of a later submission once the model has it,
+    /// without replacing responses already recorded for this run.
+    pub fn extend(&self, ids: &[CommentId]) {
+        let mut state = self.state.lock();
+        for id in ids {
+            if !state.additional_ids.contains(id) {
+                state.additional_ids.push(id.clone());
+            }
+        }
+    }
+
     /// Returns a snapshot of responses in tool-call order.
     pub fn responses(&self) -> Vec<CommentResponse> {
         self.state.lock().responses.clone()
@@ -77,6 +97,7 @@ impl TurnComments {
         let state = self.state.lock();
         self.comment_ids
             .iter()
+            .chain(&state.additional_ids)
             .filter(|comment_id| !state.responded_to.contains(*comment_id))
             .cloned()
             .collect()
@@ -88,7 +109,7 @@ impl TurnComments {
     }
 
     fn has_comments(&self) -> bool {
-        !self.comment_ids.is_empty()
+        !self.comment_ids.is_empty() || !self.state.lock().additional_ids.is_empty()
     }
 
     fn record_response(
@@ -104,6 +125,7 @@ impl TurnComments {
         let comment_id = self
             .comment_ids
             .iter()
+            .chain(&state.additional_ids)
             .find(|candidate| candidate.as_str() == comment_id)
             .cloned()
             .ok_or_else(|| CommentToolError::UnknownComment(comment_id.to_owned()))?;
@@ -318,6 +340,34 @@ mod tests {
             .record_response("comment_3", "Third response".into())
             .unwrap();
         assert!(comments.is_complete());
+    }
+
+    #[test]
+    fn steering_comments_preserve_existing_responses_and_stable_aliases() {
+        let comments = TurnComments::new(1);
+        comments
+            .record_response("comment_1", "Original reply".into())
+            .unwrap();
+        let first = TurnComments::group_ids("first", 1);
+        let second = TurnComments::group_ids("second", 1);
+        comments.extend(&first);
+        comments.extend(&second);
+        assert_eq!(
+            comments.unanswered_comment_ids(),
+            [first.clone(), second.clone()].concat()
+        );
+        comments
+            .record_response(second[0].as_str(), "Later reply".into())
+            .unwrap();
+        comments
+            .record_response(first[0].as_str(), "Earlier reply".into())
+            .unwrap();
+        assert!(comments.is_complete());
+        assert_eq!(comments.responses()[0].response, "Original reply");
+        assert!(matches!(
+            comments.record_response(second[0].as_str(), "Duplicate".into()),
+            Err(CommentToolError::AlreadyResponded(_))
+        ));
     }
 
     #[test]

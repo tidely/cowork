@@ -21,7 +21,10 @@
 //! adds an entry that has just joined the transcript, if any, and then the
 //! preview.
 
-use std::{collections::BTreeMap, ops::Range};
+use std::{
+    collections::{BTreeMap, HashSet},
+    ops::Range,
+};
 
 use agent::{
     Compaction, Conversation, Entry, Origin,
@@ -450,6 +453,11 @@ impl Thread {
                     .decode::<RunSource>()
                     .context("invalid entry from host")?;
                 self.transcript.commit(index, entry.clone())?;
+                if let Some(group_id) = steered_group(&entry, |id| user_group(&self.timeline, id))
+                    && let Some(message) = agent_message(&mut self.timeline, message_id)
+                {
+                    message.ui.steered(group_id, cx);
+                }
                 if entry.message.role == Role::Assistant {
                     *self.active_preview(message_id)? = ReplyPreview::default();
                     if let Some(message) = agent_message(&mut self.timeline, message_id) {
@@ -596,6 +604,14 @@ impl Thread {
                 TimelineMessage::User(_) => None,
             })
             .collect::<Vec<_>>();
+        let groups = self
+            .timeline
+            .iter()
+            .filter_map(|entry| match entry {
+                TimelineMessage::User(group) => Some(group.record.id),
+                TimelineMessage::Agent(_) => None,
+            })
+            .collect::<HashSet<_>>();
         let mut active = None;
         let mut runs = 0;
         for entry in &mut self.timeline {
@@ -614,6 +630,7 @@ impl Thread {
             message.ui.restore(
                 &self.transcript,
                 output,
+                |id| groups.contains(&id),
                 preview.partial().as_ref(),
                 generating,
                 cx,
@@ -680,7 +697,7 @@ impl Thread {
             }
             _ => None,
         });
-        let comments = self
+        let mut comments = self
             .timeline
             .iter()
             .find_map(|entry| match entry {
@@ -695,8 +712,24 @@ impl Thread {
                 _ => None,
             })
             .unwrap_or_else(Vec::new);
-        let Some(comment_id) = TurnComments::new(comments.len())
-            .comment_ids()
+        let mut aliases = TurnComments::new(comments.len()).comment_ids().to_vec();
+        if let Some(message) = self.timeline.iter().find_map(|entry| match entry {
+            TimelineMessage::Agent(message) if message.record.id == message_id => Some(message),
+            _ => None,
+        }) {
+            for step in message.ui.output.steps() {
+                if let crate::timeline::AgentStep::Steering(id) = step
+                    && let Some(group) = self.timeline.iter().find_map(|entry| match entry {
+                        TimelineMessage::User(group) if group.record.id == *id => Some(group),
+                        _ => None,
+                    })
+                {
+                    aliases.extend(steering_comment_ids(*id, group.record.comments.len()));
+                    comments.extend(group.record.comments.iter().map(|comment| comment.id));
+                }
+            }
+        }
+        let Some(comment_id) = aliases
             .iter()
             .position(|alias| alias.as_str() == args.comment_id)
             .and_then(|index| comments.get(index).copied())
@@ -725,6 +758,40 @@ impl Thread {
     }
 }
 
+/// The user group that `entry`, from a run's output, brings into the run. A
+/// steer joins its run as an input whose ID is its group's, and the group is
+/// published before the entry, so `is_group` (whether the timeline has a
+/// user group of that ID) holds for every steer. Live folding and replay
+/// both decide with this, so every copy places the same groups, and any
+/// other input shows nothing.
+pub(crate) fn steered_group(
+    entry: &Entry<RunSource>,
+    is_group: impl Fn(Uuid) -> bool,
+) -> Option<Uuid> {
+    let Origin::Input { id, .. } = &entry.origin else {
+        return None;
+    };
+    Some(id.as_uuid()).filter(|id| is_group(*id))
+}
+
+/// The aliases a steer's comments have in its run: `comment_<8 hex>_<n>`,
+/// named by the first 8 hex digits of its group's ID. Short enough for a
+/// small model to copy, and computed the same by every copy of the thread.
+/// A steer's text is written before it joins, so numbering steers in order
+/// would renumber later ones when an earlier one is cancelled. Two steers of
+/// one run sharing a prefix (about one in four billion per pair) would make
+/// the later one's aliases name the earlier one's comments.
+pub(crate) fn steering_comment_ids(group: Uuid, count: usize) -> Vec<tools::CommentId> {
+    let simple = group.simple().to_string();
+    TurnComments::group_ids(&simple[..8], count)
+}
+
+fn user_group(timeline: &[TimelineMessage], id: Uuid) -> bool {
+    timeline
+        .iter()
+        .any(|entry| matches!(entry, TimelineMessage::User(group) if group.record.id == id))
+}
+
 /// Agent message `id` of `timeline`, borrowed apart from the thread's other
 /// fields.
 fn agent_message(timeline: &mut [TimelineMessage], id: Uuid) -> Option<&mut AgentMessage> {
@@ -736,15 +803,24 @@ fn agent_message(timeline: &mut [TimelineMessage], id: Uuid) -> Option<&mut Agen
 
 impl crate::timeline::AgentOutput {
     /// What a run's `output` entries of `transcript` show, with the
-    /// compactions accepted among them in place.
-    pub(crate) fn from_transcript(transcript: &Transcript, output: Range<usize>) -> Self {
+    /// compactions accepted among them in place, and the steers among them
+    /// by [`steered_group`].
+    pub(crate) fn from_transcript(
+        transcript: &Transcript,
+        output: Range<usize>,
+        is_group: impl Fn(Uuid) -> bool,
+    ) -> Self {
         let mut shown = Self::default();
         let mut compactions = transcript.compactions_in(&output).peekable();
         for index in output.clone() {
             while compactions.next_if(|at| *at == index).is_some() {
                 shown.push_compaction();
             }
-            shown.push(&transcript.entries()[index].message);
+            let entry = &transcript.entries()[index];
+            if let Some(group_id) = steered_group(entry, &is_group) {
+                shown.push_steering(group_id);
+            }
+            shown.push(&entry.message);
         }
         for _ in compactions {
             shown.push_compaction();
@@ -810,18 +886,30 @@ mod tests {
             &mut transcript,
             reply(vec![Content::text("Before ".repeat(50))]),
         );
-        commit(&mut transcript, input("More"));
+        let more = input("More");
+        let Origin::Input { id, .. } = &more.origin else {
+            unreachable!()
+        };
+        let steering_id = id.as_uuid();
+        commit(&mut transcript, more);
         transcript.compact(summary(2, 0)).unwrap();
         commit(&mut transcript, reply(vec![Content::text("After")]));
-        let output = AgentOutput::from_transcript(&transcript, 1..4);
+        let steps = |is_group: bool| {
+            AgentOutput::from_transcript(&transcript, 1..4, |_| is_group)
+                .steps()
+                .to_vec()
+        };
         assert_eq!(
-            output.steps(),
-            &[
+            steps(true),
+            [
                 AgentStep::Text("Before ".repeat(50)),
+                AgentStep::Steering(steering_id),
                 AgentStep::Compaction,
                 AgentStep::Text("After".into()),
             ]
         );
+        // An input that names no user group isn't a steer, and shows nothing.
+        assert!(!steps(false).contains(&AgentStep::Steering(steering_id)));
         let bytes = postcard::to_stdvec(&transcript.to_protocol()).unwrap();
         let wire: Json<TranscriptRecord> = postcard::from_bytes(&bytes).unwrap();
         assert_eq!(wire.to_transcript().unwrap(), transcript);

@@ -29,13 +29,14 @@ pub use request::{
 };
 pub(crate) use request::{Command, CompletionResponder, Responder};
 pub use session::{
-    AgentEvent, AgentSession, EventKind, Phase, RunError, SessionError, SessionResult,
+    AgentEvent, AgentSession, DiscardReason, EventKind, Phase, RunError, SessionError,
+    SessionResult,
 };
 pub use tools::{CALL_TOOL, DynamicToolChange, SEARCH_TOOLS};
 
 // Re-exported so hosts need not depend on these crates for common types.
 pub use agent_input::{
-    Delivery, Fallback, InputId, Lifetime, Policy, QueueAccess, RunId, RunOutcome,
+    Delivery, Fallback, Input, InputId, Lifetime, Policy, QueueAccess, RunId, RunOutcome,
 };
 
 #[cfg(test)]

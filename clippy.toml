@@ -1,3 +1,14 @@
 disallowed-types = [
     { path = "std::sync::Mutex", reason = "Use parking_lot::Mutex for locking without poisoning errors." },
 ]
+disallowed-methods = [
+    # gpui-component shows these tooltips in a window-level overlay from the
+    # trigger's hover callbacks. A trigger removed while hovered (a pending
+    # message's cancel button when its message is sent) never reports that
+    # the hover ended, so its tooltip stays on screen. Use
+    # `NativeTooltip::native_tooltip` (crates/cowork/src/native_tooltip.rs),
+    # GPUI's own tooltip, which disappears with its element.
+    { path = "gpui_component::button::Button::tooltip", reason = "Its overlay tooltip outlives a removed button; use NativeTooltip::native_tooltip." },
+    { path = "gpui_component::button::Button::tooltip_with_action", reason = "Its overlay tooltip outlives a removed button; use NativeTooltip::native_tooltip." },
+    { path = "gpui_component::switch::Switch::tooltip", reason = "Its overlay tooltip outlives a removed switch; put NativeTooltip::native_tooltip on a wrapper." },
+]

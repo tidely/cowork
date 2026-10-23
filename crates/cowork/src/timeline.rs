@@ -192,6 +192,8 @@ pub(crate) enum AgentStep {
     ToolCall(AgentToolCall),
     /// An accepted summary at this point in the folded output.
     Compaction,
+    /// A later user input, placed where it joined the run's transcript.
+    Steering(Uuid),
 }
 
 /// How an [`AgentStep`] is shown: local state, never sent.
@@ -212,6 +214,7 @@ pub(crate) enum StepView {
         expanded: bool,
     },
     Compaction,
+    Steering,
 }
 
 /// Where an [`AgentOutput`]'s committed part ends: how many steps it has,
@@ -415,7 +418,10 @@ impl AgentOutput {
     pub(crate) fn tool_calls(&self) -> impl DoubleEndedIterator<Item = &AgentToolCall> {
         self.steps.iter().filter_map(|step| match step {
             AgentStep::ToolCall(call) => Some(call),
-            AgentStep::Thinking(_) | AgentStep::Text(_) | AgentStep::Compaction => None,
+            AgentStep::Thinking(_)
+            | AgentStep::Text(_)
+            | AgentStep::Compaction
+            | AgentStep::Steering(_) => None,
         })
     }
 
@@ -423,7 +429,10 @@ impl AgentOutput {
     pub(crate) fn thinking(&self) -> impl Iterator<Item = &str> {
         self.steps.iter().filter_map(|step| match step {
             AgentStep::Thinking(text) => Some(text.as_str()),
-            AgentStep::Text(_) | AgentStep::ToolCall(_) | AgentStep::Compaction => None,
+            AgentStep::Text(_)
+            | AgentStep::ToolCall(_)
+            | AgentStep::Compaction
+            | AgentStep::Steering(_) => None,
         })
     }
 
@@ -432,7 +441,7 @@ impl AgentOutput {
     pub(crate) fn response_start(&self) -> usize {
         self.steps
             .iter()
-            .rposition(|step| matches!(step, AgentStep::ToolCall(_)))
+            .rposition(|step| matches!(step, AgentStep::ToolCall(_) | AgentStep::Steering(_)))
             .map_or(0, |index| index + 1)
     }
 
@@ -455,7 +464,10 @@ impl AgentOutput {
             .iter()
             .filter_map(|step| match step {
                 AgentStep::Text(text) => Some(text.as_str()),
-                AgentStep::Thinking(_) | AgentStep::ToolCall(_) | AgentStep::Compaction => None,
+                AgentStep::Thinking(_)
+                | AgentStep::ToolCall(_)
+                | AgentStep::Compaction
+                | AgentStep::Steering(_) => None,
             })
             .collect()
     }
@@ -480,6 +492,7 @@ impl StepView {
             },
             AgentStep::ToolCall(_) => Self::ToolCall { expanded: false },
             AgentStep::Compaction => Self::Compaction,
+            AgentStep::Steering(_) => Self::Steering,
         }
     }
 
@@ -487,14 +500,14 @@ impl StepView {
     pub(crate) fn expanded(&self) -> bool {
         match self {
             Self::Thinking { expanded, .. } | Self::ToolCall { expanded } => *expanded,
-            Self::Text { .. } | Self::Compaction => false,
+            Self::Text { .. } | Self::Compaction | Self::Steering => false,
         }
     }
 
     pub(crate) fn set_expanded(&mut self, value: bool) {
         match self {
             Self::Thinking { expanded, .. } | Self::ToolCall { expanded } => *expanded = value,
-            Self::Text { .. } | Self::Compaction => {}
+            Self::Text { .. } | Self::Compaction | Self::Steering => {}
         }
     }
 }
@@ -825,6 +838,10 @@ impl AgentOutput {
         self.steps.push(AgentStep::Compaction);
     }
 
+    pub(crate) fn push_steering(&mut self, id: Uuid) {
+        self.steps.push(AgentStep::Steering(id));
+    }
+
     /// Adds what `message`, the next message of a run's output, shows.
     /// Context notes and inputs show nothing; the run's user group does.
     pub(crate) fn push(&mut self, message: &Message) {
@@ -889,7 +906,10 @@ impl AgentOutput {
     fn tool_calls_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut AgentToolCall> {
         self.steps.iter_mut().filter_map(|step| match step {
             AgentStep::ToolCall(call) => Some(call),
-            AgentStep::Thinking(_) | AgentStep::Text(_) | AgentStep::Compaction => None,
+            AgentStep::Thinking(_)
+            | AgentStep::Text(_)
+            | AgentStep::Compaction
+            | AgentStep::Steering(_) => None,
         })
     }
 
@@ -959,6 +979,15 @@ impl AgentMessageUi {
         self.show_steps(first, &[], cx);
     }
 
+    /// A user input committed at a safe boundary, between model replies.
+    pub(crate) fn steered(&mut self, id: Uuid, cx: &mut impl AppContext) {
+        self.output.rewind(self.committed);
+        let first = self.output.steps.len();
+        self.output.push_steering(id);
+        self.committed = self.output.mark();
+        self.show_steps(first, &[], cx);
+    }
+
     /// Shows a run's output after its fold moved on: `completed`, a message
     /// it has just added to the transcript, if any, then `partial`, the
     /// message it is folding. Only the part after the committed mark is
@@ -978,7 +1007,7 @@ impl AgentMessageUi {
             .iter()
             .map(|step| match step {
                 AgentStep::Thinking(text) | AgentStep::Text(text) => Some(text.clone()),
-                AgentStep::ToolCall(_) | AgentStep::Compaction => None,
+                AgentStep::ToolCall(_) | AgentStep::Compaction | AgentStep::Steering(_) => None,
             })
             .collect::<Vec<_>>();
         self.output.rewind(from);
@@ -1006,7 +1035,8 @@ impl AgentMessageUi {
                     update_step_text(view, text, old.get(index - first), cx);
                 }
                 (Some(StepView::ToolCall { .. }), AgentStep::ToolCall(_))
-                | (Some(StepView::Compaction), AgentStep::Compaction) => {}
+                | (Some(StepView::Compaction), AgentStep::Compaction)
+                | (Some(StepView::Steering), AgentStep::Steering(_)) => {}
                 (Some(view), step) => *view = StepView::new(step, cx),
                 (None, step) => self.step_views.push(StepView::new(step, cx)),
             }
@@ -1021,11 +1051,12 @@ impl AgentMessageUi {
         &mut self,
         transcript: &Transcript,
         output: std::ops::Range<usize>,
+        is_group: impl Fn(Uuid) -> bool,
         partial: Option<&Message>,
         generating: bool,
         cx: &mut impl AppContext,
     ) {
-        self.output = AgentOutput::from_transcript(transcript, output);
+        self.output = AgentOutput::from_transcript(transcript, output, is_group);
         self.committed = self.output.mark();
         self.output.extend(partial);
         self.set_thinking_complete(partial, generating);

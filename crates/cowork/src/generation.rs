@@ -5,10 +5,11 @@
 //! with the thread's first run and kept for its later ones, so the session
 //! keeps what it told the model (such as the environment note) between
 //! runs. Cowork keeps its own queue of pending submissions and hands the
-//! session one input at a time, when no run is going.
+//! session one queued input at a time. Steering uses the session's native
+//! safe-point lane; Cowork removes it from pending only once committed.
 
 use std::{
-    collections::{HashMap, hash_map::Entry},
+    collections::{HashMap, HashSet, hash_map::Entry},
     num::NonZeroUsize,
     sync::{
         Arc,
@@ -19,8 +20,8 @@ use std::{
 
 use agent::{
     AgentDefinition, AgentEvent, AgentSession, ApprovalDecision, Configuration, ContextSection,
-    Delivery, EventKind, Fallback, InputId, Lifetime, Policy, QueueAccess, Request, RequestKind,
-    RunId, SessionHandle, SessionView,
+    Delivery, DiscardReason, EventKind, Fallback, InputId, Lifetime, Policy, QueueAccess, Request,
+    RequestKind, RunId, SessionHandle, SessionView,
     model::{
         ContentDelta, JsonObject, LanguageModel, LanguageModelProvider, Thinking, ToolCallId, Usage,
     },
@@ -39,8 +40,8 @@ use crate::{
     participant::ParticipantId,
     protocol::{self, Preview, PreviewDelta, RunEvent},
     thread::{ControlGeneration, Thread, ThreadOwnership, ThreadSharing},
-    tool_approval::{self, CoworkHost},
-    transcript::{RunSource, shared_compaction, shared_entry},
+    tool_approval::{self, CoworkHost, CoworkInput},
+    transcript::{RunSource, shared_compaction, shared_entry, steering_comment_ids},
     usage::{TokenActivity, usage_tokens},
 };
 
@@ -166,6 +167,16 @@ const INPUT_POLICY: Policy = Policy {
     lifetime: Lifetime::Retain,
 };
 
+/// How steers behave. Cowork keeps the canonical group until the session
+/// commits it; a steer that finds no run to join is discarded rather than
+/// queued, so it can't start a run behind Cowork's back. It stays in
+/// Cowork's pending list instead, and starts a run of its own.
+const STEERING_POLICY: Policy = Policy {
+    access: QueueAccess::Editable,
+    fallback: Fallback::Discard,
+    lifetime: Lifetime::Retain,
+};
+
 /// A thread's agent session on the host, which outlives its runs.
 pub(crate) struct ThreadAgent {
     /// Tells this session's events apart from a later session's.
@@ -271,6 +282,10 @@ pub(crate) struct ActiveGeneration {
     /// The calls the run waits on a decision for, and whether only the host
     /// may decide each; see [`tool_approval::HOST_ONLY`].
     approvals: HashMap<ToolCallId, bool>,
+    /// The steers handed to the run that the session has neither committed
+    /// nor discarded yet. Only these are cancelled through the session;
+    /// every other pending submission is Cowork's alone.
+    offered: HashSet<InputId>,
     started_at: SystemTime,
     /// Monotonic, so the duration survives clock changes.
     started: Instant,
@@ -288,6 +303,7 @@ impl ActiveGeneration {
             session: None,
             run: None,
             approvals: HashMap::new(),
+            offered: HashSet::new(),
             started_at: SystemTime::now(),
             started: Instant::now(),
             usage: Usage::default(),
@@ -402,6 +418,104 @@ fn run_outcome(outcome: agent::RunOutcome, error: Option<agent::RunError>) -> pr
 }
 
 impl Cowork {
+    #[cfg(test)]
+    pub(crate) fn agent_event_for_test(
+        &mut self,
+        thread_id: Uuid,
+        event: AgentEvent<CoworkHost>,
+        cx: &mut Context<Self>,
+    ) {
+        self.agent_event(thread_id, event, cx);
+    }
+
+    /// Hands the run each pending steer it doesn't have yet. Called right
+    /// after the run's prompt is posted, so steers left from a stopped run
+    /// join the new run at its first safe point, before its first request
+    /// (the session's `Admission::Next`), and again for each steer accepted
+    /// during the run. A stopping run takes none; they stay pending.
+    ///
+    /// The input's ID is its group's (see [`crate::transcript::steered_group`]).
+    /// Its comment aliases are named here and join the run's comments only
+    /// when it commits ([`CoworkHost`]'s `inputs_committed`).
+    pub(super) fn offer_steering(&mut self, thread: &Entity<Thread>, cx: &mut Context<Self>) {
+        let state = thread.read(cx);
+        let Some(generation) = self.active_generations.get_mut(&state.instance_id) else {
+            return;
+        };
+        if generation.cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        for pending in &state.pending {
+            let id = InputId::from(pending.id);
+            if pending.mode != protocol::SubmissionMode::Steering
+                || generation.offered.contains(&id)
+            {
+                continue;
+            }
+            let group = &pending.group;
+            let comments = steering_comment_ids(pending.id, group.comments.len());
+            let preface = Self::comments_preface(
+                &group.comments,
+                &comments,
+                &state.timeline,
+                &state.prompt_names,
+            );
+            let content = crate::prompt::agent_message(
+                preface.as_deref(),
+                &group.blocks,
+                &state.draft().files,
+                &state.prompt_names,
+            );
+            let request = Request::new(
+                RunSource::Participant(pending.submitted_by.into_bytes()),
+                RequestKind::Input {
+                    id,
+                    payload: CoworkInput { content, comments },
+                    delivery: Delivery::Steer,
+                    policy: STEERING_POLICY,
+                },
+            );
+            // Without a session (only in tests), its events are scripted.
+            if let Some((handle, _, _)) = &generation.session
+                && handle.post(request).is_err()
+            {
+                continue;
+            }
+            generation.offered.insert(id);
+        }
+    }
+
+    /// Asks the session to withdraw steer `id` for `actor`, if the run has
+    /// it. The steer leaves the pending list only on the session's receipt:
+    /// if it joined the run first, the commit delivers it instead. Returns
+    /// whether the session decides; otherwise the steer is Cowork's alone.
+    pub(super) fn cancel_steering(
+        &mut self,
+        thread: &Entity<Thread>,
+        actor: ParticipantId,
+        id: Uuid,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let thread_id = thread.read(cx).instance_id;
+        let Some(generation) = self.active_generations.get_mut(&thread_id) else {
+            return false;
+        };
+        let id = InputId::from(id);
+        if !generation.offered.contains(&id) {
+            return false;
+        }
+        let Some((handle, _, _)) = &generation.session else {
+            // Only in tests, whose receipts are scripted.
+            return true;
+        };
+        handle
+            .post(Request::new(
+                RunSource::Participant(actor.into_bytes()),
+                RequestKind::RemoveInput { id },
+            ))
+            .is_ok()
+    }
+
     /// Starts the agent on a submission, returning the agent message it
     /// produces.
     pub(super) fn start_generation(
@@ -459,7 +573,7 @@ impl Cowork {
                 source.clone(),
                 RequestKind::Input {
                     id: InputId::new(),
-                    payload: prompt,
+                    payload: prompt.into(),
                     delivery: Delivery::Queue,
                     policy: INPUT_POLICY,
                 },
@@ -471,6 +585,7 @@ impl Cowork {
                 if let Some(generation) = self.active_generations.get_mut(&thread_id) {
                     generation.session = Some((handle, host, source));
                 }
+                self.offer_steering(&thread, cx);
             }
             Err(error) => {
                 let totals = self.active_generations[&thread_id].totals();
@@ -599,6 +714,28 @@ impl Cowork {
         let Some(generation) = self.active_generations.get_mut(&thread_id) else {
             return;
         };
+        // Receipts precede `RunFinished`, so a cancelled steer is gone before
+        // automatic pending delivery could start it. Only Cowork removes
+        // inputs, so `Removed` is always a cancellation; a steer discarded
+        // for want of a run stays pending.
+        if let EventKind::InputsDiscarded { inputs, reason } = &event.kind {
+            let ours = inputs
+                .iter()
+                .filter(|input| generation.offered.remove(&input.id))
+                .map(|input| input.id.as_uuid())
+                .collect::<HashSet<_>>();
+            if *reason == DiscardReason::Removed
+                && !ours.is_empty()
+                && let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx)
+            {
+                thread.update(cx, |thread, cx| {
+                    thread.pending.retain(|pending| !ours.contains(&pending.id));
+                    thread.publish_pending(cx);
+                });
+                self.thread_updated(thread_id, cx);
+            }
+            return;
+        }
         if matches!(event.kind, EventKind::RunStarted) && generation.run.is_none() {
             generation.run = event.run;
             if generation.cancelled.load(Ordering::Acquire) {
@@ -622,10 +759,32 @@ impl Cowork {
                     delta,
                 })
             }
-            EventKind::MessageCommitted { index, entry } => RunEvent::Committed {
-                index: index as u64,
-                entry: shared_entry(&entry),
-            },
+            EventKind::MessageCommitted { index, entry } => {
+                // A committed steer is published before its entry, so every
+                // copy has the group when the entry places it.
+                if let agent::Origin::Input { id, .. } = &entry.origin
+                    && generation.offered.remove(id)
+                    && let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx)
+                {
+                    thread.update(cx, |thread, cx| {
+                        if let Some(pending) = thread
+                            .pending
+                            .iter()
+                            .find(|pending| pending.id == id.as_uuid())
+                        {
+                            let delivered = protocol::HostMessage::PendingDelivered {
+                                id: pending.id.into_bytes(),
+                                group: pending.group.to_protocol(),
+                            };
+                            thread.emit(delivered, cx);
+                        }
+                    });
+                }
+                RunEvent::Committed {
+                    index: index as u64,
+                    entry: shared_entry(&entry),
+                }
+            }
             EventKind::UsageReported(usage) => {
                 add_usage(&mut generation.usage, &usage);
                 if usage.total_tokens.is_none()
@@ -903,6 +1062,7 @@ mod tests {
         },
     };
     use futures::future::BoxFuture;
+    use tools::TurnComments;
 
     use super::*;
 
@@ -1007,16 +1167,32 @@ mod tests {
                 source.clone(),
                 RequestKind::Input {
                     id: InputId::new(),
-                    payload: vec![Content::text("Take a note. ".repeat(20))],
+                    payload: vec![Content::text("Take a note. ".repeat(20))].into(),
                     delivery: Delivery::Queue,
                     policy: INPUT_POLICY,
+                },
+            ))
+            .unwrap();
+        // A steer sent with the prompt, as one left from a stopped run is,
+        // joins before the first request.
+        handle
+            .post(Request::new(
+                source.clone(),
+                RequestKind::Input {
+                    id: InputId::new(),
+                    payload: vec![Content::text("Left from before")].into(),
+                    delivery: Delivery::Steer,
+                    policy: STEERING_POLICY,
                 },
             ))
             .unwrap();
 
         let mut committed = Vec::new();
         let mut asked = Vec::new();
+        let mut discarded = Vec::new();
         let mut compacted = false;
+        let withdrawn_comments = TurnComments::group_ids("withdrawn", 1);
+        let delivered_comments = TurnComments::group_ids("delivered", 1);
         let outcome = loop {
             let event = tokio::time::timeout(Duration::from_secs(5), received.next())
                 .await
@@ -1026,6 +1202,44 @@ mod tests {
                 EventKind::MessageCommitted { entry, .. } => committed.push(entry),
                 EventKind::ApprovalRequested { call, tool, .. } => {
                     asked.push(tool);
+                    // Steering waits for this call's result; cancellation
+                    // withdraws it before that safe point.
+                    let withdrawn = InputId::new();
+                    let steer = |id, text, comments: &Vec<_>| {
+                        Request::new(
+                            source.clone(),
+                            RequestKind::Input {
+                                id,
+                                payload: CoworkInput {
+                                    content: vec![Content::text(text)],
+                                    comments: comments.clone(),
+                                },
+                                delivery: Delivery::Steer,
+                                policy: STEERING_POLICY,
+                            },
+                        )
+                    };
+                    handle
+                        .send(steer(withdrawn, "Never deliver this", &withdrawn_comments))
+                        .await
+                        .unwrap();
+                    assert!(matches!(
+                        handle
+                            .send(Request::new(
+                                source.clone(),
+                                RequestKind::RemoveInput { id: withdrawn }
+                            ))
+                            .await,
+                        Ok(agent::Response::Removed(_))
+                    ));
+                    handle
+                        .send(steer(
+                            InputId::new(),
+                            "Also explain the refusal",
+                            &delivered_comments,
+                        ))
+                        .await
+                        .unwrap();
                     handle
                         .post(Request::new(
                             source.clone(),
@@ -1036,6 +1250,7 @@ mod tests {
                         ))
                         .unwrap();
                 }
+                EventKind::InputsDiscarded { reason, .. } => discarded.push(reason),
                 EventKind::Compacted(_) => compacted = true,
                 EventKind::RunFinished { outcome, .. } => break outcome,
                 _ => {}
@@ -1043,6 +1258,12 @@ mod tests {
         };
         assert_eq!(outcome, RunOutcome::Completed);
         assert_eq!(asked, [WriteFile::NAME]);
+        assert_eq!(discarded, [DiscardReason::Removed]);
+        // Only the delivered steer's comments joined the run's.
+        assert_eq!(
+            host.comments().current().unanswered_comment_ids(),
+            delivered_comments
+        );
         assert!(compacted, "the full context was summarized");
         assert!(matches!(
             &committed[0].origin,
@@ -1056,7 +1277,27 @@ mod tests {
                 _ => None,
             });
         assert_eq!(refused, Some(true));
-        let first = &provider.requests.lock()[0];
+        let requests = provider.requests.lock();
+        let second = &requests[1];
+        assert!(
+            second
+                .messages
+                .iter()
+                .any(|message| message.content == [Content::text("Also explain the refusal")])
+        );
+        assert!(
+            !second
+                .messages
+                .iter()
+                .any(|message| message.content == [Content::text("Never deliver this")])
+        );
+        let first = &requests[0];
+        assert!(
+            first
+                .messages
+                .iter()
+                .any(|message| message.content == [Content::text("Left from before")])
+        );
         assert_eq!(
             first
                 .tools
@@ -1147,7 +1388,8 @@ mod tests {
                     id: InputId::new(),
                     payload: vec![Content::text(
                         "Use the calculate tool to multiply 17 by 23, then tell me the result.",
-                    )],
+                    )]
+                    .into(),
                     delivery: Delivery::Queue,
                     policy: INPUT_POLICY,
                 },

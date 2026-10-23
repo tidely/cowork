@@ -457,9 +457,7 @@ fn submitting_keeps_focus_on_an_item_that_stays(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
-fn generation_button_switches_between_stop_and_queue_for_the_whole_draft(
-    cx: &mut gpui::TestAppContext,
-) {
+fn generation_button_prioritizes_steering_and_shift_shortcut_queues(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     cowork.update_in(cx, |cowork, window, cx| {
         let draft = std::mem::replace(
@@ -484,17 +482,103 @@ fn generation_button_switches_between_stop_and_queue_for_the_whole_draft(
     });
     cx.run_until_parked();
     assert!(cx.debug_bounds("stop-generation").is_some());
-    assert!(cx.debug_bounds("queue-message").is_none());
+    assert!(cx.debug_bounds("steer-message").is_none());
 
     cx.simulate_input("hello");
     cx.run_until_parked();
-    assert!(cx.debug_bounds("queue-message").is_some());
+    assert!(cx.debug_bounds("steer-message").is_some());
     assert!(cx.debug_bounds("stop-generation").is_none());
 
-    cx.simulate_keystrokes("backspace backspace backspace backspace backspace");
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-enter"
+    } else {
+        "ctrl-enter"
+    });
+    cx.run_until_parked();
+    cowork.read_with(cx, |cowork, cx| {
+        let thread = cowork.active_thread(cx).unwrap();
+        assert_eq!(
+            thread.read(cx).pending_submissions()[0].mode,
+            protocol::SubmissionMode::Steering
+        );
+    });
+    cx.simulate_input("later");
+    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
+        "cmd-shift-enter"
+    } else {
+        "ctrl-shift-enter"
+    });
+    cx.run_until_parked();
+    cowork.read_with(cx, |cowork, cx| {
+        let thread = cowork.active_thread(cx).unwrap();
+        assert_eq!(
+            thread.read(cx).pending_submissions()[1].mode,
+            protocol::SubmissionMode::Queue
+        );
+    });
     cx.run_until_parked();
     assert!(cx.debug_bounds("stop-generation").is_some());
-    assert!(cx.debug_bounds("queue-message").is_none());
+    assert!(cx.debug_bounds("steer-message").is_none());
+}
+
+/// A pending message's cancel tooltip goes with its button when the message
+/// is sent while the pointer rests on it.
+#[gpui::test]
+fn cancel_tooltip_disappears_with_its_sent_message(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let (thread, id) = cowork.update_in(cx, |cowork, _, cx| {
+        let mut draft = std::mem::replace(
+            &mut cowork.new_thread_draft,
+            ThreadDraft::new(cowork.local_participant_id),
+        );
+        draft.create_prompt(cowork.local_participant_id.as_uuid(), "steer this");
+        let thread = Cowork::new_empty_local_thread(
+            draft,
+            cowork.local_participant_id,
+            cowork.models.clone(),
+            cowork.new_thread_model.clone(),
+            cx,
+        );
+        thread.update(cx, |thread, cx| thread.set_generating_for_test(true, cx));
+        cowork
+            .thread_store
+            .update(cx, |store, _| store.threads.push_front(thread.clone()));
+        cowork.active_thread_id = Some(thread.read(cx).instance_id);
+        assert!(cowork.accept_submission(
+            thread.read(cx).draft().id,
+            Some(thread.clone()),
+            crate::thread::submission::SubmissionRequest {
+                actor: cowork.local_participant_id,
+                submitted_locally: true,
+                mode: protocol::SubmissionMode::Steering,
+            },
+            cx,
+        ));
+        cx.notify();
+        let id = thread.read(cx).pending_submissions()[0].id;
+        (thread, id)
+    });
+    cx.run_until_parked();
+    let button: &'static str = Box::leak(format!("cancel-pending-{id}").into_boxed_str());
+    let tooltip = "tooltip: Cancel this pending message";
+    let center = cx.debug_bounds(button).expect("cancel button").center();
+    cx.simulate_mouse_move(center, None, gpui::Modifiers::default());
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    assert!(
+        cx.debug_bounds(tooltip).is_some(),
+        "hovering shows the tooltip"
+    );
+
+    // Delivered without the pointer moving.
+    thread.update(cx, |thread, cx| {
+        thread.pending.clear();
+        cx.notify();
+    });
+    cowork.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    assert!(cx.debug_bounds(button).is_none());
+    assert!(cx.debug_bounds(tooltip).is_none());
 }
 
 #[gpui::test]
@@ -525,6 +609,7 @@ fn idle_pending_messages_show_resume_until_a_new_draft_is_written(cx: &mut gpui:
             crate::thread::submission::SubmissionRequest {
                 actor: cowork.local_participant_id,
                 submitted_locally: true,
+                mode: protocol::SubmissionMode::Queue,
             },
             cx,
         ));
