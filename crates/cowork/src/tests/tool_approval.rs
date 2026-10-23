@@ -207,6 +207,22 @@ fn waiting_calls_reach_joiners_and_are_checked(cx: &mut gpui::TestAppContext) {
     });
 }
 
+/// A waiting edit's card shows its change as a diff, which every copy of
+/// the thread computes from the call alone.
+#[gpui::test]
+fn waiting_edits_show_their_diff(cx: &mut gpui::TestAppContext) {
+    let mut session = Collaboration::start(cx);
+    let waiting = wait_for_approval_of(
+        &mut session,
+        sandbox::EditFile::NAME,
+        serde_json::json!({"path": "zed/a.txt", "old_string": "a", "new_string": "b"}),
+    );
+    let selector: &'static str = Box::leak(
+        format!("file-change-{}-{}-diff", waiting.message_id, waiting.call.0).into_boxed_str(),
+    );
+    assert!(session.cx.debug_bounds(selector).is_some());
+}
+
 /// A run that ends while a call waits, as when someone stops it, no longer
 /// shows the call waiting.
 #[gpui::test]

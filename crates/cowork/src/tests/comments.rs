@@ -343,6 +343,7 @@ fn assert_backslash_selection_creates_comment(
                 comment_calls_checked: 0,
                 step_views: Default::default(),
                 text_view: main_text_view,
+                file_views: Default::default(),
                 comment_responses: target_comment_reply
                     .then(|| AgentCommentResponse {
                         id: message_id,
@@ -649,6 +650,7 @@ fn commenting_on_a_long_response_keeps_the_timeline_scroll_position(cx: &mut gpu
                 comment_calls_checked: 0,
                 step_views: Default::default(),
                 text_view: cx.new(|cx| TextViewState::markdown(&markdown, cx)),
+                file_views: Default::default(),
                 comment_responses: Vec::new(),
                 work_expanded: false,
             },

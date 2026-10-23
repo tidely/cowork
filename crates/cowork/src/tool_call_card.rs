@@ -3,7 +3,8 @@
 //! someone who may.
 //!
 //! The card is the shared shell. A tool that wants to show its calls in its
-//! own terms passes its own [`ToolCallCard::body`]; `run_command` and
+//! own terms passes its own [`ToolCallCard::body`] (file writes and edits
+//! pass their diff, `crate::file_change_view`); `run_command` and
 //! `request_permissions` are shown in theirs here, and every other tool gets
 //! its arguments listed.
 //!
@@ -29,7 +30,7 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 use gpui_kit_assets::IconName;
-use sandbox::{Access, Folders, Grant, RequestPermissions, RunCommand};
+use sandbox::{Access, EditFile, Folders, Grant, RequestPermissions, RunCommand, WriteFile};
 
 use crate::highlight::highlight_code_block_in_mode;
 
@@ -105,7 +106,6 @@ impl ToolCallCard {
 
     /// Shows `body` instead of the arguments: a tool's own presentation of
     /// what the call would do.
-    #[expect(dead_code, reason = "for tools' own cards; none passes one yet")]
     pub(crate) fn body(mut self, body: impl IntoElement) -> Self {
         self.body = Some(body.into_any_element());
         self
@@ -288,6 +288,8 @@ fn title(tool: &str) -> (IconName, SharedString) {
     match tool {
         RunCommand::NAME => (IconName::SquareTerminal, "Terminal".into()),
         RequestPermissions::NAME => (IconName::Shield, "Permissions for this turn".into()),
+        WriteFile::NAME => (IconName::FilePen, "Write file".into()),
+        EditFile::NAME => (IconName::FilePen, "Edit file".into()),
         _ => (IconName::Wrench, humanize(tool).into()),
     }
 }
@@ -474,7 +476,11 @@ fn permissions_view(
 }
 
 /// Monospace content that scrolls past a few lines, for a card's body.
-fn code_block(id: impl Into<SharedString>, text: impl IntoElement, cx: &App) -> AnyElement {
+pub(crate) fn code_block(
+    id: impl Into<SharedString>,
+    text: impl IntoElement,
+    cx: &App,
+) -> AnyElement {
     let id = id.into();
     div()
         .debug_selector({

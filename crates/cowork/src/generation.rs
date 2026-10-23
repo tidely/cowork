@@ -30,7 +30,7 @@ use agent::{
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{App, Context, Entity};
 use sandbox::{
-    ListDirectory, Needs, ReadFile, RequestPermissions, RunCommand, ViewImage, WriteFile,
+    EditFile, ListDirectory, Needs, ReadFile, RequestPermissions, RunCommand, ViewImage, WriteFile,
 };
 use tools::{Calculate, RespondToComment};
 use uuid::Uuid;
@@ -57,7 +57,8 @@ const OLLAMA_URL: &str = "http://localhost:11434";
 /// The tools every session offers, in this order. They are part of the
 /// prompt prefix, so they never change with the thread, its comments, or
 /// its project; what changes reaches the model in the environment note.
-const TOOLS: [&str; 8] = [
+/// Every tool in [`registry`], which a test checks.
+const TOOLS: [&str; 9] = [
     RespondToComment::NAME,
     Calculate::NAME,
     RunCommand::NAME,
@@ -66,6 +67,7 @@ const TOOLS: [&str; 8] = [
     ReadFile::NAME,
     ViewImage::NAME,
     WriteFile::NAME,
+    EditFile::NAME,
 ];
 
 /// The system prompt with the platform the host's commands run on, which
@@ -133,6 +135,7 @@ fn registry() -> ToolRegistry<CoworkHost, Needs> {
         registry.register(ReadFile),
         registry.register(ViewImage),
         registry.register(WriteFile),
+        registry.register(EditFile),
     ];
     for result in registered {
         result.expect("tool names are unique");
@@ -1342,8 +1345,9 @@ mod tests {
         assert_eq!(total.output_tokens, None);
     }
 
-    /// Every tool the definition offers is registered, so a session can be
-    /// built for any model.
+    /// The definition offers exactly the registered tools: each is registered,
+    /// so a session can be built for any model, and none registered is left
+    /// out, which the model would never see.
     #[test]
     fn the_definition_offers_the_registered_tools() {
         let registry = registry();
@@ -1356,8 +1360,16 @@ mod tests {
             max_tokens: 1_024,
             image_input: None,
         };
-        for tool in definition(&model, &info).tools {
-            assert!(registry.contains(&tool), "{tool}");
+        let offered = definition(&model, &info).tools;
+        for tool in &offered {
+            assert!(registry.contains(tool), "{tool}");
+        }
+        for tool in registry.descriptors() {
+            let name = tool.name();
+            assert!(
+                offered.iter().any(|offered| offered == name),
+                "{name} is not offered"
+            );
         }
     }
 

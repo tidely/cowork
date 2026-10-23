@@ -59,6 +59,14 @@ gpui_kit_assets::icon_assets!(
         ArrowLeft,
         CircleUser,
         Bot,
+        // `write_file`'s diff: its raw-arguments toggle, and `Diff`'s own
+        // controls for unfolding context.
+        Braces,
+        FileDiff,
+        FilePen,
+        ChevronsUpDown,
+        ArrowUp,
+        ArrowDown,
     ]
 );
 

@@ -706,6 +706,147 @@ pub(crate) fn write_file(places: &Places, path: &str, content: &str) -> Result<S
     })
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EditFileArgs {
+    /// The file to change, such as `myproject/src/main.rs` or
+    /// `scratch://notes.md`.
+    pub path: String,
+    /// The exact text to replace, including whitespace and indentation. It
+    /// must appear exactly once unless `replace_all` is set; include
+    /// surrounding lines to make it unique.
+    pub old_string: String,
+    /// The text to put in its place.
+    pub new_string: String,
+    /// Replace every occurrence of `old_string` instead of exactly one.
+    #[serde(default)]
+    pub replace_all: bool,
+}
+
+/// Replaces exact text in an existing file in the thread's project folders
+/// or scratch folder. Its arguments are the change itself, so every copy of
+/// a thread can show it without the file.
+pub struct EditFile;
+
+impl EditFile {
+    pub const NAME: &'static str = "edit_file";
+}
+
+impl Tool for EditFile {
+    type Args = EditFileArgs;
+    type Output = String;
+    type Context = ThreadSandbox;
+    type Access = Needs;
+
+    fn name(&self) -> &str {
+        Self::NAME
+    }
+
+    fn description(&self) -> String {
+        format!(
+            "Change part of an existing file in the user's project or the scratch folder by \
+             replacing exact text: `old_string` must match the file exactly, including \
+             whitespace and indentation, and appear exactly once unless `replace_all` is set. \
+             Read the file first. Prefer this to write_file for changing existing files; use \
+             write_file to create a file or replace all of it. Approval works as for \
+             write_file: in write or network mode, calls run at once; in read mode, every call \
+             waits for the user to allow it, except in a scheduled run, where the first such \
+             call is refused with an explanation. {PATHS}"
+        )
+    }
+
+    fn access(&self, args: &EditFileArgs, _: &ThreadSandbox) -> Needs {
+        Needs::Write {
+            path: args.path.clone(),
+        }
+    }
+
+    /// Edits the target the call was allowed to write, as `write_file` does.
+    async fn run(
+        &self,
+        call: ToolCall<Needs>,
+        sandbox: Arc<ThreadSandbox>,
+        args: Self::Args,
+    ) -> Result<Self::Output, ToolError> {
+        let approved = call.access
+            == Needs::Write {
+                path: args.path.clone(),
+            };
+        Ok(tokio::task::spawn_blocking(move || {
+            let sandboxes = sandbox.sandboxes();
+            let mut places = sandboxes.places(sandbox.thread());
+            if approved {
+                places.allow_project_write();
+            }
+            edit_file(&places, &args)
+        })
+        .await
+        .unwrap_or_else(|error| Err(FileError::Failed(error.to_string())))?)
+    }
+}
+
+pub(crate) fn edit_file(places: &Places, args: &EditFileArgs) -> Result<String, FileError> {
+    let file = location(places, &args.path, "a file")?;
+    let display = file.display();
+    if !places.writable(&file) {
+        return Err(FileError::Refused(format!(
+            "{display} can't be written: file writes require a writable project or scratch target."
+        )));
+    }
+    if file.is_root() || file.real.is_dir() {
+        return Err(FileError::Invalid(format!(
+            "{display} is a folder, not a file."
+        )));
+    }
+    if args.old_string.is_empty() {
+        return Err(FileError::Invalid(
+            "old_string is empty; use write_file to create a file or replace all of it.".into(),
+        ));
+    }
+    if args.old_string == args.new_string {
+        return Err(FileError::Invalid(
+            "old_string and new_string are the same; nothing would change.".into(),
+        ));
+    }
+    let bytes = std::fs::read(&file.real).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => FileError::NotFound(format!(
+            "{display} does not exist; use write_file to create it."
+        )),
+        _ => io_error(error, &file),
+    })?;
+    let text = String::from_utf8(bytes).map_err(|_| {
+        FileError::Invalid(format!(
+            "{display} is not UTF-8 text, so it can't be edited."
+        ))
+    })?;
+    let count = text.matches(&args.old_string).count();
+    let edited = match count {
+        0 => {
+            return Err(FileError::Invalid(format!(
+                "old_string was not found in {display}. It must match the file exactly, \
+                 including whitespace and indentation; read the file again if it may have \
+                 changed."
+            )));
+        }
+        1 => text.replacen(&args.old_string, &args.new_string, 1),
+        _ if args.replace_all => text.replace(&args.old_string, &args.new_string),
+        _ => {
+            return Err(FileError::Invalid(format!(
+                "old_string appears {count} times in {display}. Include more surrounding \
+                 lines to make it unique, or set replace_all to replace every occurrence."
+            )));
+        }
+    };
+    std::fs::write(&file.real, &edited).map_err(|error| io_error(error, &file))?;
+    Ok(match count {
+        1 => format!("Edited {display} ({} now).", lines(&edited)),
+        count => format!(
+            "Edited {display}: replaced {count} occurrences ({} now).",
+            lines(&edited)
+        ),
+    })
+}
+
 fn lines(text: &str) -> String {
     match text.lines().count() {
         1 => "1 line".to_owned(),
@@ -1045,5 +1186,63 @@ mod tests {
                 Err(FileError::Invalid(_))
             ));
         }
+    }
+
+    /// Edits replace exactly one match, or every one when asked, and are
+    /// refused, leaving the file as it was, when the text is missing or
+    /// ambiguous, the file doesn't exist, or the project is read-only.
+    #[test]
+    fn edits_replace_exact_text() {
+        let root = TestRoot::new();
+        let writable = places(&root, true);
+        let file = root.0.join("zed/lib.rs");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "let a = 1;\nlet b = 1;\n").unwrap();
+        let edit = |places: &Places, old: &str, new: &str, replace_all| {
+            edit_file(
+                places,
+                &EditFileArgs {
+                    path: "zed/lib.rs".into(),
+                    old_string: old.into(),
+                    new_string: new.into(),
+                    replace_all,
+                },
+            )
+        };
+        for (places, old, new) in [
+            (&writable, "= 1", "= 2"),
+            (&writable, "= 3", "= 2"),
+            (&writable, "", "x"),
+            (&places(&root, false), "let a", "let c"),
+        ] {
+            assert!(edit(places, old, new, false).is_err(), "{old:?}");
+        }
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "let a = 1;\nlet b = 1;\n"
+        );
+
+        assert_eq!(
+            edit(&writable, "let a = 1", "let a = 3", false).unwrap(),
+            "Edited zed/lib.rs (2 lines now)."
+        );
+        assert_eq!(
+            edit(&writable, "= ", "== ", true).unwrap(),
+            "Edited zed/lib.rs: replaced 2 occurrences (2 lines now)."
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "let a == 3;\nlet b == 1;\n"
+        );
+        let missing = edit_file(
+            &writable,
+            &EditFileArgs {
+                path: "zed/new.rs".into(),
+                old_string: "a".into(),
+                new_string: "b".into(),
+                replace_all: false,
+            },
+        );
+        assert!(matches!(missing, Err(FileError::NotFound(_))));
     }
 }

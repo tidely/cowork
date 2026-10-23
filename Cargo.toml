@@ -89,6 +89,8 @@ rrule = "0.14"
 schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Turns a file's old and new text into the unified patch `gpui_component::diff` shows.
+similar = "2.7"
 syntect = { version = "5.3", default-features = false, features = [
     "default-fancy",
 ] }

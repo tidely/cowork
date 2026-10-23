@@ -51,7 +51,7 @@ use parking_lot::Mutex;
 
 pub use context::{Needs, ThreadSandbox};
 pub use environment::{EnvironmentSource, PRINT_ENV_FLAG, print_env};
-pub use files::{ListDirectory, ReadFile, ViewImage, WriteFile};
+pub use files::{EditFile, EditFileArgs, ListDirectory, ReadFile, ViewImage, WriteFile};
 pub use grant::{Folders, Grant};
 pub use output::CommandOutput;
 pub use paths::FileError;
@@ -707,6 +707,9 @@ mod tests {
     /// Exercise native denied-path enforcement with synthetic content even on
     /// hosts without credential folders: content reads, directory entries,
     /// file metadata (a known file's existence), and writes are protected.
+    /// Writes are checked on the real file: macOS refuses them, while Linux
+    /// masks a denied folder with an empty tmpfs, where a write succeeds
+    /// but is discarded with the command.
     #[cfg(unix)]
     #[test]
     fn denied_paths_protect_contents_inside_a_writable_project() {
@@ -727,7 +730,7 @@ mod tests {
              /bin/ls -A {} >\"$TMPDIR/listing\" 2>/dev/null; \
              test ! -s \"$TMPDIR/listing\" && echo listing-hidden; \
              test -e {} && echo metadata-visible || echo metadata-hidden; \
-             {{ printf changed >> {}; }} 2>/dev/null && echo write-allowed || echo write-denied",
+             {{ printf changed >> {}; }} 2>/dev/null; true",
             quote(&secret),
             quote(&denied),
             quote(&secret),
@@ -757,7 +760,7 @@ mod tests {
         let output = execute(request, &AtomicBool::new(false), None).unwrap();
         assert_eq!(output.exit_code, 0, "{output:?}");
         assert_eq!(
-            output.stdout, "read-denied\nlisting-hidden\nmetadata-hidden\nwrite-denied\n",
+            output.stdout, "read-denied\nlisting-hidden\nmetadata-hidden\n",
             "{output:?}"
         );
         assert_eq!(

@@ -44,7 +44,9 @@ pub const WRITABLE_DEVICES: &[&str] = &[];
 /// them, relative to the user's home. Only paths that exist are passed on, as
 /// some backends cannot deny a path that is not there.
 /// Contents, listings, and file metadata are all denied: macOS refuses them
-/// (metadata since mxc-sdk 1.0.1), and Linux masks the entries.
+/// (metadata since mxc-sdk 1.0.1), and Linux masks the entries. Writes never
+/// reach them: macOS refuses them, and on Linux a denied folder is an empty
+/// tmpfs, whose writes are discarded when the command ends.
 pub const DENIED_PATHS: &[&str] = &[
     ".ssh",
     ".gnupg",

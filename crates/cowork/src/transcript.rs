@@ -532,6 +532,7 @@ impl Thread {
         message
             .ui
             .advance(completed.as_ref(), partial.as_ref(), generating, cx);
+        message.show_file_changes(cx);
         self.show_comment_responses(message_id, cx);
         Ok(())
     }
@@ -635,6 +636,7 @@ impl Thread {
                 generating,
                 cx,
             );
+            message.show_file_changes(cx);
             if generating {
                 active = Some((message.record.id, preview));
             }

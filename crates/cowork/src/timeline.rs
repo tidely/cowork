@@ -1,7 +1,7 @@
 //! A thread's submitted messages and the agent's replies, and their wire
 //! form.
 
-use std::{ops::Range, time::SystemTime};
+use std::{collections::HashMap, ops::Range, time::SystemTime};
 
 use agent::model::{
     Content, Message, Reasoning, Role, ToolArguments, ToolCall, ToolCallId, ToolResultContent,
@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::{
     attachments::{record_from_protocol, record_to_protocol},
+    file_change_view::FileChangeView,
     participant::ParticipantId,
     protocol::{self, AgentRun},
     thread_draft::ItemPresence,
@@ -96,6 +97,9 @@ pub(crate) struct AgentMessageUi {
     /// How many of `output`'s tool calls have been checked for replies to
     /// comments.
     pub(crate) comment_calls_checked: usize,
+    /// The diff view of each `write_file` and `edit_file` call in `output`;
+    /// see [`AgentMessage::show_file_changes`].
+    pub(crate) file_views: HashMap<ToolCallId, Entity<FileChangeView>>,
     // Local view state.
     /// Whether the agent's work (everything but its response) is shown. Open
     /// while the run is going, and closed when it ends.
@@ -297,12 +301,46 @@ impl AgentToolCall {
                 .map(|command| format!("Ran {command}"))
                 .unwrap_or_else(|| "Ran command".into()),
             "respond_to_comment" => "Replied to comment".into(),
-            "read_file" => "Read file".into(),
-            "write_file" => "Wrote to file".into(),
-            "list_directory" => "Listed directory".into(),
             "request_permissions" => "Requested permissions".into(),
-            name => format!("Ran {}", name),
+            name => match self.path_description(false) {
+                Some(description) => description,
+                None => format!("Ran {name}"),
+            },
         }
+    }
+
+    /// The collapsed row while the call runs: a file tool names what it is
+    /// doing to which path, and every other tool its name.
+    pub(crate) fn running_description(&self) -> String {
+        self.path_description(true)
+            .unwrap_or_else(|| format!("Running {}", self.call.name))
+    }
+
+    /// A file tool's description, naming its `path`: "Read zed/a.rs", or
+    /// "Reading zed/a.rs…" while it runs. `None` for other tools.
+    fn path_description(&self, running: bool) -> Option<String> {
+        // The tool, its verbs done and under way, and what it acts on when
+        // the call names no path.
+        let (done, doing, thing) = match self.call.name.as_str() {
+            "read_file" => ("Read", "Reading", "file"),
+            "write_file" => ("Wrote", "Writing", "file"),
+            "edit_file" => ("Edited", "Editing", "file"),
+            "view_image" => ("Viewed", "Viewing", "image"),
+            "list_directory" => ("Listed", "Listing", "directory"),
+            _ => return None,
+        };
+        let arguments = arguments_value(&self.call);
+        let target = match arguments["path"].as_str() {
+            // `.` stands for the list of project folders.
+            Some(".") if self.call.name == "list_directory" => "project folders",
+            Some(path) => path,
+            None => thing,
+        };
+        Some(if running {
+            format!("{doing} {target}…")
+        } else {
+            format!("{done} {target}")
+        })
     }
 
     /// Preview only the first nonempty shell line, never flattening a script
@@ -379,6 +417,32 @@ mod tool_call_tests {
             tool_call("other_tool", json!({"command": "cargo test"}))
                 .command_preview()
                 .is_none()
+        );
+    }
+
+    /// File tools name their path, done and while running; other tools keep
+    /// their name while running.
+    #[test]
+    fn file_calls_name_their_path() {
+        for (name, done, doing, fallback) in [
+            ("read_file", "Read", "Reading", "file"),
+            ("write_file", "Wrote", "Writing", "file"),
+            ("edit_file", "Edited", "Editing", "file"),
+            ("view_image", "Viewed", "Viewing", "image"),
+            ("list_directory", "Listed", "Listing", "directory"),
+        ] {
+            let call = tool_call(name, json!({"path": "zed/src"}));
+            assert_eq!(call.description(), format!("{done} zed/src"));
+            assert_eq!(call.running_description(), format!("{doing} zed/src…"));
+            assert_eq!(description(name, json!({})), format!("{done} {fallback}"));
+        }
+        assert_eq!(
+            description("list_directory", json!({"path": "."})),
+            "Listed project folders"
+        );
+        assert_eq!(
+            tool_call("calculate", json!({})).running_description(),
+            "Running calculate"
         );
     }
 
@@ -759,7 +823,23 @@ impl AgentMessage {
                 step_views: Vec::new(),
                 text_view: cx.new(|cx| TextViewState::markdown("", cx)),
                 comment_responses: Vec::new(),
+                file_views: HashMap::new(),
             },
+        }
+    }
+
+    /// Gives each `write_file` and `edit_file` call in `output` that has
+    /// none yet its diff view. Called whenever calls may have been added.
+    pub(crate) fn show_file_changes(&mut self, cx: &mut impl AppContext) {
+        let message_id = self.record.id;
+        for call in self.ui.output.tool_calls() {
+            if self.ui.file_views.contains_key(&call.call.id) {
+                continue;
+            }
+            let id = format!("file-change-{message_id}-{}", call.call.id.0);
+            if let Some(view) = FileChangeView::of(id, &call.call, cx) {
+                self.ui.file_views.insert(call.call.id.clone(), view);
+            }
         }
     }
 

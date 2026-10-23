@@ -22,8 +22,8 @@ use agent::{
 use gpui::Context;
 use parking_lot::Mutex;
 use sandbox::{
-    ListDirectory, Needs, ReadFile, RequestPermissions, RunCommand, ThreadSandbox, ViewImage,
-    WriteFile,
+    EditFile, ListDirectory, Needs, ReadFile, RequestPermissions, RunCommand, ThreadSandbox,
+    ViewImage, WriteFile,
 };
 use tools::{Calculate, CommentId, RespondToComment, RunComments};
 use uuid::Uuid;
@@ -56,11 +56,16 @@ pub(crate) const DENIED: &str = "The user denied this tool call.";
 pub(crate) const UNATTENDED: &str = "This tool call was not run: it needs the user's permission, and this is a scheduled run that nobody may be watching. Carry on without it if you can. If the call is necessary, make it again with exactly the same arguments: the user will then be notified and asked, and the run waits for their answer.";
 
 /// Tools whose calls only the host may allow: they act on the host's computer
-/// (its shell and tools, for `run_command`, its files, for `write_file`, and
+/// (its shell and tools, for `run_command`, its files, for `write_file` and
+/// `edit_file`, and
 /// what later commands may do there, for `request_permissions`), so an
 /// `Admin` peer may not decide for it.
-pub(crate) const HOST_ONLY: &[&str] =
-    &[RunCommand::NAME, WriteFile::NAME, RequestPermissions::NAME];
+pub(crate) const HOST_ONLY: &[&str] = &[
+    RunCommand::NAME,
+    WriteFile::NAME,
+    EditFile::NAME,
+    RequestPermissions::NAME,
+];
 
 pub(crate) fn needs_approval(tool: &str) -> bool {
     !ALWAYS_ALLOWED.contains(&tool)
@@ -555,8 +560,8 @@ mod tests {
         );
     }
 
-    /// Writing a file runs at once in write and network mode, even in a
-    /// scheduled run, and is asked about in read mode.
+    /// Writing or editing a file runs at once in write and network mode, even
+    /// in a scheduled run, and is asked about in read mode.
     #[test]
     fn writing_a_file_is_asked_about_only_in_read_mode() {
         let write = serde_json::json!({"path": "scratch://approved.txt", "content": "hello"});
@@ -582,6 +587,15 @@ mod tests {
             } else {
                 assert_eq!(scheduled, Decision::Allow, "{mode:?}");
             }
+            // An edit needs what a write does.
+            let edit = serde_json::json!({
+                "path": "scratch://approved.txt", "old_string": "a", "new_string": "b",
+            });
+            assert_eq!(
+                decide(&host_in(mode), EditFile, edit, by_someone()),
+                expected,
+                "{mode:?}"
+            );
         }
     }
 

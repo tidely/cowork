@@ -29,7 +29,7 @@ Credential locations are listed in `crates/sandbox/src/settings.rs`.
 | File tool | Read | Write | Write + Network |
 |---|---|---|---|
 | `read_file`, `view_image`, `list_directory` | Automatic | Automatic | Automatic |
-| `write_file` | Ask | Automatic | Automatic |
+| `write_file`, `edit_file` | Ask | Automatic | Automatic |
 
 File tools are app-managed. Reads/listings accept absolute host paths;
 writes stay in project or scratch folders. Approving a write in Read permits

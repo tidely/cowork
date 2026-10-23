@@ -1,18 +1,22 @@
 //! A window showing the tool call card for each kind of call the agent can
-//! make, in each project mode, as the host sees it: a row per call and a
+//! make (about permissions, and file writes' and edits' diffs), in each
+//! project mode,
+//! as the host sees it: a row per call and a
 //! column per mode. Combinations that run without asking show that instead
 //! of a card. `cargo run -p cowork --example component_preview` opens it.
 
 use agent::model::ToolCall;
 use gpui::{
-    AnyElement, App, Context, FontWeight, IntoElement, Pixels, QuitMode, Render, SharedString,
-    Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
+    AnyElement, App, Context, Entity, FontWeight, IntoElement, Pixels, QuitMode, Render,
+    SharedString, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
 };
 use gpui_component::{ActiveTheme as _, Root};
 use sandbox::{Access, RunCommand};
 use serde_json::json;
 
-use crate::{project_mode::ProjectMode, tool_call_card::ToolCallCard};
+use crate::{
+    file_change_view::FileChangeView, project_mode::ProjectMode, tool_call_card::ToolCallCard,
+};
 
 /// Runs the preview until its window closes, as the app's own run does.
 pub fn run() -> anyhow::Result<()> {
@@ -51,7 +55,16 @@ fn open(cx: &mut App) -> anyhow::Result<()> {
         ..Default::default()
     };
     cx.open_window(options, |window, cx| {
-        let preview = cx.new(|_| ComponentPreview { last_click: None });
+        let preview = cx.new(|cx| ComponentPreview {
+            last_click: None,
+            file_views: combinations()
+                .into_iter()
+                .filter_map(|(key, _, call)| {
+                    let view = FileChangeView::of(format!("preview-{key}-change"), &call, cx)?;
+                    Some((key, view))
+                })
+                .collect(),
+        });
         cx.new(|cx| Root::new(preview, window, cx))
     })?;
     Ok(())
@@ -60,7 +73,11 @@ fn open(cx: &mut App) -> anyhow::Result<()> {
 struct ComponentPreview {
     /// What the last button pressed would have done, to show it is wired.
     last_click: Option<SharedString>,
+    /// The diff views of the file rows' calls, by row.
+    file_views: std::collections::HashMap<&'static str, Entity<FileChangeView>>,
 }
+
+const GREETING: &str = "pub struct Greeting {\n    name: String,\n    excited: bool,\n}\n\nimpl Greeting {\n    pub fn new(name: &str) -> Self {\n        Self { name: name.to_owned(), excited: false }\n    }\n}\n";
 
 impl ComponentPreview {
     /// `call`'s card in a project with `mode`, or a note that it runs
@@ -87,8 +104,12 @@ impl ComponentPreview {
         let label = format!("{} in {}", call.name, mode.label());
         let allowed = SharedString::from(format!("Allowed {label}"));
         let denied = SharedString::from(format!("Denied {label}"));
-        ToolCallCard::new(format!("preview-{key}-{}", mode.key()), call.clone())
-            .project_access(mode.access())
+        let card = ToolCallCard::new(format!("preview-{key}-{}", mode.key()), call.clone());
+        let card = match self.file_views.get(key) {
+            Some(view) => card.body(view.clone()),
+            None => card,
+        };
+        card.project_access(mode.access())
             .host_only()
             .decide(
                 cx.listener(move |this, _, _, cx| {
@@ -174,8 +195,12 @@ impl Render for ComponentPreview {
 
 /// Whether `call` waits for the host in a project with `project` access,
 /// as `tool_approval` decides at the start of a run: a command with read
-/// access and no folders runs at once, and every other call asks.
+/// access and no folders runs at once, a file write or edit asks only in a Read
+/// project, and every other call asks.
 fn asks(call: &ToolCall, project: Access) -> bool {
+    if call.name == sandbox::WriteFile::NAME || call.name == sandbox::EditFile::NAME {
+        return project == Access::Read;
+    }
     if call.name != RunCommand::NAME {
         return true;
     }
@@ -245,6 +270,39 @@ fn combinations() -> Vec<(&'static str, &'static str, ToolCall)> {
                     "command": "cargo fetch",
                     "access": "network",
                     "write_folders": ["~/.cargo"],
+                }),
+            ),
+        ),
+        (
+            "write-file",
+            "Writing a file in the project",
+            tool_call(
+                sandbox::WriteFile::NAME,
+                json!({"path": "greeting/src/greeting.rs", "content": GREETING}),
+            ),
+        ),
+        (
+            "edit-file",
+            "Editing a file in the project",
+            tool_call(
+                sandbox::EditFile::NAME,
+                json!({
+                    "path": "greeting/src/greeting.rs",
+                    "old_string": "    name: String,\n}",
+                    "new_string": "    name: String,\n    excited: bool,\n}",
+                }),
+            ),
+        ),
+        (
+            "edit-file-all",
+            "Editing every occurrence in a file",
+            tool_call(
+                sandbox::EditFile::NAME,
+                json!({
+                    "path": "greeting/src/greeting.rs",
+                    "old_string": "to_owned()",
+                    "new_string": "to_string()",
+                    "replace_all": true,
                 }),
             ),
         ),

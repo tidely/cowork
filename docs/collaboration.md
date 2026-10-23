@@ -725,6 +725,13 @@ run continues. Ending a run settles outstanding calls as not run. Snapshots incl
 the waiting call; participants reject requests for calls the reply did not
 make or that already returned.
 
+`write_file` and `edit_file` calls show their change as a diff, with a
+Diff / JSON switch to the raw arguments, on the approval card and in the
+timeline. Every participant computes it from the call's arguments alone,
+so nothing extra travels: an edit shows `old_string` becoming
+`new_string`, without the file's line numbers, and a write shows its whole
+content as added, whatever the file held before.
+
 ### Model selection
 
 - Model selection is per thread. New local threads start with the last model

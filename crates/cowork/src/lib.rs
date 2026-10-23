@@ -54,6 +54,7 @@ mod composer;
 mod composer_attachments;
 
 mod draft_editing;
+mod file_change_view;
 
 mod highlight;
 mod inline_icons;

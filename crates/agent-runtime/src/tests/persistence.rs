@@ -189,17 +189,19 @@ async fn torn_tail_can_be_reopened_but_unknown_schemas_are_preserved_as_errors()
     .unwrap();
     log.finish().await.unwrap();
     let updates = directory.0.join("updates.jsonl");
+    // Flushed before returning: a tokio `File` writes on a background thread,
+    // so `write_all` alone may return before the bytes reach the file, and
+    // the reads below would race the append.
     let append = |bytes: Vec<u8>| {
         let updates = updates.clone();
         async move {
-            tokio::fs::OpenOptions::new()
+            let mut file = tokio::fs::OpenOptions::new()
                 .append(true)
                 .open(&updates)
                 .await
-                .unwrap()
-                .write_all(&bytes)
-                .await
                 .unwrap();
+            file.write_all(&bytes).await.unwrap();
+            file.flush().await.unwrap();
         }
     };
     append(b"{\"type_id\":".to_vec()).await;

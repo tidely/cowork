@@ -29,6 +29,7 @@ rrule.workspace = true
 sandbox.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+similar.workspace = true
 syntect.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true

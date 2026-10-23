@@ -876,7 +876,7 @@ impl Cowork {
                 .min_w_0()
                 .truncate()
                 .child(if running {
-                    format!("Running {}", call.call.name)
+                    call.running_description()
                 } else {
                     call.description()
                 })
@@ -933,21 +933,32 @@ impl Cowork {
                         .pl_3()
                         .border_l_1()
                         .border_color(cx.theme().border)
-                        .opacity(0.7)
                         .flex()
                         .flex_col()
                         .gap_1()
                         .text_sm()
                         .child(label("Input"))
-                        .child(div().child(call.arguments_text()))
+                        // A file write shows the change it made, with its
+                        // arguments a switch away; the diff keeps its colors.
+                        .child(match message.ui.file_views.get(&call.call.id) {
+                            Some(view) => view.clone().into_any_element(),
+                            None => div()
+                                .opacity(0.7)
+                                .child(call.arguments_text())
+                                .into_any_element(),
+                        })
                         .child(label("Output"))
-                        .child(div().child(call.result_text().unwrap_or_else(|| {
-                            if running {
-                                "Running…".into()
-                            } else {
-                                "No result".into()
-                            }
-                        }))),
+                        .child(
+                            div()
+                                .opacity(0.7)
+                                .child(call.result_text().unwrap_or_else(|| {
+                                    if running {
+                                        "Running…".into()
+                                    } else {
+                                        "No result".into()
+                                    }
+                                })),
+                        ),
                 )
             })
             .into_any_element()
@@ -959,16 +970,20 @@ impl Cowork {
     fn render_tool_approval(
         &self,
         thread_id: Uuid,
-        message_id: Uuid,
+        message: &AgentMessage,
         step_index: usize,
         call: &AgentToolCall,
         rights: ApprovalRights,
         cx: &Context<Self>,
     ) -> gpui::AnyElement {
+        let message_id = message.record.id;
         let id = format!("tool-approval-{message_id}-{step_index}");
         let tool = call.call.name.to_string();
         let mut card =
             ToolCallCard::new(id, call.call.clone()).project_access(rights.project_mode.access());
+        if let Some(view) = message.ui.file_views.get(&call.call.id) {
+            card = card.body(view.clone());
+        }
         if let Some(mut approved) = self
             .active_generations
             .get(&thread_id)
@@ -1437,7 +1452,7 @@ impl Cowork {
                     if let AgentStep::ToolCall(call) = step {
                         calls.push(if awaiting == Some(step_index) {
                             self.render_tool_approval(
-                                thread_id, message_id, step_index, call, rights, cx,
+                                thread_id, message, step_index, call, rights, cx,
                             )
                         } else {
                             Self::render_tool_call(
