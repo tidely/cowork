@@ -34,6 +34,10 @@ rendering a subset does not change those indices. In-run dividers use their run
 UUID and step index; no transcript positions flow through folded output. A thread
 owns at most one active execution, whose activity and event fold end together;
 stopped and failed run records still retain their unfinished replay events.
+When steering extends a run after an answer, that earlier answer stays visible
+before its steering message even with work collapsed. Text preceding a tool call
+within each steering-delimited segment remains collapsible work; the latest
+response retains the run's commentable text offsets.
 
 Context compaction is the agent runtime's, run at a safe boundary of the host's
 session: before a run's first request, or between two requests of a run once
