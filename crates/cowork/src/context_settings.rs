@@ -1,6 +1,7 @@
 //! The local context settings and the shared context details shown by the
 //! composer and the component preview. Compaction starts at the configured
-//! percentage of the context window.
+//! percentage of the context window. The settings are saved with the
+//! others; see `settings_file.rs`.
 
 use gpui::{
     App, Context, Div, Entity, IntoElement, Subscription, Window, div, prelude::*, px, relative,
@@ -10,6 +11,7 @@ use gpui_component::{
     ActiveTheme as _, Disableable as _, Sizable as _, button::Button, input::Input,
     progress::ProgressCircle,
 };
+use serde::{Deserialize, Serialize};
 
 use crate::{
     Cowork,
@@ -17,9 +19,13 @@ use crate::{
 };
 
 const MIN_CONTEXT_TOKENS: u64 = 1_024;
+/// The compaction percentages the steppers offer.
+const THRESHOLD_PERCENTS: std::ops::RangeInclusive<u8> = 5..=95;
 
-/// App-session policy; like provider selection, this is local to the host.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Policy local to the host, like provider selection, and kept across
+/// launches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
 pub(crate) struct ContextSettings {
     /// Requested Ollama window for local threads; mirrored in model catalogs.
     pub(crate) window_tokens: u64,
@@ -36,6 +42,17 @@ impl Default for ContextSettings {
 }
 
 impl ContextSettings {
+    /// These settings within what the controls offer, for ones read from a
+    /// file that may have been edited by hand.
+    pub(crate) fn in_range(self) -> Self {
+        Self {
+            window_tokens: self.window_tokens.max(MIN_CONTEXT_TOKENS),
+            threshold_percent: self
+                .threshold_percent
+                .clamp(*THRESHOLD_PERCENTS.start(), *THRESHOLD_PERCENTS.end()),
+        }
+    }
+
     /// Preview the selected window without a provider or running conversation.
     pub(crate) fn example_usage(self, percent: u8) -> ContextUsage {
         ContextUsage {
@@ -251,11 +268,17 @@ pub(crate) fn controls<T: 'static>(
         ..settings
     };
     let percentage_down = ContextSettings {
-        threshold_percent: settings.threshold_percent.saturating_sub(5).max(5),
+        threshold_percent: settings
+            .threshold_percent
+            .saturating_sub(5)
+            .max(*THRESHOLD_PERCENTS.start()),
         ..settings
     };
     let percentage_up = ContextSettings {
-        threshold_percent: settings.threshold_percent.saturating_add(5).min(95),
+        threshold_percent: settings
+            .threshold_percent
+            .saturating_add(5)
+            .min(*THRESHOLD_PERCENTS.end()),
         ..settings
     };
 
@@ -340,16 +363,29 @@ pub(crate) fn controls<T: 'static>(
                     .into_any_element(),
                 percentage_down,
                 percentage_up,
-                settings.threshold_percent <= 5,
-                settings.threshold_percent >= 95,
+                settings.threshold_percent <= *THRESHOLD_PERCENTS.start(),
+                settings.threshold_percent >= *THRESHOLD_PERCENTS.end(),
             ),
         ))
 }
 
 impl Cowork {
+    /// Applies `settings` and saves them for the next launch.
+    pub(crate) fn set_context_settings(
+        &mut self,
+        settings: ContextSettings,
+        cx: &mut Context<Self>,
+    ) {
+        if settings == self.context_settings {
+            return;
+        }
+        self.apply_context_settings(settings, cx);
+        self.save_settings();
+    }
+
     /// Update the host's catalogs through their existing sharing path. Runs
     /// already in progress keep the window and threshold captured at startup.
-    pub(crate) fn set_context_settings(
+    pub(crate) fn apply_context_settings(
         &mut self,
         settings: ContextSettings,
         cx: &mut Context<Self>,
@@ -379,7 +415,7 @@ impl Cowork {
                     .child("Choose how much context the agent can use and when long conversations are summarized."))
                 .child(controls(settings, window, cx, Self::set_context_settings))
                 .child(div().text_sm().text_color(cx.theme().muted_foreground)
-                    .child("Changes apply for this app session. The window applies to new and existing local chats from their next agent run. Shared chats use their host’s window. Compaction starts when context usage reaches the selected percentage."))
+                    .child("Changes are saved for future launches. The window applies to new and existing local chats from their next agent run. Shared chats use their host’s window. Compaction starts when context usage reaches the selected percentage."))
                 .child(div().pt_4().text_sm().child(format!("Example · {}-token window", settings.window_tokens)))
                 .child(context_details(settings.example_usage(60), Some(settings), false, cx)))
     }

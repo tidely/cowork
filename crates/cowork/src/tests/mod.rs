@@ -262,6 +262,7 @@ fn test_cowork(
         caret_label_refresh: None,
         working_refresh: None,
         new_thread_model: None,
+        settings_file: None,
         new_thread_project_folders: Vec::new(),
         new_thread_project_mode: Default::default(),
         model_picker,

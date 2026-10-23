@@ -298,6 +298,12 @@ fn provider_can_be_set_up_without_discovered_models(cx: &mut gpui::TestAppContex
 #[gpui::test]
 fn providers_settings_pick_the_new_chats_model(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let dir = std::env::temp_dir().join(format!("cowork-settings-{}", Uuid::new_v4()));
+    let settings = dir.join("settings.json");
+    cowork.update(cx, |cowork, cx| {
+        cowork.new_thread_model = None;
+        cowork.start_settings(Some(settings.clone()), cx);
+    });
     cx.update(|window, cx| {
         cowork.update(cx, |cowork, cx| {
             cowork.open_settings(SettingsPage::Providers, window, cx);
@@ -343,6 +349,63 @@ fn providers_settings_pick_the_new_chats_model(cx: &mut gpui::TestAppContext) {
     cx.simulate_click(back.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("providers-page").is_some());
+
+    // The next launch loads it, and the context settings.
+    let context = crate::context_settings::ContextSettings {
+        window_tokens: 32_768,
+        threshold_percent: 60,
+    };
+    cowork.update(cx, |cowork, cx| {
+        cowork.set_context_settings(context, cx);
+        cowork.context_settings = Default::default();
+        cowork.new_thread_model = None;
+        cowork.start_settings(Some(settings.clone()), cx);
+        assert_eq!(cowork.new_thread_model, Some(ollama_qwen()));
+        assert_eq!(cowork.context_settings, context);
+    });
+    _ = std::fs::remove_dir_all(dir);
+}
+
+/// Onboarding depends only on whether the user has threads; the model only
+/// decides whether it waits for the user to choose one.
+#[gpui::test]
+fn launch_onboards_only_users_without_threads(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    cowork.update_in(cx, |cowork, window, cx| {
+        // An archived thread is enough to skip onboarding, with no model
+        // selected yet: it is picked in the new chat's composer.
+        let thread = Cowork::new_empty_local_thread(
+            ThreadDraft::new(cowork.local_participant_id),
+            cowork.local_participant_id,
+            cowork.models.clone(),
+            None,
+            cx,
+        );
+        cowork
+            .thread_store
+            .update(cx, |store, _| store.archived.push_front(thread));
+        cowork.new_thread_model = None;
+        cowork.main_stage = MainStage::Welcome;
+        cowork.open_start_stage(window, cx);
+        assert_eq!(cowork.main_stage, MainStage::Thread);
+        assert_eq!(cowork.stage_before_settings, MainStage::Thread);
+        assert!(cowork.active_thread_id.is_none());
+
+        // Without threads, as after deleting the onboarding chat, the welcome
+        // screen waits for discovery (not driven here), then onboarding
+        // starts with the selected model without choosing it again.
+        cowork
+            .thread_store
+            .update(cx, |store, _| store.archived.clear());
+        cowork.new_thread_model = Some(ollama_qwen());
+        cowork.open_start_stage(window, cx);
+        assert_eq!(cowork.main_stage, MainStage::Welcome);
+        cowork.onboard_if_welcome(window, cx);
+        assert_eq!(cowork.main_stage, MainStage::Thread);
+        let thread = cowork.active_thread(cx).expect("onboarding starts a chat");
+        assert_eq!(thread.read(cx).summary.title, "Welcome to Cowork");
+        assert_eq!(thread.read(cx).model(), Some(&ollama_qwen()));
+    });
 }
 
 #[test]

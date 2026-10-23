@@ -384,7 +384,7 @@ impl Cowork {
             ProviderSetupPlace::Welcome => self.select_model(model, cx),
             ProviderSetupPlace::Settings => {
                 if self.models.contains(&model) {
-                    self.new_thread_model = Some(model);
+                    self.set_new_thread_model(model);
                     cx.notify();
                 }
             }

@@ -1,16 +1,20 @@
 //! The first chat is a normal, saved thread. Seed its opening through the
 //! usual host events so replay, comments, and sharing need no tutorial state.
 //! The greeting streams in as previews of the seeded run, as a reply would.
+//!
+//! Whether to onboard is decided here, from the user's threads alone; which
+//! model it runs with is the model selection's (the welcome screen's steps,
+//! or the saved model). Onboarding only waits for one.
 
 use std::time::{Duration, SystemTime};
 
 use agent::{DefinitionRevision, Entry, InputId, Origin, model::Message};
-use gpui::{AppContext, Context, Window};
+use gpui::{AppContext, Context, Task, Window};
 use uuid::Uuid;
 
 use super::{Thread, draft::ThreadDraft};
 use crate::{
-    Cowork,
+    Cowork, MainStage,
     protocol::{HostMessage, Preview, PreviewDelta, RunEvent, RunOutcome},
     transcript::{RunSource, shared_entry},
 };
@@ -64,6 +68,47 @@ Type **hi** and press **{send_shortcut}** for a quick tour."
 }
 
 impl Cowork {
+    /// Whether the user is new to Cowork: no threads of their own, open or
+    /// archived. Deleting them all makes them new again.
+    pub(crate) fn needs_onboarding(&self, cx: &gpui::App) -> bool {
+        let store = self.thread_store.read(cx);
+        store.threads.is_empty() && store.archived.is_empty()
+    }
+
+    /// Shows the welcome screen, which leads to the onboarding chat. With a
+    /// model already selected, the chat starts on its own once `discovered`
+    /// (the provider's models being discovered) finishes; see
+    /// [`Cowork::onboard_if_welcome`]. Otherwise the user chooses one first.
+    pub(crate) fn offer_onboarding(
+        &mut self,
+        discovered: Task<()>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.main_stage = MainStage::Welcome;
+        if self.new_thread_model.is_some() {
+            cx.spawn_in(window, async move |this, cx| {
+                discovered.await;
+                _ = this.update_in(cx, |this, window, cx| {
+                    this.onboard_if_welcome(window, cx);
+                });
+            })
+            .detach();
+        } else {
+            discovered.detach();
+        }
+        cx.notify();
+    }
+
+    /// Starts the onboarding chat, as continuing from the welcome screen
+    /// would, unless the user has moved on from it or the selected model
+    /// isn't offered; then the welcome screen stays, with it preselected.
+    pub(crate) fn onboard_if_welcome(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.main_stage == MainStage::Welcome {
+            self.start_onboarding(window, cx);
+        }
+    }
+
     /// No session or model request is created until the user replies. A fresh
     /// draft keeps any work prepared before setup out of the tutorial. The
     /// thread is saved once the greeting has finished streaming in.

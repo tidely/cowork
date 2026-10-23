@@ -52,6 +52,7 @@ mod caret;
 pub mod component_preview;
 mod composer;
 mod composer_attachments;
+
 mod draft_editing;
 
 mod highlight;
@@ -75,6 +76,8 @@ mod scheduler;
 mod schedules;
 mod search_palette;
 mod settings;
+
+mod settings_file;
 
 mod sidebar;
 mod statistics;
@@ -199,8 +202,12 @@ struct Cowork {
     caret_label_refresh: Option<gpui::Task<()>>,
     /// The next redraw of a running agent's "Working for" line.
     working_refresh: Option<gpui::Task<()>>,
-    /// The model new threads start with: the last one selected locally.
+    /// The model new threads start with: the last one selected locally,
+    /// saved for the next launch; see [`Cowork::set_new_thread_model`].
     new_thread_model: Option<ModelRef>,
+    /// Where the user's settings are saved; `None` keeps them in memory, as
+    /// in tests. See `settings_file.rs`.
+    settings_file: Option<std::path::PathBuf>,
     /// The folders added before the thread exists, which move into it with
     /// the draft; see [`Thread::project_folders`].
     new_thread_project_folders: Vec<ProjectFolder>,
@@ -252,6 +259,22 @@ impl Cowork {
             model,
             cx,
         )
+    }
+
+    /// What a launch opens on, once the saved threads and settings are
+    /// loaded. Models are discovered either way. A new user is onboarded
+    /// (see `thread/onboarding.rs`); anyone else gets a new chat, with the
+    /// saved model or none yet, to pick in the composer.
+    fn open_start_stage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let discovered = self.discover_models(cx);
+        if self.needs_onboarding(cx) {
+            self.offer_onboarding(discovered, window, cx);
+        } else {
+            self.main_stage = MainStage::Thread;
+            discovered.detach();
+        }
+        self.stage_before_settings = self.main_stage;
+        cx.notify();
     }
 
     fn end_stale_mouse_drag(window: &mut Window, cx: &mut App) {
@@ -761,8 +784,8 @@ pub fn run() -> anyhow::Result<()> {
     let ephemeral = std::env::args_os().skip(1).any(|arg| arg == "--ephemeral");
     // Own the persistent store before starting any services or reading other
     // saved state. Only an explicit --ephemeral launch may skip the lock.
-    let (root, mut statistics_file, mut schedule_file) = if ephemeral {
-        (None, None, None)
+    let (root, mut statistics_file, mut schedule_file, mut settings_file) = if ephemeral {
+        (None, None, None, None)
     } else {
         (
             Some(thread_files::threads_dir().ok_or_else(|| {
@@ -772,6 +795,7 @@ pub fn run() -> anyhow::Result<()> {
             })?),
             statistics::statistics_file(),
             scheduler::schedule_file(),
+            settings_file::settings_file(),
         )
     };
     let (thread_files, saved_threads) = thread_files::ThreadFiles::open(root)?;
@@ -874,6 +898,7 @@ pub fn run() -> anyhow::Result<()> {
                         caret_label_refresh: None,
                         working_refresh: None,
                         new_thread_model: None,
+                        settings_file: None,
                         new_thread_project_folders: Vec::new(),
                         new_thread_project_mode: ProjectMode::default(),
                         model_picker,
@@ -890,7 +915,9 @@ pub fn run() -> anyhow::Result<()> {
                         cowork.start_thread_files(files, saved, cx);
                     }
                     cowork.start_statistics(statistics_file.take());
+                    cowork.start_settings(settings_file.take(), cx);
                     cowork.start_scheduler(schedule_file.take(), Some(window_handle), cx);
+                    cowork.open_start_stage(window, cx);
                 });
                 cx.new(|cx| Root::new(cowork, window, cx))
             }) {

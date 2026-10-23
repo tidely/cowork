@@ -173,6 +173,12 @@ impl Cowork {
     /// Asks Ollama which models it offers, and makes them the catalog. The
     /// picker follows on the next frame; see [`Cowork::sync_model_picker`].
     pub(crate) fn refresh_models(&mut self, cx: &mut Context<Self>) {
+        self.discover_models(cx).detach();
+    }
+
+    /// [`Cowork::refresh_models`], finishing once the catalog is replaced or
+    /// discovery failed.
+    pub(crate) fn discover_models(&mut self, cx: &mut Context<Self>) -> gpui::Task<()> {
         let task = self.tokio_handle.spawn(async {
             crate::submission::provider(ModelProvider::Ollama)?
                 .list_models()
@@ -206,7 +212,6 @@ impl Cowork {
             Ok(Err(error)) => eprintln!("could not discover Ollama models: {error:#}"),
             Err(error) => eprintln!("Ollama discovery task failed: {error}"),
         })
-        .detach();
     }
 
     fn model_picker_event(
@@ -259,10 +264,10 @@ impl Cowork {
                 return;
             }
             if local {
-                self.new_thread_model = Some(model);
+                self.set_new_thread_model(model);
             }
         } else {
-            self.new_thread_model = Some(model);
+            self.set_new_thread_model(model);
         }
         cx.notify();
     }
