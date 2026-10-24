@@ -38,7 +38,7 @@ use crate::{
     thread_draft::ThreadDraft,
     timeline::{PromptBlock, ThreadMessageId, TimelineMessage},
     timeline_view::{SegmentTextView, ShownSegments, TimelineRow},
-    timeline_virtualization::{DeferredTimelineRow, TimelinePress},
+    timeline_virtualization::{BuildRow, TimelineLayout, TimelinePress, VirtualTimeline},
     top_bar::macos_traffic_light_position,
     usage::ActivityRange,
 };
@@ -92,6 +92,7 @@ mod thread_files;
 use thread::{draft as thread_draft, sharing, submission};
 mod timeline;
 mod timeline_projection;
+mod timeline_selection;
 mod timeline_view;
 mod timeline_virtualization;
 mod tool_approval;
@@ -137,6 +138,10 @@ struct Cowork {
     /// A pressed pointer can anchor a drag before GPUI reports a nonempty
     /// selection; see [`TimelinePress`].
     timeline_press: Option<TimelinePress>,
+    /// The measured heights of the active thread's timeline rows.
+    timeline_layout: Rc<std::cell::RefCell<TimelineLayout>>,
+    /// The rows holding the ends of a selection in the timeline.
+    timeline_selection: Rc<std::cell::RefCell<timeline_selection::TimelineSelection>>,
     /// Taken when someone presses on a user message, as agent text takes
     /// focus itself, so that Copy reaches the window's text selection
     /// instead of an editor with nothing selected.
@@ -358,96 +363,96 @@ impl Cowork {
         let row_width = text_width + px(80.);
         let available_width = window.viewport_size().width - sidebar_width - px(82.);
         let wrap_width = available_width.max(px(120.)).min(text_width);
-        // Keep native selection geometry for every row while a drag or selection
-        // is active. Otherwise stable history, including open work, only needs
-        // its measured height and the rows near the viewport; the composer and
-        // live/interactive rows stay on the original layout path.
-        let defer_history = message_count >= 64;
-        let culling = defer_history && !self.timeline_drag_started(window, cx);
-        let comments = Rc::new(comments);
-        let mut timeline_messages = Vec::new();
-        if let Some((thread, thread_id)) = active_thread {
-            let owner = cx.entity().downgrade();
-            let (rows, steering_groups) =
-                self.plan_timeline_rows(&thread, thread_id, culling, &comments, cx);
-            let steering_groups = Rc::new(steering_groups);
-            for row in rows {
-                let (row_id, geometry, pinned) = (row.id, row.geometry, row.pinned);
-                match row.native {
-                    None => {
-                        let render_owner = owner.clone();
-                        let thread = thread.clone();
-                        let comments = comments.clone();
-                        let steering_groups = steering_groups.clone();
-                        let (index, message_id) = (row.index, row.message_id);
-                        timeline_messages.push(
-                            DeferredTimelineRow::new(
-                                row_id,
-                                wrap_width,
-                                owner.clone(),
-                                geometry,
-                                culling,
-                                move |window, cx| {
-                                    render_owner
-                                        .update(cx, |this, cx| {
-                                            // Built in this frame's prepaint,
-                                            // from the thread as it rendered.
-                                            let row = TimelineRow::capture(
-                                                &thread.read(cx).timeline,
-                                                index,
-                                                message_id,
-                                                &steering_groups,
-                                            );
-                                            match row {
-                                                Some(row) => this.render_timeline_message(
-                                                    thread_id, &row, &comments, wrap_width, window,
-                                                    cx,
-                                                ),
-                                                None => div().into_any_element(),
-                                            }
-                                        })
-                                        .expect("the timeline owner is mounted")
-                                },
-                            )
-                            .pinned(pinned)
-                            .into_any_element(),
-                        );
-                    }
-                    Some(captured) => {
-                        // Build interactive rows now, before the segment-cache
-                        // sweep. Keep the wrapper's ID even on this path so
-                        // starting a selection or crossing the history
-                        // threshold never remounts a participant under a
-                        // different element ID.
-                        let element = self.render_timeline_message(
-                            thread_id, &captured, &comments, wrap_width, window, cx,
-                        );
-                        timeline_messages.push(
-                            DeferredTimelineRow::new(
-                                row_id,
-                                wrap_width,
-                                owner.clone(),
-                                geometry,
-                                false,
-                                move |_, _| element,
-                            )
-                            .into_any_element(),
-                        );
-                    }
-                }
-            }
+        // A selection's rows stay built while it lasts; see
+        // `timeline_selection`.
+        if self.timeline_press.is_none() && !gpui_base::TextSelection::has_selection(window, cx) {
+            self.timeline_selection.borrow_mut().clear();
         }
+        let comments = Rc::new(comments);
+        let (rows, build): (_, BuildRow) = match active_thread {
+            Some((thread, thread_id)) => {
+                let (rows, steering_groups) = self.plan_timeline_rows(&thread.read(cx).timeline);
+                let owner = cx.entity().downgrade();
+                let build = move |index: usize,
+                                  message_id: Uuid,
+                                  first: bool,
+                                  window: &mut Window,
+                                  cx: &mut App| {
+                    owner
+                        .update(cx, |this, cx| {
+                            // Built in this frame's prepaint, from the thread
+                            // as it rendered.
+                            let row = TimelineRow::capture(
+                                &thread.read(cx).timeline,
+                                index,
+                                message_id,
+                                &steering_groups,
+                            );
+                            div()
+                                .id(gpui::ElementId::Uuid(message_id))
+                                .w_full()
+                                .when(!first, |this| this.pt_6())
+                                .children(row.map(|row| {
+                                    this.render_timeline_message(
+                                        thread_id, &row, &comments, wrap_width, window, cx,
+                                    )
+                                }))
+                                .into_any_element()
+                        })
+                        .expect("the timeline owner is mounted")
+                };
+                (rows, Rc::new(build))
+            }
+            None => (
+                Vec::new(),
+                Rc::new(|_, _, _, _: &mut Window, _: &mut App| div().into_any_element()),
+            ),
+        };
 
+        // Keep what the previous frame used, including rows built in its
+        // prepaint, after this render.
+        let previous_generation = self.render_generation.wrapping_sub(1);
         self.segment_text_views
-            .retain(|_, text_view| text_view.rendered_at == self.render_generation);
+            .retain(|_, text_view| text_view.rendered_at >= previous_generation);
         self.shown_segments
-            .retain(|_, shown| shown.rendered_at == self.render_generation);
+            .retain(|_, shown| shown.rendered_at >= previous_generation);
 
         let can_write = composer.is_some();
         let composer = composer.map(|composer| self.render_composer(composer, cx));
         let pending_rows = active_thread_id
             .map(|thread_id| self.render_pending_messages(thread_id, message_count, cx))
             .unwrap_or_default();
+        // What follows the rows in the scroll flow, laid out natively.
+        let tail = div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .children(pending_rows)
+            .children(composer.map(|composer| composer.when(message_count > 0, |this| this.mt_6())))
+            .when(!can_write, |this| {
+                this.child(
+                    div()
+                        .id("read-only-thread")
+                        .when(message_count > 0, |this| this.mt_6())
+                        .relative()
+                        .w_full()
+                        .flex()
+                        .justify_center()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground.opacity(0.7))
+                        .child("Read-only thread")
+                        .child(
+                            canvas(
+                                move |bounds, _, _| {
+                                    read_only_line_bounds.set(Some(bounds));
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .absolute()
+                            .size_full(),
+                        ),
+                )
+            });
 
         div()
             .id("main-editor")
@@ -525,39 +530,16 @@ impl Cowork {
                             .flex_col()
                             .text_sm()
                             .text_color(cx.theme().foreground)
-                            .children(timeline_messages.into_iter().enumerate().map(
-                                |(index, message)| {
-                                    div().when(index != 0, |this| this.mt_6()).child(message)
-                                },
-                            ))
-                            .children(pending_rows)
-                            .children(composer.map(|composer| {
-                                composer.when(message_count > 0, |this| this.mt_6())
-                            }))
-                            .when(!can_write, |this| {
-                                this.child(
-                                    div()
-                                        .id("read-only-thread")
-                                        .when(message_count > 0, |this| this.mt_6())
-                                        .relative()
-                                        .w_full()
-                                        .flex()
-                                        .justify_center()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground.opacity(0.7))
-                                        .child("Read-only thread")
-                                        .child(
-                                            canvas(
-                                                move |bounds, _, _| {
-                                                    read_only_line_bounds.set(Some(bounds));
-                                                },
-                                                |_, _, _, _| {},
-                                            )
-                                            .absolute()
-                                            .size_full(),
-                                        ),
-                                )
-                            }),
+                            .child(VirtualTimeline::new(
+                                self.timeline_layout.clone(),
+                                active_thread_id,
+                                rows,
+                                build,
+                                tail.into_any_element(),
+                                self.timeline_selection.clone(),
+                                self.timeline_scroll_handle.clone(),
+                                cx.entity().downgrade(),
+                            )),
                     ),
             )
     }
@@ -600,6 +582,7 @@ impl Render for Cowork {
             // Run before the focused editor's own handling, which they
             // extend to the composer as a whole.
             .capture_action(cx.listener(Self::paste_attachments))
+            .capture_action(cx.listener(Self::copy_timeline_selection))
             .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
                 if this.move_between_draft_editors(true, window, cx) {
                     cx.stop_propagation();
@@ -804,6 +787,8 @@ pub fn run() -> anyhow::Result<()> {
                         pending_attachments: Vec::new(),
                         timeline_scroll_handle: ScrollHandle::new(),
                         timeline_press: None,
+                        timeline_layout: Default::default(),
+                        timeline_selection: Default::default(),
                         timeline_focus_handle: cx.focus_handle(),
                         follow_generation: true,
                         thread_store,

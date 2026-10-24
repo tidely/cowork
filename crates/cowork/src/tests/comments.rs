@@ -790,4 +790,26 @@ fn commenting_on_a_long_response_keeps_the_timeline_scroll_position(cx: &mut gpu
             .collect::<Vec<_>>();
         assert_eq!(highlighted, [quote]);
     });
+
+    // Rows are built during the frame's prepaint, after render sweeps the
+    // segment views; the views of a row drawn every frame must survive it
+    // rather than being created, and parsed, again.
+    let segment_views = |cx: &mut gpui::VisualTestContext| {
+        cowork.read_with(cx, |cowork, _| {
+            let mut views = cowork
+                .segment_text_views
+                .iter()
+                .map(|(key, view)| (key.1, view.state.entity_id()))
+                .collect::<Vec<_>>();
+            views.sort();
+            views
+        })
+    };
+    let before = segment_views(cx);
+    assert!(before.len() > 1, "the response is split into segments");
+    for _ in 0..3 {
+        cowork.update(cx, |_, cx| cx.notify());
+        settle(cx);
+        assert_eq!(segment_views(cx), before);
+    }
 }

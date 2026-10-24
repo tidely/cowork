@@ -918,6 +918,8 @@ pub(crate) mod tests {
                         pending_attachments: Vec::new(),
                         timeline_scroll_handle: ScrollHandle::new(),
                         timeline_press: None,
+                        timeline_layout: Default::default(),
+                        timeline_selection: Default::default(),
                         timeline_focus_handle: cx.focus_handle(),
                         follow_generation: true,
                         thread_store,

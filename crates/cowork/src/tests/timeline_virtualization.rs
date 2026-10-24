@@ -1,5 +1,6 @@
-//! Geometry and selection regressions for deferred history in a real Cowork
-//! window. No provider, VM, timing measurements, or private row-cache hooks.
+//! Virtualization and selection regressions for the timeline in a real
+//! Cowork window. No provider, VM, timing measurements, or private row-cache
+//! hooks.
 
 use super::*;
 use gpui::{Pixels, VisualTestContext, size};
@@ -179,21 +180,16 @@ impl Fixture {
         settle(cx);
     }
 
+    /// Only rows near the view are built, wherever it is.
     fn assert_culled(&self, cx: &mut VisualTestContext) {
-        assert!(
-            cx.debug_bounds(self.users[self.users.len() / 2].1)
-                .is_none(),
-            "a stable middle row must not be prepainted outside the viewport"
-        );
         let visible = self
             .users
             .iter()
             .filter(|(_, selector)| cx.debug_bounds(selector).is_some())
             .count();
-        assert!(visible > 0, "the viewport must still contain user text");
         assert!(
-            visible < self.users.len() / 2,
-            "only near-viewport text should be prepainted, found {visible} user rows"
+            visible < self.users.len() / 4,
+            "only near-view rows should be built, found {visible} user rows"
         );
     }
 
@@ -243,25 +239,35 @@ impl Fixture {
         self.redraw(cx);
     }
 
-    /// The geometry with every row laid out natively: an active selection
-    /// is the production fallback that culls nothing.
-    fn native_geometry(&self, cx: &mut VisualTestContext) -> (Pixels, Pixels) {
-        let culled = self.geometry(cx);
-        self.select_first_user(cx);
-        assert!(
-            cx.debug_bounds(self.users[self.users.len() / 2].1)
-                .is_some()
-        );
-        let native = self.geometry(cx);
-        self.clear_selection(cx);
+    /// Scrolls through the whole history, so that every row has been drawn
+    /// and measured, and returns to where the view was. Returns the extent
+    /// then, which is exact.
+    fn measure_all(&self, cx: &mut VisualTestContext) -> Pixels {
+        let (start, _) = self.geometry(cx);
+        let mut offset = px(0.);
+        for _ in 0..1000 {
+            self.cowork.update(cx, |cowork, cx| {
+                cowork
+                    .timeline_scroll_handle
+                    .set_offset(point(px(0.), offset));
+                cx.notify();
+            });
+            settle(cx);
+            let (current, max) = self.geometry(cx);
+            if current <= -max + px(1.) {
+                break;
+            }
+            offset = current - px(500.);
+        }
+        let (_, max) = self.geometry(cx);
         self.cowork.update(cx, |cowork, cx| {
             cowork
                 .timeline_scroll_handle
-                .set_offset(point(px(0.), culled.0));
+                .set_offset(point(px(0.), start));
             cx.notify();
         });
         settle(cx);
-        native
+        max
     }
 
     fn clear_selection(&self, cx: &mut VisualTestContext) {
@@ -269,6 +275,61 @@ impl Fixture {
         self.redraw(cx);
         cx.update(|window, cx| assert!(!TextSelection::has_selection(window, cx)));
     }
+}
+
+/// Scrolls to the middle of the history, where no row has been measured.
+fn middle(fixture: &Fixture, cx: &mut VisualTestContext) {
+    let (_, max) = fixture.geometry(cx);
+    fixture.cowork.update(cx, |cowork, cx| {
+        cowork.follow_generation = false;
+        cowork
+            .timeline_scroll_handle
+            .set_offset(point(px(0.), -max / 2.));
+        cx.notify();
+    });
+    settle(cx);
+}
+
+/// A prompt's text, or a reply's work summary or tool call, in the view, and
+/// where it is.
+fn visible_row(fixture: &Fixture, cx: &mut VisualTestContext) -> (&'static str, Pixels) {
+    let mut selectors = fixture
+        .users
+        .iter()
+        .map(|(_, selector)| *selector)
+        .collect::<Vec<_>>();
+    for index in (1..MESSAGE_COUNT).step_by(2) {
+        let id = fixture
+            .thread
+            .read_with(cx, |thread, _| match &thread.timeline[index] {
+                TimelineMessage::Agent(message) => message.record.id,
+                TimelineMessage::User(_) => unreachable!("replies are at odd indices"),
+            });
+        for selector in [
+            format!("toggle-work-{id}"),
+            format!("tool-call-{id}-1"),
+            format!("tool-call-{id}-3"),
+        ] {
+            selectors.push(Box::leak(selector.into_boxed_str()));
+        }
+    }
+    selectors
+        .into_iter()
+        .find_map(|selector| {
+            cx.debug_bounds(selector)
+                .filter(|bounds| bounds.top() > px(60.) && bounds.top() < px(600.))
+                .map(|bounds| (selector, bounds.top()))
+        })
+        .expect("a row in the view")
+}
+
+fn scroll_wheel(delta: Pixels, cx: &mut VisualTestContext) {
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: point(px(600.), px(380.)),
+        delta: gpui::ScrollDelta::Pixels(point(px(0.), delta)),
+        ..Default::default()
+    });
+    settle(cx);
 }
 
 fn settle(cx: &mut VisualTestContext) {
@@ -297,15 +358,12 @@ fn assert_same_geometry(actual: (Pixels, Pixels), expected: (Pixels, Pixels)) {
 }
 
 #[gpui::test]
-fn selection_survives_crossing_the_deferred_history_threshold(cx: &mut gpui::TestAppContext) {
+fn selection_survives_new_messages(cx: &mut gpui::TestAppContext) {
     let (fixture, _runtime, cx) = Fixture::new(cx, timeline_bench::SHORT);
-    let next = fixture.thread.update(cx, |thread, _| {
-        let next = thread.timeline[63].clone();
-        thread.timeline.truncate(63);
-        next
-    });
+    let next = fixture
+        .thread
+        .update(cx, |thread, _| thread.timeline.pop().unwrap());
     fixture.redraw(cx);
-    assert!(cx.debug_bounds(fixture.users[25].1).is_some());
     fixture.select_first_user(cx);
     let selected = cx.update(TextSelection::selected_text);
     assert!(!selected.is_empty());
@@ -317,14 +375,14 @@ fn selection_survives_crossing_the_deferred_history_threshold(cx: &mut gpui::Tes
     assert_eq!(
         cx.update(TextSelection::selected_text),
         selected,
-        "changing the history rendering mode must not remount the selection anchor"
+        "a new row must not remount the selection anchor"
     );
     fixture.clear_selection(cx);
     fixture.assert_culled(cx);
 }
 
 #[gpui::test]
-fn settled_history_culls_rows_and_keeps_its_geometry(cx: &mut gpui::TestAppContext) {
+fn history_builds_only_rows_near_the_view(cx: &mut gpui::TestAppContext) {
     let (fixture, _runtime, cx) = Fixture::new(cx, timeline_bench::SHORT);
     fixture.assert_culled(cx);
     assert!(cx.debug_bounds(fixture.users[0].1).is_some());
@@ -337,21 +395,15 @@ fn settled_history_culls_rows_and_keeps_its_geometry(cx: &mut gpui::TestAppConte
     fixture.assert_culled(cx);
     assert!(cx.debug_bounds(fixture.users[0].1).is_none());
     assert!(cx.debug_bounds(fixture.users.last().unwrap().1).is_some());
-    assert_same_geometry(fixture.geometry(cx), (-max, max));
+    let (offset, max) = fixture.geometry(cx);
+    assert_eq!(
+        offset, -max,
+        "the bottom stays the bottom as its rows are measured"
+    );
 
-    fixture.top(cx);
-    assert_same_geometry(fixture.geometry(cx), (px(0.), max));
-
-    // Stable redraws leave an interior offset and the extent unchanged.
-    fixture.cowork.update(cx, |cowork, cx| {
-        cowork
-            .timeline_scroll_handle
-            .set_offset(point(px(0.), -max / 3.));
-        cx.notify();
-    });
-    settle(cx);
+    // Redraws leave an interior offset and the extent unchanged.
+    middle(&fixture, cx);
     let before = fixture.geometry(cx);
-    assert!((before.0 + max / 3.).abs() < px(1.));
     for _ in 0..8 {
         fixture.redraw(cx);
         assert_same_geometry(fixture.geometry(cx), before);
@@ -361,74 +413,98 @@ fn settled_history_culls_rows_and_keeps_its_geometry(cx: &mut gpui::TestAppConte
     assert_same_geometry(fixture.geometry(cx), before);
 }
 
-/// Finished work left open, with its tool details and diffs, is settled
-/// history too: offscreen it is not prepainted, yet the scroll extent is
-/// the one every row laid out natively gives.
+/// Rows never drawn count as an estimate; once drawn, their real height
+/// replaces it without moving what is on screen. Open work makes every
+/// reply much taller than the prompts around it, so estimates are wrong.
 #[gpui::test]
-fn settled_open_work_culls_offscreen_and_keeps_native_geometry(cx: &mut gpui::TestAppContext) {
+fn measuring_rows_above_the_view_keeps_the_view_still(cx: &mut gpui::TestAppContext) {
+    let (fixture, _runtime, cx) = Fixture::with_open_work(cx);
+    middle(&fixture, cx);
+    fixture.assert_culled(cx);
+    for _ in 0..6 {
+        let (selector, top) = visible_row(&fixture, cx);
+        scroll_wheel(px(90.), cx);
+        let moved = cx
+            .debug_bounds(selector)
+            .expect("the row is still in the view");
+        assert!(
+            (moved.top() - (top + px(90.))).abs() < px(1.),
+            "the view must move by the wheel's distance: {top:?} -> {:?}",
+            moved.top()
+        );
+    }
+    fixture.assert_culled(cx);
+}
+
+/// Finished work left open, with its tool details and diffs, is built only
+/// near the view too, and once every row has been measured, the extent no
+/// longer changes.
+#[gpui::test]
+fn open_work_builds_only_near_the_view_and_its_extent_converges(cx: &mut gpui::TestAppContext) {
     let (fixture, _runtime, cx) = Fixture::with_open_work(cx);
     let first = fixture.read_details(1, cx);
-    let middle = fixture.read_details(MESSAGE_COUNT / 2 + 1, cx);
+    let middle_details = fixture.read_details(MESSAGE_COUNT / 2 + 1, cx);
     fixture.assert_culled(cx);
     assert!(
         cx.debug_bounds(first).is_some(),
         "open work near the top shows"
     );
     assert!(
-        cx.debug_bounds(middle).is_none(),
-        "open work far offscreen must not be prepainted"
+        cx.debug_bounds(middle_details).is_none(),
+        "open work far offscreen must not be built"
     );
-    let culled = fixture.geometry(cx);
-    assert_same_geometry(fixture.native_geometry(cx), culled);
+    let max = fixture.measure_all(cx);
     fixture.assert_culled(cx);
+    assert_same_geometry(fixture.geometry(cx), (px(0.), max));
+    assert_eq!(fixture.measure_all(cx), max);
     for _ in 0..3 {
         fixture.redraw(cx);
-        assert_same_geometry(fixture.geometry(cx), culled);
+        assert_same_geometry(fixture.geometry(cx), (px(0.), max));
     }
 
     fixture.bottom(cx);
-    let (_, max) = culled;
     assert_same_geometry(fixture.geometry(cx), (-max, max));
     assert!(cx.debug_bounds(first).is_none());
-    assert!(cx.debug_bounds(middle).is_none());
+    assert!(cx.debug_bounds(middle_details).is_none());
 }
 
-/// Folding or opening work far offscreen changes what the row draws, so its
-/// measured height must follow without the row coming into view.
+/// Folding work above the view changes a row that isn't drawn: the view
+/// stays where it is, and the row shows folded when it is drawn again.
 #[gpui::test]
-fn folding_offscreen_work_remeasures_its_row(cx: &mut gpui::TestAppContext) {
+fn folding_work_above_the_view_keeps_the_view_still(cx: &mut gpui::TestAppContext) {
     let (fixture, _runtime, cx) = Fixture::with_open_work(cx);
-    let (_, open) = fixture.geometry(cx);
-    let row = MESSAGE_COUNT / 2 + 1;
-
-    // A tool's details.
-    fixture.update_reply(row, cx, |ui| {
-        ui.step_view_mut(1).unwrap().set_expanded(false)
-    });
-    let (_, details_folded) = fixture.geometry(cx);
-    assert!(
-        details_folded < open - px(100.),
-        "folding offscreen details must shrink the history: {open:?} -> {details_folded:?}"
-    );
-    assert_same_geometry(fixture.native_geometry(cx), (px(0.), details_folded));
-
-    // The whole work section, then reopening it with the details still
-    // folded: the row's expansion state is its own, not reset by culling.
+    fixture.measure_all(cx);
+    middle(&fixture, cx);
+    let (selector, top) = visible_row(&fixture, cx);
+    let row = MESSAGE_COUNT / 4;
+    let details = fixture.read_details(row, cx);
+    let summary = fixture
+        .thread
+        .read_with(cx, |thread, _| match &thread.timeline[row] {
+            TimelineMessage::Agent(message) => {
+                &*Box::leak(format!("toggle-work-{}", message.record.id).into_boxed_str())
+            }
+            TimelineMessage::User(_) => unreachable!("replies are at odd indices"),
+        });
     fixture.update_reply(row, cx, |ui| ui.work_expanded = false);
-    let (_, work_folded) = fixture.geometry(cx);
-    assert!(work_folded < details_folded - px(100.));
-    assert_same_geometry(fixture.native_geometry(cx), (px(0.), work_folded));
-    fixture.update_reply(row, cx, |ui| ui.work_expanded = true);
-    assert_same_geometry(fixture.geometry(cx), (px(0.), details_folded));
-    fixture.update_reply(row, cx, |ui| {
-        ui.step_view_mut(1).unwrap().set_expanded(true)
-    });
-    assert_same_geometry(fixture.geometry(cx), (px(0.), open));
-    fixture.assert_culled(cx);
+    assert_eq!(
+        cx.debug_bounds(selector).map(|bounds| bounds.top()),
+        Some(top)
+    );
+    fixture.top(cx);
+    // Scroll down to the folded row, measuring the rows on the way.
+    for _ in 0..200 {
+        if cx.debug_bounds(summary).is_some() {
+            break;
+        }
+        scroll_wheel(px(-300.), cx);
+    }
+    assert!(cx.debug_bounds(summary).is_some());
+    assert!(cx.debug_bounds(details).is_none(), "the row shows folded");
 }
 
-/// A click in history, here on a tool's toggle, is not a drag: history stays
-/// culled while the button is held, and the click still lands.
+/// A click in history, here on a tool's toggle, is not a drag: only rows
+/// near the view are built while the button is held, and the click lands.
 #[gpui::test]
 fn clicking_a_history_toggle_keeps_history_culled(cx: &mut gpui::TestAppContext) {
     let (fixture, _runtime, cx) = Fixture::with_open_work(cx);
@@ -453,13 +529,12 @@ fn clicking_a_history_toggle_keeps_history_culled(cx: &mut gpui::TestAppContext)
     fixture.assert_culled(cx);
     let (_, folded) = fixture.geometry(cx);
     assert!(folded < open - px(100.));
-    assert_same_geometry(fixture.native_geometry(cx), (px(0.), folded));
 }
 
-/// A finished run that a steer joined is as stable as the group it draws
-/// there, so it culls offscreen like any settled row.
+/// A finished run that a steer joined draws the group there, and builds
+/// only near the view like any row.
 #[gpui::test]
-fn settled_runs_with_steers_cull_offscreen(cx: &mut gpui::TestAppContext) {
+fn runs_with_steers_build_only_near_the_view(cx: &mut gpui::TestAppContext) {
     let (fixture, _runtime, cx) = Fixture::new(cx, timeline_bench::SHORT);
     let (group_index, _) = fixture.users[fixture.users.len() / 2];
     fixture.thread.update(cx, |thread, cx| {
@@ -479,80 +554,67 @@ fn settled_runs_with_steers_cull_offscreen(cx: &mut gpui::TestAppContext) {
     assert_same_geometry(fixture.geometry(cx), before);
 }
 
+/// A width change measures only the rows drawn at the new width; once every
+/// row has been measured, the extent is the native one at that width.
 #[gpui::test]
-fn width_changes_remeasure_offscreen_rows_and_match_native_selection_layout(
-    cx: &mut gpui::TestAppContext,
-) {
+fn width_changes_build_only_rows_near_the_view(cx: &mut gpui::TestAppContext) {
     let response = "A completed paragraph with enough ordinary words to wrap differently when the timeline becomes narrower. ".repeat(12);
     let (fixture, _runtime, cx) = Fixture::new(cx, &response);
-    let wide = fixture.geometry(cx);
-    fixture.select_first_user(cx);
-    // Active selection is the production all-native baseline, with precisely
-    // the same content, outer scroll handle, and window as the deferred path.
-    assert!(cx.debug_bounds(fixture.users[25].1).is_some());
-    assert_same_geometry(fixture.geometry(cx), wide);
-    fixture.clear_selection(cx);
-    fixture.assert_culled(cx);
+    let wide = fixture.measure_all(cx);
 
     cx.simulate_resize(size(px(640.), px(760.)));
     fixture.redraw(cx);
-    let narrow = fixture.geometry(cx);
+    fixture.assert_culled(cx);
+    let narrow = fixture.measure_all(cx);
     assert!(
-        narrow.1 > wide.1 + px(500.),
+        narrow > wide + px(500.),
         "narrower text must increase the full history height: {wide:?} -> {narrow:?}"
     );
-    fixture.select_first_user(cx);
-    assert_same_geometry(fixture.geometry(cx), narrow);
-    fixture.clear_selection(cx);
     fixture.assert_culled(cx);
-    assert_same_geometry(fixture.geometry(cx), narrow);
-
-    cx.simulate_resize(size(px(1200.), px(760.)));
-    fixture.redraw(cx);
-    assert_same_geometry(fixture.geometry(cx), wide);
+    assert_same_geometry(fixture.geometry(cx), (px(0.), narrow));
 }
 
+/// The rows at the bottom grow, as a streamed reply's does: following the
+/// bottom keeps it in view. A change to a row far above isn't drawn, so it
+/// doesn't move the view either.
 #[gpui::test]
-fn late_offscreen_source_parse_invalidates_height_and_keeps_follow_bottom_pinned(
-    cx: &mut gpui::TestAppContext,
-) {
+fn growing_rows_keep_follow_bottom_pinned(cx: &mut gpui::TestAppContext) {
     let (fixture, _runtime, cx) = Fixture::new(cx, timeline_bench::SHORT);
     fixture.bottom(cx);
     fixture
         .cowork
         .update(cx, |cowork, _| cowork.follow_generation = true);
     let (_, before) = fixture.geometry(cx);
-    assert!(cx.debug_bounds(fixture.users[0].1).is_none());
 
-    // Change an already measured, offscreen source without notifying Cowork.
-    // Only the source view's asynchronous parse/observer should invalidate its
-    // cached height and request the owner frame that follows the new bottom.
-    let replacement = "A late parsed paragraph grows an offscreen completed reply.\n\n".repeat(80);
-    fixture.thread.update(cx, |thread, cx| {
-        let crate::timeline::TimelineMessage::Agent(record) = &thread.timeline[1] else {
-            panic!("the benchmark's second row is a completed agent reply");
-        };
-        let message = thread
-            .agent_message_mut(record.record.id.into_bytes())
-            .unwrap();
-        message.ui.output.text = replacement.clone();
-        message
-            .ui
-            .text_view
-            .update(cx, |view, cx| view.set_text(&replacement, cx));
-    });
+    // Change replies' views without notifying Cowork: the views' own
+    // notifications redraw the rows that draw them.
+    let replacement = "A late parsed paragraph grows a completed reply.\n\n".repeat(80);
+    for index in [1, MESSAGE_COUNT - 1] {
+        fixture.thread.update(cx, |thread, cx| {
+            let crate::timeline::TimelineMessage::Agent(record) = &thread.timeline[index] else {
+                panic!("replies are at odd indices");
+            };
+            let message = thread
+                .agent_message_mut(record.record.id.into_bytes())
+                .unwrap();
+            message.ui.output.text = replacement.clone();
+            message
+                .ui
+                .text_view
+                .update(cx, |view, cx| view.set_text(&replacement, cx));
+        });
+    }
     settle(cx);
     let after = fixture.geometry(cx);
     assert!(
         after.1 > before + px(500.),
-        "offscreen source changes must invalidate measured height: {before:?} -> {after:?}"
+        "the last reply grew: {before:?} -> {after:?}"
     );
     assert!(
         (after.0 + after.1).abs() < px(1.),
         "follow-bottom lost its pin: {after:?}"
     );
     fixture.assert_culled(cx);
-    assert!(cx.debug_bounds(fixture.users.last().unwrap().1).is_some());
     for _ in 0..3 {
         fixture.redraw(cx);
         assert_same_geometry(fixture.geometry(cx), after);
@@ -560,16 +622,16 @@ fn late_offscreen_source_parse_invalidates_height_and_keeps_follow_bottom_pinned
 }
 
 #[gpui::test]
-fn cross_row_drag_copies_the_whole_history_then_culls_again_after_clear(
+fn cross_row_drag_builds_only_its_rows_and_copies_every_row_in_order(
     cx: &mut gpui::TestAppContext,
 ) {
     let (fixture, _runtime, cx) = Fixture::new(cx, timeline_bench::SHORT);
     fixture.assert_culled(cx);
-    let (_, max) = fixture.geometry(cx);
     let first = cx
         .debug_bounds(fixture.users[0].1)
         .expect("first user text");
-    let start = point(first.left() + px(1.), first.center().y);
+    // From inside the first prompt's text to inside the last's.
+    let start = point(first.left() + px(40.), first.center().y);
     cx.simulate_mouse_down(start, MouseButton::Left, gpui::Modifiers::default());
     // Scroll before moving the pointer: the drag already has an anchor, but
     // GPUI reports no selection until its endpoints differ.
@@ -577,28 +639,31 @@ fn cross_row_drag_copies_the_whole_history_then_culls_again_after_clear(
     cx.update(|window, cx| {
         assert!(!TextSelection::has_selection(window, cx));
     });
-    // A press alone is not a drag: history stays culled.
+    // A press alone is not a drag: only rows near the view are built.
     fixture.assert_culled(cx);
-    assert_same_geometry(fixture.geometry(cx), (px(0.), max));
 
     // Scrolling with the button held is deterministic and does not depend on
-    // auto-scroll timing. The anchor's row stays laid out while held, though
+    // auto-scroll timing. The anchor's row stays built while held, though
     // offscreen, so the drag that starts below still has its anchor.
     fixture.bottom(cx);
     assert!(
         cx.debug_bounds(fixture.users[0].1).is_some(),
-        "the pressed row must stay laid out while the button is held"
+        "the pressed row must stay built while the button is held"
     );
     assert!(cx.debug_bounds(fixture.users[25].1).is_none());
     let last = cx
         .debug_bounds(fixture.users.last().unwrap().1)
         .expect("last user text");
-    let end = point(last.right() - px(1.), last.center().y);
+    let end = point(last.left() + px(40.), last.center().y);
     cx.simulate_mouse_move(end, Some(MouseButton::Left), gpui::Modifiers::default());
     cx.simulate_mouse_up(end, MouseButton::Left, gpui::Modifiers::default());
     fixture.redraw(cx);
     assert_selection(cx);
-    assert_same_geometry(fixture.geometry(cx), (-max, max));
+    let (offset, max) = fixture.geometry(cx);
+    assert_eq!(
+        offset, -max,
+        "building every row keeps the view at the bottom"
+    );
     cx.write_to_clipboard(ClipboardItem::new_string("stale clipboard".into()));
     cx.simulate_keystrokes(cfg_select! {
         target_os = "macos" => "cmd-c",
@@ -609,16 +674,33 @@ fn cross_row_drag_copies_the_whole_history_then_culls_again_after_clear(
         .read_from_clipboard()
         .and_then(|item| item.text())
         .expect("copied text");
-    for (index, _) in &fixture.users {
-        assert!(
-            copied.contains(&user_text(*index)),
-            "selection lost user row {index}: {copied:?}"
-        );
-    }
+    // The end rows give what of them is selected; every row between, its
+    // whole text, in timeline order: each prompt, then its reply.
+    let (first_text, last_text) = (
+        user_text(fixture.users[0].0),
+        user_text(fixture.users.last().unwrap().0),
+    );
+    let head = copied.lines().next().unwrap();
+    let tail = copied.lines().last().unwrap();
+    assert!(
+        !head.is_empty() && head.len() < first_text.len() && first_text.ends_with(head),
+        "the first prompt gives the end of it: {head:?}"
+    );
+    assert!(
+        !tail.is_empty() && tail.len() < last_text.len() && last_text.starts_with(tail),
+        "the last prompt gives the start of it: {tail:?}"
+    );
+    let middle = fixture.users[1..fixture.users.len() - 1]
+        .iter()
+        .map(|(index, _)| user_text(*index))
+        .collect::<Vec<_>>()
+        .join(&format!("\n{}\n", timeline_bench::SHORT));
     assert_eq!(
-        copied.matches(timeline_bench::SHORT).count(),
-        MESSAGE_COUNT / 2 - 1,
-        "copy must include every intervening agent reply, but not the reply after the endpoint"
+        copied,
+        format!(
+            "{head}\n{reply}\n{middle}\n{reply}\n{tail}",
+            reply = timeline_bench::SHORT
+        )
     );
 
     fixture.clear_selection(cx);

@@ -184,29 +184,69 @@ and `generation-profile-real-reasoning-empty.data`. Their corresponding
 supervisor's empty-history capture is in
 `target/generation-profiles/short-h0-gz71ln72/`.
 
-## Implemented fix: app-level history culling
+## Implemented fix: full timeline virtualization
 
-`lib.rs::render_main_editor` now wraps timeline bodies in the custom GPUI
-`DeferredTimelineRow` element (`timeline_virtualization.rs`). With at least
-64 messages, settled rows (including finished work left open, with its tool
-details, reasoning and diffs) retain measured heights and construct their
-bodies only near the viewport (128 px overdraw). Offscreen bodies skip prepaint
-and paint even while their initial heights are being measured. There are **no
-vendored crates, dependency patches, or dependency changes**.
+`lib.rs::render_main_editor` hands the timeline's rows to `VirtualTimeline`
+(`timeline_virtualization.rs`), a custom GPUI element inside the existing
+`timeline-scroll` div and `ScrollHandle`. It reports the rows' total height to
+the scroll container and builds, lays out and paints only the rows within
+128 px of the view, plus pinned rows (a held press's row and a selection's end
+rows). Pending submissions and the composer follow the rows, laid out
+natively. Every row is virtualized, live and interactive ones included; there
+is no message-count threshold. There are **no vendored crates, dependency
+patches, or dependency changes**.
+
+Heights are measured when a row is built, at the width it is drawn at, and
+kept in `TimelineLayout`; a row never drawn counts as the average measured
+row. They are hints: every drawn row is measured again each frame, and when a
+measurement differs the rows are placed around an anchor (the first visible
+row, or the end of the history while it is in view) and the scroll offset
+moves by the same amount, clamped to what the next frame's container allows.
+What is on screen stays put while the extent converges. Nothing invalidates an
+offscreen height; a changed row is measured when next drawn. Width and
+typography changes therefore cost only the rows drawn.
 
 Rendering reads the thread's timeline in place and never copies it whole:
-`Cowork::plan_timeline_rows` scans it by reference once per frame, deferred
-rows keep only their message's identity and clone it (`TimelineRow::capture`)
-when they are built near the viewport, and only rows that must be built now
-are captured during render.
+`Cowork::plan_timeline_rows` scans it by reference once per frame, and a row
+clones its message (`TimelineRow::capture`) only when it is built. Rows are
+built during the element's prepaint, so the segment-view caches keep what the
+previous frame used rather than only what this render touched.
 
-This reduces the historical TextViews participating in selection registration
-and retained Markdown layout maintenance on each live frame—the two sampled
-hotspots—without modifying GPUI internals or agent event ordering.
+Selection no longer lays out the history (`timeline_selection.rs`). The row a
+press lands in stays built while the button is held, and the rows holding a
+selection's ends (tracked from the pointer during the drag) stay built while
+the selection lasts, at their true positions, so GPUI Base keeps the
+selection. Rows paint in timeline order. Copy of a selection spanning rows is
+built by the app, in timeline order: the selected text of the two end rows
+(Markdown views' own selection; prompts through `PromptText`, which records
+its projected range) and the whole text of every row between them, from the
+views and prompts `Cowork::copy_pieces` lists for each row, painted or not.
 
-### Live-generation verification
+### Interaction benchmark
 
-The same owned-Ollama supervisor and real production scheduling were used after
+Measured with a temporary benchmark (since removed) that dispatched real
+input through the whole `Cowork` root with production text shaping, scrolled
+to the bottom. In GPUI's Test mode the effect flush draws dirty windows, so a
+sample is event handling plus the frames it caused. Medians in ms, release:
+
+| 1000 turns | Before | Virtualized |
+| --- | ---: | ---: |
+| short: redraw / click | 9.6 / 10.1 | 1.07 / 1.15 |
+| markdown: redraw / click | 12.6 / 13.6 | 1.28 / 1.57 |
+| short: drag frame | 1283 | 1.14 |
+| markdown: drag frame | 10293 | 1.36 |
+| short: width change (sidebar toggle) | 95 | 1.19 |
+| markdown: width change | 943 | 1.39 |
+| markdown: scroll up 240 px | 20.3 | 1.41 |
+| markdown: copy the whole history | n/a | 1.7 (worst 18) |
+
+Before virtualization a click cost a whole frame like any redraw: mouse down
+and up each caused one. A width change laid out every row natively.
+
+### Live-generation verification (of the earlier culling)
+
+These captures verified the earlier `DeferredTimelineRow` culling, which kept
+every outer row in layout. The same owned-Ollama supervisor and real production scheduling were used after
 the fix, with `qwen3.8:27b` and 1000 messages:
 
 | History | Worst event lag, before → after | Max queued events, before → after | Events after | Stage renders after |
@@ -229,36 +269,30 @@ Captures and reports:
 
 ### Correctness and tradeoffs
 
-- This is **partial virtualization**: every outer flex row remains in layout;
-  initial/invalidated heights still require native measurement. The per-frame
-  scan of the timeline and outer-row traversal are still proportional to
-  history length.
-- Generating replies, approvals, comments, attachments, images, and comment
-  responses retain native rendering. Interactive rows are built eagerly before
-  the segment-cache sweep.
-- An actual drag (the held pointer moving more than 2 px) or a nonempty window
-  text selection disables culling, preserving native cross-row drag/copy
-  geometry. That intentionally restores the costly path during selection. A
-  press alone does not: the row it lands in is visible, hence built, and stays
-  built and painted while the button is held (`TimelinePress`), so a drag that
-  starts after scrolling with the button held keeps its anchor. Stable wrapper
-  IDs preserve anchors when switching modes or crossing the 64-message
-  threshold.
-- Height invalidation includes typography, rem size, computed wrap width,
-  actual allocated width, and the row's `RowGeometry`: a key of the folding
-  that decides what it draws (open work, open tool details and reasoning),
-  plus the views it draws that change on their own (Markdown, whose committed
-  parse revision counts, and file-change views, whose Diff/JSON switch does).
-  `Cowork::agent_row_geometry` derives both from the same projection the
-  renderer draws. Changes invalidate offscreen rows too and maintain
-  bottom-follow; selection/highlight notifications do not invalidate geometry.
-  Culling mode is not part of the key: a native frame measures every row, so
-  its heights stay valid when culling resumes after a drag.
-- Regression tests cover offscreen culling/extent (text-only and open work),
-  folding offscreen work, stable interior scrolling, resize versus native
-  layout, late offscreen parsing/bottom-follow, clicks keeping history culled,
-  dragging across history (including scrolling before the first pointer
-  movement), and selection surviving the history threshold.
+- The scroll extent is an estimate until rows have been drawn; the timeline
+  has no scrollbar. Scrolling through the history makes it exact.
+- An offscreen row that changes (late parsing, folding) keeps its old height
+  until drawn, when anchoring absorbs the difference.
+- Copy of a selection spanning rows depends on `Cowork::copy_pieces` matching
+  what `render_timeline_message` draws; tool calls and comments are not
+  selectable text and are not copied. Selections spanning rows that a drag
+  didn't make (e.g. shift-click extension) are not tracked; GPUI Base copies
+  those itself, painted rows only.
+- GPUI Base orders selection participants by `document_order`: prompts set
+  `timeline index × 1000 + block`, while agent Markdown views take a per-frame
+  paint counter. The two schemes don't interleave, so GPUI Base's own copy
+  put every reply after the first prompt (fixed for spanning selections by
+  building Copy in the app), and highlighting can still include prompts above
+  an anchor in agent text. A proper fix needs GPUI Base to let the app set a
+  `TextView`'s order.
+- After any frame that lays out every Markdown row (none remain in the app's
+  own paths), the retained-layout sweep below makes later frames proportional
+  to history again.
+- Regression tests (`tests/timeline_virtualization.rs`) cover building only
+  nearby rows, anchoring while rows above are measured, folding above the
+  view, extent convergence, width changes, bottom-follow while rows grow,
+  clicks, steers, and a cross-row drag staying culled and copying every row
+  in order with partial end rows.
 
 ## Completed-thread measurements
 

@@ -3,7 +3,6 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
     time::{Duration, Instant},
 };
@@ -15,8 +14,7 @@ use gpui::{
     rems, rgb, rgba, size,
 };
 use gpui_base::{
-    RangeHighlight, RenderedText, SelectableText, TextSelection, TextView, TextViewState,
-    TextViewStyle, Textarea,
+    RangeHighlight, RenderedText, TextSelection, TextView, TextViewState, TextViewStyle, Textarea,
     input::TextareaState,
     text::{CodeBlock, SelectionFormat},
 };
@@ -40,7 +38,7 @@ use crate::{
         UserMessage,
     },
     timeline_projection::{RunItem, RunProjection},
-    timeline_virtualization::{HeightSource, RowGeometry},
+    timeline_selection::{CopyPiece, PromptText},
     tool_approval::{self, ApprovalRights},
     tool_call_card::ToolCallCard,
 };
@@ -668,13 +666,12 @@ impl Cowork {
                 content.push(
                     div()
                         .debug_selector(move || format!("timeline-user-text-{block_id}"))
-                        .child(
-                            SelectableText::new(
-                                format!("timeline-user-text-{block_id}"),
-                                block.text.clone(),
-                            )
-                            .document_order((index * 1_000 + block_index) as u64),
-                        )
+                        .child(PromptText::new(
+                            block_id,
+                            block.text.clone().into(),
+                            (index * 1_000 + block_index) as u64,
+                            self.timeline_selection.clone(),
+                        ))
                         .into_any_element(),
                 );
             }
@@ -1418,46 +1415,6 @@ impl Cowork {
             .into_any_element()
     }
 
-    /// What [`Self::render_agent_message`] draws for `message` that its
-    /// height depends on: which steps are shown and open, and the views among
-    /// them that change on their own. Keep in step with that method, so that
-    /// settled history can keep a culled row's measured height until one of
-    /// them changes. Comment responses aren't listed: messages with them are
-    /// never culled.
-    pub(crate) fn agent_row_geometry(message: &AgentMessage) -> RowGeometry {
-        let mut key = DefaultHasher::new();
-        let mut sources = vec![HeightSource::Text(message.ui.text_view.clone())];
-        // Activity markers come and go with the run, and runs are not culled.
-        for item in RunProjection::new(message, None).into_items() {
-            let RunItem::Content(step_index) = item else {
-                continue;
-            };
-            let Some(view) = message.ui.step_view(step_index) else {
-                continue;
-            };
-            let expanded = view.expanded() || message.ui.output.thinking_in_progress(step_index);
-            (step_index, expanded).hash(&mut key);
-            match view {
-                StepView::Text { view } => sources.push(HeightSource::Text(view.clone())),
-                StepView::Thinking { view, .. } if expanded => {
-                    sources.push(HeightSource::Text(view.clone()));
-                }
-                StepView::ToolCall { .. } if expanded => {
-                    if let AgentStep::ToolCall(call) = &message.ui.output.steps()[step_index]
-                        && let Some(view) = message.ui.file_views.get(&call.call.id)
-                    {
-                        sources.push(HeightSource::FileChange(view.clone()));
-                    }
-                }
-                _ => {}
-            }
-        }
-        RowGeometry {
-            key: key.finish(),
-            sources,
-        }
-    }
-
     /// An agent message: the comments it was asked about, a summary of its
     /// work and, while that is open, the work itself, then its response.
     #[allow(clippy::too_many_arguments)]
@@ -1717,6 +1674,126 @@ impl Cowork {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// The selectable views and prompts the row of `row` draws, in the order
+    /// it draws them, for Copy of a selection spanning rows. Keep in step
+    /// with [`Self::render_timeline_message`]. Tool calls and comments are
+    /// not selectable text.
+    pub(crate) fn copy_pieces(
+        &self,
+        thread_id: Uuid,
+        row: &TimelineRow,
+        cx: &App,
+    ) -> Vec<CopyPiece> {
+        let prompts = |group: &UserMessage, pieces: &mut Vec<CopyPiece>| {
+            pieces.extend(
+                group
+                    .record
+                    .blocks
+                    .iter()
+                    .filter(|block| !block.text.trim().is_empty())
+                    .map(|block| CopyPiece::Prompt {
+                        block_id: block.id,
+                        text: block.text.clone().into(),
+                    }),
+            );
+        };
+        // Agent text shows split into segments around its comments.
+        let text = |message_id: Uuid,
+                    text: &str,
+                    view: &Entity<TextViewState>,
+                    pieces: &mut Vec<CopyPiece>| {
+            let id = ThreadMessageId {
+                thread_id,
+                message_id,
+            };
+            match self
+                .shown_segments
+                .get(&id)
+                .and_then(|shown| shown.segments.as_ref())
+            {
+                Some(segments) => pieces.extend(
+                    segments
+                        .iter()
+                        .map(|segment| CopyPiece::Text(segment.state.clone())),
+                ),
+                None if !text.is_empty() => pieces.push(CopyPiece::Text(view.clone())),
+                None => {}
+            }
+        };
+        let mut pieces = Vec::new();
+        let message = match &row.message {
+            TimelineMessage::User(group) => {
+                prompts(group, &mut pieces);
+                return pieces;
+            }
+            TimelineMessage::Agent(message) => message,
+        };
+        let response_to = |comment_id: Uuid| {
+            message
+                .ui
+                .comment_responses
+                .iter()
+                .filter(move |response| response.comment_id == comment_id)
+        };
+        for comment in &row.submitted_comments {
+            for response in response_to(comment.id) {
+                text(
+                    response.id,
+                    &response.response,
+                    &response.response_view,
+                    &mut pieces,
+                );
+            }
+        }
+        let activity = self
+            .thread_store
+            .read(cx)
+            .thread(thread_id, cx)
+            .and_then(|thread| thread.read(cx).run_activity(message.record.id));
+        for item in RunProjection::new(message, activity).into_items() {
+            match item {
+                RunItem::Content(step_index) => match message.ui.step_view(step_index) {
+                    Some(StepView::Text { view }) => pieces.push(CopyPiece::Text(view.clone())),
+                    Some(StepView::Thinking { view, .. })
+                        if message.ui.output.thinking_in_progress(step_index)
+                            || message
+                                .ui
+                                .step_view(step_index)
+                                .is_some_and(StepView::expanded) =>
+                    {
+                        pieces.push(CopyPiece::Text(view.clone()));
+                    }
+                    _ => {}
+                },
+                RunItem::Steering(id) => {
+                    if let Some((_, group)) =
+                        row.steered.iter().find(|(_, group)| group.record.id == id)
+                    {
+                        prompts(group, &mut pieces);
+                        for comment in &group.record.comments {
+                            for response in response_to(comment.id) {
+                                text(
+                                    response.id,
+                                    &response.response,
+                                    &response.response_view,
+                                    &mut pieces,
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        text(
+            message.record.id,
+            &message.ui.output.text,
+            &message.ui.text_view,
+            &mut pieces,
+        );
+        pieces
     }
 
     /// The timeline entry `row` captured.
