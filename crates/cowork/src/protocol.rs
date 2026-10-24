@@ -45,7 +45,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 36;
+pub(crate) const PROTOCOL_VERSION: u32 = 37;
 
 /// A request from a collaborator to the host.
 ///
@@ -252,11 +252,13 @@ pub(crate) enum HostMessage {
     /// transcript as the run's first input, in an `AgentEvent`.
     /// `comment_group_id` identifies the submitted user comments rendered at
     /// the top of this response. `started_at` is when the host started
-    /// generating it.
+    /// generating it. `model` is the model the run uses, shown with the
+    /// message; see [`AgentMessage::model`].
     AgentStarted {
         id: uuid::Bytes,
         comment_group_id: Option<uuid::Bytes>,
         started_at: SystemTime,
+        model: Option<ModelRef>,
     },
     /// Something the host's agent session reported while producing message
     /// `id`. Every participant, the host included, folds these into the
@@ -542,6 +544,11 @@ pub(crate) struct AgentMessage {
     /// these, never sent separately; see `transcript.rs`.
     pub(crate) pending_events: Vec<Preview>,
     pub(crate) run: AgentRun,
+    /// The model that wrote the message, so a thread that switched models
+    /// shows each message's own provider. A run keeps its model to the end,
+    /// as a model change applies from the next run. `None` for a reply no
+    /// model wrote (the onboarding greeting).
+    pub(crate) model: Option<ModelRef>,
     /// The tool call the run is waiting for approval of; see
     /// [`HostMessage::ToolApprovalRequested`].
     pub(crate) awaiting_approval: Option<ToolCallId>,
@@ -725,7 +732,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ModelInfo, ModelProvider};
+    use crate::models::{ModelInfo, ModelProvider, Reasoning};
 
     fn sample_model() -> ModelRef {
         ModelRef {
@@ -744,7 +751,9 @@ mod tests {
                     ModelInfo {
                         name: "Qwen".into(),
                         max_tokens: 131_072,
+                        max_output_tokens: Some(8_192),
                         image_input: Some(true),
+                        reasoning: Reasoning::Effort("medium".into()),
                     },
                 ),
                 (
@@ -752,7 +761,9 @@ mod tests {
                     ModelInfo {
                         name: "Llama".into(),
                         max_tokens: 8_192,
+                        max_output_tokens: None,
                         image_input: None,
+                        reasoning: Reasoning::Budget(1_024),
                     },
                 ),
             ],
@@ -957,6 +968,7 @@ mod tests {
                         outcome: RunOutcome::Failed("Failed".into()),
                         duration: Duration::from_millis(12_345),
                     },
+                    model: Some(sample_model()),
                     awaiting_approval: Some(ToolCallId("call_1".into())),
                 }),
             ],
@@ -1054,6 +1066,7 @@ mod tests {
                 id: [7; 16],
                 comment_group_id: Some([8; 16]),
                 started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                model: Some(sample_model()),
             },
             HostMessage::AgentEvent {
                 id: [7; 16],

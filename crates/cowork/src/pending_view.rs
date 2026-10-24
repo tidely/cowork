@@ -86,7 +86,7 @@ impl Cowork {
                         ),
                 )
             });
-        self.render_message_row(None, [separator.into_any_element()])
+        self.render_message_row(None, [separator.into_any_element()], cx)
             .into_any_element()
     }
 

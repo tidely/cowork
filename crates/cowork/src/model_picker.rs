@@ -1,44 +1,74 @@
-//! The model picker and context window indicator in the bottom bar, and
-//! discovering the models this app can run.
+//! The model picker and context window indicator in the bottom bar, and how
+//! providers are shown: their names and logos. Discovering the models is
+//! `providers.rs`'s.
 
 use std::{collections::BTreeMap, sync::Arc};
 
 use gpui::{
-    App, AppContext, Context, Entity, IntoElement, SharedString, Subscription, WeakEntity, Window,
-    div, img, prelude::*, px,
+    App, AppContext, Context, Entity, IntoElement, Pixels, SharedString, Subscription, WeakEntity,
+    Window, div, img, prelude::*, px, svg,
 };
 use gpui_component::{
+    ActiveTheme as _,
     combobox::{ComboboxEvent, ComboboxState},
     searchable_list::{SearchableGroup, SearchableListItem, SearchableVec},
     tooltip::Tooltip,
 };
 
 use crate::{
-    Cowork,
-    assets::OLLAMA_AVATAR_PATH,
+    Cowork, assets,
     context_settings::{context_details, context_ring},
-    models::{ModelCatalog, ModelInfo, ModelProvider, ModelRef},
+    models::{ModelCatalog, ModelProvider, ModelRef},
     thread::{Thread, ThreadOwnership},
     usage::ContextUsage,
 };
+
+/// How a provider's logo is drawn.
+enum Logo {
+    /// A one-color mark, drawn in the theme's text color so it reads on any
+    /// background (the files' own fill would be black).
+    Monochrome(&'static str),
+    /// A mark in its brand colors, drawn as it is.
+    Colored(&'static str),
+}
 
 impl ModelProvider {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::Ollama => "Ollama",
+            Self::Anthropic => "Anthropic",
+            Self::OpenAi => "OpenAI",
         }
     }
 
-    pub(crate) fn icon_path(self) -> &'static str {
+    fn logo(self) -> Logo {
         match self {
-            Self::Ollama => OLLAMA_AVATAR_PATH,
+            Self::Ollama => Logo::Monochrome(assets::OLLAMA_LOGO_PATH),
+            Self::Anthropic => Logo::Colored(assets::ANTHROPIC_LOGO_PATH),
+            Self::OpenAi => Logo::Monochrome(assets::OPENAI_LOGO_PATH),
         }
+    }
+
+    /// The provider's logo, `size` square. Dimming the returned element
+    /// (`opacity`) dims the logo.
+    pub(crate) fn icon(self, size: Pixels, cx: &App) -> gpui::Div {
+        let logo = match self.logo() {
+            Logo::Monochrome(path) => svg()
+                .path(path)
+                .size_full()
+                .text_color(cx.theme().foreground)
+                .into_any_element(),
+            Logo::Colored(path) => img(path).size_full().into_any_element(),
+        };
+        div().size(size).flex_none().child(logo)
     }
 
     /// Shown under the name on the provider's setup card.
     pub(crate) fn description(self) -> &'static str {
         match self {
             Self::Ollama => "Run models locally",
+            Self::Anthropic => "Claude models, with an API key",
+            Self::OpenAi => "GPT models, with an API key",
         }
     }
 }
@@ -64,16 +94,16 @@ impl SearchableListItem for LanguageModel {
         self.name.clone()
     }
 
-    fn render(&self, _: &mut Window, _: &mut App) -> impl IntoElement {
+    fn render(&self, _: &mut Window, cx: &mut App) -> impl IntoElement {
         div()
             .id(SharedString::from(format!("model-{}", self.model.id)))
             .flex()
             .items_center()
             .gap_2()
             .child(
-                img(self.model.provider.icon_path())
-                    .size(px(18.))
-                    .rounded(px(4.))
+                self.model
+                    .provider
+                    .icon(px(16.), cx)
                     .when(!self.available, |this| this.opacity(0.5)),
             )
             .child(self.name.clone())
@@ -168,50 +198,6 @@ impl Cowork {
         });
         let subscription = cx.subscribe(&picker, Self::model_picker_event);
         (picker, subscription)
-    }
-
-    /// Asks Ollama which models it offers, and makes them the catalog. The
-    /// picker follows on the next frame; see [`Cowork::sync_model_picker`].
-    pub(crate) fn refresh_models(&mut self, cx: &mut Context<Self>) {
-        self.discover_models(cx).detach();
-    }
-
-    /// [`Cowork::refresh_models`], finishing once the catalog is replaced or
-    /// discovery failed.
-    pub(crate) fn discover_models(&mut self, cx: &mut Context<Self>) -> gpui::Task<()> {
-        let task = self.tokio_handle.spawn(async {
-            crate::submission::provider(ModelProvider::Ollama)?
-                .list_models()
-                .await
-                .map_err(anyhow::Error::from)
-        });
-        cx.spawn(async move |this, cx| match task.await {
-            Ok(Ok(models)) => {
-                _ = this.update(cx, |this, cx| {
-                    let mut catalog = ModelCatalog::default();
-                    catalog.set_provider(
-                        ModelProvider::Ollama,
-                        models
-                            .into_iter()
-                            .filter(|model| !model.id.is_empty())
-                            .map(|model| {
-                                let name = model.name.unwrap_or_else(|| model.id.clone());
-                                let info = ModelInfo {
-                                    name,
-                                    // Ollama's listing does not report a maximum.
-                                    max_tokens: this.context_settings.window_tokens,
-                                    image_input: model.image_input,
-                                };
-                                (model.id, info)
-                            }),
-                    );
-                    this.set_models(catalog, cx);
-                    cx.notify();
-                });
-            }
-            Ok(Err(error)) => eprintln!("could not discover Ollama models: {error:#}"),
-            Err(error) => eprintln!("Ollama discovery task failed: {error}"),
-        })
     }
 
     fn model_picker_event(

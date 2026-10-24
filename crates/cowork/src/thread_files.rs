@@ -62,8 +62,9 @@ use crate::{
     usage::TokenActivity,
 };
 
-/// The format of `thread.json` and `messages.jsonl`.
-const FILE_VERSION: u32 = 1;
+/// The format of `thread.json` and `messages.jsonl`. 2 records each run's
+/// model.
+const FILE_VERSION: u32 = 2;
 const THREAD_FILE: &str = "thread.json";
 const MESSAGES_FILE: &str = "messages.jsonl";
 const ATTACHMENTS_DIR: &str = "attachments";
@@ -181,6 +182,8 @@ struct SavedRun {
     /// The reply a stopped or failed run had sampled so far, which the
     /// transcript never got.
     unfinished: Option<Envelope>,
+    /// The model that wrote the reply; `None` when no model did.
+    model: Option<ModelRef>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -273,6 +276,7 @@ impl SavedMessage {
                     unfinished: ReplyPreview::of(&run.pending_events)
                         .partial()
                         .and_then(|reply| Envelope::encode_message(&reply).ok()),
+                    model: run.model,
                 })
             }
         }
@@ -338,6 +342,7 @@ impl SavedMessage {
                         },
                         duration: run.duration,
                     },
+                    model: run.model,
                     awaiting_approval: None,
                 })
             }
@@ -1156,6 +1161,14 @@ mod tests {
         events.push(host.ended(run, protocol::RunOutcome::Completed));
         for event in events {
             thread.apply_for_test(event, cx);
+        }
+        for message in &mut thread.timeline {
+            if let TimelineMessage::Agent(message) = message {
+                message.record.model = Some(ModelRef {
+                    provider: crate::models::ModelProvider::Anthropic,
+                    id: "claude".into(),
+                });
+            }
         }
         (thread, records.into_iter().next().unwrap())
     }

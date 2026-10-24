@@ -2,15 +2,19 @@
 //! screen before the first chat (`welcome.rs`), and by the Providers settings
 //! page without the welcome text (`settings.rs`). Each passes its own intro
 //! and closing button; the steps, cards, and buttons between them are here.
+//! A provider that needs an API key asks for it above its models; keeping
+//! the key is `providers.rs`'s.
 
 use std::sync::Arc;
 
 use gpui::{
-    AnyElement, App, Context, IntoElement, SharedString, Stateful, div, img, prelude::*, px,
+    AnyElement, App, Context, Entity, IntoElement, SharedString, Stateful, Subscription, Window,
+    div, prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Disableable as _,
     button::{Button, ButtonVariants as _},
+    input::{Input, InputEvent, InputState},
     tooltip::Tooltip,
 };
 
@@ -19,6 +23,26 @@ use crate::{
     models::{ModelCatalog, ModelProvider, ModelRef},
     usage::format_token_count,
 };
+
+/// The API key field on a provider's models step. Made for one provider
+/// and dropped when another's models show, or once its key is saved, so it
+/// never shows one provider's key under another.
+pub(crate) struct ApiKeyInput {
+    provider: ModelProvider,
+    state: Entity<InputState>,
+    _subscription: Subscription,
+}
+
+/// A step's small capitals heading, over the full width.
+fn section_label(label: &'static str, cx: &App) -> AnyElement {
+    div()
+        .mb_3()
+        .w_full()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .child(label)
+        .into_any_element()
+}
 
 /// Which step of setting up a provider is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -109,12 +133,7 @@ fn setup_card_content(
             .flex()
             .items_center()
             .gap_2()
-            .child(
-                img(provider.icon_path())
-                    .size(px(24.))
-                    .flex_none()
-                    .rounded(px(5.)),
-            )
+            .child(provider.icon(px(22.), cx))
             .child(
                 div()
                     .min_w_0()
@@ -137,11 +156,12 @@ impl Cowork {
     /// Shows `step` with `intro` above the cards and `footer` below the
     /// buttons.
     pub(crate) fn render_provider_setup(
-        &self,
+        &mut self,
         place: ProviderSetupPlace,
         step: ProviderStep,
         intro: Option<AnyElement>,
         footer: Option<AnyElement>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let stage_id = match (place, step) {
@@ -151,14 +171,16 @@ impl Cowork {
             (ProviderSetupPlace::Settings, ProviderStep::Models(_)) => "provider-models-page",
         };
         let has_intro = intro.is_some();
-        let (label, body) = match step {
-            ProviderStep::Providers => {
-                ("AVAILABLE PROVIDERS", self.render_provider_step(place, cx))
+        let body = match step {
+            ProviderStep::Providers => self.render_provider_step(place, cx),
+            ProviderStep::Models(provider) => {
+                let mut body = Vec::new();
+                if provider.needs_api_key() {
+                    body.extend(self.render_api_key_section(provider, window, cx));
+                }
+                body.extend(self.render_model_step(place, provider, cx));
+                body
             }
-            ProviderStep::Models(provider) => (
-                "AVAILABLE MODELS",
-                self.render_model_step(place, provider, cx),
-            ),
         };
 
         div()
@@ -190,13 +212,12 @@ impl Cowork {
                     .child(
                         div()
                             .when(has_intro, |this| this.mt_8())
-                            .mb_3()
                             .w_full()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(label),
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .children(body),
                     )
-                    .children(body)
                     .children(footer),
             )
     }
@@ -215,6 +236,11 @@ impl Cowork {
                 .flex_wrap()
                 .gap_3()
                 .children(ModelProvider::ALL.into_iter().map(|provider| {
+                    let detail = if self.providers.has_api_key(provider) {
+                        "API key saved"
+                    } else {
+                        provider.description()
+                    };
                     setup_card(
                         format!("setup-provider-{}", provider.label()),
                         selected == Some(provider),
@@ -227,7 +253,7 @@ impl Cowork {
                     .children(setup_card_content(
                         provider,
                         provider.label(),
-                        provider.description(),
+                        detail,
                         cx,
                     ))
                 }));
@@ -245,7 +271,148 @@ impl Cowork {
                     this.show_provider_step(place, ProviderStep::Models(provider), cx);
                 }
             }));
-        vec![cards.into_any_element(), continue_button.into_any_element()]
+        vec![
+            section_label("AVAILABLE PROVIDERS", cx),
+            cards.into_any_element(),
+            continue_button.into_any_element(),
+        ]
+    }
+
+    /// `provider`'s API key: a field to save a new one, removing the saved
+    /// one, where to get one, and what went wrong with it.
+    fn render_api_key_section(
+        &mut self,
+        provider: ModelProvider,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
+        let input = self.api_key_input(provider, window, cx);
+        let has_key = self.providers.has_api_key(provider);
+        let entered = !input.read(cx).value().trim().is_empty();
+        let field = div()
+            .w_full()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .debug_selector(|| "api-key-input".to_owned())
+                    .child(
+                        Input::new(&input)
+                            .id("api-key-input")
+                            .mask_toggle()
+                            .h(px(38.)),
+                    ),
+            )
+            .child(
+                Button::new("api-key-save")
+                    .primary()
+                    .label(if has_key { "Replace key" } else { "Save key" })
+                    .disabled(!entered)
+                    .debug_selector(|| "api-key-save".to_owned())
+                    .h(px(38.))
+                    .on_click(cx.listener(|this, _, _, cx| this.submit_api_key(cx))),
+            )
+            .when(has_key, |this| {
+                this.child(
+                    Button::new("api-key-remove")
+                        .ghost()
+                        .label("Remove")
+                        .debug_selector(|| "api-key-remove".to_owned())
+                        .h(px(38.))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.remove_api_key(provider, cx);
+                        })),
+                )
+            });
+        let note = div()
+            .mt_2()
+            .w_full()
+            .flex()
+            .flex_wrap()
+            .gap_1()
+            .text_xs()
+            .text_color(cx.theme().muted_foreground)
+            .child(if has_key {
+                "A key is saved in your system keychain."
+            } else {
+                "Saved in your system keychain, and never shared with collaborators."
+            })
+            .when_some(provider.api_key_page(), |this, page| {
+                this.child(
+                    div()
+                        .id("api-key-page")
+                        .cursor_pointer()
+                        .text_color(cx.theme().link)
+                        .hover(|this| this.underline())
+                        .child("Get an API key")
+                        .on_click(move |_, _, cx| cx.open_url(page)),
+                )
+            });
+        let error = self.providers.error(provider).map(|error| {
+            div()
+                .mt_2()
+                .w_full()
+                .text_xs()
+                .text_color(cx.theme().danger)
+                .child(error)
+        });
+        vec![
+            section_label("API KEY", cx),
+            field.into_any_element(),
+            note.into_any_element(),
+            div().mb_8().w_full().children(error).into_any_element(),
+        ]
+    }
+
+    /// The API key field for `provider`, made the first time it shows.
+    fn api_key_input(
+        &mut self,
+        provider: ModelProvider,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<InputState> {
+        if let Some(input) = &self.api_key_input
+            && input.provider == provider
+        {
+            return input.state.clone();
+        }
+        let placeholder = match provider {
+            ModelProvider::Anthropic => "sk-ant-…",
+            ModelProvider::Ollama | ModelProvider::OpenAi => "sk-…",
+        };
+        let state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .masked(true)
+                .placeholder(placeholder)
+        });
+        let subscription = cx.subscribe(&state, |this, _, event: &InputEvent, cx| match event {
+            InputEvent::Change => cx.notify(),
+            InputEvent::PressEnter { .. } => this.submit_api_key(cx),
+            _ => {}
+        });
+        self.api_key_input = Some(ApiKeyInput {
+            provider,
+            state: state.clone(),
+            _subscription: subscription,
+        });
+        state
+    }
+
+    /// Saves the key typed in the field, clearing the field.
+    fn submit_api_key(&mut self, cx: &mut Context<Self>) {
+        let Some(input) = &self.api_key_input else {
+            return;
+        };
+        let provider = input.provider;
+        let key = input.state.read(cx).value();
+        if key.trim().is_empty() {
+            return;
+        }
+        self.api_key_input = None;
+        self.save_api_key(provider, &key, cx);
     }
 
     /// `provider`'s model cards, going back to the providers, and
@@ -271,6 +438,14 @@ impl Cowork {
             })
             .collect::<Vec<_>>();
         let has_models = !models.is_empty();
+        let reachable = !provider.needs_api_key() || self.providers.has_api_key(provider);
+        let empty_message = if provider == ModelProvider::Ollama {
+            "No Ollama models found. Start Ollama, then try again.".to_owned()
+        } else if reachable {
+            format!("No {} models found.", provider.label())
+        } else {
+            format!("Save an API key to see {}'s models.", provider.label())
+        };
 
         let cards = div()
             .w_full()
@@ -300,15 +475,13 @@ impl Cowork {
                         .border_1()
                         .border_color(cx.theme().border)
                         .text_color(cx.theme().muted_foreground)
-                        .child(format!(
-                            "No {0} models found. Start {0}, then try again.",
-                            provider.label()
-                        )),
+                        .child(empty_message),
                 )
             });
         // The welcome screen offers discovering again only when it found
-        // nothing; settings always do, for models pulled since.
-        let show_refresh = !has_models || place == ProviderSetupPlace::Settings;
+        // nothing; settings always do, for models pulled since. Without a
+        // key there is nothing to discover.
+        let show_refresh = reachable && (!has_models || place == ProviderSetupPlace::Settings);
         let buttons = div()
             .mt_6()
             .flex()
@@ -337,7 +510,11 @@ impl Cowork {
                         })),
                 )
             });
-        vec![cards.into_any_element(), buttons.into_any_element()]
+        vec![
+            section_label("AVAILABLE MODELS", cx),
+            cards.into_any_element(),
+            buttons.into_any_element(),
+        ]
     }
 
     /// Moves to `step`, discovering the provider's models when it shows them.
@@ -356,6 +533,8 @@ impl Cowork {
             }
             ProviderSetupPlace::Settings => self.settings_provider_step = step,
         }
+        // A half-typed key never carries over to another visit.
+        self.api_key_input = None;
         if let ProviderStep::Models(_) = step {
             self.refresh_models(cx);
         }

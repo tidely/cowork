@@ -5,7 +5,7 @@
 mod generation;
 #[cfg(test)]
 pub(crate) use generation::RunTotals;
-pub(crate) use generation::{ActiveGeneration, ThreadAgent, provider};
+pub(crate) use generation::{ActiveGeneration, ThreadAgent};
 
 use std::{collections::HashMap, sync::Arc};
 

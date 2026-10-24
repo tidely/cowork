@@ -98,7 +98,10 @@ fields; base64 images and tool calls retain their order in native arrays.
 Assistant thinking must precede text/images, which must precede tool calls;
 backwards interleaving is rejected. Native fields still merge adjacent blocks
 and cannot preserve text/image placement. The canonical input is not mutated,
-and its stored representation keeps those distinctions.
+and its stored representation keeps those distinctions. Streamed replies
+finish in that same order whatever order their fields arrived in (a model may
+stream tool calls before text), so a reply can always be sent back; previews
+keep their arrival indices.
 
 Native tool calls use full JSON argument objects. Responses with scalar,
 array, string, or explicit-null arguments remain canonical `Invalid` arguments,

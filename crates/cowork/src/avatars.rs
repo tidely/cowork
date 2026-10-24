@@ -3,11 +3,11 @@
 use std::collections::HashMap;
 
 use gpui::{App, FontWeight, SharedString, div, img, prelude::*, px, rgb};
-use gpui_component::ActiveTheme;
+use gpui_component::{ActiveTheme, Icon};
+use gpui_kit_assets::IconName;
 
 use crate::{
     Cowork,
-    assets::OLLAMA_AVATAR_PATH,
     participant::ParticipantId,
     profile::{Profile, appearance, participant_name},
     thread::Thread,
@@ -75,17 +75,30 @@ impl Cowork {
             .child(appearance.initials())
     }
 
-    pub(crate) fn render_avatar(&self, author: MessageAuthor) -> gpui::Div {
+    /// The agent's avatar shows the logo of the provider whose model wrote
+    /// the message, or a generic one when no model did.
+    pub(crate) fn render_avatar(&self, author: MessageAuthor, cx: &App) -> gpui::Div {
         const SIZE: gpui::Pixels = px(22.);
+        const LOGO: gpui::Pixels = px(14.);
 
         match author {
             MessageAuthor::User(participant) => self.render_participant_avatar(participant, SIZE),
-            MessageAuthor::Agent => div()
+            MessageAuthor::Agent(provider) => div()
                 .size(SIZE)
+                .flex()
                 .flex_none()
-                .overflow_hidden()
+                .items_center()
+                .justify_center()
                 .rounded_full()
-                .child(img(OLLAMA_AVATAR_PATH).size_full()),
+                .bg(cx.theme().secondary)
+                .child(match provider {
+                    Some(provider) => provider.icon(LOGO, cx),
+                    None => div().child(
+                        Icon::new(IconName::Bot)
+                            .size(LOGO)
+                            .text_color(cx.theme().foreground),
+                    ),
+                }),
         }
     }
 
@@ -133,7 +146,7 @@ impl Cowork {
         let count = layered.len();
         div()
             .relative()
-            .child(self.render_avatar(MessageAuthor::User(primary)))
+            .child(self.render_avatar(MessageAuthor::User(primary), cx))
             .children(layered.into_iter().enumerate().map(|(index, avatar)| {
                 // Centered under the primary avatar, fanned out sideways.
                 let offset = (index as f32 - (count as f32 - 1.) / 2.) * STEP;

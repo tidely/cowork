@@ -223,6 +223,8 @@ impl Thread {
                 id: id.into_bytes(),
                 comment_group_id: None,
                 started_at: SystemTime::now(),
+                // The greeting is canned; no model writes it.
+                model: None,
             },
             cx,
         );

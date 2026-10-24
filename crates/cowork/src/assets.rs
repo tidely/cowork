@@ -4,7 +4,26 @@ use std::borrow::Cow;
 
 use gpui::{AssetSource, SharedString};
 
-pub(crate) const OLLAMA_AVATAR_PATH: &str = "providers/ollama.png";
+pub(crate) const OLLAMA_LOGO_PATH: &str = "providers/ollama.svg";
+pub(crate) const ANTHROPIC_LOGO_PATH: &str = "providers/anthropic.svg";
+pub(crate) const OPENAI_LOGO_PATH: &str = "providers/openai.svg";
+
+/// The providers' logos, by path; how each is drawn is
+/// `ModelProvider::icon`'s.
+const PROVIDER_LOGOS: [(&str, &[u8]); 3] = [
+    (
+        OLLAMA_LOGO_PATH,
+        include_bytes!("../../../assets/providers/ollama.svg"),
+    ),
+    (
+        ANTHROPIC_LOGO_PATH,
+        include_bytes!("../../../assets/providers/anthropic.svg"),
+    ),
+    (
+        OPENAI_LOGO_PATH,
+        include_bytes!("../../../assets/providers/openai.svg"),
+    ),
+];
 
 gpui_kit_assets::icon_assets!(
     AppIconAssets,
@@ -74,19 +93,20 @@ pub(crate) struct Assets;
 
 impl AssetSource for Assets {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
-        match path {
-            OLLAMA_AVATAR_PATH => Ok(Some(Cow::Borrowed(include_bytes!(
-                "../../../assets/providers/ollama.png"
-            )))),
-            _ => AppIconAssets.load(path),
+        match PROVIDER_LOGOS.iter().find(|(logo, _)| *logo == path) {
+            Some((_, bytes)) => Ok(Some(Cow::Borrowed(bytes))),
+            None => AppIconAssets.load(path),
         }
     }
 
     fn list(&self, path: &str) -> gpui::Result<Vec<SharedString>> {
         let mut assets = AppIconAssets.list(path)?;
-        if OLLAMA_AVATAR_PATH.starts_with(path) {
-            assets.push(OLLAMA_AVATAR_PATH.into());
-        }
+        assets.extend(
+            PROVIDER_LOGOS
+                .iter()
+                .filter(|(logo, _)| logo.starts_with(path))
+                .map(|(logo, _)| SharedString::from(*logo)),
+        );
         Ok(assets)
     }
 }
@@ -98,8 +118,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn assets_serve_icons_and_the_provider_logo() {
-        for path in [IconName::SendHorizontal.path(), OLLAMA_AVATAR_PATH.into()] {
+    fn assets_serve_icons_and_the_provider_logos() {
+        let logos = PROVIDER_LOGOS
+            .iter()
+            .map(|(path, _)| SharedString::from(*path));
+        for path in std::iter::once(IconName::SendHorizontal.path()).chain(logos) {
             let bytes = Assets.load(&path).unwrap().expect("a bundled asset");
             assert!(!bytes.is_empty(), "empty asset: {path}");
         }

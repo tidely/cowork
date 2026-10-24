@@ -932,6 +932,8 @@ pub(crate) mod tests {
                         stage_before_settings: MainStage::Thread,
                         selected_provider: None,
                         settings_provider_step: Default::default(),
+                        providers: Default::default(),
+                        api_key_input: None,
                         context_settings: Default::default(),
                         profile: Profile::local(actor),
                         shown_profiles: HashMap::new(),

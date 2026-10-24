@@ -14,6 +14,7 @@ use uuid::Uuid;
 use crate::{
     attachments::{record_from_protocol, record_to_protocol},
     file_change_view::FileChangeView,
+    models::{ModelProvider, ModelRef},
     participant::ParticipantId,
     protocol::{self, AgentRun},
     thread_draft::ItemPresence,
@@ -23,7 +24,9 @@ use crate::{
 #[derive(Clone, Copy)]
 pub(crate) enum MessageAuthor {
     User(ParticipantId),
-    Agent,
+    /// The agent, with the provider of the model that wrote the message
+    /// when it is known.
+    Agent(Option<ModelProvider>),
 }
 
 /// Orthogonal activity is owned by the thread's one active execution. Ended
@@ -71,6 +74,8 @@ pub(crate) struct AgentRunRecord {
     /// See [`protocol::AgentMessage::pending_events`].
     pub(crate) pending_events: Vec<protocol::Preview>,
     pub(crate) run: AgentRun,
+    /// See [`protocol::AgentMessage::model`].
+    pub(crate) model: Option<ModelRef>,
 
     /// The tool call the run is waiting for someone to allow or deny. Kept
     /// beside `output` rather than in it, since the output is refolded on
@@ -810,6 +815,7 @@ impl AgentMessage {
                 start,
                 pending_events,
                 run,
+                model: None,
                 awaiting_approval: None,
             },
             ui: AgentMessageUi {
@@ -880,6 +886,7 @@ impl AgentRunRecord {
             start: self.start,
             pending_events: self.pending_events.clone(),
             run: self.run.clone(),
+            model: self.model.clone(),
             awaiting_approval: self.awaiting_approval.clone(),
         }
     }
@@ -899,6 +906,7 @@ impl protocol::AgentMessage {
             self.pending_events,
             cx,
         );
+        message.record.model = self.model;
         message.record.awaiting_approval = self.awaiting_approval;
         message
     }

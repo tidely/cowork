@@ -255,6 +255,17 @@ impl Fold {
                     return Err(response_error("Ollama completed an unnamed tool call"));
                 }
             }
+            // Blocks were added in arrival order, but a native message is
+            // unordered fields: a model can stream its tool calls before its
+            // text. Finish in the fields' order (thinking, text, calls), the
+            // only order requests accept, so every reply can be sent back.
+            // A stable sort keeps each kind's own order; previews already
+            // shown keep the indices they had.
+            self.message.content.sort_by_key(|content| match content {
+                Content::Reasoning(_) => 0,
+                Content::Text { .. } | Content::Image(_) => 1,
+                _ => 2,
+            });
             let usage = Usage {
                 input_tokens: self
                     .metadata

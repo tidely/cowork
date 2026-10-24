@@ -130,7 +130,9 @@ fn agent_stream_events(host: &mut ScriptedHost, message_id: Uuid) -> Vec<protoco
                     ModelInfo {
                         name: "Other".into(),
                         max_tokens: 65_536,
+                        max_output_tokens: None,
                         image_input: None,
+                        reasoning: crate::models::Reasoning::Default,
                     },
                 )],
             );

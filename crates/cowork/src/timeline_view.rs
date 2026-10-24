@@ -595,7 +595,11 @@ impl Cowork {
                         .into_any_element(),
                 );
             }
-            rows.push(self.render_message_row(Some(MessageAuthor::User(block.author)), content));
+            rows.push(self.render_message_row(
+                Some(MessageAuthor::User(block.author)),
+                content,
+                cx,
+            ));
         }
 
         div()
@@ -626,7 +630,7 @@ impl Cowork {
         let authors = Self::comment_authors(comments);
         match authors.split_first() {
             Some((first, rest)) => self.render_presence_row(*first, rest, content, cx),
-            None => self.render_message_row(None, content),
+            None => self.render_message_row(None, content, cx),
         }
     }
 
@@ -649,7 +653,7 @@ impl Cowork {
         content: impl IntoIterator<Item = gpui::AnyElement>,
         cx: &App,
     ) -> gpui::Div {
-        self.render_message_row(None, content)
+        self.render_message_row(None, content, cx)
             .child(
                 div()
                     .absolute()
@@ -735,6 +739,7 @@ impl Cowork {
         &self,
         author: Option<MessageAuthor>,
         content: impl IntoIterator<Item = gpui::AnyElement>,
+        cx: &App,
     ) -> gpui::Div {
         div()
             .w_full()
@@ -746,7 +751,7 @@ impl Cowork {
                     .flex_none()
                     .flex()
                     .justify_center()
-                    .children(author.map(|author| self.render_avatar(author))),
+                    .children(author.map(|author| self.render_avatar(author, cx))),
             )
             .child(
                 div()
@@ -1542,7 +1547,12 @@ impl Cowork {
                     .flex_none()
                     .flex()
                     .justify_center()
-                    .child(self.render_avatar(MessageAuthor::Agent)),
+                    .child(self.render_avatar(
+                        MessageAuthor::Agent(
+                            message.record.model.as_ref().map(|model| model.provider),
+                        ),
+                        cx,
+                    )),
             )
             .child(
                 div()

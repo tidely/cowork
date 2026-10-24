@@ -399,7 +399,7 @@ fn generation_profile() {
                 let mut stats = Stats::default();
                 cx.update(|cx| fixture.emit(HostMessage::AgentStarted {
                     id: fixture.message_id.into_bytes(), comment_group_id: None,
-                    started_at: SystemTime::now(),
+                    started_at: SystemTime::now(), model: None,
                 }, &mut stats, cx));
                 let (sender, mut receiver) = mpsc::unbounded_channel();
                 let queued = Arc::new(AtomicUsize::new(0));

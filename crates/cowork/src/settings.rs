@@ -79,7 +79,10 @@ impl Cowork {
         self.main_stage = MainStage::Settings(page);
         match page {
             SettingsPage::Profile => self.profile_error = None,
-            SettingsPage::Providers => self.settings_provider_step = ProviderStep::Providers,
+            SettingsPage::Providers => {
+                self.settings_provider_step = ProviderStep::Providers;
+                self.api_key_input = None;
+            }
             SettingsPage::Context | SettingsPage::Archive => {}
         }
         // The composer is hidden, so it must not keep taking keystrokes.
@@ -106,7 +109,7 @@ impl Cowork {
     ) -> AnyElement {
         match page {
             SettingsPage::Profile => self.render_profile_page(cx).into_any_element(),
-            SettingsPage::Providers => self.render_providers_page(cx).into_any_element(),
+            SettingsPage::Providers => self.render_providers_page(window, cx).into_any_element(),
             SettingsPage::Context => self.render_context_page(window, cx).into_any_element(),
             SettingsPage::Archive => self.render_archive_page(cx).into_any_element(),
         }
@@ -114,7 +117,11 @@ impl Cowork {
 
     /// The welcome screen's provider steps without its welcome text; the
     /// models step is titled with its provider's name.
-    fn render_providers_page(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    fn render_providers_page(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let step = self.settings_provider_step;
         let intro = match step {
             ProviderStep::Providers => None,
@@ -122,7 +129,7 @@ impl Cowork {
                 Some(provider_setup_intro(provider.label(), None, cx))
             }
         };
-        self.render_provider_setup(ProviderSetupPlace::Settings, step, intro, None, cx)
+        self.render_provider_setup(ProviderSetupPlace::Settings, step, intro, None, window, cx)
     }
 
     /// The settings sidebar's header: the way back to the app, spaced further

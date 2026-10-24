@@ -159,7 +159,9 @@ fn catalog_of(models: &[ModelRef]) -> ModelCatalog {
                         name: model.id.clone(),
                         max_tokens: crate::context_settings::ContextSettings::default()
                             .window_tokens,
+                        max_output_tokens: None,
                         image_input: None,
+                        reasoning: crate::models::Reasoning::Default,
                     };
                     (model.id.clone(), info)
                 }),
@@ -240,6 +242,8 @@ fn test_cowork(
         stage_before_settings: MainStage::Thread,
         selected_provider: None,
         settings_provider_step: Default::default(),
+        providers: Default::default(),
+        api_key_input: None,
         context_settings: Default::default(),
         profile: Profile::local(local_participant_id),
         shown_profiles: HashMap::new(),

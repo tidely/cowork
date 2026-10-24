@@ -11,17 +11,23 @@ use serde::{Deserialize, Serialize};
 /// identity: a catalog lists each at most once, and a model reference cannot
 /// name a provider that does not exist. Its name and icon are fixed per
 /// variant (see `ModelProvider::label` in `model_picker.rs`) and never travel over the
-/// wire. A generic OpenAI-compatible endpoint would be one more variant.
+/// wire. How the app connects to each, and what its requests need, is in
+/// `providers.rs`. A generic OpenAI-compatible endpoint would be one more
+/// variant.
 ///
-/// Declaration order is the order providers are listed in.
+/// Declaration order is the order providers are listed in. New variants go
+/// last: saved settings and schedules name providers, and the wire numbers
+/// them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum ModelProvider {
     Ollama,
+    Anthropic,
+    OpenAi,
 }
 
 impl ModelProvider {
     /// Providers offered during setup, including those with no discovered models.
-    pub(crate) const ALL: [Self; 1] = [Self::Ollama];
+    pub(crate) const ALL: [Self; 3] = [Self::Ollama, Self::Anthropic, Self::OpenAi];
 }
 
 /// Identifies a model: its provider, and the id that provider knows it by.
@@ -38,10 +44,31 @@ pub(crate) struct ModelInfo {
     pub(crate) name: String,
     /// The context window the model is run with.
     pub(crate) max_tokens: u64,
+    /// The longest reply the model can write, when its provider said;
+    /// requests that need a cap (Anthropic's) ask for this much.
+    pub(crate) max_output_tokens: Option<u64>,
     /// Whether the model accepts images, as discovery reported it; `None`
     /// when it didn't say. A model known not to is sent a note in place of
     /// each image (see the agent runtime's model metadata).
     pub(crate) image_input: Option<bool>,
+    /// How requests ask the model to reason.
+    pub(crate) reasoning: Reasoning,
+}
+
+/// How requests ask a model to reason, decided when its provider's models
+/// are discovered, as models differ in what they accept: asking a model for
+/// a kind of reasoning it doesn't support fails the request. Each provider
+/// turns it into its own request parameters (`providers.rs`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum Reasoning {
+    /// Requests don't mention reasoning, leaving the provider's default.
+    Default,
+    /// A model-defined effort level, such as `"medium"`, or `"none"` to turn
+    /// reasoning off where that is how the model accepts tools.
+    Effort(String),
+    /// Thinking within a token budget: Anthropic's extended thinking, for
+    /// models without adaptive thinking.
+    Budget(u64),
 }
 
 /// The models a thread can run, grouped by provider.
@@ -69,10 +96,11 @@ impl ModelCatalog {
         }
     }
 
-    /// Ollama's listing has no window size: every discovered model uses the
-    /// session's configured window. Publishing this catalog keeps peers aligned.
+    /// Ollama runs a model with the window it is asked for, so its models
+    /// use the configured window; other providers' models keep the window
+    /// their provider gave. Publishing this catalog keeps peers aligned.
     pub(crate) fn set_context_window(&mut self, tokens: u64) {
-        for models in self.providers.values_mut() {
+        if let Some(models) = self.providers.get_mut(&ModelProvider::Ollama) {
             for info in models.values_mut() {
                 info.max_tokens = tokens;
             }
@@ -107,7 +135,9 @@ mod tests {
         ModelInfo {
             name: name.into(),
             max_tokens: 1_024,
+            max_output_tokens: None,
             image_input: None,
+            reasoning: Reasoning::Default,
         }
     }
 
@@ -119,5 +149,25 @@ mod tests {
 
         assert_eq!(catalog, ModelCatalog::default());
         assert_eq!(catalog.providers().count(), 0);
+    }
+
+    #[test]
+    fn the_configured_window_applies_only_to_ollama() {
+        let mut catalog = ModelCatalog::default();
+        catalog.set_provider(ModelProvider::Ollama, [("qwen".into(), info("Qwen"))]);
+        catalog.set_provider(ModelProvider::OpenAi, [("gpt".into(), info("GPT"))]);
+        catalog.set_context_window(4_096);
+
+        let window = |provider, id: &str| {
+            catalog
+                .get(&ModelRef {
+                    provider,
+                    id: id.into(),
+                })
+                .unwrap()
+                .max_tokens
+        };
+        assert_eq!(window(ModelProvider::Ollama, "qwen"), 4_096);
+        assert_eq!(window(ModelProvider::OpenAi, "gpt"), 1_024);
     }
 }

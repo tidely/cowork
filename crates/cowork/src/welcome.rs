@@ -1,7 +1,7 @@
 //! The welcome screen before the first chat: setting up a provider (see
 //! `provider_setup.rs`) with a greeting, then starting an onboarding chat.
 
-use gpui::{Context, IntoElement, prelude::*};
+use gpui::{Context, IntoElement, Window, prelude::*};
 use gpui_component::{
     Disableable as _,
     button::{Button, ButtonVariants as _},
@@ -15,7 +15,11 @@ use crate::{
 
 impl Cowork {
     /// Greets the user over the providers.
-    pub(crate) fn render_welcome(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    pub(crate) fn render_welcome(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
         let greeting = self
             .profile
             .name
@@ -32,14 +36,16 @@ impl Cowork {
             ProviderStep::Providers,
             Some(intro),
             None,
+            window,
             cx,
         )
     }
 
     /// Shows the selected provider's models, then starts the onboarding chat.
     pub(crate) fn render_welcome_models(
-        &self,
+        &mut self,
         provider: ModelProvider,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let intro = provider_setup_intro(
@@ -64,6 +70,7 @@ impl Cowork {
             ProviderStep::Models(provider),
             Some(intro),
             Some(start.into_any_element()),
+            window,
             cx,
         )
     }

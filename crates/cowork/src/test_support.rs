@@ -43,6 +43,7 @@ impl Thread {
                         id: Uuid::new_v4().into_bytes(),
                         comment_group_id: None,
                         started_at: std::time::SystemTime::now(),
+                        model: None,
                     },
                     cx,
                 );
@@ -176,6 +177,7 @@ impl ScriptedHost {
             id: id.into_bytes(),
             comment_group_id,
             started_at: std::time::SystemTime::UNIX_EPOCH,
+            model: None,
         }
     }
 

@@ -6,7 +6,7 @@ use std::{cell::Cell, rc::Rc};
 use draft::{DraftItemKind, ItemId};
 use gpui::{
     App, Bounds, Context, Entity, ExternalPaths, Focusable, IntoElement, MouseButton, Window,
-    canvas, div, img, prelude::*, px, rems, rgb,
+    canvas, div, prelude::*, px, rems, rgb,
 };
 use gpui_base::{GlobalState, Textarea, input::TextareaState};
 use gpui_component::{
@@ -370,10 +370,8 @@ impl Cowork {
                                 })
                                 .when_some(provider, |this, provider| {
                                     this.child(
-                                        img(provider.icon_path())
-                                            .size(px(18.))
-                                            .flex_none()
-                                            .rounded(px(4.))
+                                        provider
+                                            .icon(px(16.), cx)
                                             .when(unavailable, |this| this.opacity(0.5)),
                                     )
                                 })
@@ -821,7 +819,7 @@ impl Cowork {
                     .into_any_element(),
             );
         } else if !errors.is_empty() {
-            rows.push(self.render_message_row(None, errors).into_any_element());
+            rows.push(self.render_message_row(None, errors, cx).into_any_element());
         }
 
         div()

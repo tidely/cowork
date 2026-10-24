@@ -72,6 +72,7 @@ mod project_mode;
 mod prompt;
 mod protocol;
 mod provider_setup;
+mod providers;
 mod scheduled_task;
 mod scheduler;
 mod schedules;
@@ -158,6 +159,12 @@ struct Cowork {
     selected_provider: Option<models::ModelProvider>,
     /// Which step the Providers settings page shows.
     settings_provider_step: ProviderStep,
+    /// The connections to providers, with their API keys; see
+    /// `providers.rs`.
+    providers: providers::Providers,
+    /// The API key field of the provider whose models show, made when it
+    /// first shows; see `provider_setup.rs`.
+    api_key_input: Option<provider_setup::ApiKeyInput>,
     context_settings: context_settings::ContextSettings,
     profile: Profile,
     /// Everyone's profile as the active thread shows them, refreshed at the
@@ -263,11 +270,12 @@ impl Cowork {
     }
 
     /// What a launch opens on, once the saved threads and settings are
-    /// loaded. Models are discovered either way. A new user is onboarded
-    /// (see `thread/onboarding.rs`); anyone else gets a new chat, with the
-    /// saved model or none yet, to pick in the composer.
+    /// loaded. Models are discovered either way, once the API keys are
+    /// read. A new user is onboarded (see `thread/onboarding.rs`); anyone
+    /// else gets a new chat, with the saved model or none yet, to pick in
+    /// the composer.
     fn open_start_stage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let discovered = self.discover_models(cx);
+        let discovered = self.start_providers(cx);
         if self.needs_onboarding(cx) {
             self.offer_onboarding(discovered, window, cx);
         } else {
@@ -709,9 +717,9 @@ impl Render for Cowork {
                                     this.child(self.render_settings_page(page, window, cx))
                                 }
                                 MainStage::Schedules => this.child(self.render_schedules_page(cx)),
-                                MainStage::Welcome => this.child(self.render_welcome(cx)),
+                                MainStage::Welcome => this.child(self.render_welcome(window, cx)),
                                 MainStage::ProviderSetup(provider) => {
-                                    this.child(self.render_welcome_models(provider, cx))
+                                    this.child(self.render_welcome_models(provider, window, cx))
                                 }
                                 MainStage::Thread => this
                                     .child(self.render_main_editor(
@@ -877,6 +885,8 @@ pub fn run() -> anyhow::Result<()> {
                         stage_before_settings: MainStage::Welcome,
                         selected_provider: None,
                         settings_provider_step: ProviderStep::default(),
+                        providers: Default::default(),
+                        api_key_input: None,
                         context_settings: context_settings::ContextSettings::default(),
                         profile: Profile::local(local_participant_id),
                         shown_profiles: HashMap::new(),

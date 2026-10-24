@@ -335,6 +335,7 @@ fn assert_backslash_selection_creates_comment(
                     outcome: crate::protocol::RunOutcome::Completed,
                     duration: std::time::Duration::ZERO,
                 },
+                model: None,
                 awaiting_approval: None,
             },
             ui: crate::timeline::AgentMessageUi {
@@ -642,6 +643,7 @@ fn commenting_on_a_long_response_keeps_the_timeline_scroll_position(cx: &mut gpu
                     outcome: crate::protocol::RunOutcome::Completed,
                     duration: std::time::Duration::ZERO,
                 },
+                model: None,
                 awaiting_approval: None,
             },
             ui: crate::timeline::AgentMessageUi {

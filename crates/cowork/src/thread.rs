@@ -1634,6 +1634,7 @@ impl Thread {
                 id,
                 comment_group_id,
                 started_at,
+                model,
             } => {
                 anyhow::ensure!(!self.is_generating(), "a run is already active");
                 anyhow::ensure!(
@@ -1641,7 +1642,7 @@ impl Thread {
                         TimelineMessage::Agent(message) if message.record.id == Uuid::from_bytes(id))),
                     "duplicate agent run identity"
                 );
-                let message = AgentMessage::new(
+                let mut message = AgentMessage::new(
                     Uuid::from_bytes(id),
                     comment_group_id.map(Uuid::from_bytes),
                     started_at,
@@ -1650,6 +1651,7 @@ impl Thread {
                     Vec::new(),
                     cx,
                 );
+                message.record.model = model;
                 self.timeline.push(TimelineMessage::Agent(message));
                 self.active_run = Some(ActiveRun {
                     id: Uuid::from_bytes(id),

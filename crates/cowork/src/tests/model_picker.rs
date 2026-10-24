@@ -1,6 +1,7 @@
 //! Picking models, and how the picker follows each thread's catalog.
 
 use super::*;
+use crate::provider_setup::ProviderSetupPlace;
 
 #[gpui::test]
 fn context_window_changes_update_local_and_archived_threads(cx: &mut gpui::TestAppContext) {
@@ -42,6 +43,50 @@ fn context_window_changes_update_local_and_archived_threads(cx: &mut gpui::TestA
             cowork.models.get(&recommended_qwen()).unwrap().max_tokens,
             32_768
         );
+    });
+}
+
+/// A key typed on a provider's models step connects the provider; removing
+/// it takes only that provider's models out of the catalog. Discovery with
+/// the key never runs, as the test's Tokio runtime isn't driven.
+#[gpui::test]
+fn api_keys_are_saved_and_removed_from_the_providers_page(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let provider = ModelProvider::Anthropic;
+    cowork.update_in(cx, |cowork, window, cx| {
+        cowork.open_settings(SettingsPage::Providers, window, cx);
+        cowork.show_provider_step(
+            ProviderSetupPlace::Settings,
+            ProviderStep::Models(provider),
+            cx,
+        );
+    });
+    cx.run_until_parked();
+    assert!(cx.debug_bounds("api-key-remove").is_none());
+
+    let input = cx.debug_bounds("api-key-input").expect("the key field");
+    cx.simulate_click(input.center(), gpui::Modifiers::none());
+    cx.simulate_input("sk-ant-test");
+    let save = cx.debug_bounds("api-key-save").expect("the save button");
+    cx.simulate_click(save.center(), gpui::Modifiers::none());
+    cx.run_until_parked();
+    let claude = ModelRef {
+        provider,
+        id: "claude".into(),
+    };
+    cowork.update(cx, |cowork, cx| {
+        assert!(cowork.providers.has_api_key(provider));
+        // As discovery with the key would have found.
+        cowork.set_models(catalog_of(&[ollama_qwen(), claude.clone()]), cx);
+    });
+    cx.run_until_parked();
+
+    let remove = cx.debug_bounds("api-key-remove").expect("removing the key");
+    cx.simulate_click(remove.center(), gpui::Modifiers::none());
+    cowork.read_with(cx, |cowork, _| {
+        assert!(!cowork.providers.has_api_key(provider));
+        assert!(!cowork.models.contains(&claude));
+        assert!(cowork.models.contains(&ollama_qwen()));
     });
 }
 

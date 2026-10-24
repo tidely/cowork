@@ -633,6 +633,62 @@ fn unsupported_content_and_ambiguous_history_are_explicit_errors() {
     );
 }
 
+/// A model may stream its calls before its text, and its thinking last;
+/// the reply still finishes in the order requests accept, so the next
+/// request of the run can send it back.
+#[test]
+fn replies_streamed_out_of_field_order_can_be_sent_back() {
+    let mut fold = crate::streaming::Fold::default();
+    let mut last = None;
+    for chunk in [
+        json!({"message":{"role":"assistant","content":"","tool_calls":[
+            {"id":"call_a","function":{"name":"respond","arguments":{}}}
+        ]},"done":false}),
+        json!({"message":{"role":"assistant","content":"Done."},"done":false}),
+        json!({"message":{"role":"assistant","content":"","thinking":"Hm"},"done":true}),
+    ] {
+        last = fold
+            .apply(serde_json::from_value(chunk).unwrap())
+            .unwrap()
+            .pop_back();
+    }
+    let Some(StreamEvent::Finished(completion)) = last else {
+        panic!("expected finished")
+    };
+    let kinds = completion
+        .message
+        .content
+        .iter()
+        .map(|content| match content {
+            Content::Reasoning(_) => "reasoning",
+            Content::Text { .. } => "text",
+            Content::ToolCall(_) => "call",
+            _ => "other",
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(kinds, ["reasoning", "text", "call"]);
+
+    let Content::ToolCall(call) = completion.message.content[2].clone() else {
+        unreachable!()
+    };
+    let mut input = request();
+    input.messages.push(completion.message);
+    input.messages.push(Message::new(
+        Role::Tool,
+        vec![Content::ToolResult(ToolResult {
+            call: call.id,
+            provider_id: call.provider_id,
+            name: Some(call.name),
+            content: vec![ToolResultContent::Text { text: "ok".into() }],
+            is_error: false,
+        })],
+    ));
+    assert!(
+        ollama_types::ChatRequest::from_completion(&LanguageModel::new("test-model"), input)
+            .is_ok()
+    );
+}
+
 #[test]
 fn malformed_arguments_are_retained_and_duplicate_provider_ids_rejected() {
     let mut fold = crate::streaming::Fold::default();

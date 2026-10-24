@@ -22,9 +22,7 @@ use agent::{
     AgentDefinition, AgentEvent, AgentSession, ApprovalDecision, Configuration, ContextSection,
     Delivery, DiscardReason, EventKind, Fallback, InputId, Lifetime, Policy, QueueAccess, Request,
     RequestKind, RunId, SessionHandle, SessionView,
-    model::{
-        ContentDelta, JsonObject, LanguageModel, LanguageModelProvider, Thinking, ToolCallId, Usage,
-    },
+    model::{ContentDelta, LanguageModel, LanguageModelProvider, ToolCallId, Usage},
     tool::ToolRegistry,
 };
 use futures::{StreamExt as _, channel::mpsc};
@@ -38,7 +36,7 @@ use uuid::Uuid;
 use super::GenerationPlan;
 use crate::{
     Cowork,
-    models::{ModelInfo, ModelProvider, ModelRef},
+    models::{ModelInfo, ModelRef},
     participant::ParticipantId,
     protocol::{self, Preview, PreviewDelta, RunEvent},
     thread::{ControlGeneration, Thread, ThreadOwnership, ThreadSharing},
@@ -50,9 +48,6 @@ use crate::{
 /// The system prompt every run starts with, before [`platform_prompt`]. Kept
 /// in its own file so it reads and diffs as prose.
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
-
-/// Where the app finds Ollama.
-const OLLAMA_URL: &str = "http://localhost:11434";
 
 /// The tools every session offers, in this order. They are part of the
 /// prompt prefix, so they never change with the thread, its comments, or
@@ -99,27 +94,25 @@ fn platform_prompt() -> String {
     )
 }
 
-/// What the prompt is made of for `model`: the system prompt, the tools,
-/// medium thinking, and Ollama's `num_ctx`, which is a model option only the
-/// native `/api/chat` accepts. Whether the model accepts images decides
-/// whether the runtime sends them or a note in their place; the tools stay
-/// the same either way, so switching models keeps the prompt prefix.
+/// What the prompt is made of for `model`: the system prompt and the tools,
+/// with the thinking and options its provider takes (see
+/// `ModelProvider::request_parameters`). Whether the model accepts images
+/// decides whether the runtime sends them or a note in their place; the
+/// tools stay the same either way, so switching models keeps the prompt
+/// prefix.
 fn definition(model: &ModelRef, info: &ModelInfo) -> AgentDefinition {
     let mut language_model = LanguageModel::new(model.id.clone());
     language_model.name = Some(info.name.clone());
     language_model.context_window = Some(info.max_tokens);
+    language_model.max_output_tokens = info.max_output_tokens;
     language_model.image_input = info.image_input;
-    let mut options = JsonObject::new();
-    options.insert(
-        "options".into(),
-        serde_json::json!({ "num_ctx": info.max_tokens }),
-    );
+    let parameters = model.provider.request_parameters(info);
     AgentDefinition {
         model: language_model,
         instructions: Some(system_prompt().to_owned()),
         tools: TOOLS.iter().map(|tool| (*tool).to_owned()).collect(),
-        thinking: Some(Thinking::Effort("medium".into())),
-        options,
+        thinking: parameters.thinking,
+        options: parameters.options,
     }
 }
 
@@ -141,13 +134,6 @@ fn registry() -> ToolRegistry<CoworkHost, Needs> {
         result.expect("tool names are unique");
     }
     registry
-}
-
-/// The connection that serves `provider`'s models.
-pub(crate) fn provider(provider: ModelProvider) -> anyhow::Result<Arc<dyn LanguageModelProvider>> {
-    match provider {
-        ModelProvider::Ollama => Ok(Arc::new(agent::Ollama::new(OLLAMA_URL)?)),
-    }
 }
 
 /// Where the thread's commands run, as the model is told: its project's
@@ -196,6 +182,9 @@ pub(crate) struct ThreadAgent {
     /// The model the session's definition names, and what the catalog said
     /// of it (its window and image input).
     model: (ModelRef, ModelInfo),
+    /// The connection the session sends requests through; replaced when
+    /// the model's provider, or its API key, changes.
+    connection: Arc<dyn LanguageModelProvider>,
 }
 
 impl Drop for ThreadAgent {
@@ -222,7 +211,8 @@ fn start_session(
 ) -> anyhow::Result<SessionHandle<CoworkHost>> {
     let configuration = Configuration {
         // Ollama has no default output cap, and a reply cut short could not
-        // run its calls.
+        // run its calls. Providers that need a cap get it in the
+        // definition's options, as it depends on the model.
         sampling: agent::Sampling {
             max_output_tokens: None,
             ..agent::Sampling::default()
@@ -550,12 +540,19 @@ impl Cowork {
 
         let message_id = Uuid::new_v4();
         let generation = ActiveGeneration::new(message_id);
+        // The model `thread_agent` runs this run on; without one the run
+        // fails before writing anything.
+        let model = thread
+            .read(cx)
+            .runnable_model()
+            .map(|(model, _)| model.clone());
         thread.update(cx, |thread, cx| {
             thread.emit(
                 protocol::HostMessage::AgentStarted {
                     id: message_id.into_bytes(),
                     comment_group_id: comment_group_id.map(Uuid::into_bytes),
                     started_at: generation.started_at,
+                    model,
                 },
                 cx,
             )
@@ -623,16 +620,19 @@ impl Cowork {
             .map(|(model, info)| (model.clone(), info.clone()))
             .ok_or_else(|| anyhow::anyhow!("No available model selected"))?;
         let key = (model.clone(), info.clone());
+        let connection = self.providers.connection(model.provider)?;
         if let Some(agent) = self.agents.get_mut(&thread_id) {
-            if agent.model != key {
+            let reconnect = !Arc::ptr_eq(&agent.connection, &connection);
+            if agent.model != key || reconnect {
                 agent.handle.post(Request::new(
                     RunSource::Host,
                     RequestKind::ReplaceDefinition {
                         definition: definition(&model, &info),
-                        provider: None,
+                        provider: reconnect.then(|| connection.clone()),
                     },
                 ))?;
                 agent.model = key;
+                agent.connection = connection;
             }
             return Ok((agent.handle.clone(), agent.host.clone()));
         }
@@ -644,7 +644,7 @@ impl Cowork {
         let (events, mut received) = mpsc::unbounded();
         let handle = start_session(
             host.clone(),
-            provider(model.provider)?,
+            connection.clone(),
             &model,
             &info,
             state.transcript.conversation().clone(),
@@ -660,6 +660,7 @@ impl Cowork {
                 handle: handle.clone(),
                 host: host.clone(),
                 model: key,
+                connection,
             },
         );
         cx.spawn(async move |this, cx| {
@@ -1076,6 +1077,8 @@ mod tests {
     use tools::TurnComments;
 
     use super::*;
+    use crate::models::{ModelProvider, Reasoning};
+    use agent::model::JsonObject;
 
     /// A provider answering each request with the next of its replies, and
     /// keeping the requests.
@@ -1160,7 +1163,9 @@ mod tests {
         let info = ModelInfo {
             name: "Model".into(),
             max_tokens: 1_024,
+            max_output_tokens: None,
             image_input: None,
+            reasoning: Reasoning::Effort("medium".into()),
         };
         let (events, mut received) = mpsc::unbounded();
         let handle = start_session(
@@ -1358,7 +1363,9 @@ mod tests {
         let info = ModelInfo {
             name: "Model".into(),
             max_tokens: 1_024,
+            max_output_tokens: None,
             image_input: None,
+            reasoning: Reasoning::Default,
         };
         let offered = definition(&model, &info).tools;
         for tool in &offered {
@@ -1387,7 +1394,9 @@ mod tests {
         let info = ModelInfo {
             name: model.id.clone(),
             max_tokens: 16_384,
+            max_output_tokens: None,
             image_input: None,
+            reasoning: Reasoning::Effort("medium".into()),
         };
         let host = Arc::new(CoworkHost::new(Arc::new(sandbox::ThreadSandbox::new(
             crate::test_support::unused_sandboxes(),
@@ -1396,7 +1405,7 @@ mod tests {
         let (events, mut received) = mpsc::unbounded();
         let handle = start_session(
             host,
-            provider(ModelProvider::Ollama).unwrap(),
+            crate::providers::connect(ModelProvider::Ollama, None).unwrap(),
             &model,
             &info,
             agent::Conversation::default(),

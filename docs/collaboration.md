@@ -58,7 +58,7 @@ the context window (default: 80%), and before a run starts when the last measure
 context plus unmeasured tool-result or streamed-output estimates already does,
 with no minimum-used-token floor. The Context settings page also controls the default Ollama window
 (131,072 tokens), accepting custom counts down to 1,024 tokens and stepping through
-powers of two. Window changes update all local thread catalogs,
+powers of two. Window changes update the Ollama models in all local thread catalogs,
 including archived threads, and reach collaborators through `ModelCatalogChanged`.
 Discovery uses the current setting. The indicator and examples update immediately;
 runs already in progress keep their captured window and compaction policy until
@@ -736,6 +736,11 @@ content as added, whatever the file held before.
 
 - Model selection is per thread. New local threads start with the last model
   selected locally.
+- Each agent message records the model its run used, sent in `AgentStarted`,
+  kept in its wire form and saved thread, so a thread that switched models
+  shows each message's own provider logo. A run keeps its model to the end,
+  as a model change applies from the next run. The onboarding greeting has
+  none, and shows a generic icon.
 - Every thread carries a model catalog: the models of whoever runs its agent,
   grouped by provider. Local and hosted threads use this app's discovered
   catalog; a mirrored thread uses the host's, which arrives in the
@@ -743,9 +748,16 @@ content as added, whatever the file held before.
   successful discovery (including with an empty catalog). Failed discovery
   leaves the previous catalog in place.
 - Each catalog entry has the model's name, the context window it is run
-  with, and whether it accepts images, as discovery reported it (unknown
-  when the provider didn't say). The host's session sends a model that
-  doesn't accept images a note in place of each image.
+  with, the longest reply it can write (when its provider said), whether it
+  accepts images, as discovery reported it (unknown when the provider didn't
+  say), and how requests ask it to reason. The host's session sends a model
+  that doesn't accept images a note in place of each image.
+- The providers are Ollama, Anthropic, and OpenAI. Anthropic and OpenAI need
+  an API key, which the host keeps in its OS keychain; keys never travel, and
+  each provider's discovery replaces only its own part of the catalog.
+  Ollama's models use the configured window, Anthropic's the window its
+  listing reports, and OpenAI's come from a built-in list with their windows
+  (`providers.rs`), offered where the account's listing includes them.
 - Providers are a fixed enum known at compile time, and the provider is part
   of a model's identity (`ModelRef` is a provider and the provider's model
   ID). The catalog is keyed by provider and then by model ID, so neither can
