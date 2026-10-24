@@ -3,6 +3,7 @@
 
 use std::{
     collections::{HashMap, HashSet},
+    hash::{DefaultHasher, Hash, Hasher},
     ops::Range,
     time::{Duration, Instant},
 };
@@ -35,9 +36,11 @@ use crate::{
     thread_draft::{CARET_LABEL_DURATION, EditorSlot, RemoteCaret},
     timeline::{
         AgentCommentResponse, AgentMessage, AgentStep, AgentToolCall, MessageAuthor, StepView,
-        ThreadMessageId, TimelineMessage, UserComment, UserCommentBody,
+        SubmittedComment, ThreadMessageId, TimelineMessage, UserComment, UserCommentBody,
+        UserMessage,
     },
     timeline_projection::{RunItem, RunProjection},
+    timeline_virtualization::{HeightSource, RowGeometry},
     tool_approval::{self, ApprovalRights},
     tool_call_card::ToolCallCard,
 };
@@ -74,6 +77,86 @@ pub(crate) struct ShownSegments {
     /// Since when newer segments have been waiting to be parsed.
     pub(crate) pending_since: Option<Instant>,
     pub(crate) rendered_at: u64,
+}
+
+/// What building one timeline row needs from its thread, cloned only when
+/// the row is built, so that rendering never copies the whole history: the
+/// entry at `index`, the user groups a run draws where their steers joined
+/// it (with their timeline indices), and the comments of the group a run
+/// answers.
+pub(crate) struct TimelineRow {
+    pub(crate) index: usize,
+    pub(crate) message: TimelineMessage,
+    pub(crate) steered: Vec<(usize, UserMessage)>,
+    pub(crate) submitted_comments: Vec<SubmittedComment>,
+}
+
+impl TimelineRow {
+    /// The row of entry `id`, expected at `index` of `timeline`, with
+    /// `steering_groups` giving the timeline index of each steered group.
+    /// Looked up by identity when the entry has moved; `None` when it is gone.
+    pub(crate) fn capture(
+        timeline: &[TimelineMessage],
+        index: usize,
+        id: Uuid,
+        steering_groups: &HashMap<Uuid, usize>,
+    ) -> Option<Self> {
+        let entry_id = |entry: &TimelineMessage| match entry {
+            TimelineMessage::User(group) => group.record.id,
+            TimelineMessage::Agent(message) => message.record.id,
+        };
+        let index = if timeline
+            .get(index)
+            .is_some_and(|entry| entry_id(entry) == id)
+        {
+            index
+        } else {
+            timeline.iter().position(|entry| entry_id(entry) == id)?
+        };
+        let user = |id: Uuid, index: Option<usize>| {
+            index
+                .and_then(|index| timeline.get(index).map(|entry| (index, entry)))
+                .filter(|(_, entry)| entry_id(entry) == id)
+                .or_else(|| {
+                    timeline
+                        .iter()
+                        .enumerate()
+                        .find(|(_, entry)| entry_id(entry) == id)
+                })
+                .and_then(|(index, entry)| match entry {
+                    TimelineMessage::User(group) => Some((index, group)),
+                    TimelineMessage::Agent(_) => None,
+                })
+        };
+        let (steered, submitted_comments) = match &timeline[index] {
+            TimelineMessage::Agent(message) => (
+                message
+                    .ui
+                    .output
+                    .steps()
+                    .iter()
+                    .filter_map(|step| match step {
+                        AgentStep::Steering(id) => user(*id, steering_groups.get(id).copied())
+                            .map(|(index, group)| (index, group.clone())),
+                        _ => None,
+                    })
+                    .collect(),
+                message
+                    .record
+                    .comment_group_id
+                    .and_then(|group_id| user(group_id, None))
+                    .map(|(_, group)| group.record.comments.clone())
+                    .unwrap_or_default(),
+            ),
+            TimelineMessage::User(_) => (Vec::new(), Vec::new()),
+        };
+        Some(Self {
+            index,
+            message: timeline[index].clone(),
+            steered,
+            submitted_comments,
+        })
+    }
 }
 
 /// How long newly split segments may stay unparsed before they are shown
@@ -1335,6 +1418,46 @@ impl Cowork {
             .into_any_element()
     }
 
+    /// What [`Self::render_agent_message`] draws for `message` that its
+    /// height depends on: which steps are shown and open, and the views among
+    /// them that change on their own. Keep in step with that method, so that
+    /// settled history can keep a culled row's measured height until one of
+    /// them changes. Comment responses aren't listed: messages with them are
+    /// never culled.
+    pub(crate) fn agent_row_geometry(message: &AgentMessage) -> RowGeometry {
+        let mut key = DefaultHasher::new();
+        let mut sources = vec![HeightSource::Text(message.ui.text_view.clone())];
+        // Activity markers come and go with the run, and runs are not culled.
+        for item in RunProjection::new(message, None).into_items() {
+            let RunItem::Content(step_index) = item else {
+                continue;
+            };
+            let Some(view) = message.ui.step_view(step_index) else {
+                continue;
+            };
+            let expanded = view.expanded() || message.ui.output.thinking_in_progress(step_index);
+            (step_index, expanded).hash(&mut key);
+            match view {
+                StepView::Text { view } => sources.push(HeightSource::Text(view.clone())),
+                StepView::Thinking { view, .. } if expanded => {
+                    sources.push(HeightSource::Text(view.clone()));
+                }
+                StepView::ToolCall { .. } if expanded => {
+                    if let AgentStep::ToolCall(call) = &message.ui.output.steps()[step_index]
+                        && let Some(view) = message.ui.file_views.get(&call.call.id)
+                    {
+                        sources.push(HeightSource::FileChange(view.clone()));
+                    }
+                }
+                _ => {}
+            }
+        }
+        RowGeometry {
+            key: key.finish(),
+            sources,
+        }
+    }
+
     /// An agent message: the comments it was asked about, a summary of its
     /// work and, while that is open, the work itself, then its response.
     #[allow(clippy::too_many_arguments)]
@@ -1343,8 +1466,7 @@ impl Cowork {
         thread_id: Uuid,
         index: usize,
         message: &AgentMessage,
-        timeline: &[TimelineMessage],
-        steering_groups: &HashMap<Uuid, usize>,
+        steered: &[(usize, UserMessage)],
         comments: &[UserComment],
         submitted_comments: &[crate::timeline::SubmittedComment],
         wrap_width: gpui::Pixels,
@@ -1486,9 +1608,10 @@ impl Cowork {
                     flush(&mut calls, &mut content);
                     match item {
                         RunItem::Steering(id) => {
-                            if let Some(&index) = steering_groups.get(&id)
-                                && let TimelineMessage::User(group) = &timeline[index]
+                            if let Some((index, group)) =
+                                steered.iter().find(|(_, group)| group.record.id == id)
                             {
+                                let index = *index;
                                 let cards = self.user_group_cards(thread_id, group, cx);
                                 content
                                     .push(self.render_user_message_group(index, group, cards, cx));
@@ -1596,34 +1719,28 @@ impl Cowork {
             .unwrap_or_default()
     }
 
-    /// Timeline entry `index`. `steering_groups` has the index of each user
-    /// group a run draws where its steer joined.
-    #[allow(clippy::too_many_arguments)]
+    /// The timeline entry `row` captured.
     pub(crate) fn render_timeline_message(
         &mut self,
         thread_id: Uuid,
-        index: usize,
-        timeline: &[TimelineMessage],
-        steering_groups: &HashMap<Uuid, usize>,
+        row: &TimelineRow,
         comments: &[UserComment],
-        submitted_comments: &[crate::timeline::SubmittedComment],
         wrap_width: gpui::Pixels,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        match &timeline[index] {
+        match &row.message {
             TimelineMessage::User(group) => {
                 let cards = self.user_group_cards(thread_id, group, cx);
-                self.render_user_message_group(index, group, cards, cx)
+                self.render_user_message_group(row.index, group, cards, cx)
             }
             TimelineMessage::Agent(message) => self.render_agent_message(
                 thread_id,
-                index,
+                row.index,
                 message,
-                timeline,
-                steering_groups,
+                &row.steered,
                 comments,
-                submitted_comments,
+                &row.submitted_comments,
                 wrap_width,
                 window,
                 cx,

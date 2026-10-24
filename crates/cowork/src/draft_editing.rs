@@ -917,7 +917,7 @@ pub(crate) mod tests {
                         attachment_errors: Vec::new(),
                         pending_attachments: Vec::new(),
                         timeline_scroll_handle: ScrollHandle::new(),
-                        timeline_pointer_down: false,
+                        timeline_press: None,
                         timeline_focus_handle: cx.focus_handle(),
                         follow_generation: true,
                         thread_store,

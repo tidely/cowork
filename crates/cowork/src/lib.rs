@@ -4,16 +4,16 @@
 
 use std::{
     cell::Cell,
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     rc::Rc,
     sync::{Arc, OnceLock},
 };
 
 use gpui::{
     App, AppContext, Bounds, Context, Entity, EntityId, ExternalPaths, IntoElement, KeyBinding,
-    MouseButton, MouseDownEvent, MouseUpEvent, PlatformInput, QuitMode, Render, ScrollHandle,
-    SharedString, Subscription, TextRun, TitlebarOptions, Window, WindowBounds, WindowDecorations,
-    WindowOptions, actions, canvas, div, prelude::*, px, size,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PlatformInput, QuitMode, Render,
+    ScrollHandle, SharedString, Subscription, TextRun, TitlebarOptions, Window, WindowBounds,
+    WindowDecorations, WindowOptions, actions, canvas, div, prelude::*, px, size,
 };
 use gpui_base::input::{Backspace, Escape, MoveDown, MoveUp};
 use gpui_component::{ActiveTheme as _, Root, TitleBar};
@@ -37,8 +37,8 @@ use crate::{
     thread::{Thread, ThreadStore},
     thread_draft::ThreadDraft,
     timeline::{PromptBlock, ThreadMessageId, TimelineMessage},
-    timeline_view::{SegmentTextView, ShownSegments},
-    timeline_virtualization::DeferredTimelineRow,
+    timeline_view::{SegmentTextView, ShownSegments, TimelineRow},
+    timeline_virtualization::{DeferredTimelineRow, TimelinePress},
     top_bar::macos_traffic_light_position,
     usage::ActivityRange,
 };
@@ -135,8 +135,8 @@ struct Cowork {
     pending_attachments: Vec<PendingAttachment>,
     timeline_scroll_handle: ScrollHandle,
     /// A pressed pointer can anchor a drag before GPUI reports a nonempty
-    /// selection. Keep its offscreen participant alive until release.
-    timeline_pointer_down: bool,
+    /// selection; see [`TimelinePress`].
+    timeline_press: Option<TimelinePress>,
     /// Taken when someone presses on a user message, as agent text takes
     /// focus itself, so that Copy reaches the window's text selection
     /// instead of an editor with nothing selected.
@@ -307,29 +307,32 @@ impl Cowork {
         let pointer_owner = cx.entity().downgrade();
         self.render_generation = self.render_generation.wrapping_add(1);
         let active_thread_id = self.active_thread_id;
-        let (messages, draft_comments) = active_thread_id
+        // The thread is read in place, never copied whole: a row clones only
+        // its own message, and only when it is built.
+        let active_thread = active_thread_id
             .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
-            .map(|thread| {
-                let thread = thread.read(cx);
-                (
-                    thread.timeline.clone(),
-                    thread.draft().comment_views(thread.participants()),
-                )
-            })
-            .unwrap_or_else(|| (Vec::new(), self.new_thread_draft.comment_views(&[])));
+            .zip(active_thread_id);
         let composer = self
             .readable_draft_id(cx)
             .and_then(|draft_id| self.composer_model(draft_id, window, cx));
-        let comments = messages
-            .iter()
-            .filter_map(|message| match message {
-                TimelineMessage::User(group) => Some(group.record.comments.as_slice()),
-                TimelineMessage::Agent(_) => None,
-            })
-            .flatten()
-            .map(timeline::SubmittedComment::to_view)
-            .chain(draft_comments)
-            .collect::<Vec<_>>();
+        let (message_count, comments) = match &active_thread {
+            Some((thread, _)) => {
+                let thread = thread.read(cx);
+                let comments = thread
+                    .timeline
+                    .iter()
+                    .filter_map(|message| match message {
+                        TimelineMessage::User(group) => Some(group.record.comments.as_slice()),
+                        TimelineMessage::Agent(_) => None,
+                    })
+                    .flatten()
+                    .map(timeline::SubmittedComment::to_view)
+                    .chain(thread.draft().comment_views(thread.participants()))
+                    .collect::<Vec<_>>();
+                (thread.timeline.len(), comments)
+            }
+            None => (0, self.new_thread_draft.comment_views(&[])),
+        };
         let sidebar_width = if self.sidebar_open {
             SIDEBAR_WIDTH
         } else {
@@ -356,169 +359,81 @@ impl Cowork {
         let available_width = window.viewport_size().width - sidebar_width - px(82.);
         let wrap_width = available_width.max(px(120.)).min(text_width);
         // Keep native selection geometry for every row while a drag or selection
-        // is active. Otherwise stable history only needs its measured height and
-        // the rows near the viewport; the composer and live/interactive rows stay
-        // on the original layout path.
-        let defer_history = messages.len() >= 64;
-        let culling = defer_history
-            && !self.timeline_pointer_down
-            && !gpui_base::TextSelection::has_selection(window, cx);
-        let messages = Rc::new(messages);
+        // is active. Otherwise stable history, including open work, only needs
+        // its measured height and the rows near the viewport; the composer and
+        // live/interactive rows stay on the original layout path.
+        let defer_history = message_count >= 64;
+        let culling = defer_history && !self.timeline_drag_started(window, cx);
         let comments = Rc::new(comments);
-        // The timeline index of each user group drawn inside a run, where its
-        // steer joined it, found once per frame.
-        let steered = messages
-            .iter()
-            .filter_map(|entry| match entry {
-                TimelineMessage::Agent(message) => Some(message.ui.output.steps()),
-                TimelineMessage::User(_) => None,
-            })
-            .flatten()
-            .filter_map(|step| match step {
-                timeline::AgentStep::Steering(id) => Some(*id),
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
-        let steering_groups = Rc::new(
-            messages
-                .iter()
-                .enumerate()
-                .filter_map(|(index, entry)| match entry {
-                    TimelineMessage::User(group) if steered.contains(&group.record.id) => {
-                        Some((group.record.id, index))
-                    }
-                    _ => None,
-                })
-                .collect::<HashMap<_, _>>(),
-        );
         let mut timeline_messages = Vec::new();
-        if let Some(thread_id) = active_thread_id {
-            let user_stable = |group: &timeline::UserMessage| {
-                group.record.comments.is_empty()
-                    && group
-                        .record
-                        .blocks
-                        .iter()
-                        .all(|block| block.attachments.is_empty())
-            };
-            for index in 0..messages.len() {
-                let message = &messages[index];
-                // A steering group is a canonical timeline entry, but is
-                // drawn only where its input joined the run.
-                if let TimelineMessage::User(group) = message
-                    && steering_groups.contains_key(&group.record.id)
-                {
-                    continue;
-                }
-                let submitted_comments = match message {
-                    TimelineMessage::Agent(message) => message
-                        .record
-                        .comment_group_id
-                        .and_then(|group_id| {
-                            messages.iter().find_map(|entry| match entry {
-                                TimelineMessage::User(group) if group.record.id == group_id => {
-                                    Some(group.record.comments.as_slice())
-                                }
-                                _ => None,
-                            })
-                        })
-                        .unwrap_or_default(),
-                    TimelineMessage::User(_) => &[],
-                };
-                let stable = match message {
-                    TimelineMessage::User(group) => user_stable(group),
-                    TimelineMessage::Agent(message) => {
-                        // A finished run's steers can't change, so it is
-                        // stable when the groups it draws are.
-                        let steers_stable = message.ui.output.steps().iter().all(|step| {
-                            let timeline::AgentStep::Steering(id) = step else {
-                                return true;
-                            };
-                            steering_groups.get(id).is_none_or(|&group| {
-                                matches!(&messages[group], TimelineMessage::User(group) if user_stable(group))
-                            })
-                        });
-                        !message.is_generating()
-                            && steers_stable
-                            && !message.ui.work_expanded
-                            && message.record.awaiting_approval.is_none()
-                            && message.record.comment_group_id.is_none()
-                            && message.ui.comment_responses.is_empty()
-                            && !message.ui.output.text.contains("![")
-                            && !message.ui.output.text.to_ascii_lowercase().contains("<img")
-                            && !comments
-                                .iter()
-                                .any(|comment| comment.reference.message_id == message.record.id)
+        if let Some((thread, thread_id)) = active_thread {
+            let owner = cx.entity().downgrade();
+            let (rows, steering_groups) =
+                self.plan_timeline_rows(&thread, thread_id, culling, &comments, cx);
+            let steering_groups = Rc::new(steering_groups);
+            for row in rows {
+                let (row_id, geometry, pinned) = (row.id, row.geometry, row.pinned);
+                match row.native {
+                    None => {
+                        let render_owner = owner.clone();
+                        let thread = thread.clone();
+                        let comments = comments.clone();
+                        let steering_groups = steering_groups.clone();
+                        let (index, message_id) = (row.index, row.message_id);
+                        timeline_messages.push(
+                            DeferredTimelineRow::new(
+                                row_id,
+                                wrap_width,
+                                owner.clone(),
+                                geometry,
+                                culling,
+                                move |window, cx| {
+                                    render_owner
+                                        .update(cx, |this, cx| {
+                                            // Built in this frame's prepaint,
+                                            // from the thread as it rendered.
+                                            let row = TimelineRow::capture(
+                                                &thread.read(cx).timeline,
+                                                index,
+                                                message_id,
+                                                &steering_groups,
+                                            );
+                                            match row {
+                                                Some(row) => this.render_timeline_message(
+                                                    thread_id, &row, &comments, wrap_width, window,
+                                                    cx,
+                                                ),
+                                                None => div().into_any_element(),
+                                            }
+                                        })
+                                        .expect("the timeline owner is mounted")
+                                },
+                            )
+                            .pinned(pinned)
+                            .into_any_element(),
+                        );
                     }
-                };
-                let (message_id, source) = match message {
-                    TimelineMessage::User(group) => (group.record.id, None),
-                    TimelineMessage::Agent(message) => {
-                        (message.record.id, Some(message.ui.text_view.clone()))
+                    Some(captured) => {
+                        // Build interactive rows now, before the segment-cache
+                        // sweep. Keep the wrapper's ID even on this path so
+                        // starting a selection or crossing the history
+                        // threshold never remounts a participant under a
+                        // different element ID.
+                        let element = self.render_timeline_message(
+                            thread_id, &captured, &comments, wrap_width, window, cx,
+                        );
+                        timeline_messages.push(
+                            DeferredTimelineRow::new(
+                                row_id,
+                                wrap_width,
+                                owner.clone(),
+                                geometry,
+                                false,
+                                move |_, _| element,
+                            )
+                            .into_any_element(),
+                        );
                     }
-                };
-                let owner = cx.entity().downgrade();
-                let row_id: SharedString =
-                    format!("deferred-timeline-{thread_id}-{message_id}").into();
-                if stable && culling {
-                    let render_owner = owner.clone();
-                    let messages = messages.clone();
-                    let comments = comments.clone();
-                    let steering_groups = steering_groups.clone();
-                    timeline_messages.push(
-                        DeferredTimelineRow::new(
-                            row_id,
-                            wrap_width,
-                            owner,
-                            source,
-                            culling,
-                            move |window, cx| {
-                                render_owner
-                                    .update(cx, |this, cx| {
-                                        this.render_timeline_message(
-                                            thread_id,
-                                            index,
-                                            &messages,
-                                            &steering_groups,
-                                            &comments,
-                                            &[],
-                                            wrap_width,
-                                            window,
-                                            cx,
-                                        )
-                                    })
-                                    .expect("the timeline owner is mounted")
-                            },
-                        )
-                        .into_any_element(),
-                    );
-                } else {
-                    // Build interactive rows now, before the segment-cache sweep.
-                    // Keep the wrapper's ID even on this path so starting a
-                    // selection or crossing the history threshold never remounts
-                    // a participant under a different element ID.
-                    let row = self.render_timeline_message(
-                        thread_id,
-                        index,
-                        &messages,
-                        &steering_groups,
-                        &comments,
-                        submitted_comments,
-                        wrap_width,
-                        window,
-                        cx,
-                    );
-                    timeline_messages.push(
-                        DeferredTimelineRow::new(
-                            row_id,
-                            wrap_width,
-                            owner,
-                            source,
-                            false,
-                            move |_, _| row,
-                        )
-                        .into_any_element(),
-                    );
                 }
             }
         }
@@ -531,7 +446,7 @@ impl Cowork {
         let can_write = composer.is_some();
         let composer = composer.map(|composer| self.render_composer(composer, cx));
         let pending_rows = active_thread_id
-            .map(|thread_id| self.render_pending_messages(thread_id, messages.len(), cx))
+            .map(|thread_id| self.render_pending_messages(thread_id, message_count, cx))
             .unwrap_or_default();
 
         div()
@@ -552,18 +467,36 @@ impl Cowork {
                         // Window-level capture includes release outside the timeline
                         // and runs before a child can consume the pointer event.
                         let owner = pointer_owner.clone();
+                        // A press alone changes no layout, so it doesn't
+                        // redraw; starting or ending a drag switches history
+                        // between culled and native layout.
                         window.on_mouse_event(move |event: &MouseDownEvent, phase, _, cx| {
                             if phase.capture() && event.button == MouseButton::Left {
+                                _ = owner.update(cx, |this, _| {
+                                    this.timeline_press = Some(TimelinePress::new(event.position));
+                                });
+                            }
+                        });
+                        let owner = pointer_owner.clone();
+                        window.on_mouse_event(move |event: &MouseMoveEvent, phase, _, cx| {
+                            if phase.capture() && event.pressed_button == Some(MouseButton::Left) {
                                 _ = owner.update(cx, |this, cx| {
-                                    this.timeline_pointer_down = true;
-                                    cx.notify();
+                                    if let Some(press) = &mut this.timeline_press
+                                        && press.moved_to(event.position)
+                                    {
+                                        cx.notify();
+                                    }
                                 });
                             }
                         });
                         window.on_mouse_event(move |event: &MouseUpEvent, phase, _, cx| {
                             if phase.capture() && event.button == MouseButton::Left {
                                 _ = pointer_owner.update(cx, |this, cx| {
-                                    if std::mem::take(&mut this.timeline_pointer_down) {
+                                    if this
+                                        .timeline_press
+                                        .take()
+                                        .is_some_and(|press| press.dragging)
+                                    {
                                         cx.notify();
                                     }
                                 });
@@ -599,13 +532,13 @@ impl Cowork {
                             ))
                             .children(pending_rows)
                             .children(composer.map(|composer| {
-                                composer.when(!messages.is_empty(), |this| this.mt_6())
+                                composer.when(message_count > 0, |this| this.mt_6())
                             }))
                             .when(!can_write, |this| {
                                 this.child(
                                     div()
                                         .id("read-only-thread")
-                                        .when(!messages.is_empty(), |this| this.mt_6())
+                                        .when(message_count > 0, |this| this.mt_6())
                                         .relative()
                                         .w_full()
                                         .flex()
@@ -633,7 +566,7 @@ impl Cowork {
 impl Render for Cowork {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.main_stage != MainStage::Thread {
-            self.timeline_pointer_down = false;
+            self.timeline_press = None;
         }
         self.sync_model_picker(window, cx);
         let active_thread = self.active_thread(cx);
@@ -870,7 +803,7 @@ pub fn run() -> anyhow::Result<()> {
                         attachment_errors: Vec::new(),
                         pending_attachments: Vec::new(),
                         timeline_scroll_handle: ScrollHandle::new(),
-                        timeline_pointer_down: false,
+                        timeline_press: None,
                         timeline_focus_handle: cx.focus_handle(),
                         follow_generation: true,
                         thread_store,

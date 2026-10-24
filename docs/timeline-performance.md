@@ -188,10 +188,17 @@ supervisor's empty-history capture is in
 
 `lib.rs::render_main_editor` now wraps timeline bodies in the custom GPUI
 `DeferredTimelineRow` element (`timeline_virtualization.rs`). With at least
-64 messages, stable text-only rows retain measured heights and construct their
+64 messages, settled rows (including finished work left open, with its tool
+details, reasoning and diffs) retain measured heights and construct their
 bodies only near the viewport (128 px overdraw). Offscreen bodies skip prepaint
 and paint even while their initial heights are being measured. There are **no
 vendored crates, dependency patches, or dependency changes**.
+
+Rendering reads the thread's timeline in place and never copies it whole:
+`Cowork::plan_timeline_rows` scans it by reference once per frame, deferred
+rows keep only their message's identity and clone it (`TimelineRow::capture`)
+when they are built near the viewport, and only rows that must be built now
+are captured during render.
 
 This reduces the historical TextViews participating in selection registration
 and retained Markdown layout maintenance on each live frame—the two sampled
@@ -223,23 +230,35 @@ Captures and reports:
 ### Correctness and tradeoffs
 
 - This is **partial virtualization**: every outer flex row remains in layout;
-  initial/invalidated heights still require native measurement. Timeline cloning
-  and outer-row traversal are still proportional to history length.
-- Generating replies, expanded work, approvals, comments, attachments, images,
-  and comment responses retain native rendering. Interactive rows are built
-  eagerly before the segment-cache sweep.
-- A window text selection or held left pointer disables culling, preserving
-  native cross-row drag/copy geometry. That intentionally restores the costly
-  path during selection. Stable wrapper IDs preserve anchors when switching
-  modes or crossing the 64-message threshold.
-- Height invalidation includes typography, rem size, computed wrap width, actual
-  allocated width, culling mode, source identity, and committed parse revision.
-  Parse notifications invalidate offscreen rows and maintain bottom-follow;
-  selection/highlight notifications do not invalidate geometry.
-- Regression tests cover offscreen culling/extent, stable interior scrolling,
-  resize versus native layout, late offscreen parsing/bottom-follow, dragging
-  across history (including scrolling before the first pointer movement), and
-  selection surviving the history threshold. A unit test covers height keys.
+  initial/invalidated heights still require native measurement. The per-frame
+  scan of the timeline and outer-row traversal are still proportional to
+  history length.
+- Generating replies, approvals, comments, attachments, images, and comment
+  responses retain native rendering. Interactive rows are built eagerly before
+  the segment-cache sweep.
+- An actual drag (the held pointer moving more than 2 px) or a nonempty window
+  text selection disables culling, preserving native cross-row drag/copy
+  geometry. That intentionally restores the costly path during selection. A
+  press alone does not: the row it lands in is visible, hence built, and stays
+  built and painted while the button is held (`TimelinePress`), so a drag that
+  starts after scrolling with the button held keeps its anchor. Stable wrapper
+  IDs preserve anchors when switching modes or crossing the 64-message
+  threshold.
+- Height invalidation includes typography, rem size, computed wrap width,
+  actual allocated width, and the row's `RowGeometry`: a key of the folding
+  that decides what it draws (open work, open tool details and reasoning),
+  plus the views it draws that change on their own (Markdown, whose committed
+  parse revision counts, and file-change views, whose Diff/JSON switch does).
+  `Cowork::agent_row_geometry` derives both from the same projection the
+  renderer draws. Changes invalidate offscreen rows too and maintain
+  bottom-follow; selection/highlight notifications do not invalidate geometry.
+  Culling mode is not part of the key: a native frame measures every row, so
+  its heights stay valid when culling resumes after a drag.
+- Regression tests cover offscreen culling/extent (text-only and open work),
+  folding offscreen work, stable interior scrolling, resize versus native
+  layout, late offscreen parsing/bottom-follow, clicks keeping history culled,
+  dragging across history (including scrolling before the first pointer
+  movement), and selection surviving the history threshold.
 
 ## Completed-thread measurements
 
@@ -297,6 +316,7 @@ prevent those offscreen rows from taking part in layout/prepaint/CPU paint.
 Unchanged Markdown is parsed already, but its block element tree is reconstructed
 during layout requests. The clone is measurable but much smaller than the
 observed frame cost; eliminating it alone would not resolve this slowdown.
+(Rendering no longer clones the timeline; see "Implemented fix".)
 
 ### 2. Selection bookkeeping repeats whole-window work per participant
 
@@ -370,8 +390,8 @@ patches or vendored/forked dependencies.
   prefix-copy work.
 - Committed entries are serialized to `protocol::Json` and decoded on the local
   authoritative path too. `pending_events` accumulates a reply's previews until
-  it is committed; the render-time `timeline.clone()` copies it. Prefer a render-facing snapshot
-  excluding protocol-only data rather than changing wire semantics casually.
+  it is committed. Rendering no longer copies the timeline, so these only
+  reach rows that are built.
 - GPUI Base appends coalesce queued parser updates (up to 64 per parse) and
   normally reparse the **last Markdown block**, not the whole document. A huge
   paragraph/open fence/list/table can still make this expensive; document source
