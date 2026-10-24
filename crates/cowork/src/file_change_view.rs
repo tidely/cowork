@@ -1,6 +1,7 @@
-//! A `write_file` or `edit_file` call shown as the change it makes: the
-//! file's path and line counts, a Diff / JSON switch, and either a unified
-//! diff (gpui-component's [`Diff`]) or the call's raw arguments.
+//! A `write_file` or `edit_file` call shown as the change it makes: what it
+//! does to which file ("Edit zed/a.rs") and its line counts, a Diff / JSON
+//! switch, and either a unified diff (gpui-component's [`Diff`]) or the
+//! call's raw arguments. That label is also the approval card's title.
 //!
 //! Every copy of a thread computes the diff from the call's arguments
 //! alone, never from the file: an edit's `old_string` becomes its
@@ -14,7 +15,8 @@ use std::time::Duration;
 
 use agent::model::ToolCall;
 use gpui::{
-    Context, Entity, IntoElement, Pixels, Render, SharedString, Window, div, prelude::*, px,
+    Context, Entity, FontWeight, IntoElement, Pixels, Render, SharedString, Window, div,
+    prelude::*, px,
 };
 use gpui_component::{
     ActiveTheme as _, Icon, Sizable as _,
@@ -147,10 +149,10 @@ impl FileChangeView {
 
     fn file_label(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let note = match self.kind {
-            ChangeKind::Write => Some("whole file"),
-            ChangeKind::Edit { replace_all: true } => Some("every occurrence"),
-            ChangeKind::Edit { replace_all: false } => None,
+        let (verb, note) = match self.kind {
+            ChangeKind::Write => ("Write", Some("whole file")),
+            ChangeKind::Edit { replace_all: true } => ("Edit", Some("every occurrence")),
+            ChangeKind::Edit { replace_all: false } => ("Edit", None),
         };
         h_flex()
             .min_w_0()
@@ -160,6 +162,12 @@ impl FileChangeView {
                     .size_3()
                     .flex_none()
                     .text_color(theme.muted_foreground),
+            )
+            .child(
+                div()
+                    .flex_none()
+                    .font_weight(FontWeight::MEDIUM)
+                    .child(verb),
             )
             .child(
                 div()

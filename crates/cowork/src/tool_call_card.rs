@@ -8,7 +8,9 @@
 //! `request_permissions` are shown in theirs here, and every other tool gets
 //! its arguments listed.
 //!
-//! It keeps to a title, what the call would do, and the decision. Only a
+//! It keeps to a title, what the call would do, and the decision. A tool's
+//! own body names the call itself, so it takes the title's place, keeping
+//! the card small. Only a
 //! call asking for more than the thread's mode gets a badge beside the
 //! title, naming only the additional permissions, and a quiet note beside
 //! the decision of how long it lasts.
@@ -104,8 +106,8 @@ impl ToolCallCard {
         self
     }
 
-    /// Shows `body` instead of the arguments: a tool's own presentation of
-    /// what the call would do.
+    /// Shows `body` instead of the title and the arguments: a tool's own
+    /// presentation of what the call would do, which names it too.
     pub(crate) fn body(mut self, body: impl IntoElement) -> Self {
         self.body = Some(body.into_any_element());
         self
@@ -170,6 +172,7 @@ impl RenderOnce for ToolCallCard {
         let tool = self.call.name.as_str();
         let (icon, title) = title(tool);
         let mut access = None;
+        let titled = self.body.is_none();
         let body =
             self.body.unwrap_or_else(|| {
                 let arguments = crate::timeline::arguments_value(&self.call);
@@ -275,7 +278,7 @@ impl RenderOnce for ToolCallCard {
             GroupBox::new()
                 .outline()
                 .content_style(StyleRefinement::default().px_3().py_2p5().gap_2().text_xs())
-                .child(header)
+                .when(titled, |this| this.child(header))
                 .child(body)
                 .child(footer),
         )
@@ -288,6 +291,7 @@ fn title(tool: &str) -> (IconName, SharedString) {
     match tool {
         RunCommand::NAME => (IconName::SquareTerminal, "Terminal".into()),
         RequestPermissions::NAME => (IconName::Shield, "Permissions for this turn".into()),
+        // Only shown when a file call's arguments have no diff to show.
         WriteFile::NAME => (IconName::FilePen, "Write file".into()),
         EditFile::NAME => (IconName::FilePen, "Edit file".into()),
         _ => (IconName::Wrench, humanize(tool).into()),
