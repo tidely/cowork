@@ -43,29 +43,22 @@ fn stream_chunks(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// Each feature line starts with its icon from `inline_icons.rs`; a
-/// trailing backslash is a Markdown line break, keeping them together.
-fn welcome() -> String {
-    let send_shortcut = if cfg!(target_os = "macos") {
-        "Cmd-Enter"
-    } else {
-        "Ctrl-Enter"
-    };
-    format!(
-        "\
-Welcome to Cowork! I can help with almost any kind of work: writing, research, \
+const WELCOME_MESSAGE: &str = concat!(
+    "Welcome to Cowork! I can help with almost any kind of work: writing, research, \
 planning, budgets, organizing files, or building software.
-
-What makes Cowork different:
 
 ![Collaborate](icon:collaborate) **Collaborate** on chats and work together, live.\\
 ![Projects](icon:folder) **Projects** let me work with the files in your folders.\\
 ![Schedules](icon:schedule) **Schedules** run tasks on their own, daily or weekly.\\
 ![Comments](icon:comment) **Comments** on my replies point at exactly what to change.
 
-Type **hi** and press **{send_shortcut}** for a quick tour."
-    )
-}
+Type **hi** and press **",
+    cfg_select!(
+        target_os = "macos" => "Cmd-Enter",
+        _ => "Ctrl-Enter",
+    ),
+    "** for a quick tour."
+);
 
 impl Cowork {
     /// Whether the user is new to Cowork: no threads of their own, open or
@@ -137,7 +130,7 @@ impl Cowork {
             thread_id,
             message_id,
         });
-        let chunks = stream_chunks(&welcome());
+        let chunks = stream_chunks(WELCOME_MESSAGE);
         cx.spawn(async move |this, cx| {
             for chunk in chunks {
                 cx.background_executor().timer(STREAM_FRAME).await;
@@ -266,7 +259,7 @@ impl Thread {
         self.commit_onboarding(
             id,
             Entry {
-                message: Message::assistant(welcome()),
+                message: Message::assistant(WELCOME_MESSAGE),
                 origin: Origin::Model {
                     revision: DefinitionRevision::default(),
                 },
@@ -303,7 +296,7 @@ mod tests {
 
     #[test]
     fn the_greeting_streams_in_whole_words_within_its_frames() {
-        let text = welcome();
+        let text = WELCOME_MESSAGE;
         let chunks = stream_chunks(&text);
         assert!(chunks.len() <= STREAM_FRAMES);
         assert_eq!(chunks.concat(), text);
