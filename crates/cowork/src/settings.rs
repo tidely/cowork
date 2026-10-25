@@ -6,16 +6,13 @@
 //! palette, say) brings the app's sidebar back without extra bookkeeping.
 
 use gpui::{AnyElement, Context, IntoElement, Window, div, prelude::*, px};
-use gpui_component::{
-    ActiveTheme as _, Icon, h_flex,
-    sidebar::{SidebarMenu, SidebarMenuItem},
-};
+use gpui_component::{ActiveTheme as _, Icon, h_flex};
 use gpui_kit_assets::IconName as AssetIconName;
 
 use crate::{
     Cowork, MainStage,
     provider_setup::{ProviderSetupPlace, ProviderStep, provider_setup_intro},
-    sidebar::CoworkSidebarSection,
+    sidebar::{CoworkSidebarSection, SidebarEntry},
 };
 
 /// A settings page: its tab in the settings sidebar and the page it shows on
@@ -167,21 +164,17 @@ impl Cowork {
     pub(crate) fn settings_sidebar_tabs(&self, cx: &mut Context<Self>) -> CoworkSidebarSection {
         let menu = SettingsPage::ALL
             .into_iter()
-            .fold(SidebarMenu::new(), |menu, page| {
-                menu.child(
-                    SidebarMenuItem::new(page.label())
-                        .min_h(px(34.))
-                        .icon(
-                            Icon::new(page.icon())
-                                .size_4()
-                                .text_color(cx.theme().secondary_foreground),
-                        )
-                        .active(self.main_stage == MainStage::Settings(page))
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.open_settings(page, window, cx);
-                        })),
+            .map(|page| {
+                SidebarEntry::new(
+                    page.label(),
+                    page.icon(),
+                    self.main_stage == MainStage::Settings(page),
+                    cx.listener(move |this, _, window, cx| {
+                        this.open_settings(page, window, cx);
+                    }),
                 )
-            });
+            })
+            .collect();
         CoworkSidebarSection::new(None::<&str>, menu)
     }
 }

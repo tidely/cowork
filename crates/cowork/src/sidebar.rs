@@ -11,7 +11,7 @@ use gpui_component::{
     ActiveTheme, Collapsible, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
     h_flex,
-    sidebar::{Sidebar, SidebarCollapsible, SidebarItem, SidebarMenu, SidebarMenuItem},
+    sidebar::{Sidebar, SidebarCollapsible, SidebarItem},
     v_flex,
 };
 use gpui_kit_assets::IconName as AssetIconName;
@@ -44,12 +44,77 @@ type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
 #[derive(Clone)]
 enum SectionItems {
-    Menu(Box<SidebarMenu>),
+    Menu(Vec<SidebarEntry>),
     Threads(Vec<ThreadRow>),
 }
 
-/// A thread's row in the sidebar. `SidebarMenuItem` can't show buttons only
-/// while it is hovered, so threads get their own row, styled like one.
+/// A sidebar action or destination. Selection changes the text weight, not
+/// the background: the background always belongs to hover.
+#[derive(Clone)]
+pub(crate) struct SidebarEntry {
+    label: SharedString,
+    icon: AssetIconName,
+    active: bool,
+    on_click: ClickHandler,
+}
+
+impl SidebarEntry {
+    pub(crate) fn new(
+        label: impl Into<SharedString>,
+        icon: AssetIconName,
+        active: bool,
+        on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            icon,
+            active,
+            on_click: Rc::new(on_click),
+        }
+    }
+
+    fn render(self, cx: &App) -> impl IntoElement {
+        let on_click = self.on_click;
+        sidebar_row(self.label.clone(), self.active, cx)
+            .aria_label(self.label.clone())
+            .h(px(34.))
+            .gap_2()
+            .child(
+                Icon::new(self.icon)
+                    .size_4()
+                    .text_color(cx.theme().secondary_foreground),
+            )
+            .child(self.label)
+            .on_click(move |event, window, cx| on_click(event, window, cx))
+    }
+}
+
+/// Keep navigation and thread rows consistent, including their accessible
+/// selection state, without making the current destination look hovered.
+fn sidebar_row(
+    id: impl Into<gpui::ElementId>,
+    active: bool,
+    cx: &App,
+) -> gpui::Stateful<gpui::Div> {
+    let theme = cx.theme();
+    h_flex()
+        .id(id)
+        .role(Role::TreeItem)
+        .aria_selected(active)
+        .w_full()
+        .h(px(30.))
+        .flex_shrink_0()
+        .p_2()
+        .rounded(theme.radius)
+        .text_sm()
+        .hover(|this| {
+            this.bg(theme.sidebar_accent.opacity(0.8))
+                .text_color(theme.sidebar_accent_foreground)
+        })
+        .when(active, |this| this.font_weight(FontWeight::SEMIBOLD))
+}
+
+/// A thread's row also shows its archive button only while hovered.
 #[derive(Clone)]
 struct ThreadRow {
     thread_id: Uuid,
@@ -66,46 +131,18 @@ impl ThreadRow {
         let hover_bg = theme.sidebar_accent.opacity(0.8);
         // What the row's background looks like while hovered, for the
         // buttons to sit on and the title to fade into.
-        let buttons_bg: Hsla = if self.active {
-            theme.tokens.sidebar_accent.into()
-        } else {
-            theme.sidebar.blend(hover_bg)
-        };
-        let rest_bg: Hsla = if self.active {
-            buttons_bg
-        } else {
-            theme.sidebar
-        };
+        let buttons_bg = theme.sidebar.blend(hover_bg);
+        let rest_bg = theme.sidebar;
         let group = SharedString::from(format!("sidebar-thread-{}", self.thread_id));
         let thread_id = self.thread_id;
         let on_open = self.on_open;
 
-        h_flex()
-            .id(self.thread_id)
+        sidebar_row(self.thread_id, self.active, cx)
             .group(group.clone())
             .debug_selector(|| format!("sidebar-thread-{thread_id}"))
-            .role(Role::TreeItem)
             .aria_label(self.title.clone())
-            .aria_selected(self.active)
             .relative()
-            .w_full()
-            .h(px(30.))
-            .flex_shrink_0()
-            .p_2()
-            .rounded(theme.radius)
             .overflow_hidden()
-            .text_sm()
-            .when(!self.active, |this| {
-                this.hover(|this| {
-                    this.bg(hover_bg)
-                        .text_color(theme.sidebar_accent_foreground)
-                })
-            })
-            .when(self.active, |this| {
-                this.font_weight(FontWeight::MEDIUM)
-                    .bg(theme.tokens.sidebar_accent)
-                    .text_color(theme.sidebar_accent_foreground)
-            })
             .on_click(move |event, window, cx| on_open(event, window, cx))
             .child(
                 div()
@@ -175,8 +212,8 @@ pub(crate) struct CoworkSidebarSection {
 }
 
 impl CoworkSidebarSection {
-    pub(crate) fn new(label: Option<impl Into<SharedString>>, menu: SidebarMenu) -> Self {
-        Self::with_items(label, SectionItems::Menu(Box::new(menu)))
+    pub(crate) fn new(label: Option<impl Into<SharedString>>, menu: Vec<SidebarEntry>) -> Self {
+        Self::with_items(label, SectionItems::Menu(menu))
     }
 
     fn threads(label: impl Into<SharedString>, threads: Vec<ThreadRow>) -> Self {
@@ -219,7 +256,7 @@ impl SidebarItem for CoworkSidebarSection {
     fn render(
         self,
         id: impl Into<gpui::ElementId>,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut App,
     ) -> impl IntoElement {
         let id = id.into();
@@ -260,15 +297,10 @@ impl SidebarItem for CoworkSidebarSection {
             })
             .when(open, |this| match self.items {
                 SectionItems::Menu(menu) => this.child(
-                    <SidebarMenu as SidebarItem>::render(
-                        (*menu).collapsed(self.collapsed),
-                        format!("{id}-menu"),
-                        window,
-                        cx,
-                    )
-                    .into_any_element(),
+                    v_flex()
+                        .gap_2()
+                        .children(menu.into_iter().map(|entry| entry.render(cx))),
                 ),
-                // Spaced like `SidebarMenu` spaces its items.
                 SectionItems::Threads(threads) => this.child(
                     v_flex()
                         .gap_2()
@@ -373,52 +405,37 @@ impl Cowork {
 
         let actions = CoworkSidebarSection::new(
             None::<SharedString>,
-            SidebarMenu::new()
-                .child(
-                    SidebarMenuItem::new("New chat")
-                        .min_h(px(34.))
-                        .icon(
-                            Icon::new(AssetIconName::SquarePen)
-                                .size_4()
-                                .text_color(cx.theme().secondary_foreground),
-                        )
-                        .active(
-                            self.main_stage == MainStage::Thread && self.active_thread_id.is_none(),
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.new_thread_draft = ThreadDraft::new(this.local_participant_id);
-                            this.active_thread_id = None;
-                            this.selection_message_id = None;
-                            this.main_stage = MainStage::Thread;
-                            this.focus_composer(window, cx);
-                            cx.notify();
-                        })),
-                )
-                .child(
-                    SidebarMenuItem::new("Join shared thread")
-                        .min_h(px(34.))
-                        .icon(
-                            Icon::new(AssetIconName::UsersRound)
-                                .size_4()
-                                .text_color(cx.theme().secondary_foreground),
-                        )
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_join_dialog(window, cx);
-                        })),
-                )
-                .child(
-                    SidebarMenuItem::new("Scheduled")
-                        .min_h(px(34.))
-                        .icon(
-                            Icon::new(AssetIconName::CalendarClock)
-                                .size_4()
-                                .text_color(cx.theme().secondary_foreground),
-                        )
-                        .active(self.main_stage == MainStage::Schedules)
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            this.open_schedules(window, cx);
-                        })),
+            vec![
+                SidebarEntry::new(
+                    "New chat",
+                    AssetIconName::SquarePen,
+                    false,
+                    cx.listener(|this, _, window, cx| {
+                        this.new_thread_draft = ThreadDraft::new(this.local_participant_id);
+                        this.active_thread_id = None;
+                        this.selection_message_id = None;
+                        this.main_stage = MainStage::Thread;
+                        this.focus_composer(window, cx);
+                        cx.notify();
+                    }),
                 ),
+                SidebarEntry::new(
+                    "Join shared thread",
+                    AssetIconName::UsersRound,
+                    false,
+                    cx.listener(|this, _, window, cx| {
+                        this.open_join_dialog(window, cx);
+                    }),
+                ),
+                SidebarEntry::new(
+                    "Scheduled",
+                    AssetIconName::CalendarClock,
+                    self.main_stage == MainStage::Schedules,
+                    cx.listener(|this, _, window, cx| {
+                        this.open_schedules(window, cx);
+                    }),
+                ),
+            ],
         );
 
         let mut rows = |threads: &[(Uuid, ThreadSummary, bool)]| {
