@@ -157,6 +157,30 @@ fn a_long_title_is_cut_off_inside_its_row(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+fn recents_compose_only_appears_on_header_hover_and_starts_a_chat(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let thread_id = add_thread(&cowork, 1, cx);
+    draw(cx);
+    click(selector("sidebar-thread", thread_id), cx);
+    let row = cx
+        .debug_bounds(selector("sidebar-thread", thread_id))
+        .unwrap();
+    cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
+    draw(cx);
+    assert!(cx.debug_bounds("recents-new-chat").is_none());
+
+    let header = cx.debug_bounds("sidebar-section-Recents").unwrap();
+    cx.simulate_mouse_move(header.center(), None, gpui::Modifiers::default());
+    draw(cx);
+    click("recents-new-chat", cx);
+    cowork.read_with(cx, |cowork, _| {
+        assert_eq!(cowork.active_thread_id, None);
+        assert_eq!(cowork.main_stage, MainStage::Thread);
+        assert!(cowork.recents_open, "composing must not collapse Recents");
+    });
+}
+
+#[gpui::test]
 fn the_archive_button_only_takes_clicks_while_its_row_is_hovered(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     let thread_id = add_thread(&cowork, 1, cx);

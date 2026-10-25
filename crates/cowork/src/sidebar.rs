@@ -209,6 +209,7 @@ pub(crate) struct CoworkSidebarSection {
     pub(crate) collapsed: bool,
     pub(crate) open: bool,
     on_label_click: Option<ClickHandler>,
+    label_action: Option<SidebarEntry>,
 }
 
 impl CoworkSidebarSection {
@@ -227,6 +228,7 @@ impl CoworkSidebarSection {
             collapsed: false,
             open: true,
             on_label_click: None,
+            label_action: None,
         }
     }
 
@@ -237,6 +239,11 @@ impl CoworkSidebarSection {
     ) -> Self {
         self.open = open;
         self.on_label_click = Some(Rc::new(on_click));
+        self
+    }
+
+    fn label_action(mut self, action: SidebarEntry) -> Self {
+        self.label_action = Some(action);
         self
     }
 }
@@ -263,6 +270,7 @@ impl SidebarItem for CoworkSidebarSection {
         let open = self.open;
         let on_label_click = self.on_label_click;
         let group = SharedString::from(format!("{id}-section"));
+        let header_group = SharedString::from(format!("{id}-header"));
 
         div()
             .group(group.clone())
@@ -272,6 +280,8 @@ impl SidebarItem for CoworkSidebarSection {
                 this.pt_3().child(
                     div()
                         .id(format!("{id}-label"))
+                        .group(header_group.clone())
+                        .debug_selector(|| format!("sidebar-section-{label}"))
                         .h(px(30.))
                         .flex()
                         .items_center()
@@ -301,6 +311,27 @@ impl SidebarItem for CoworkSidebarSection {
                                             .text_color(cx.theme().muted_foreground),
                                         ),
                                 )
+                        })
+                        .when_some(self.label_action, |this, action| {
+                            this.child(
+                                div()
+                                    .ml_auto()
+                                    .invisible()
+                                    .group_hover(header_group, |style| style.visible())
+                                    .child(
+                                        Button::new(format!("{id}-action"))
+                                            .icon(Icon::new(action.icon).size_4())
+                                            .ghost()
+                                            .xsmall()
+                                            .debug_selector(|| "recents-new-chat".to_owned())
+                                            .accessibility_label(action.label.clone())
+                                            .tooltip(action.label)
+                                            .on_click(move |event, window, cx| {
+                                                cx.stop_propagation();
+                                                (action.on_click)(event, window, cx);
+                                            }),
+                                    ),
+                            )
                         }),
                 )
             })
@@ -409,22 +440,23 @@ impl Cowork {
             }
         }
 
+        let new_chat = SidebarEntry::new(
+            "New chat",
+            AssetIconName::SquarePen,
+            false,
+            cx.listener(|this, _, window, cx| {
+                this.new_thread_draft = ThreadDraft::new(this.local_participant_id);
+                this.active_thread_id = None;
+                this.selection_message_id = None;
+                this.main_stage = MainStage::Thread;
+                this.focus_composer(window, cx);
+                cx.notify();
+            }),
+        );
         let actions = CoworkSidebarSection::new(
             None::<SharedString>,
             vec![
-                SidebarEntry::new(
-                    "New chat",
-                    AssetIconName::SquarePen,
-                    false,
-                    cx.listener(|this, _, window, cx| {
-                        this.new_thread_draft = ThreadDraft::new(this.local_participant_id);
-                        this.active_thread_id = None;
-                        this.selection_message_id = None;
-                        this.main_stage = MainStage::Thread;
-                        this.focus_composer(window, cx);
-                        cx.notify();
-                    }),
-                ),
+                new_chat.clone(),
                 SidebarEntry::new(
                     "Join shared thread",
                     AssetIconName::UsersRound,
@@ -455,13 +487,15 @@ impl Cowork {
         let hosting = CoworkSidebarSection::threads("Shared by me", rows(&hosting_threads));
         let collaborating =
             CoworkSidebarSection::threads("Collaborating", rows(&collaborating_threads));
-        let recents = CoworkSidebarSection::threads("Recents", rows(&recent_threads)).label_toggle(
-            self.recents_open,
-            cx.listener(|this, _, _, cx| {
-                this.recents_open = !this.recents_open;
-                cx.notify();
-            }),
-        );
+        let recents = CoworkSidebarSection::threads("Recents", rows(&recent_threads))
+            .label_toggle(
+                self.recents_open,
+                cx.listener(|this, _, _, cx| {
+                    this.recents_open = !this.recents_open;
+                    cx.notify();
+                }),
+            )
+            .label_action(new_chat);
 
         let sidebar = sidebar
             .header(
