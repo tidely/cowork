@@ -262,8 +262,10 @@ impl SidebarItem for CoworkSidebarSection {
         let id = id.into();
         let open = self.open;
         let on_label_click = self.on_label_click;
+        let group = SharedString::from(format!("{id}-section"));
 
         div()
+            .group(group.clone())
             .flex()
             .flex_col()
             .when_some(self.label, |this, label| {
@@ -273,7 +275,7 @@ impl SidebarItem for CoworkSidebarSection {
                         .h(px(30.))
                         .flex()
                         .items_center()
-                        .justify_between()
+                        .gap_1()
                         .px_2()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground.opacity(0.7))
@@ -283,13 +285,21 @@ impl SidebarItem for CoworkSidebarSection {
                                 .hover(|this| this.text_color(cx.theme().muted_foreground))
                                 .on_click(move |event, window, cx| on_click(event, window, cx))
                                 .child(
-                                    Icon::new(if open {
-                                        AssetIconName::ChevronDown
-                                    } else {
-                                        AssetIconName::ChevronRight
-                                    })
-                                    .size_4()
-                                    .text_color(cx.theme().muted_foreground),
+                                    div()
+                                        .flex()
+                                        .when(open, |this| {
+                                            this.invisible()
+                                                .group_hover(group, |style| style.visible())
+                                        })
+                                        .child(
+                                            Icon::new(if open {
+                                                AssetIconName::ChevronDown
+                                            } else {
+                                                AssetIconName::ChevronRight
+                                            })
+                                            .size_4()
+                                            .text_color(cx.theme().muted_foreground),
+                                        ),
                                 )
                         }),
                 )
