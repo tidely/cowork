@@ -34,6 +34,14 @@ Missed schedules behavior: Rerun when available, skip, notify
 
 We should also add a `schedule` tool, which provides a rich interface to the user, who may accept the agents recommended prompt schedule
 
+## Projects: drag to reorder
+
+Drag projects in the sidebar to reorder them, instead of newest first.
+
+## Projects: rename
+
+Rename a project from the sidebar. See `docs/projects.md`.
+
 ## Sandbox helper for restricted file writes
 
 Keep file tools app-managed, but route restricted writes through an

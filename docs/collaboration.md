@@ -875,7 +875,9 @@ host's app; a saved thread comes back with an empty one.
 
 The host saves its own threads, archived ones included, each in a folder of
 its own, `~/.cowork/threads/<thread id>/`: `thread.json` (title, model,
-project folders and mode, the profiles and prompt names of everyone who took
+project folders and mode, the sidebar project it is filed under (local
+organization, never sent to collaborators; see `docs/projects.md`), the
+profiles and prompt names of everyone who took
 part, token usage, and the timeline's messages and run records),
 `messages.jsonl` (the transcript, one of the agent's versioned entry or
 compaction records per line, only appended to), `attachments/` (the bytes of
@@ -900,8 +902,8 @@ folder). `crates/cowork/src/thread_files.rs` has the format.
   Another normal launch exits with an already-running error before loading
   saved state. There is no automatic activation of the first instance.
   `--ephemeral` opens an independent instance without reading or writing
-  `~/.cowork` or acquiring its lock: threads, statistics, and schedules are
-  not persisted. Scratch files use a unique temporary folder removed on
+  `~/.cowork` or acquiring its lock: threads, statistics, schedules, and
+  projects are not persisted. Scratch files use a unique temporary folder removed on
   orderly shutdown (a crash may leave it behind). Ephemeral mode does not
   restrict otherwise permitted agent changes to project files.
 - Deleting a thread from the archive removes its folder.

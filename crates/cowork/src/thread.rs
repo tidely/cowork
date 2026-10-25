@@ -38,6 +38,7 @@ use crate::{
     profile::Profile,
     project_folders::{self, ProjectFolder},
     project_mode::ProjectMode,
+    projects::ProjectId,
     protocol,
     timeline::{AgentMessage, TimelineMessage},
     transcript::{BYTES_PER_TOKEN, ReplyPreview, Transcript, validate_agent_runs},
@@ -189,6 +190,10 @@ pub(crate) struct Thread {
     /// Whether the project is open for writing or only reading. Chosen by
     /// the host and mirrored.
     project_mode: ProjectMode,
+    /// The sidebar project the user filed this chat under; see
+    /// `projects.rs`. Local organization only: saved with the host's own
+    /// thread and never sent to collaborators, so a mirror has none.
+    project: Option<ProjectId>,
 }
 
 struct ActiveRun {
@@ -336,6 +341,7 @@ impl Thread {
             ownership: ThreadOwnership::Local,
             project_folders: Vec::new(),
             project_mode: ProjectMode::default(),
+            project: None,
         }
     }
 
@@ -465,6 +471,30 @@ impl Thread {
 
     pub(crate) fn project_mode(&self) -> ProjectMode {
         self.project_mode
+    }
+
+    pub(crate) fn project(&self) -> Option<ProjectId> {
+        self.project
+    }
+
+    /// Files the chat under a sidebar project. Only the user's own chats
+    /// are filed, as a mirror belongs to its host.
+    pub(crate) fn set_project(&mut self, project: Option<ProjectId>) {
+        if self.is_host() {
+            self.project = project;
+        }
+    }
+
+    /// When the chat was last active: when its latest run started, every
+    /// submission starting one. `None` before its first run.
+    pub(crate) fn last_activity(&self) -> Option<std::time::SystemTime> {
+        self.timeline
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                TimelineMessage::Agent(run) => Some(run.record.started_at),
+                TimelineMessage::User(_) => None,
+            })
     }
 
     /// Only the host can, as for the folders.
@@ -615,6 +645,7 @@ impl Thread {
             ownership: ThreadOwnership::Remote,
             project_folders: Vec::new(),
             project_mode: ProjectMode::default(),
+            project: None,
         };
         thread
             .apply_welcome(prepared, cx)

@@ -271,6 +271,8 @@ fn test_cowork(
         settings_file: None,
         new_thread_project_folders: Vec::new(),
         new_thread_project_mode: Default::default(),
+        new_thread_project: None,
+        projects: Default::default(),
         model_picker,
         model_picker_hovered: false,
         models: Arc::default(),

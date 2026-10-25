@@ -418,7 +418,8 @@ impl Cowork {
         self.sync_sandbox_project(thread, cx);
     }
 
-    /// Moves the folders and mode chosen before the thread existed into it.
+    /// Moves the folders and mode chosen before the thread existed into it,
+    /// and files it under the sidebar project it was composed in, if any.
     /// The mode starts over for the next new thread.
     pub(crate) fn move_project_into(&mut self, thread: &gpui::Entity<Thread>, cx: &mut App) {
         let paths = std::mem::take(&mut self.new_thread_project_folders)
@@ -426,9 +427,11 @@ impl Cowork {
             .filter_map(|folder| folder.path)
             .collect();
         let mode = std::mem::take(&mut self.new_thread_project_mode);
+        let project = self.new_thread_project.take();
         thread.update(cx, |thread, cx| {
             thread.add_project_folders(paths);
             thread.set_project_mode(mode, cx);
+            thread.set_project(project);
         });
         self.sync_sandbox_project(thread, cx);
     }

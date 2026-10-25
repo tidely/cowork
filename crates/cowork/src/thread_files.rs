@@ -56,6 +56,7 @@ use crate::{
     models::{ModelCatalog, ModelRef},
     project_folders::ProjectFolder,
     project_mode::ProjectMode,
+    projects::ProjectId,
     protocol,
     thread::{Thread, ThreadOwnership},
     transcript::{ReplyPreview, Transcript, TranscriptExtent, TranscriptLine, TranscriptRecord},
@@ -89,6 +90,11 @@ struct ThreadFile {
     model: Option<ModelRef>,
     project_folders: Vec<SavedFolder>,
     project_mode: ProjectMode,
+    /// The sidebar project the thread is filed under; see `projects.rs`.
+    /// Missing in files saved before projects, which read as none, so it
+    /// needs no new format.
+    #[serde(default)]
+    project: Option<ProjectId>,
     /// Everyone who joined while it was shared, so their messages keep
     /// their names.
     profiles: Vec<SavedProfile>,
@@ -402,6 +408,7 @@ fn thread_file(thread: &Thread, archived: bool, position: usize) -> ThreadFile {
             })
             .collect(),
         project_mode: thread.project_mode(),
+        project: thread.project(),
         profiles,
         prompt_names,
         tokens_used: thread.tokens_used,
@@ -588,6 +595,7 @@ impl SavedThread {
             })
             .collect();
         let mut thread = Thread::from_saved(prepared, folders, files, cx);
+        thread.set_project(file.project);
         thread.tokens_used = file.tokens_used;
         thread.token_activity = file.token_activity;
         Ok(thread)
@@ -1137,6 +1145,7 @@ mod tests {
             },
         );
         thread.add_project_folders(vec![folder.to_owned()]);
+        thread.set_project(Some(ProjectId::new()));
         thread.tokens_used = 120;
         thread.token_activity.push(TokenActivity {
             at: SystemTime::UNIX_EPOCH,
@@ -1209,6 +1218,7 @@ mod tests {
             assert_eq!(restored.instance_id, thread.instance_id);
             assert_eq!(restored.participant_id(), thread.participant_id());
             assert_eq!(restored.project_folders(), thread.project_folders());
+            assert_eq!(restored.project(), thread.project());
             assert_eq!(restored.tokens_used, 120);
             assert_eq!(restored.token_activity, thread.token_activity);
             assert_eq!(
@@ -1247,9 +1257,23 @@ mod tests {
             save(&mut files, &thread);
             drop(files);
 
-            let (_files, threads) = reopen(&root, cx);
+            let (files, threads) = reopen(&root, cx);
             let [restored] = threads.try_into().ok().expect("one saved thread");
             assert_eq!(shown(&restored), shown(&thread));
+            drop(files);
+
+            // Saved before projects, a thread is in none.
+            let path = root
+                .0
+                .join(thread.instance_id.to_string())
+                .join(THREAD_FILE);
+            let mut saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            saved.as_object_mut().unwrap().remove("project").unwrap();
+            std::fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+            let (_files, threads) = reopen(&root, cx);
+            let [restored] = threads.try_into().ok().expect("one saved thread");
+            assert_eq!(restored.project(), None);
         });
     }
 }

@@ -60,6 +60,7 @@ mod highlight;
 mod inline_icons;
 
 mod context_settings;
+mod create_project;
 mod model_picker;
 mod models;
 mod participant;
@@ -69,6 +70,7 @@ mod profile;
 mod profile_page;
 mod project_folders;
 mod project_mode;
+mod projects;
 mod prompt;
 mod protocol;
 mod provider_setup;
@@ -227,6 +229,12 @@ struct Cowork {
     /// The mode chosen before the thread exists, which moves into it with
     /// the folders; see [`Thread::project_mode`].
     new_thread_project_mode: ProjectMode,
+    /// The sidebar project the thread about to be created is composed in,
+    /// which it is filed under when it is created; see
+    /// [`Cowork::compose_in_project`].
+    new_thread_project: Option<projects::ProjectId>,
+    /// The sidebar's projects; see `projects.rs`.
+    projects: projects::Projects,
     /// Always shows the active thread's model; see [`Cowork::sync_model_picker`].
     model_picker: Entity<ModelPickerState>,
     model_picker_hovered: bool,
@@ -709,20 +717,22 @@ pub fn run() -> anyhow::Result<()> {
     let ephemeral = std::env::args_os().skip(1).any(|arg| arg == "--ephemeral");
     // Own the persistent store before starting any services or reading other
     // saved state. Only an explicit --ephemeral launch may skip the lock.
-    let (root, mut statistics_file, mut schedule_file, mut settings_file) = if ephemeral {
-        (None, None, None, None)
-    } else {
-        (
-            Some(thread_files::threads_dir().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "Cannot find the home directory. Use --ephemeral to run without saving."
-                )
-            })?),
-            statistics::statistics_file(),
-            scheduler::schedule_file(),
-            settings_file::settings_file(),
-        )
-    };
+    let (root, mut statistics_file, mut schedule_file, mut settings_file, mut projects_file) =
+        if ephemeral {
+            (None, None, None, None, None)
+        } else {
+            (
+                Some(thread_files::threads_dir().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Cannot find the home directory. Use --ephemeral to run without saving."
+                    )
+                })?),
+                statistics::statistics_file(),
+                scheduler::schedule_file(),
+                settings_file::settings_file(),
+                projects::projects_file(),
+            )
+        };
     let (thread_files, saved_threads) = thread_files::ThreadFiles::open(root)?;
     let worker_threads = std::thread::available_parallelism()
         .map(usize::from)
@@ -830,6 +840,8 @@ pub fn run() -> anyhow::Result<()> {
                         settings_file: None,
                         new_thread_project_folders: Vec::new(),
                         new_thread_project_mode: ProjectMode::default(),
+                        new_thread_project: None,
+                        projects: projects::Projects::load(projects_file.take()),
                         model_picker,
                         model_picker_hovered: false,
                         models: Arc::default(),

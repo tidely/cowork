@@ -3,6 +3,7 @@
 use gpui_component::WindowExt as _;
 
 use super::*;
+use crate::projects::{ProjectId, SHOWN_CHATS_STEP};
 
 /// The debug selector `name` gives `thread_id`'s row or button.
 fn selector(name: &str, thread_id: Uuid) -> &'static str {
@@ -50,6 +51,81 @@ fn click(selector: &'static str, cx: &mut gpui::VisualTestContext) {
         .unwrap_or_else(|| panic!("{selector} should be drawn"));
     cx.simulate_click(bounds.center(), gpui::Modifiers::default());
     draw(cx);
+}
+
+/// The debug selector `name` gives `project`'s row or button.
+fn project_selector(name: &str, project: ProjectId) -> &'static str {
+    Box::leak(format!("{name}-{project}").into_boxed_str())
+}
+
+fn hover(selector: &'static str, cx: &mut gpui::VisualTestContext) {
+    let bounds = cx
+        .debug_bounds(selector)
+        .unwrap_or_else(|| panic!("{selector} should be drawn"));
+    cx.simulate_mouse_move(bounds.center(), None, gpui::Modifiers::default());
+    draw(cx);
+}
+
+/// Creates a project named `name` starting chats with `folders`.
+fn add_project(
+    cowork: &Entity<Cowork>,
+    name: &str,
+    folders: Vec<PathBuf>,
+    cx: &mut gpui::VisualTestContext,
+) -> ProjectId {
+    cowork.update(cx, |cowork, cx| {
+        assert!(cowork.create_project(name, folders, cx));
+        cowork.projects.records()[0].id
+    })
+}
+
+/// Adds one of the user's own threads filed under `project`, whose one run
+/// started `seconds` after the epoch.
+fn add_project_thread(
+    cowork: &Entity<Cowork>,
+    project: Option<ProjectId>,
+    seconds: u64,
+    cx: &mut gpui::VisualTestContext,
+) -> Uuid {
+    let thread_id = add_thread(cowork, 1, cx);
+    cowork.update(cx, |cowork, cx| {
+        let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
+        thread.update(cx, |thread, _| {
+            thread.set_project(project);
+            for message in &mut thread.timeline {
+                if let TimelineMessage::Agent(run) = message {
+                    run.record.started_at = SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
+                }
+            }
+        });
+        cx.notify();
+    });
+    thread_id
+}
+
+/// The ids of the threads in each project, and in Recents.
+fn project_groups(
+    cowork: &Entity<Cowork>,
+    cx: &mut gpui::VisualTestContext,
+) -> (Vec<(ProjectId, Vec<Uuid>)>, Vec<Uuid>) {
+    cowork.read_with(cx, |cowork, cx| {
+        let groups = cowork.sidebar_groups(cx);
+        let ids = |threads: &[crate::sidebar::ListedThread]| {
+            threads.iter().map(|(id, _, _)| *id).collect::<Vec<_>>()
+        };
+        (
+            groups
+                .projects
+                .iter()
+                .map(|(project, threads)| (*project, ids(threads)))
+                .collect(),
+            ids(&groups.recents),
+        )
+    })
+}
+
+fn drawn(selector: &'static str, cx: &mut gpui::VisualTestContext) -> bool {
+    cx.debug_bounds(selector).is_some()
 }
 
 fn open_archive_settings(cowork: &Entity<Cowork>, cx: &mut gpui::VisualTestContext) {
@@ -167,12 +243,10 @@ fn recents_compose_only_appears_on_header_hover_and_starts_a_chat(cx: &mut gpui:
         .unwrap();
     cx.simulate_mouse_move(row.center(), None, gpui::Modifiers::default());
     draw(cx);
-    assert!(cx.debug_bounds("recents-new-chat").is_none());
+    assert!(cx.debug_bounds("sidebar-section-action-Recents").is_none());
 
-    let header = cx.debug_bounds("sidebar-section-Recents").unwrap();
-    cx.simulate_mouse_move(header.center(), None, gpui::Modifiers::default());
-    draw(cx);
-    click("recents-new-chat", cx);
+    hover("sidebar-section-Recents", cx);
+    click("sidebar-section-action-Recents", cx);
     cowork.read_with(cx, |cowork, _| {
         assert_eq!(cowork.active_thread_id, None);
         assert_eq!(cowork.main_stage, MainStage::Thread);
@@ -357,4 +431,212 @@ fn the_archive_restores_or_deletes_everything_at_once(cx: &mut gpui::TestAppCont
 
     assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
     assert_eq!(thread_ids(&cowork, cx), (vec![], vec![]));
+}
+
+#[gpui::test]
+fn a_project_is_created_in_the_dialog_without_starting_a_chat(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    draw(cx);
+    // The header's button shows only while the header is hovered, and
+    // opens the dialog without collapsing the section.
+    assert!(!drawn("sidebar-section-action-Projects", cx));
+    hover("sidebar-section-Projects", cx);
+    click("sidebar-section-action-Projects", cx);
+    assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+    cowork.read_with(cx, |cowork, _| assert!(cowork.projects.section_open()));
+    cx.update(|window, cx| window.close_dialog(cx));
+    draw(cx);
+
+    let form = cx
+        .update(|window, cx| {
+            cowork.update(cx, |cowork, cx| {
+                cowork.open_create_project_dialog(window, cx)
+            })
+        })
+        .unwrap();
+    draw(cx);
+    assert!(drawn("create-project-choose-folders", cx));
+    // Not without a name.
+    click("create-project", cx);
+    assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+    cx.simulate_input("  Site  ");
+    let (a, b) = (PathBuf::from("/src/a"), PathBuf::from("/src/b"));
+    form.update(cx, |form, cx| {
+        form.add_folders(vec![a.clone(), b.clone()], cx);
+        form.add_folders(vec![a.clone()], cx);
+    });
+    draw(cx);
+    assert!(drawn("create-project-add-folder", cx));
+    assert!(!drawn("create-project-folder-2", cx), "a was chosen once");
+    click("create-project-remove-folder-0", cx);
+    click("create-project", cx);
+
+    assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
+    cowork.read_with(cx, |cowork, cx| {
+        let [record] = cowork.projects.records() else {
+            panic!("one project");
+        };
+        assert_eq!(record.name, "Site");
+        assert_eq!(record.folders, std::slice::from_ref(&b));
+        // Created open, with no chat.
+        assert_eq!(
+            cowork.projects.shown_chats(record.id),
+            Some(SHOWN_CHATS_STEP)
+        );
+        assert!(cowork.thread_store.read(cx).threads.is_empty());
+        assert_eq!(cowork.active_thread_id, None);
+    });
+}
+
+#[gpui::test]
+fn composing_in_a_project_files_the_new_chat_under_it(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let (a, b) = (PathBuf::from("/src/a"), PathBuf::from("/src/b"));
+    let project = add_project(&cowork, "Site", vec![a.clone()], cx);
+    let recent = add_project_thread(&cowork, None, 1, cx);
+    draw(cx);
+    let compose = project_selector("compose-in-project", project);
+    let row = project_selector("sidebar-project", project);
+
+    // Only hovering the project's own row shows its compose button.
+    hover("sidebar-section-Projects", cx);
+    assert!(!drawn(compose, cx));
+    hover(selector("sidebar-thread", recent), cx);
+    assert!(!drawn(compose, cx));
+    hover(row, cx);
+    assert!(!drawn("sidebar-section-action-Projects", cx));
+    click(compose, cx);
+    cowork.read_with(cx, |cowork, _| {
+        assert_eq!(cowork.new_thread_project, Some(project));
+        assert_eq!(cowork.active_thread_id, None);
+        assert_eq!(cowork.projects.shown_chats(project), Some(SHOWN_CHATS_STEP));
+    });
+
+    // The folders are the chat's own once copied.
+    cowork.update(cx, |cowork, cx| {
+        cowork.add_project_folders(None, vec![b.clone()], cx);
+    });
+    cx.simulate_input("question");
+    cx.update(|window, cx| cowork.update(cx, |cowork, cx| cowork.submit_composer(window, cx)));
+    draw(cx);
+    let thread = cowork.read_with(cx, |cowork, cx| cowork.active_thread(cx).unwrap());
+    let thread_id = thread.read_with(cx, |thread, _| {
+        assert_eq!(thread.project(), Some(project));
+        let paths: Vec<_> = thread
+            .project_folders()
+            .iter()
+            .filter_map(|folder| folder.path.clone())
+            .collect();
+        assert_eq!(paths, [a.clone(), b.clone()]);
+        thread.instance_id
+    });
+    cowork.read_with(cx, |cowork, _| {
+        assert_eq!(
+            cowork.projects.records()[0].folders,
+            std::slice::from_ref(&a)
+        );
+        assert_eq!(cowork.new_thread_project, None);
+    });
+    assert_eq!(
+        project_groups(&cowork, cx),
+        (vec![(project, vec![thread_id])], vec![recent])
+    );
+    assert!(drawn(selector("sidebar-thread", thread_id), cx));
+
+    // Recents' compose starts a chat in no project, without its folders.
+    hover(row, cx);
+    click(compose, cx);
+    hover("sidebar-section-Recents", cx);
+    click("sidebar-section-action-Recents", cx);
+    cowork.read_with(cx, |cowork, _| {
+        assert_eq!(cowork.new_thread_project, None);
+        assert!(cowork.new_thread_project_folders.is_empty());
+    });
+}
+
+#[gpui::test]
+fn project_chats_leave_while_shared_or_archived_and_come_back(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let project = add_project(&cowork, "Site", Vec::new(), cx);
+    let older = add_project_thread(&cowork, Some(project), 10, cx);
+    let newer = add_project_thread(&cowork, Some(project), 20, cx);
+    // Filed under a project that isn't known, as when its file was lost.
+    let unknown = add_project_thread(&cowork, Some(ProjectId::new()), 30, cx);
+    // Most recently active first, whatever the store's order.
+    cowork.update(cx, |cowork, cx| {
+        cowork
+            .thread_store
+            .update(cx, |store, _| store.threads.rotate_left(1));
+    });
+    assert_eq!(
+        project_groups(&cowork, cx),
+        (vec![(project, vec![newer, older])], vec![unknown])
+    );
+
+    let thread = cowork.read_with(cx, |cowork, cx| {
+        cowork.thread_store.read(cx).thread(newer, cx).unwrap()
+    });
+    thread.update(cx, |thread, _| thread.sharing = ThreadSharing::Sharing);
+    assert_eq!(project_groups(&cowork, cx).0, [(project, vec![older])]);
+    cowork.read_with(cx, |cowork, cx| {
+        let hosting = cowork.sidebar_groups(cx).hosting;
+        assert_eq!(hosting.len(), 1);
+        assert_eq!(hosting[0].0, newer);
+    });
+    thread.update(cx, |thread, _| thread.sharing = ThreadSharing::NotShared);
+    assert_eq!(
+        project_groups(&cowork, cx).0,
+        [(project, vec![newer, older])]
+    );
+
+    cx.update(|window, cx| {
+        cowork.update(cx, |cowork, cx| cowork.archive_thread(newer, window, cx))
+    });
+    assert_eq!(project_groups(&cowork, cx).0, [(project, vec![older])]);
+    cowork.update(cx, |cowork, cx| cowork.restore_thread(newer, cx));
+    assert_eq!(
+        project_groups(&cowork, cx).0,
+        [(project, vec![newer, older])]
+    );
+}
+
+#[gpui::test]
+fn a_project_shows_five_more_chats_at_a_time(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let project = add_project(&cowork, "Site", Vec::new(), cx);
+    // Newest first.
+    let mut chats: Vec<Uuid> = (0..12)
+        .map(|seconds| add_project_thread(&cowork, Some(project), seconds, cx))
+        .collect();
+    chats.reverse();
+    draw(cx);
+    let more = project_selector("sidebar-project-show-more", project);
+    let row = project_selector("sidebar-project", project);
+    let shown = |cx: &mut gpui::VisualTestContext| {
+        chats
+            .iter()
+            .filter(|chat| drawn(selector("sidebar-thread", **chat), cx))
+            .count()
+    };
+
+    assert_eq!(shown(cx), 5);
+    assert!(drawn(selector("sidebar-thread", chats[4]), cx));
+    click(more, cx);
+    assert_eq!(shown(cx), 10);
+    click(more, cx);
+    assert_eq!(shown(cx), 12);
+    assert!(!drawn(more, cx), "everything is shown");
+
+    // Closing starts it over at five.
+    click(row, cx);
+    assert_eq!(shown(cx), 0);
+    click(row, cx);
+    assert_eq!(shown(cx), 5);
+    // So does closing the section.
+    click(more, cx);
+    click("sidebar-section-Projects", cx);
+    assert!(!drawn(row, cx));
+    click("sidebar-section-Projects", cx);
+    assert!(drawn(row, cx));
+    assert_eq!(shown(cx), 0);
 }
