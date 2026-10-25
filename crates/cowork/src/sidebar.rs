@@ -77,7 +77,7 @@ impl SidebarEntry {
         let on_click = self.on_click;
         sidebar_row(self.label.clone(), self.active, cx)
             .aria_label(self.label.clone())
-            .h(px(34.))
+            .h(px(32.))
             .gap_2()
             .child(
                 Icon::new(self.icon)
@@ -102,9 +102,9 @@ fn sidebar_row(
         .role(Role::TreeItem)
         .aria_selected(active)
         .w_full()
-        .h(px(30.))
+        .h(px(28.))
         .flex_shrink_0()
-        .p_2()
+        .px_2()
         .rounded(theme.radius)
         .text_sm()
         .hover(|this| {
@@ -267,15 +267,14 @@ impl SidebarItem for CoworkSidebarSection {
             .flex()
             .flex_col()
             .when_some(self.label, |this, label| {
-                this.child(
+                this.pt_3().child(
                     div()
                         .id(format!("{id}-label"))
-                        .h(px(38.))
+                        .h(px(30.))
                         .flex()
-                        .items_end()
+                        .items_center()
                         .justify_between()
                         .px_2()
-                        .pb_2()
                         .text_sm()
                         .text_color(cx.theme().muted_foreground.opacity(0.7))
                         .child(label)
@@ -298,14 +297,11 @@ impl SidebarItem for CoworkSidebarSection {
             .when(open, |this| match self.items {
                 SectionItems::Menu(menu) => this.child(
                     v_flex()
-                        .gap_2()
+                        .gap(px(2.))
                         .children(menu.into_iter().map(|entry| entry.render(cx))),
                 ),
-                SectionItems::Threads(threads) => this.child(
-                    v_flex()
-                        .gap_2()
-                        .children(threads.into_iter().map(|thread| thread.render(cx))),
-                ),
+                SectionItems::Threads(threads) => this
+                    .child(v_flex().children(threads.into_iter().map(|thread| thread.render(cx)))),
             })
     }
 }
@@ -463,14 +459,14 @@ impl Cowork {
                 // buttons to reach the right edge.
                 div()
                     .flex_1()
-                    .h(px(42.))
+                    .h(px(36.))
                     .flex()
                     .items_center()
                     .justify_between()
                     .px_2()
                     .child(
                         div()
-                            .text_size(px(18.))
+                            .text_size(px(16.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .child("Cowork"),
                     )
