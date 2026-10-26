@@ -19,7 +19,7 @@ use gpui::{
     prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, Sizable as _,
+    ActiveTheme as _, Icon, Sizable as _, Theme,
     button::{Toggle, ToggleGroup, ToggleVariants as _},
     diff::{Diff, DiffFile, DiffHunkSeparator, DiffState},
     h_flex,
@@ -27,7 +27,7 @@ use gpui_component::{
 use gpui_kit_assets::IconName;
 use sandbox::{EditFile, WriteFile};
 
-use crate::tool_call_card::code_block;
+use crate::{highlight::highlight_code_in_mode, tool_call_card::code_block};
 
 /// How long finding a change's lines may take before settling for a
 /// coarser diff, as it runs on the UI thread.
@@ -140,7 +140,24 @@ impl FileChangeView {
             path: change.path,
             kind: change.kind,
             json,
-            diff: cx.new(|cx| DiffState::new(file.clone(), cx)),
+            diff: cx.new(|cx| {
+                // Diff prepares each hunk's two sides in the background. Only
+                // colors depend on the app; no context crosses to that task.
+                cx.observe_global::<Theme>(|diff: &mut DiffState, cx| {
+                    let is_dark = cx.theme().is_dark();
+                    // Replace only the highlighter, preserving selection and
+                    // scrolling in this same state when the palette changes.
+                    diff.set_syntax_highlighter(
+                        move |language, code| highlight_code_in_mode(Some(language), code, is_dark),
+                        cx,
+                    );
+                })
+                .detach();
+                let is_dark = cx.theme().is_dark();
+                DiffState::new(file.clone(), cx).with_syntax_highlighter(move |language, code| {
+                    highlight_code_in_mode(Some(language), code, is_dark)
+                })
+            }),
             file,
             rows,
             raw: false,
@@ -347,6 +364,54 @@ mod tests {
         ] {
             assert_eq!(FileChange::of(&call), None);
         }
+    }
+
+    #[test]
+    fn diff_languages_use_the_shared_palette() {
+        use gpui_base::text::CodeBlock;
+
+        use crate::highlight::highlight_code_block_in_mode;
+
+        for (path, language, code) in [
+            (
+                "project/main.rs",
+                "rust",
+                "fn main() {\n    let café = 42;\n}\n",
+            ),
+            (
+                "scratch://test.py",
+                "python",
+                "def café():\n    return 42\n",
+            ),
+        ] {
+            let call = tool_call("w", WriteFile::NAME, json!({"path": path, "content": code}));
+            let change = FileChange::of(&call).unwrap();
+            let file = DiffFile::parse(&change.patch).unwrap().remove(0);
+            let detected = file.language();
+            let mut modes = Vec::new();
+            for is_dark in [false, true] {
+                let highlights = highlight_code_in_mode(Some(&detected), code, is_dark);
+                assert_eq!(
+                    highlights,
+                    highlight_code_block_in_mode(
+                        &CodeBlock::from_code(code, Some(language)),
+                        is_dark,
+                    ),
+                );
+                assert!(highlights.windows(2).any(|pair| pair[0].1 != pair[1].1));
+                assert!(highlights.iter().all(|(range, _)| {
+                    range.start < range.end
+                        && code.is_char_boundary(range.start)
+                        && code.is_char_boundary(range.end)
+                }));
+                modes.push(highlights);
+            }
+            assert_ne!(modes[0], modes[1]);
+        }
+        assert_eq!(
+            highlight_code_in_mode(Some("unknown-language"), "plain café\n", true),
+            highlight_code_in_mode(None, "plain café\n", true),
+        );
     }
 
     #[gpui::test]
