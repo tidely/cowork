@@ -340,7 +340,7 @@ impl Cowork {
                                 .h_full()
                                 .flex_none()
                                 .whitespace_nowrap()
-                                .px_2()
+                                .px_1p5()
                                 .flex()
                                 .items_center()
                                 .gap_1()
@@ -430,7 +430,7 @@ impl Cowork {
             .items_center()
             .justify_end()
             .gap_1()
-            .px_3()
+            .px_2()
             .child(
                 canvas(
                     |_, _, _| (),

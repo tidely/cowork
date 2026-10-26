@@ -77,6 +77,27 @@ fn submission_waits_for_a_selected_model(cx: &mut gpui::TestAppContext) {
 }
 
 #[gpui::test]
+fn blank_timeline_space_keeps_composer_focus(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let timeline = cx.debug_bounds("timeline-scroll").unwrap();
+    let composer = cx.debug_bounds("composer").unwrap();
+    let blank = point(timeline.center().x, timeline.bottom() - px(20.));
+    assert!(blank.y > composer.bottom());
+
+    cx.simulate_click(blank, gpui::Modifiers::none());
+    cx.simulate_input("first");
+    cx.run_until_parked();
+    assert_eq!(prompt_bodies(&cowork, cx), ["first"]);
+
+    // Typing turns the draft position into a prompt block. The unused
+    // scroll area must not steal that editor's focus either.
+    cx.simulate_click(blank, gpui::Modifiers::none());
+    cx.simulate_input(" second");
+    cx.run_until_parked();
+    assert_eq!(prompt_bodies(&cowork, cx), ["first second"]);
+}
+
+#[gpui::test]
 fn typing_at_the_draft_position_turns_it_into_a_block(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     assert_eq!(focused_slot(&cowork, cx), Some(EditorSlot::DraftPosition));

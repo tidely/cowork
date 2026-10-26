@@ -842,11 +842,16 @@ impl Cowork {
     }
 
     /// Mirrors the main stage's bottom bar, but with its divider always shown.
+    /// The profile button is a row like the sidebar's own, its avatar and
+    /// name lining up with their icons and labels.
     fn render_sidebar_bottom_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         // `Sidebar` pads its footer slot by `px_3` and `pb_3`; bleeding over
         // that padding lets the bar span the sidebar's full width and line up
         // with the main stage's bottom bar.
         const FOOTER_INSET: gpui::Rems = rems(-0.75);
+        // A little larger than the rows' 16px icons, with the gap trimmed so
+        // the name starts where their labels do.
+        const AVATAR_SIZE: gpui::Pixels = px(18.);
 
         div()
             .id("sidebar-bottom-bar")
@@ -857,7 +862,8 @@ impl Cowork {
             .h(TOP_BAR_HEIGHT)
             .flex()
             .items_center()
-            .px_1()
+            // The sidebar's own gutter, for the row to line up with its rows.
+            .px_3()
             .child(
                 div()
                     .absolute()
@@ -868,27 +874,16 @@ impl Cowork {
                     .bg(cx.theme().border),
             )
             .child(
-                Button::new("identity")
-                    .ghost()
+                sidebar_row("identity", false, cx)
+                    .role(Role::Button)
                     .debug_selector(|| "identity-button".to_owned())
-                    .flex_1()
-                    .px_1p5()
-                    .accessibility_label("Open profile")
+                    .aria_label("Open profile")
+                    .gap_1p5()
+                    .child(self.render_profile_avatar(AVATAR_SIZE))
+                    .child(div().min_w_0().truncate().child(self.profile_name()))
                     .on_click(cx.listener(|this, _, window, cx| {
                         this.open_settings(SettingsPage::Profile, window, cx);
-                    }))
-                    // `Button` centers its content, so fill it with a single
-                    // left-aligned row.
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(self.render_profile_avatar(px(22.)))
-                            .child(div().min_w_0().text_ellipsis().child(self.profile_name())),
-                    ),
+                    })),
             )
     }
 }

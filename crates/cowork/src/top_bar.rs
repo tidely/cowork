@@ -7,12 +7,16 @@ use gpui_component::{ActiveTheme as _, TitleBar, sidebar::SidebarToggleButton, t
 
 use crate::{Cowork, MainStage, thread::Thread};
 
-pub(crate) const TOP_BAR_HEIGHT: gpui::Pixels = px(40.);
+/// The height of the top bar and of the bottom bars below the sidebar and
+/// the main stage: the sidebar header's row height, so the window's chrome
+/// is as compact as the sidebar's rows.
+const BAR_HEIGHT: f32 = 36.;
+pub(crate) const TOP_BAR_HEIGHT: gpui::Pixels = px(BAR_HEIGHT);
 
 /// `SidebarToggleButton` is a small icon button (`size_6`, 24px) centered in
 /// the top bar; matching its top gap on the left keeps it evenly inset from
 /// the window corner.
-const SIDEBAR_TOGGLE_INSET: gpui::Pixels = px((40. - 24.) / 2.);
+const SIDEBAR_TOGGLE_INSET: gpui::Pixels = px((BAR_HEIGHT - 24.) / 2.);
 
 pub(crate) fn macos_traffic_light_position() -> gpui::Point<gpui::Pixels> {
     const MACOS_TRAFFIC_LIGHT_X_INSET: gpui::Pixels = px(12.);
@@ -74,10 +78,10 @@ impl Cowork {
                     .child(
                         div()
                             .h_full()
-                            .mr_2()
+                            .mr_1p5()
                             .flex()
                             .items_center()
-                            .gap_2()
+                            .gap_1p5()
                             .children(
                                 active_thread.as_ref().and_then(|thread| {
                                     self.render_participants(thread.read(cx), cx)
@@ -130,7 +134,6 @@ impl Cowork {
             div()
                 .id("participants")
                 .debug_selector(|| "participants".to_owned())
-                .mr_2()
                 .flex_none()
                 .flex()
                 .items_center()

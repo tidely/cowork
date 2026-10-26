@@ -522,10 +522,15 @@ impl Cowork {
             .child(
                 div()
                     .id("timeline-scroll")
+                    .debug_selector(|| "timeline-scroll".to_owned())
                     .track_focus(&self.timeline_focus_handle)
                     .size_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.timeline_scroll_handle)
+                    // Keep the focus scope for Copy, but let message rows
+                    // and editors take focus themselves. The scroll area's
+                    // blank space must not take it away from the composer.
+                    .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
                     .on_scroll_wheel(cx.listener(Self::timeline_scrolled))
                     .child(
                         div()
