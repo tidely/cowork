@@ -324,7 +324,7 @@ fn visible_row(fixture: &Fixture, cx: &mut VisualTestContext) -> (&'static str, 
 }
 
 fn scroll_wheel(delta: Pixels, cx: &mut VisualTestContext) {
-    cx.simulate_event(gpui::ScrollWheelEvent {
+    cx.simulate_event(gpui::ScrollEvent {
         position: point(px(600.), px(380.)),
         delta: gpui::ScrollDelta::Pixels(point(px(0.), delta)),
         ..Default::default()
@@ -670,7 +670,7 @@ fn navigating_to_a_turn_reaches_rows_never_drawn(cx: &mut gpui::TestAppContext) 
     let marker = cx
         .debug_bounds(fixture.marker(index, cx))
         .expect("every turn has a marker");
-    cx.simulate_event(gpui::ScrollWheelEvent {
+    cx.simulate_event(gpui::ScrollEvent {
         position: rail.center(),
         delta: gpui::ScrollDelta::Pixels(point(px(0.), rail.center().y - marker.center().y)),
         ..Default::default()
@@ -750,7 +750,7 @@ fn a_long_rail_scrolls_without_the_conversation(cx: &mut gpui::TestAppContext) {
     };
     for delta in [px(-10.), px(-100_000.), px(100_000.)] {
         let start = rail_offset(cx);
-        cx.simulate_event(gpui::ScrollWheelEvent {
+        cx.simulate_event(gpui::ScrollEvent {
             position: rail.center(),
             delta: gpui::ScrollDelta::Pixels(point(px(0.), delta)),
             ..Default::default()
@@ -767,7 +767,7 @@ fn a_long_rail_scrolls_without_the_conversation(cx: &mut gpui::TestAppContext) {
         cowork.navigate_to_turn(group, cx);
     });
     settle(cx);
-    cx.simulate_event(gpui::ScrollWheelEvent {
+    cx.simulate_event(gpui::ScrollEvent {
         position: rail.center(),
         delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
         ..Default::default()

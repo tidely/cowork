@@ -10,8 +10,8 @@ use std::{
 use draft::CommentTarget;
 use gpui::{
     App, AppContext, Bounds, Context, Entity, HighlightStyle, IntoElement, KeyDownEvent,
-    LineFragment, MouseButton, ScrollWheelEvent, StyledText, Window, canvas, div, prelude::*, px,
-    rems, rgb, rgba, size,
+    LineFragment, MouseButton, ScrollEvent, StyledText, Window, canvas, div, prelude::*, px, rems,
+    rgb, rgba, size,
 };
 use gpui_base::{
     RangeHighlight, RenderedText, TextSelection, TextView, TextViewState, TextViewStyle, Textarea,
@@ -1827,7 +1827,7 @@ impl Cowork {
 
     pub(crate) fn timeline_scrolled(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         window: &mut Window,
         _: &mut Context<Self>,
     ) {

@@ -542,7 +542,7 @@ impl Cowork {
                     // and editors take focus themselves. The scroll area's
                     // blank space must not take it away from the composer.
                     .on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-                    .on_scroll_wheel(cx.listener(Self::timeline_scrolled))
+                    .on_scroll(cx.listener(Self::timeline_scrolled))
                     .child(
                         div()
                             .w_full()
@@ -689,15 +689,15 @@ impl Render for Cowork {
 fn bind_app_keys(cx: &mut App) {
     // Keep both existing submit bindings, registering the native one last so
     // shortcut tooltips show Command on macOS and Control elsewhere.
-    let (alternate, native) = cfg_select! {
-        target_os = "macos" => ("ctrl", "cmd"),
-        _ => ("cmd", "ctrl"),
+    let (alternate_submit, native_submit, alternate_queue, native_queue) = cfg_select! {
+        target_os = "macos" => ("ctrl-enter", "cmd-enter", "ctrl-shift-enter", "cmd-shift-enter"),
+        _ => ("cmd-enter", "ctrl-enter", "cmd-shift-enter", "ctrl-shift-enter"),
     };
     cx.bind_keys([
-        KeyBinding::new(&format!("{alternate}-enter"), SubmitComposer, None),
-        KeyBinding::new(&format!("{native}-enter"), SubmitComposer, None),
-        KeyBinding::new(&format!("{alternate}-shift-enter"), QueueComposer, None),
-        KeyBinding::new(&format!("{native}-shift-enter"), QueueComposer, None),
+        KeyBinding::new(alternate_submit, SubmitComposer, None),
+        KeyBinding::new(native_submit, SubmitComposer, None),
+        KeyBinding::new(alternate_queue, QueueComposer, None),
+        KeyBinding::new(native_queue, QueueComposer, None),
         KeyBinding::new(
             cfg_select! {
                 target_os = "macos" => "cmd-.",
