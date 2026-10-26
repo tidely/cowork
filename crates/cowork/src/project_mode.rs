@@ -110,7 +110,6 @@ impl Cowork {
         let trigger = Button::new("project-mode")
             .debug_selector(|| "project-mode".to_owned())
             .label(mode.label())
-            .dropdown_caret(true)
             .ghost()
             .small()
             .flex_none()

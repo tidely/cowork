@@ -355,7 +355,13 @@ impl Cowork {
                                 })
                                 .when(can_change_model, |this| this.cursor_pointer())
                                 .when(model_picker_hovered && can_change_model, |this| {
-                                    this.bg(cx.theme().secondary_hover)
+                                    this.bg(cx.theme().tokens.secondary_hover)
+                                })
+                                .when(can_change_model, |this| {
+                                    this.active(|this| this.bg(cx.theme().tokens.secondary_active))
+                                })
+                                .when(trigger.is_open(), |this| {
+                                    this.bg(cx.theme().tokens.secondary_active)
                                 })
                                 .text_sm()
                                 .text_color(if unavailable {
@@ -375,17 +381,7 @@ impl Cowork {
                                             .when(unavailable, |this| this.opacity(0.5)),
                                     )
                                 })
-                                .child(div().child(title))
-                                .child(
-                                    Icon::new(if trigger.is_open() {
-                                        AssetIconName::ChevronUp
-                                    } else {
-                                        AssetIconName::ChevronDown
-                                    })
-                                    .size_4()
-                                    .flex_none()
-                                    .text_color(cx.theme().muted_foreground),
-                                ),
+                                .child(div().child(title)),
                         )
                     }),
             );
