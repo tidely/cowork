@@ -252,10 +252,20 @@ pub(crate) enum TurnResponse {
 
 /// What the card shows of a turn, from its shared records.
 #[derive(Clone, Debug, PartialEq)]
+pub(crate) enum TurnPrompt {
+    Text(String),
+    /// Individual comment bodies, sharing one preview budget. Labels are
+    /// presentation, not content that the renderer has to recognize.
+    Comments(Vec<String>),
+}
+
+/// What the card shows of a turn, from its shared records.
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TurnPreview {
     /// The comments' and prompt blocks' text, in the order the timeline
     /// shows them, or attachments' names where a block has no text.
-    pub(crate) prompt: String,
+    pub(crate) prompt: TurnPrompt,
+    pub(crate) comment_count: usize,
     pub(crate) response: TurnResponse,
     /// Everyone who wrote the group's comments or prompt blocks, in the
     /// order they first did; not who sent it, nor who steered the run.
@@ -284,8 +294,17 @@ impl TurnPreview {
             return None;
         }
         let group = &group.record;
+        let comment_count = group.comments.len();
+        let comments_only = comment_count > 0
+            && group
+                .blocks
+                .iter()
+                .all(|block| block.text.trim().is_empty() && block.attachments.is_empty());
         let mut prompt = PreviewText::default();
         'prompt: {
+            if comments_only {
+                break 'prompt;
+            }
             for comment in &group.comments {
                 let body = comment.body.trim();
                 if !body.is_empty()
@@ -375,8 +394,16 @@ impl TurnPreview {
             .as_ref()
             .and_then(|model| thread.models().get(model))
             .map(|info| info.name.clone());
+        let prompt = if comments_only {
+            TurnPrompt::Comments(comment_previews(
+                group.comments.iter().map(|comment| comment.body.as_str()),
+            ))
+        } else {
+            TurnPrompt::Text(prompt.finish())
+        };
         Some(Self {
-            prompt: prompt.finish(),
+            prompt,
+            comment_count,
             response,
             authors,
             scheduled,
@@ -398,13 +425,27 @@ fn kind_label(kind: AttachmentKind) -> &'static str {
 /// Accumulates only a preview's byte budget, including separators and its
 /// truncation indicator. A formatting error means the budget is exhausted:
 /// callers stop visiting further input, and `write!` stops formatting parts.
-#[derive(Default)]
 struct PreviewText {
     text: String,
     truncated: bool,
+    limit: usize,
+}
+
+impl Default for PreviewText {
+    fn default() -> Self {
+        Self::new(PREVIEW_BYTES)
+    }
 }
 
 impl PreviewText {
+    fn new(limit: usize) -> Self {
+        Self {
+            text: String::new(),
+            truncated: false,
+            limit,
+        }
+    }
+
     fn section(&mut self) -> fmt::Result {
         if self.text.is_empty() {
             Ok(())
@@ -416,7 +457,7 @@ impl PreviewText {
     fn finish(mut self) -> String {
         if self.truncated {
             const ELLIPSIS: &str = "…";
-            let end = char_boundary(&self.text, PREVIEW_BYTES - ELLIPSIS.len());
+            let end = char_boundary(&self.text, self.limit - ELLIPSIS.len());
             self.text.truncate(end);
             self.text.push_str(ELLIPSIS);
         }
@@ -429,7 +470,7 @@ impl fmt::Write for PreviewText {
         if self.truncated {
             return Err(fmt::Error);
         }
-        let remaining = PREVIEW_BYTES - self.text.len();
+        let remaining = self.limit - self.text.len();
         let end = char_boundary(text, remaining);
         self.text.push_str(&text[..end]);
         if end < text.len() {
@@ -447,6 +488,38 @@ fn char_boundary(text: &str, limit: usize) -> usize {
         end -= 1;
     }
     end
+}
+
+const COMMENT_LABEL: &str = "Comment: ";
+
+/// Bound all comment bodies together, counting the labels and separators
+/// the renderer will add, without flattening away their structure.
+fn comment_previews<'a>(bodies: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut comments: Vec<String> = Vec::new();
+    let mut remaining = PREVIEW_BYTES;
+    for body in bodies {
+        let body = body.trim();
+        if body.is_empty() {
+            continue;
+        }
+        let overhead = COMMENT_LABEL.len() + usize::from(!comments.is_empty());
+        if remaining < overhead + "…".len() {
+            if let Some(last) = comments.last_mut() {
+                last.truncate(char_boundary(last, last.len().saturating_sub("…".len())));
+                last.push('…');
+            }
+            break;
+        }
+        let mut preview = PreviewText::new(remaining - overhead);
+        let truncated = preview.write_str(body).is_err();
+        let text = preview.finish();
+        remaining -= overhead + text.len();
+        comments.push(text);
+        if truncated {
+            break;
+        }
+    }
+    comments
 }
 
 /// How long before `now` a run started: "just now", "5 min ago", "3 h
@@ -594,6 +667,29 @@ pub(crate) fn render_turn_card(
 ) -> gpui::Stateful<gpui::Div> {
     let theme = cx.theme();
     let divider = || div().h(px(1.)).w_full().flex_none().bg(theme.border);
+    let prompt = match &preview.prompt {
+        TurnPrompt::Text(text) => gpui::StyledText::new(SharedString::new(text)),
+        TurnPrompt::Comments(comments) => {
+            let mut text = String::new();
+            let mut highlights = Vec::with_capacity(comments.len());
+            for comment in comments {
+                if !text.is_empty() {
+                    text.push('\n');
+                }
+                let start = text.len();
+                text.push_str(COMMENT_LABEL);
+                highlights.push((
+                    start..text.len(),
+                    gpui::HighlightStyle {
+                        color: Some(theme.muted_foreground),
+                        ..Default::default()
+                    },
+                ));
+                text.push_str(comment);
+            }
+            gpui::StyledText::new(SharedString::from(text)).with_highlights(highlights)
+        }
+    };
     let response = match &preview.response {
         TurnResponse::Text(text) => div()
             .text_color(theme.muted_foreground)
@@ -659,14 +755,10 @@ pub(crate) fn render_turn_card(
         .shadow_lg()
         .text_sm()
         .text_color(theme.popover_foreground)
-        .child(
-            div()
-                .line_clamp(PROMPT_LINES)
-                .text_ellipsis()
-                .child(SharedString::from(preview.prompt.clone())),
-        )
-        .child(divider())
-        .child(response)
+        .child(div().line_clamp(PROMPT_LINES).text_ellipsis().child(prompt))
+        .when(matches!(preview.prompt, TurnPrompt::Text(_)), |this| {
+            this.child(divider()).child(response)
+        })
         .child(divider())
         .child(
             div()
@@ -677,6 +769,24 @@ pub(crate) fn render_turn_card(
                 .text_color(theme.muted_foreground)
                 .child(authors.text_color(theme.popover_foreground))
                 .child(model)
+                .when(preview.comment_count > 0, |this| {
+                    this.child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1p5()
+                            .child(Icon::new(IconName::MessageSquare).size(px(14.)).flex_none())
+                            .child(format!(
+                                "{} {}",
+                                preview.comment_count,
+                                if preview.comment_count == 1 {
+                                    "comment"
+                                } else {
+                                    "comments"
+                                },
+                            )),
+                    )
+                })
                 .child(
                     div()
                         .flex()
@@ -859,6 +969,33 @@ mod tests {
         timeline::PromptBlock,
         transcript::shared_entry,
     };
+
+    #[test]
+    fn comment_previews_preserve_bodies_and_share_one_budget() {
+        assert_eq!(
+            comment_previews([" First comment ", "", "Second\ncomment 🙂"]),
+            ["First comment", "Second\ncomment 🙂"],
+        );
+
+        let long = "🙂".repeat(PREVIEW_BYTES);
+        let comments = comment_previews(["First", long.as_str(), "Must not be included"]);
+        assert_eq!(comments.len(), 2);
+        assert_eq!(comments[0], "First");
+        assert!(comments[1].ends_with('…'));
+        let rendered_bytes = comments
+            .iter()
+            .map(|body| COMMENT_LABEL.len() + body.len())
+            .sum::<usize>()
+            + comments.len()
+            - 1;
+        assert!(rendered_bytes <= PREVIEW_BYTES);
+
+        let full = "a".repeat(PREVIEW_BYTES - COMMENT_LABEL.len());
+        let comments = comment_previews([full.as_str(), "Another comment"]);
+        assert_eq!(comments.len(), 1);
+        assert!(comments[0].ends_with('…'));
+        assert!(comments[0].len() + COMMENT_LABEL.len() <= PREVIEW_BYTES);
+    }
 
     #[test]
     fn preview_accumulation_bounds_unicode_and_stops_formatting() {
@@ -1128,7 +1265,10 @@ mod tests {
             script.apply(
                 HostMessage::UserMessage(group(
                     commented,
-                    vec![comment(host, "Is this safe?")],
+                    vec![
+                        comment(host, "Is this safe?"),
+                        comment(host, "What about retries?"),
+                    ],
                     &[],
                 )),
                 cx,
@@ -1167,14 +1307,19 @@ mod tests {
             script.end(scheduled, RunOutcome::Completed, cx);
 
             let first = script.preview_of(commented);
-            assert_eq!(first.prompt, "“Is this safe?”");
+            assert_eq!(
+                first.prompt,
+                TurnPrompt::Comments(vec!["Is this safe?".into(), "What about retries?".into()])
+            );
+            assert_eq!(first.comment_count, 2);
             assert_eq!(first.response, TurnResponse::Text("It is, because…".into()));
             assert_eq!(first.model, Some(first_model));
             assert_eq!(first.started_at, earlier);
             assert!(!first.scheduled);
 
             let second = script.preview_of(attached);
-            assert_eq!(second.prompt, "crash.log (text)");
+            assert_eq!(second.prompt, TurnPrompt::Text("crash.log (text)".into()));
+            assert_eq!(second.comment_count, 0);
             assert_eq!(second.response, TurnResponse::Status("No response"));
             assert_eq!(second.model, None, "never the thread's current model");
             assert!(second.scheduled);

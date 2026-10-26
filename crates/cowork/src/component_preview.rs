@@ -535,12 +535,13 @@ impl TurnNavigationPreview {
         use crate::{
             models::{ModelProvider, ModelRef},
             participant::ParticipantId,
-            turn_navigation::{TurnPreview, TurnResponse},
+            turn_navigation::{TurnPreview, TurnPrompt, TurnResponse},
         };
         let now = std::time::SystemTime::now();
         if rich {
             TurnPreview {
-                prompt: "“Is the retry loop safe if the host disconnects mid-transfer?”\nInvestigate the crash when a collaborator joins while an attachment is still uploading. Keep the protocol unchanged if you can, and add a regression test that reproduces the late join with a large file.\nAlso check the attached log.".into(),
+                prompt: TurnPrompt::Text("“Is the retry loop safe if the host disconnects mid-transfer?”\nInvestigate the crash when a collaborator joins while an attachment is still uploading. Keep the protocol unchanged if you can, and add a regression test that reproduces the late join with a large file.\nAlso check the attached log.".into()),
+                comment_count: 1,
                 response: TurnResponse::Text("The crash comes from the attachment table being read before the host has stored every chunk. A late joiner receives the record from the snapshot but the bytes are still in flight, so the transfer resumes from an index that doesn't exist yet.\n\nI changed the host to send only stored records in the Welcome snapshot and queue the rest, and added a regression test that joins during a 4 MB upload. The protocol is unchanged.".into()),
                 authors: vec![ParticipantId::new(), ParticipantId::new(), ParticipantId::new()],
                 scheduled: false,
@@ -550,7 +551,8 @@ impl TurnNavigationPreview {
             }
         } else {
             TurnPreview {
-                prompt: "crash.log (text), screenshot.png (PNG image)".into(),
+                prompt: TurnPrompt::Text("crash.log (text), screenshot.png (PNG image)".into()),
+                comment_count: 0,
                 response: TurnResponse::Status("Stopped"),
                 authors: vec![ParticipantId::new()],
                 scheduled: true,
