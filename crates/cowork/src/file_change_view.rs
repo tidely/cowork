@@ -1,7 +1,8 @@
-//! A `write_file` or `edit_file` call shown as the change it makes: what it
-//! does to which file ("Edit zed/a.rs") and its line counts, a Diff / JSON
-//! switch, and either a unified diff (gpui-component's [`Diff`]) or the
-//! call's raw arguments. That label is also the approval card's title.
+//! A `write_file` or `edit_file` call shown as the change it makes: a
+//! unified diff (gpui-component's [`Diff`]). The timeline row's summary
+//! names the file, so its details are the diff alone; the approval card
+//! puts [`card_body`]'s label, what the call does to which file ("Edit
+//! zed/a.rs") and its line counts, above it in place of a title.
 //!
 //! Every copy of a thread computes the diff from the call's arguments
 //! alone, never from the file: an edit's `old_string` becomes its
@@ -9,25 +10,25 @@
 //! file held. An edit shows only the text it replaces, without the file's
 //! line numbers, which its arguments don't give. Each call keeps one view
 //! (see `AgentMessage::show_file_changes`), both the approval card's body
-//! and the timeline row's details, so the switch stays where it was left.
+//! and the timeline row's details, so its scrolling and selection carry
+//! over once the call is decided.
 
 use std::time::Duration;
 
 use agent::model::ToolCall;
 use gpui::{
-    Context, Entity, FontWeight, IntoElement, Pixels, Render, SharedString, Window, div,
-    prelude::*, px,
+    AnyElement, App, Context, Entity, FontWeight, IntoElement, Pixels, Render, SharedString,
+    Window, div, prelude::*, px,
 };
 use gpui_component::{
-    ActiveTheme as _, Icon, Sizable as _, Theme,
-    button::{Toggle, ToggleGroup, ToggleVariants as _},
+    ActiveTheme as _, Icon, Theme,
     diff::{Diff, DiffFile, DiffHunkSeparator, DiffState},
-    h_flex,
+    h_flex, v_flex,
 };
 use gpui_kit_assets::IconName;
 use sandbox::{EditFile, WriteFile};
 
-use crate::{highlight::highlight_code_in_mode, tool_call_card::code_block};
+use crate::highlight::highlight_code_in_mode;
 
 /// How long finding a change's lines may take before settling for a
 /// coarser diff, as it runs on the UI thread.
@@ -103,15 +104,11 @@ pub(crate) struct FileChangeView {
     id: SharedString,
     path: String,
     kind: ChangeKind,
-    /// The call's arguments, pretty-printed.
-    json: String,
     /// `None` when nothing changes.
     file: Option<DiffFile>,
     /// Lines the diff shows: its hunks' lines and a divider for each.
     rows: usize,
     diff: Entity<DiffState>,
-    /// Whether the raw JSON is shown instead of the diff.
-    raw: bool,
 }
 
 impl FileChangeView {
@@ -132,14 +129,10 @@ impl FileChangeView {
             .filter(|line| !line.starts_with("--- ") && !line.starts_with("+++ "))
             .count();
         let id = id.into();
-        // A `Value` always encodes.
-        let json = serde_json::to_string_pretty(&crate::timeline::arguments_value(call))
-            .unwrap_or_default();
         Some(cx.new(|cx| Self {
             id,
             path: change.path,
             kind: change.kind,
-            json,
             diff: cx.new(|cx| {
                 // Diff prepares each hunk's two sides in the background. Only
                 // colors depend on the app; no context crosses to that task.
@@ -160,11 +153,10 @@ impl FileChangeView {
             }),
             file,
             rows,
-            raw: false,
         }))
     }
 
-    fn file_label(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn file_label(&self, cx: &App) -> impl IntoElement {
         let theme = cx.theme();
         let (verb, note) = match self.kind {
             ChangeKind::Write => ("Write", Some("whole file")),
@@ -219,27 +211,21 @@ impl FileChangeView {
     }
 }
 
+/// The approval card's body for a file call: what it does to which file,
+/// with its line counts, above its diff.
+pub(crate) fn card_body(view: &Entity<FileChangeView>, cx: &App) -> AnyElement {
+    v_flex()
+        .gap_1p5()
+        .text_xs()
+        .child(view.read(cx).file_label(cx))
+        .child(view.clone())
+        .into_any_element()
+}
+
 impl Render for FileChangeView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let id = self.id.clone();
-        let raw = self.raw;
-        let switch = ToggleGroup::new(SharedString::from(format!("{id}-switch")))
-            .segmented()
-            .outline()
-            .xsmall()
-            .child(Toggle::new("diff").label("Diff").checked(!raw))
-            .child(Toggle::new("json").label("JSON").checked(raw))
-            .on_click(cx.listener(move |this, checked: &Vec<bool>, _, cx| {
-                // Clicking the side shown unchecks it and changes nothing;
-                // clicking the other checks both.
-                if checked.iter().all(|checked| *checked) {
-                    this.raw = !raw;
-                    cx.notify();
-                }
-            }));
-        let content = if raw {
-            code_block(format!("{id}-json"), self.json.clone(), cx)
-        } else if self.file.is_some() {
+        let content = if self.file.is_some() {
             // `Diff` owns its scrolling and needs a bounded height: its rows'
             // own, as it computes them, up to `MAX_ROWS`.
             let font_size = window.rem_size() * (f32::from(cx.theme().mono_font_size) / 16.);
@@ -268,25 +254,13 @@ impl Render for FileChangeView {
         };
         div()
             .debug_selector(move || id.to_string())
-            .flex()
-            .flex_col()
-            .gap_1p5()
             .text_xs()
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .gap_2()
-                    .child(self.file_label(cx))
-                    .child(div().flex_1())
-                    .child(switch),
-            )
             .child(content)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use gpui::{Modifiers, TestAppContext};
     use serde_json::json;
 
     use super::*;
@@ -412,36 +386,5 @@ mod tests {
             highlight_code_in_mode(Some("unknown-language"), "plain café\n", true),
             highlight_code_in_mode(None, "plain café\n", true),
         );
-    }
-
-    #[gpui::test]
-    fn the_switch_shows_the_raw_arguments(cx: &mut TestAppContext) {
-        cx.update(|cx| {
-            gpui_component::init(cx);
-            crate::theme::init(cx);
-        });
-        let call = tool_call(
-            "call_1",
-            EditFile::NAME,
-            json!({"path": "zed/a.txt", "old_string": "a", "new_string": "b"}),
-        );
-        struct Host(Entity<FileChangeView>);
-        impl Render for Host {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                div().w(px(480.)).child(self.0.clone())
-            }
-        }
-        let (_, cx) =
-            cx.add_window_view(|_, cx| Host(FileChangeView::of("change", &call, cx).unwrap()));
-        cx.run_until_parked();
-        assert!(cx.debug_bounds("change-diff").is_some());
-        assert!(cx.debug_bounds("change-json").is_none());
-
-        let row = cx.debug_bounds("change").unwrap();
-        // The JSON toggle is the switch's right half, at the row's end.
-        let json = gpui::point(row.right() - px(8.), row.top() + px(8.));
-        cx.simulate_click(json, Modifiers::default());
-        assert!(cx.debug_bounds("change-json").is_some());
-        assert!(cx.debug_bounds("change-diff").is_none());
     }
 }

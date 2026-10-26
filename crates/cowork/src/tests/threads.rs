@@ -535,6 +535,61 @@ fn thinking_after_a_tool_call_is_a_new_step(cx: &mut gpui::TestAppContext) {
     });
 }
 
+/// A file change, shown as its diff, starts open; a call shown as its raw
+/// arguments starts folded. A change someone folds stays folded as the run
+/// continues.
+#[gpui::test]
+fn file_changes_start_open_and_raw_calls_folded(cx: &mut gpui::TestAppContext) {
+    let message_id = Uuid::new_v4();
+    let mut host = ScriptedHost::default();
+    let mut events = host.start(message_id, "Fix it");
+    events.extend(host.turn(
+        message_id,
+        [streamed_tool_call(
+            "edit",
+            sandbox::EditFile::NAME,
+            serde_json::json!({"path": "zed/a.rs", "old_string": "a", "new_string": "b"}),
+        )],
+        100,
+    ));
+    let edited = events.len();
+    events.extend(host.results(message_id, "Edited"));
+    events.extend(host.turn(
+        message_id,
+        [streamed_tool_call(
+            "sum",
+            "calculate",
+            serde_json::json!({"operation": "add", "a": 1, "b": 2}),
+        )],
+        200,
+    ));
+    let (thread, cx) = empty_thread(cx, Arc::default());
+    cx.update(|_, cx| {
+        thread.update(cx, |thread, cx| {
+            for event in events.iter().take(edited) {
+                thread.apply_for_test(event.clone(), cx);
+            }
+            let message = thread
+                .agent_message_mut(message_id.into_bytes())
+                .expect("the agent message");
+            assert!(message.ui.step_view(0).unwrap().expanded());
+            message.ui.step_view_mut(0).unwrap().set_expanded(false);
+            for event in events.iter().skip(edited) {
+                thread.apply_for_test(event.clone(), cx);
+            }
+            let message = thread
+                .agent_message_mut(message_id.into_bytes())
+                .expect("the agent message");
+            assert!(matches!(
+                message.ui.output.steps(),
+                [AgentStep::ToolCall(_), AgentStep::ToolCall(_)]
+            ));
+            assert!(!message.ui.step_view(0).unwrap().expanded());
+            assert!(!message.ui.step_view(1).unwrap().expanded());
+        });
+    });
+}
+
 #[gpui::test]
 fn membership_events_are_idempotent_and_uncatalogued_models_cannot_run(
     cx: &mut gpui::TestAppContext,

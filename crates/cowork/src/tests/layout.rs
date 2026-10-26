@@ -291,6 +291,7 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
                 result: Some(vec![agent::model::ToolResultContent::Text {
                     text: "3".into(),
                 }]),
+                failed: false,
             }),
             AgentStep::ToolCall(crate::timeline::AgentToolCall {
                 call: call(
@@ -299,6 +300,7 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
                     serde_json::json!({"a": 3, "b": 2, "operation": "multiply"}),
                 ),
                 result: None,
+                failed: false,
             }),
             AgentStep::Thinking("Check them.".into()),
         ];

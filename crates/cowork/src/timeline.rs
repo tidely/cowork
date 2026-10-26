@@ -4,7 +4,8 @@
 use std::{collections::HashMap, ops::Range, time::SystemTime};
 
 use agent::model::{
-    Content, Message, Reasoning, Role, ToolArguments, ToolCall, ToolCallId, ToolResultContent,
+    Content, Message, Reasoning, Role, ToolArguments, ToolCall, ToolCallId, ToolResult,
+    ToolResultContent,
 };
 use draft::AttachmentRecord;
 use gpui::{AppContext, Entity, SharedString};
@@ -251,6 +252,17 @@ pub(crate) struct AgentToolCall {
     pub(crate) call: ToolCall,
     /// `None` until the tool returns. A run that ends first leaves it so.
     pub(crate) result: Option<Vec<ToolResultContent>>,
+    /// Whether the tool returned an error, such as an edit whose text
+    /// wasn't found; false until it returns.
+    pub(crate) failed: bool,
+}
+
+/// What a file call acts on, as its row names it.
+enum Target<'a> {
+    /// The path the call names.
+    Path(&'a str),
+    /// What it acts on in words, when it names no path to show.
+    Named(&'static str),
 }
 
 /// A call's arguments as JSON: the object, or the text of arguments that
@@ -321,11 +333,35 @@ impl AgentToolCall {
             .unwrap_or_else(|| format!("Running {}", self.call.name))
     }
 
+    /// A finished file call's verb and the path it names, shown apart so the
+    /// path can look like one: ("Edited", "zed/a.rs"). `None` for other
+    /// tools and for calls naming no path.
+    pub(crate) fn path_summary(&self) -> Option<(&'static str, String)> {
+        let (done, _, target) = self.file_action()?;
+        match target {
+            Target::Path(path) => Some((done, path.to_owned())),
+            Target::Named(_) => None,
+        }
+    }
+
     /// A file tool's description, naming its `path`: "Read zed/a.rs", or
     /// "Reading zed/a.rs…" while it runs. `None` for other tools.
     fn path_description(&self, running: bool) -> Option<String> {
-        // The tool, its verbs done and under way, and what it acts on when
-        // the call names no path.
+        let (done, doing, target) = self.file_action()?;
+        let target = match target {
+            Target::Path(path) => path,
+            Target::Named(thing) => thing,
+        };
+        Some(if running {
+            format!("{doing} {target}…")
+        } else {
+            format!("{done} {target}")
+        })
+    }
+
+    /// A file tool's verbs, done and under way, and what it acts on. `None`
+    /// for other tools.
+    fn file_action(&self) -> Option<(&'static str, &'static str, Target<'_>)> {
         let (done, doing, thing) = match self.call.name.as_str() {
             "read_file" => ("Read", "Reading", "file"),
             "write_file" => ("Wrote", "Writing", "file"),
@@ -334,18 +370,17 @@ impl AgentToolCall {
             "list_directory" => ("Listed", "Listing", "directory"),
             _ => return None,
         };
-        let arguments = arguments_value(&self.call);
-        let target = match arguments["path"].as_str() {
-            // `.` stands for the list of project folders.
-            Some(".") if self.call.name == "list_directory" => "project folders",
-            Some(path) => path,
-            None => thing,
+        let path = match &self.call.arguments {
+            ToolArguments::Object { value } => value.get("path").and_then(|path| path.as_str()),
+            ToolArguments::Invalid { .. } => None,
         };
-        Some(if running {
-            format!("{doing} {target}…")
-        } else {
-            format!("{done} {target}")
-        })
+        let target = match path {
+            // `.` stands for the list of project folders.
+            Some(".") if self.call.name == "list_directory" => Target::Named("project folders"),
+            Some(path) => Target::Path(path),
+            None => Target::Named(thing),
+        };
+        Some((done, doing, target))
     }
 
     /// Preview only the first nonempty shell line, never flattening a script
@@ -393,6 +428,7 @@ mod tool_call_tests {
         AgentToolCall {
             call: super::tool_call("test", name, arguments),
             result: Some(Vec::new()),
+            failed: false,
         }
     }
 
@@ -439,11 +475,17 @@ mod tool_call_tests {
             let call = tool_call(name, json!({"path": "zed/src"}));
             assert_eq!(call.description(), format!("{done} zed/src"));
             assert_eq!(call.running_description(), format!("{doing} zed/src…"));
+            assert_eq!(call.path_summary(), Some((done, "zed/src".into())));
             assert_eq!(description(name, json!({})), format!("{done} {fallback}"));
+            assert_eq!(tool_call(name, json!({})).path_summary(), None);
         }
         assert_eq!(
             description("list_directory", json!({"path": "."})),
             "Listed project folders"
+        );
+        assert_eq!(
+            tool_call("list_directory", json!({"path": "."})).path_summary(),
+            None
         );
         assert_eq!(
             tool_call("calculate", json!({})).running_description(),
@@ -835,16 +877,26 @@ impl AgentMessage {
     }
 
     /// Gives each `write_file` and `edit_file` call in `output` that has
-    /// none yet its diff view. Called whenever calls may have been added.
+    /// none yet its diff view, and opens its row: a call shown in its own
+    /// terms starts open, while one shown as raw arguments stays folded.
+    /// Each call gets its view once, so a row someone folds stays folded.
+    /// Called whenever calls may have been added.
     pub(crate) fn show_file_changes(&mut self, cx: &mut impl AppContext) {
         let message_id = self.record.id;
-        for call in self.ui.output.tool_calls() {
-            if self.ui.file_views.contains_key(&call.call.id) {
+        let ui = &mut self.ui;
+        for (index, step) in ui.output.steps.iter().enumerate() {
+            let AgentStep::ToolCall(call) = step else {
+                continue;
+            };
+            if ui.file_views.contains_key(&call.call.id) {
                 continue;
             }
             let id = format!("file-change-{message_id}-{}", call.call.id.0);
             if let Some(view) = FileChangeView::of(id, &call.call, cx) {
-                self.ui.file_views.insert(call.call.id.clone(), view);
+                ui.file_views.insert(call.call.id.clone(), view);
+                if let Some(step_view) = ui.step_views.get_mut(index) {
+                    step_view.set_expanded(true);
+                }
             }
         }
     }
@@ -943,6 +995,7 @@ impl AgentOutput {
                             self.steps.push(AgentStep::ToolCall(AgentToolCall {
                                 call: call.clone(),
                                 result: None,
+                                failed: false,
                             }));
                         }
                         Content::Reasoning(Reasoning::Redacted { .. })
@@ -954,7 +1007,7 @@ impl AgentOutput {
             Role::Tool => {
                 for part in &message.content {
                     if let Content::ToolResult(result) = part {
-                        self.record_tool_result(&result.call, &result.content);
+                        self.record_tool_result(result);
                     }
                 }
             }
@@ -1002,12 +1055,13 @@ impl AgentOutput {
     }
 
     /// Records what the tool returned for `call`.
-    fn record_tool_result(&mut self, call: &ToolCallId, content: &[ToolResultContent]) {
+    fn record_tool_result(&mut self, result: &ToolResult) {
         if let Some(tool_call) = self
             .tool_calls_mut()
-            .rfind(|tool_call| tool_call.call.id == *call)
+            .rfind(|tool_call| tool_call.call.id == result.call)
         {
-            tool_call.result = Some(content.to_vec());
+            tool_call.result = Some(result.content.clone());
+            tool_call.failed = result.is_error;
         };
     }
 
@@ -1042,6 +1096,7 @@ impl AgentOutput {
         }
         for call in self.tool_calls_mut().skip(mark.answered) {
             call.result = None;
+            call.failed = false;
         }
     }
 

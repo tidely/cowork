@@ -108,7 +108,7 @@ impl ComponentPreview {
         let denied = SharedString::from(format!("Denied {label}"));
         let card = ToolCallCard::new(format!("preview-{key}-{}", mode.key()), call.clone());
         let card = match self.file_views.get(key) {
-            Some(view) => card.body(view.clone()),
+            Some(view) => card.body(crate::file_change_view::card_body(view, cx)),
             None => card,
         };
         card.project_access(mode.access())

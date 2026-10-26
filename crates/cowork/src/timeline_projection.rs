@@ -84,6 +84,7 @@ mod tests {
                 AgentStep::ToolCall(AgentToolCall {
                     call: tool_call("call", "calculate", serde_json::json!({})),
                     result: Some(Vec::new()),
+                    failed: false,
                 }),
                 AgentStep::Thinking("Thinking".into()),
                 AgentStep::Text("First answer".into()),

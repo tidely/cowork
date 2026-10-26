@@ -27,6 +27,7 @@ use crate::{
     Cowork,
     caret::{paint_caret_label, selection_rects},
     composer_attachments::AttachmentCard,
+    file_change_view,
     highlight::highlight_code_block_in_mode,
     inline_icons::InlineIcons,
     participant::ParticipantId,
@@ -925,8 +926,8 @@ impl Cowork {
             .into_any_element()
     }
 
-    /// A tool call as one quiet line, which opens to show what went in and
-    /// what came out.
+    /// A tool call as one quiet line with a chevron after it, which opens to
+    /// show what went in and what came out, or a file change's diff alone.
     fn render_tool_call(
         thread_id: Uuid,
         message: &AgentMessage,
@@ -937,25 +938,35 @@ impl Cowork {
     ) -> gpui::AnyElement {
         let message_id = message.record.id;
         let running = call.result.is_none() && message.is_generating();
-        let summary = if let Some(command) = call.command_preview().filter(|_| !running) {
-            let block = CodeBlock::from_code(command.as_str(), Some("sh"));
-            let highlights = highlight_code_block_in_mode(&block, cx.theme().is_dark());
+        // A verb, and what it acted on in the monospace font.
+        let verb_and = |verb: &'static str, target: gpui::AnyElement| {
             div()
                 .min_w_0()
-                .flex_1()
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(div().flex_none().child("Ran"))
+                .child(div().flex_none().child(verb))
                 .child(
                     div()
                         .min_w_0()
                         .truncate()
                         .font_family(cx.theme().mono_font_family.clone())
                         .opacity(0.8)
-                        .child(StyledText::new(command).with_highlights(highlights)),
+                        .child(target),
                 )
                 .into_any_element()
+        };
+        let summary = if let Some(command) = call.command_preview().filter(|_| !running) {
+            let block = CodeBlock::from_code(command.as_str(), Some("sh"));
+            let highlights = highlight_code_block_in_mode(&block, cx.theme().is_dark());
+            verb_and(
+                "Ran",
+                StyledText::new(command)
+                    .with_highlights(highlights)
+                    .into_any_element(),
+            )
+        } else if let Some((verb, path)) = call.path_summary().filter(|_| !running) {
+            verb_and(verb, path.into_any_element())
         } else {
             div()
                 .min_w_0()
@@ -994,6 +1005,7 @@ impl Cowork {
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.toggle_step(thread_id, message_id, step_index, cx);
                     }))
+                    .child(summary)
                     .child(
                         Icon::new(if expanded {
                             AssetIconName::ChevronDown
@@ -1002,17 +1014,32 @@ impl Cowork {
                         })
                         .size_3()
                         .flex_none(),
-                    )
-                    .child(summary),
+                    ),
             )
             .when(expanded, |this| {
+                let details = div()
+                    .id(format!("tool-call-details-{message_id}-{}", step_index))
+                    .debug_selector(move || format!("tool-call-details-{message_id}-{step_index}"));
+                // A file change is its diff; the row already names the file,
+                // and what the tool returned matters only when it failed.
+                if let Some(view) = message.ui.file_views.get(&call.call.id) {
+                    return this.child(
+                        details
+                            .mt_1()
+                            .mb_2()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(view.clone())
+                            .when(call.failed, |this| {
+                                this.children(call.result_text().map(|error| {
+                                    div().text_xs().text_color(cx.theme().danger).child(error)
+                                }))
+                            }),
+                    );
+                }
                 this.child(
-                    div()
-                        .id(format!("tool-call-details-{message_id}-{}", step_index))
-                        .debug_selector(move || {
-                            format!("tool-call-details-{message_id}-{step_index}")
-                        })
-                        .ml(px(6.))
+                    details
                         .mt_1()
                         .mb_2()
                         .pl_3()
@@ -1023,15 +1050,7 @@ impl Cowork {
                         .gap_1()
                         .text_sm()
                         .child(label("Input"))
-                        // A file write shows the change it made, with its
-                        // arguments a switch away; the diff keeps its colors.
-                        .child(match message.ui.file_views.get(&call.call.id) {
-                            Some(view) => view.clone().into_any_element(),
-                            None => div()
-                                .opacity(0.7)
-                                .child(call.arguments_text())
-                                .into_any_element(),
-                        })
+                        .child(div().opacity(0.7).child(call.arguments_text()))
                         .child(label("Output"))
                         .child(
                             div()
@@ -1067,7 +1086,7 @@ impl Cowork {
         let mut card =
             ToolCallCard::new(id, call.call.clone()).project_access(rights.project_mode.access());
         if let Some(view) = message.ui.file_views.get(&call.call.id) {
-            card = card.body(view.clone());
+            card = card.body(file_change_view::card_body(view, cx));
         }
         if let Some(mut approved) = self
             .active_generations

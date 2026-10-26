@@ -35,6 +35,7 @@ fn open_work(message: &mut crate::timeline::AgentMessage, index: usize, cx: &mut
             result: Some(vec![agent::model::ToolResultContent::Text {
                 text: result.into(),
             }]),
+            failed: false,
         })
     };
     let steps = vec![
