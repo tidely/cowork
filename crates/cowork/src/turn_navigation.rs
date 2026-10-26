@@ -30,7 +30,7 @@ use draft::AttachmentKind;
 use gpui::{
     AnyElement, App, Bounds, Context, Element, ElementId, Entity, GlobalElementId, Hsla,
     InspectorElementId, IntoElement, LayoutId, MouseButton, Pixels, Position, ScrollHandle,
-    SharedString, Style, Task, Window, div, point, prelude::*, px,
+    SharedString, Style, Window, div, point, prelude::*, px,
 };
 use gpui_component::{ActiveTheme as _, Icon};
 use gpui_kit_assets::IconName;
@@ -64,10 +64,8 @@ const PILL_MOTION: Duration = Duration::from_millis(140);
 pub(crate) const CARD_WIDTH: Pixels = px(360.);
 /// The least room the card keeps from the stage's edges.
 const CARD_INSET: Pixels = px(8.);
-/// Between the card and the rail. Leaving a marker closes the card only
-/// after [`CLOSE_DELAY`], so the pointer can cross it.
+/// Between the card and the rail.
 pub(crate) const CARD_GAP: Pixels = px(6.);
-const CLOSE_DELAY: Duration = Duration::from_millis(150);
 /// Below this the stage is too narrow for a card worth reading.
 const MIN_CARD_WIDTH: Pixels = px(160.);
 const PROMPT_LINES: usize = 4;
@@ -227,12 +225,6 @@ pub(crate) struct TurnRail {
     pub(crate) hovered: Option<Uuid>,
     /// The final action marker widens without opening a turn card.
     hovered_end: bool,
-    /// The marker the pointer is over.
-    pointer_on: Option<Uuid>,
-    /// Whether the pointer is over the card.
-    on_card: bool,
-    /// Closes the card shortly after the pointer leaves both.
-    close: Option<Task<()>>,
     pub(crate) scroll: ScrollHandle,
     /// The current turn the rail last scrolled into view.
     shown_current: Option<Uuid>,
@@ -807,12 +799,7 @@ impl Cowork {
         let preview = TurnPreview::of(thread.read(cx), turn)?;
         let marker_y = marker.center().y + self.turn_rail.scroll.offset().y;
         let height = stage.size.height;
-        let owner = cx.entity().downgrade();
         let card = render_turn_card(&preview, &self.shown_profiles, SystemTime::now(), cx)
-            .occlude()
-            .on_hover(move |hovered, _, cx| {
-                _ = owner.update(cx, |this, cx| this.hover_turn_card(*hovered, cx));
-            })
             .w(width)
             .max_h(height - CARD_INSET * 2.);
         Some(
@@ -829,43 +816,15 @@ impl Cowork {
         let rail = &mut self.turn_rail;
         if hovered {
             rail.hovered = Some(id);
-            rail.pointer_on = Some(id);
-            rail.close = None;
-        } else if rail.pointer_on == Some(id) {
-            rail.pointer_on = None;
-            self.close_turn_card_soon(cx);
+        } else if rail.hovered == Some(id) {
+            rail.hovered = None;
         }
         cx.notify();
-    }
-
-    fn hover_turn_card(&mut self, hovered: bool, cx: &mut Context<Self>) {
-        self.turn_rail.on_card = hovered;
-        if hovered {
-            self.turn_rail.close = None;
-        } else {
-            self.close_turn_card_soon(cx);
-        }
-    }
-
-    /// Closes the card unless the pointer returns to it or a marker first.
-    fn close_turn_card_soon(&mut self, cx: &mut Context<Self>) {
-        self.turn_rail.close = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor().timer(CLOSE_DELAY).await;
-            _ = this.update(cx, |this, cx| {
-                let rail = &mut this.turn_rail;
-                if rail.pointer_on.is_none() && !rail.on_card && rail.hovered.take().is_some() {
-                    cx.notify();
-                }
-            });
-        }));
     }
 
     /// Closes the card, if one shows; true when it did.
     pub(crate) fn dismiss_turn_card(&mut self, cx: &mut Context<Self>) -> bool {
         let rail = &mut self.turn_rail;
-        rail.close = None;
-        rail.pointer_on = None;
-        rail.on_card = false;
         let shown = rail.hovered.take().is_some();
         if shown {
             cx.notify();

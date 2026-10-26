@@ -831,6 +831,14 @@ fn hover_cards_close_on_escape_and_stay_with_their_thread(cx: &mut gpui::TestApp
     assert!((card.center().y - marker.center().y).abs() < px(2.));
     assert!(card.right() < marker.left());
 
+    // The card cannot keep itself open when the pointer leaves the pill.
+    cx.simulate_mouse_move(card.center(), None, gpui::Modifiers::default());
+    settle(cx);
+    assert!(cx.debug_bounds("turn-card").is_none());
+    cx.simulate_mouse_move(marker.center(), None, gpui::Modifiers::default());
+    settle(cx);
+    assert!(cx.debug_bounds("turn-card").is_some());
+
     cx.simulate_keystrokes("escape");
     settle(cx);
     assert!(cx.debug_bounds("turn-card").is_none());
