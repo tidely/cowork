@@ -197,7 +197,11 @@ fn title_bar_preserves_layout_and_the_sidebar_toggle(cx: &mut gpui::TestAppConte
         .debug_bounds("top-bar-sidebar-toggle")
         .expect("sidebar toggle should be rendered");
 
-    thread_menu_gateway(cx);
+    let sharing_button = thread_menu_gateway(cx);
+    assert!(
+        sharing_button.size.width > sharing_button.size.height * 2.,
+        "the sharing button must fit its icon and label, not constrain them to an icon-sized square: {sharing_button:?}"
+    );
     assert!(cx.debug_bounds("toggle-sharing").is_none());
     assert!(cx.debug_bounds("copy-endpoint-id").is_none());
     assert!(content.contains(&toggle.center()));

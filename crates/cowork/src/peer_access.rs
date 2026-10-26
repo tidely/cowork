@@ -48,9 +48,10 @@ impl Cowork {
             Button::new("thread-menu-trigger")
                 .debug_selector(|| "thread-menu-trigger".to_owned())
                 .icon(Icon::new(IconName::Users).size_4())
+                .label("Share")
                 .ghost()
                 .small()
-                .size(px(28.))
+                .h(px(28.))
                 .accessibility_label("Sharing and access")
                 .tooltip("Sharing and access")
                 .when(
