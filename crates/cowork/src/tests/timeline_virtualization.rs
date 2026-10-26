@@ -621,6 +621,254 @@ fn growing_rows_keep_follow_bottom_pinned(cx: &mut gpui::TestAppContext) {
     }
 }
 
+impl Fixture {
+    /// The id of the user group at timeline `index`: a turn of the rail.
+    fn group_id(&self, index: usize, cx: &VisualTestContext) -> Uuid {
+        self.thread
+            .read_with(cx, |thread, _| match &thread.timeline[index] {
+                TimelineMessage::User(group) => group.record.id,
+                TimelineMessage::Agent(_) => unreachable!("users are at even indices"),
+            })
+    }
+
+    fn marker(&self, index: usize, cx: &VisualTestContext) -> &'static str {
+        Box::leak(format!("turn-marker-{}", self.group_id(index, cx)).into_boxed_str())
+    }
+
+    fn current_turn(&self, cx: &VisualTestContext) -> Option<Uuid> {
+        let thread_id = self.thread.read_with(cx, |thread, _| thread.instance_id);
+        self.cowork.read_with(cx, |cowork, _| {
+            cowork.timeline_layout.borrow().current_turn(thread_id)
+        })
+    }
+
+    /// The top of the timeline's view.
+    fn view_top(&self, cx: &VisualTestContext) -> Pixels {
+        self.cowork
+            .read_with(cx, |cowork, _| cowork.timeline_scroll_handle.bounds().top())
+    }
+}
+
+/// Clicking a turn's marker scrolls a distant prompt, never drawn, to the
+/// top of the view, where it stays as the rows around it are measured;
+/// the current turn follows the view, and a run belongs to its prompt.
+#[gpui::test]
+fn navigating_to_a_turn_reaches_rows_never_drawn(cx: &mut gpui::TestAppContext) {
+    let (fixture, _runtime, cx) = Fixture::with_open_work(cx);
+    fixture
+        .cowork
+        .update(cx, |cowork, _| cowork.follow_generation = true);
+    let (index, text) = fixture.users[fixture.users.len() * 3 / 4];
+    assert!(
+        cx.debug_bounds(text).is_none(),
+        "the target was never drawn"
+    );
+    assert_eq!(fixture.current_turn(cx), Some(fixture.group_id(0, cx)));
+
+    // The rail shows the current turn; scroll it to the target's marker.
+    let rail = cx.debug_bounds("turn-rail").expect("the rail shows");
+    let marker = cx
+        .debug_bounds(fixture.marker(index, cx))
+        .expect("every turn has a marker");
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: rail.center(),
+        delta: gpui::ScrollDelta::Pixels(point(px(0.), rail.center().y - marker.center().y)),
+        ..Default::default()
+    });
+    settle(cx);
+    assert_eq!(fixture.geometry(cx).0, px(0.));
+    let marker = cx.debug_bounds(fixture.marker(index, cx)).unwrap();
+    assert!(rail.contains(&marker.center()));
+    cx.simulate_click(marker.center(), gpui::Modifiers::default());
+    settle(cx);
+    let top = cx.debug_bounds(text).expect("the target is built").top();
+    let view_top = fixture.view_top(cx);
+    assert!(
+        top >= view_top && top < view_top + px(60.),
+        "the target is at the top of the view: {top:?}, view at {view_top:?}"
+    );
+    assert_eq!(fixture.current_turn(cx), Some(fixture.group_id(index, cx)));
+    assert!(
+        !fixture
+            .cowork
+            .read_with(cx, |cowork, _| cowork.follow_generation),
+        "navigating stops following the run's output"
+    );
+    fixture.assert_culled(cx);
+    for _ in 0..3 {
+        fixture.redraw(cx);
+        assert_eq!(cx.debug_bounds(text).map(|bounds| bounds.top()), Some(top));
+    }
+
+    // Down through the turn's run, its own until the next prompt reaches
+    // the top of the view.
+    let next = fixture.users[fixture.users.len() * 3 / 4 + 1].1;
+    let mut reached = false;
+    for _ in 0..100 {
+        scroll_wheel(px(-90.), cx);
+        let next_top = cx.debug_bounds(next).map(|bounds| bounds.top());
+        let current = fixture.current_turn(cx);
+        if next_top.is_some_and(|top| top <= view_top) {
+            assert_eq!(current, Some(fixture.group_id(index + 2, cx)));
+            reached = true;
+            break;
+        }
+        if next_top.is_none_or(|top| top > view_top + px(60.)) {
+            assert_eq!(current, Some(fixture.group_id(index, cx)));
+        }
+    }
+    assert!(reached, "scrolling reaches the next prompt");
+
+    // A group that steers a run is part of that run's turn, not a turn.
+    fixture.thread.update(cx, |thread, cx| {
+        let steer = match &thread.timeline[index + 2] {
+            TimelineMessage::User(group) => group.record.id,
+            TimelineMessage::Agent(_) => unreachable!(),
+        };
+        let TimelineMessage::Agent(run) = &mut thread.timeline[index + 1] else {
+            unreachable!("replies follow prompts");
+        };
+        run.ui.steered(steer, cx);
+    });
+    fixture.redraw(cx);
+    assert!(cx.debug_bounds(fixture.marker(index + 2, cx)).is_none());
+    assert_eq!(fixture.current_turn(cx), Some(fixture.group_id(index, cx)));
+}
+
+/// A rail longer than the stage scrolls on its own, the conversation
+/// staying put, even past the rail's end.
+#[gpui::test]
+fn a_long_rail_scrolls_without_the_conversation(cx: &mut gpui::TestAppContext) {
+    let (fixture, _runtime, cx) = Fixture::new(cx, timeline_bench::SHORT);
+    middle(&fixture, cx);
+    let before = fixture.geometry(cx);
+    let rail = cx.debug_bounds("turn-rail").expect("the rail shows");
+    let rail_offset = |cx: &VisualTestContext| {
+        fixture
+            .cowork
+            .read_with(cx, |cowork, _| cowork.turn_rail.scroll.offset().y)
+    };
+    for delta in [px(-10.), px(-100_000.), px(100_000.)] {
+        let start = rail_offset(cx);
+        cx.simulate_event(gpui::ScrollWheelEvent {
+            position: rail.center(),
+            delta: gpui::ScrollDelta::Pixels(point(px(0.), delta)),
+            ..Default::default()
+        });
+        settle(cx);
+        assert_ne!(rail_offset(cx), start, "the rail scrolls");
+        assert_same_geometry(fixture.geometry(cx), before);
+    }
+
+    // The final marker returns to the actual end, not the last prompt,
+    // and takes over from an in-progress turn navigation.
+    let group = fixture.group_id(0, cx);
+    fixture.cowork.update(cx, |cowork, cx| {
+        cowork.navigate_to_turn(group, cx);
+    });
+    settle(cx);
+    cx.simulate_event(gpui::ScrollWheelEvent {
+        position: rail.center(),
+        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-100_000.))),
+        ..Default::default()
+    });
+    settle(cx);
+    let end = cx.debug_bounds("jump-to-end").expect("the final action");
+    assert!(rail.contains(&end.center()));
+    cx.simulate_mouse_move(end.center(), None, gpui::Modifiers::default());
+    settle(cx);
+    assert!(cx.debug_bounds("turn-card").is_none());
+    cx.simulate_click(end.center(), gpui::Modifiers::default());
+    settle(cx);
+    fixture.cowork.read_with(cx, |cowork, _| {
+        assert!(cowork.follow_generation);
+        let scroll = &cowork.timeline_scroll_handle;
+        assert!((scroll.offset().y + scroll.max_offset().y).abs() < px(1.));
+    });
+
+    // There is no lone end marker in an empty conversation.
+    fixture.thread.update(cx, |thread, cx| {
+        thread.timeline.clear();
+        cx.notify();
+    });
+    fixture.redraw(cx);
+    assert!(cx.debug_bounds("jump-to-end").is_none());
+    assert!(cx.debug_bounds("turn-rail").is_none());
+}
+
+/// Hovering a marker opens its card; Escape closes it, and another thread
+/// starts with neither a card nor a turn to navigate to.
+#[gpui::test]
+fn hover_cards_close_on_escape_and_stay_with_their_thread(cx: &mut gpui::TestAppContext) {
+    let (fixture, _runtime, cx) = Fixture::new(cx, timeline_bench::SHORT);
+    let hover = |cx: &mut VisualTestContext| {
+        let marker = cx
+            .debug_bounds(fixture.marker(0, cx))
+            .expect("the first turn's marker");
+        cx.simulate_mouse_move(marker.center(), None, gpui::Modifiers::default());
+        settle(cx);
+    };
+    hover(cx);
+    assert!(cx.debug_bounds("turn-card").is_some());
+
+    // A marker near the middle opens its card centered beside it, rather
+    // than snapping the card's top/bottom edge to the marker.
+    let rail = cx.debug_bounds("turn-rail").unwrap();
+    let marker = fixture
+        .users
+        .iter()
+        .filter_map(|(index, _)| cx.debug_bounds(fixture.marker(*index, cx)))
+        .min_by(|a, b| {
+            (a.center().y - rail.center().y)
+                .abs()
+                .partial_cmp(&(b.center().y - rail.center().y).abs())
+                .unwrap()
+        })
+        .unwrap();
+    cx.simulate_mouse_move(marker.center(), None, gpui::Modifiers::default());
+    settle(cx);
+    let card = cx.debug_bounds("turn-card").unwrap();
+    assert!((card.center().y - marker.center().y).abs() < px(2.));
+    assert!(card.right() < marker.left());
+
+    cx.simulate_keystrokes("escape");
+    settle(cx);
+    assert!(cx.debug_bounds("turn-card").is_none());
+
+    cx.simulate_mouse_move(point(px(600.), px(380.)), None, gpui::Modifiers::default());
+    hover(cx);
+    assert!(cx.debug_bounds("turn-card").is_some());
+    let group = fixture.group_id(fixture.users.last().unwrap().0, cx);
+    let other = Uuid::new_v4();
+    fixture.cowork.update(cx, |cowork, cx| {
+        // A navigation still on its way when the thread changes.
+        cowork.navigate_to_turn(group, cx);
+        let thread = cx.new(|cx| {
+            test_thread(
+                other,
+                timeline_bench::timeline(4, timeline_bench::SHORT, cx),
+                ThreadDraft::new(ParticipantId::new()),
+            )
+        });
+        cowork
+            .thread_store
+            .update(cx, |store, _| store.threads.push_front(thread));
+        cowork.active_thread_id = Some(other);
+        cx.notify();
+    });
+    settle(cx);
+    assert!(cx.debug_bounds("turn-card").is_none());
+    assert_eq!(fixture.current_turn(cx), None);
+    fixture
+        .cowork
+        .read_with(cx, |cowork, _| assert_eq!(cowork.turn_rail.hovered, None));
+    assert_eq!(
+        fixture.geometry(cx).0,
+        px(0.),
+        "another thread's navigation doesn't scroll this one"
+    );
+}
+
 #[gpui::test]
 fn cross_row_drag_builds_only_its_rows_and_copies_every_row_in_order(
     cx: &mut gpui::TestAppContext,

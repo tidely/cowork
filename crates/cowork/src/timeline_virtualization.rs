@@ -19,12 +19,14 @@
 //! stays built while the button is held (see [`TimelinePress`]), and the
 //! rows holding a selection's ends while it lasts. Copy takes the rows
 //! between them from the thread; see `timeline_selection`.
+//!
+//! The same placement serves the conversation navigation rail
+//! (`turn_navigation`): each frame notes which turn the top of the view is
+//! in, and a turn navigated to becomes the anchor, placed at the top of the
+//! view, until its rows' heights stop changing. Rows on the way are never
+//! built: the target is found by identity, at its estimated position.
 
-use std::{
-    cell::RefCell,
-    collections::{HashMap, HashSet},
-    rc::Rc,
-};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use gpui::{
     AnyElement, App, AvailableSpace, Bounds, Display, Element, ElementId, FlexDirection,
@@ -36,8 +38,9 @@ use uuid::Uuid;
 
 use crate::{
     Cowork,
-    timeline::{AgentStep, TimelineMessage},
+    timeline::TimelineMessage,
     timeline_selection::TimelineSelection,
+    turn_navigation::{initiates_run, steered_groups},
 };
 
 /// How far beyond the visible area rows are built, so that a short scroll
@@ -79,6 +82,10 @@ impl TimelinePress {
     }
 }
 
+/// How many frames a navigation target may take to settle before it is
+/// let go, should the scroll container keep clamping it elsewhere.
+const TARGET_FRAMES: u8 = 8;
+
 /// The measured heights of the active thread's rows, by message. Owned by
 /// [`Cowork`] so that they outlive the frames a row isn't drawn in.
 #[derive(Default)]
@@ -87,9 +94,33 @@ pub(crate) struct TimelineLayout {
     heights: HashMap<Uuid, Pixels>,
     /// The sum of `heights`, for the estimate of rows never measured.
     measured_total: Pixels,
+    /// The turn row (see [`TimelineRowSlot::turn`]) the top of the view was
+    /// in when last drawn; see `turn_navigation`.
+    current_turn: Option<Uuid>,
+    /// The row navigated to, held at the top of the view while rows around
+    /// it are measured, and the frames it has left to settle.
+    target: Option<(Uuid, u8)>,
 }
 
 impl TimelineLayout {
+    /// The turn the top of `thread`'s view was in when it was last drawn.
+    pub(crate) fn current_turn(&self, thread: Uuid) -> Option<Uuid> {
+        self.current_turn.filter(|_| self.thread == Some(thread))
+    }
+
+    /// Scrolls `thread`'s row `message_id` to the top of the view (or as
+    /// close as the end of the content allows) in the next frame, built
+    /// there whether or not it was ever drawn.
+    pub(crate) fn navigate(&mut self, thread: Uuid, message_id: Uuid) {
+        self.show_thread(thread);
+        self.target = Some((message_id, TARGET_FRAMES));
+    }
+
+    /// Lets go of a navigation target, as scrolling by hand does.
+    pub(crate) fn cancel_navigation(&mut self) {
+        self.target = None;
+    }
+
     /// Forgets another thread's heights.
     fn show_thread(&mut self, thread: Uuid) {
         if self.thread != Some(thread) {
@@ -130,6 +161,8 @@ pub(crate) struct TimelineRowSlot {
     pub(crate) message_id: Uuid,
     /// Built and painted even offscreen; see [`TimelinePress::row`].
     pub(crate) pinned: bool,
+    /// The user group that started a run: a turn of the navigation rail.
+    pub(crate) turn: bool,
 }
 
 impl Cowork {
@@ -140,18 +173,7 @@ impl Cowork {
         &self,
         timeline: &[TimelineMessage],
     ) -> (Vec<TimelineRowSlot>, HashMap<Uuid, usize>) {
-        let steered = timeline
-            .iter()
-            .filter_map(|entry| match entry {
-                TimelineMessage::Agent(message) => Some(message.ui.output.steps()),
-                TimelineMessage::User(_) => None,
-            })
-            .flatten()
-            .filter_map(|step| match step {
-                AgentStep::Steering(id) => Some(*id),
-                _ => None,
-            })
-            .collect::<HashSet<_>>();
+        let steered = steered_groups(timeline);
         let selection = self.timeline_selection.borrow();
         let mut steering_groups = HashMap::new();
         let mut rows = Vec::with_capacity(timeline.len());
@@ -167,6 +189,7 @@ impl Cowork {
             rows.push(TimelineRowSlot {
                 index,
                 message_id,
+                turn: initiates_run(timeline, index, &steered),
                 pinned: selection.pins(message_id)
                     || self
                         .timeline_press
@@ -241,6 +264,41 @@ pub(crate) struct VirtualTimelineLayout {
 }
 
 impl VirtualTimeline {
+    /// Notes the turn the top of the view is in, with rows placed at `tops`
+    /// moved by `shift`, as this frame paints them: the last turn row whose
+    /// top is at or above the view's, the first before any is, and the last
+    /// while the end of the content is in view. Redraws the owner when that
+    /// changes, so the rail follows.
+    fn note_current_turn(
+        &self,
+        tops: &[Pixels],
+        shift: Pixels,
+        visible_top: Pixels,
+        at_bottom: bool,
+        cx: &mut App,
+    ) {
+        let mut turns = self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.turn)
+            .peekable();
+        let first = turns.peek().map(|(_, row)| row.message_id);
+        let current = if at_bottom {
+            turns.last().map(|(_, row)| row.message_id)
+        } else {
+            turns
+                .take_while(|(index, _)| tops[*index] + shift <= visible_top + px(1.))
+                .last()
+                .map(|(_, row)| row.message_id)
+                .or(first)
+        };
+        let previous = std::mem::replace(&mut self.layout.borrow_mut().current_turn, current);
+        if previous != current {
+            _ = self.owner.update(cx, |_, cx| cx.notify());
+        }
+    }
+
     /// While a drag selects, notes the rows it began in and is over now,
     /// so that both stay built; see `timeline_selection`.
     fn track_selection(&self, mask: Bounds<Pixels>, window: &Window, cx: &App) {
@@ -378,9 +436,22 @@ impl Element for VirtualTimeline {
         let visible_bottom = visible.bottom() - bounds.top();
         // While the end is in view (scrolled to the bottom, or the content
         // shorter than the view), it stays put; otherwise the first visible
-        // row does.
+        // row does. A row navigated to is the anchor instead, and the view
+        // is built where it will be: with the row at its top.
         let at_bottom = bounds.bottom() <= visible.bottom() + px(1.);
-        let anchor = if at_bottom {
+        let target = self
+            .layout
+            .borrow()
+            .target
+            .and_then(|(id, _)| self.rows.iter().position(|row| row.message_id == id));
+        if target.is_none() {
+            self.layout.borrow_mut().target = None;
+        }
+        let jump = target.map_or(px(0.), |target| tops[target] - visible_top);
+        let (build_top, build_bottom) = (visible_top + jump, visible_bottom + jump);
+        let anchor = if let Some(target) = target {
+            target
+        } else if at_bottom {
             count
         } else {
             (0..count)
@@ -412,7 +483,7 @@ impl Element for VirtualTimeline {
             // filled with measured rows, then up from it the same way.
             let mut bottom = tops[anchor];
             for (index, row) in self.rows.iter().enumerate().skip(anchor) {
-                if bottom >= visible_bottom + OVERDRAW {
+                if bottom >= build_bottom + OVERDRAW {
                     break;
                 }
                 let (element, height) = measure(index, row, window);
@@ -422,7 +493,7 @@ impl Element for VirtualTimeline {
             }
             let mut top = tops[anchor];
             for index in (0..anchor).rev() {
-                if top <= visible_top - OVERDRAW {
+                if top <= build_top - OVERDRAW {
                     break;
                 }
                 let (element, height) = measure(index, &self.rows[index], window);
@@ -462,12 +533,31 @@ impl Element for VirtualTimeline {
         let offset = self.scroll.offset().y;
         let overflow = bounds.bottom() - visible.bottom() - offset;
         let next_max = (overflow + new_tops[count] - old_end).max(px(0.));
-        let next_offset = (offset + tops[anchor] - new_tops[anchor]).clamp(-next_max, px(0.));
+        // A target moves to the top of the view; any other anchor stays.
+        let anchor_at = target.map_or(tops[anchor], |_| visible_top);
+        let next_offset = (offset + anchor_at - new_tops[anchor]).clamp(-next_max, px(0.));
         let shift = next_offset - offset;
         let changed = heights
             .iter()
             .zip(old)
             .any(|(new, old)| (*new - *old).abs() > px(0.5));
+        // Once its row is at the top and nothing around it changes size, a
+        // target has arrived, and ordinary anchoring keeps it there.
+        let navigating = target.is_some() && (changed || shift.abs() > px(0.5));
+        {
+            let mut layout = self.layout.borrow_mut();
+            layout.target = layout
+                .target
+                .filter(|_| navigating)
+                .and_then(|(id, frames)| frames.checked_sub(1).map(|frames| (id, frames)));
+        }
+        self.note_current_turn(
+            &new_tops,
+            shift,
+            visible_top,
+            at_bottom && target.is_none(),
+            cx,
+        );
         for (index, mut element, height) in built {
             let origin = bounds.origin + point(px(0.), new_tops[index] + shift);
             element.prepaint_at(origin, window, cx);
@@ -480,10 +570,10 @@ impl Element for VirtualTimeline {
             self.tail.prepaint(window, cx);
         });
 
-        if changed {
+        if changed || navigating {
             // Keep what is on screen there in the next frame, which lays
             // the rows out with these heights.
-            if at_bottom && offset <= -self.scroll.max_offset().y + px(1.) {
+            if target.is_none() && at_bottom && offset <= -self.scroll.max_offset().y + px(1.) {
                 // Exactly at the end, whatever rounding the container applies.
                 self.scroll.scroll_to_bottom();
             } else {

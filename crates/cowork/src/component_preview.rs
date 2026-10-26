@@ -6,6 +6,8 @@
 //! of a card. `cargo run -p cowork --example component_preview` opens it.
 
 use agent::model::ToolCall;
+use std::rc::Rc;
+
 use gpui::{
     AnyElement, App, Context, Entity, FontWeight, IntoElement, Pixels, QuitMode, Render,
     SharedString, Window, WindowBounds, WindowOptions, div, prelude::*, px, size,
@@ -456,5 +458,294 @@ impl Render for CompactionPreview {
                                 .tooltip(move |window, cx| gpui_component::tooltip::Tooltip::element(move |_, cx| context_details(usage, Some(hover), compacting, cx)).py_2().px_3().build(window, cx))))
                         .child(context_details(usage, Some(settings), compacting, cx))
                 })))
+    }
+}
+
+/// Opens the conversation navigation rail in its states side by side: at
+/// rest, hovered with its neighbors widened, current apart from hovered with
+/// a long card, a card without a response, an overflowing rail, and a live
+/// rail to hover and click. No provider or thread is needed.
+pub fn run_turn_navigation() -> anyhow::Result<()> {
+    gpui_platform::application()
+        .with_assets(crate::assets::Assets)
+        .run(|cx: &mut App| {
+            crate::init_app(cx);
+            let options = WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(gpui::Bounds::centered(
+                    None,
+                    size(px(1280.), px(900.)),
+                    cx,
+                ))),
+                titlebar: Some(gpui::TitlebarOptions {
+                    title: Some("Cowork turn navigation preview".into()),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            if let Err(error) = cx.open_window(options, |window, cx| {
+                let preview = cx.new(|_| TurnNavigationPreview::new());
+                cx.new(|cx| Root::new(preview, window, cx))
+            }) {
+                eprintln!("failed to open the turn navigation preview: {error}");
+                cx.quit();
+            }
+            cx.set_quit_mode(QuitMode::LastWindowClosed);
+            cx.activate(true);
+        });
+    Ok(())
+}
+
+/// One stage of the preview: its markers and their own scroll offset.
+struct PreviewRail {
+    markers: Vec<uuid::Uuid>,
+    scroll: gpui::ScrollHandle,
+}
+
+impl PreviewRail {
+    fn new(count: usize) -> Self {
+        Self {
+            markers: (0..count).map(|_| uuid::Uuid::new_v4()).collect(),
+            scroll: gpui::ScrollHandle::new(),
+        }
+    }
+}
+
+struct TurnNavigationPreview {
+    rails: Vec<PreviewRail>,
+    /// The live rail's hovered and current markers.
+    live_hovered: Option<usize>,
+    live_current: usize,
+}
+
+const STAGE: gpui::Size<Pixels> = gpui::Size {
+    width: px(560.),
+    height: px(360.),
+};
+
+impl TurnNavigationPreview {
+    fn new() -> Self {
+        Self {
+            rails: [9, 9, 9, 9, 60, 12].map(PreviewRail::new).into(),
+            live_hovered: None,
+            live_current: 11,
+        }
+    }
+
+    fn card(&self, rich: bool) -> crate::turn_navigation::TurnPreview {
+        use crate::{
+            models::{ModelProvider, ModelRef},
+            participant::ParticipantId,
+            turn_navigation::{TurnPreview, TurnResponse},
+        };
+        let now = std::time::SystemTime::now();
+        if rich {
+            TurnPreview {
+                prompt: "“Is the retry loop safe if the host disconnects mid-transfer?”\nInvestigate the crash when a collaborator joins while an attachment is still uploading. Keep the protocol unchanged if you can, and add a regression test that reproduces the late join with a large file.\nAlso check the attached log.".into(),
+                response: TurnResponse::Text("The crash comes from the attachment table being read before the host has stored every chunk. A late joiner receives the record from the snapshot but the bytes are still in flight, so the transfer resumes from an index that doesn't exist yet.\n\nI changed the host to send only stored records in the Welcome snapshot and queue the rest, and added a regression test that joins during a 4 MB upload. The protocol is unchanged.".into()),
+                authors: vec![ParticipantId::new(), ParticipantId::new(), ParticipantId::new()],
+                scheduled: false,
+                model: Some(ModelRef { provider: ModelProvider::Anthropic, id: "claude-sonnet".into() }),
+                model_name: Some("Claude Sonnet".into()),
+                started_at: now - std::time::Duration::from_secs(42 * 60),
+            }
+        } else {
+            TurnPreview {
+                prompt: "crash.log (text), screenshot.png (PNG image)".into(),
+                response: TurnResponse::Status("Stopped"),
+                authors: vec![ParticipantId::new()],
+                scheduled: true,
+                model: None,
+                model_name: None,
+                started_at: now - std::time::Duration::from_secs(3 * 86_400),
+            }
+        }
+    }
+
+    /// A stage with fake conversation lines, the rail at its right edge
+    /// and, when given, a card beside the marker at `card_at`.
+    #[allow(clippy::too_many_arguments)]
+    fn stage(
+        &self,
+        title: &'static str,
+        rail: usize,
+        hovered: Option<usize>,
+        current: Option<usize>,
+        card: Option<(usize, bool)>,
+        live: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        use crate::turn_navigation::{
+            CARD_GAP, CARD_WIDTH, RAIL_WIDTH, render_rail, render_turn_card,
+        };
+        let rail_state = &self.rails[rail];
+        let entity = cx.entity().downgrade();
+        let markers = rail_state.markers.clone();
+        let on_hover: crate::turn_navigation::HoverMarker = if live {
+            let markers = markers.clone();
+            Rc::new(move |id, hovered, _, cx| {
+                let index = id.map_or(Some(markers.len()), |id| {
+                    markers.iter().position(|marker| *marker == id)
+                });
+                _ = entity.update(cx, |this, cx| {
+                    if hovered {
+                        this.live_hovered = index;
+                    } else if this.live_hovered == index {
+                        this.live_hovered = None;
+                    }
+                    cx.notify();
+                });
+            })
+        } else {
+            Rc::new(|_, _, _, _| {})
+        };
+        let entity = cx.entity().downgrade();
+        let on_click: crate::turn_navigation::ClickMarker = if live {
+            Rc::new(move |id, _, cx| {
+                let index = id.and_then(|id| markers.iter().position(|marker| *marker == id));
+                _ = entity.update(cx, |this, cx| {
+                    this.live_current = index.unwrap_or(this.live_current);
+                    cx.notify();
+                });
+            })
+        } else {
+            Rc::new(|_, _, _| {})
+        };
+        let rail_element = render_rail(
+            &rail_state.markers,
+            hovered,
+            current,
+            &rail_state.scroll,
+            on_hover,
+            on_click,
+            window,
+            cx,
+        );
+        let muted = cx.theme().muted_foreground;
+        let card = card.map(|(at, rich)| {
+            render_turn_card(
+                &self.card(rich),
+                &Default::default(),
+                std::time::SystemTime::now(),
+                cx,
+            )
+            .absolute()
+            .right(RAIL_WIDTH + CARD_GAP)
+            .w(CARD_WIDTH.min(STAGE.width - RAIL_WIDTH - CARD_GAP - px(8.)))
+            .top(px(24. + 22. * at as f32).min(px(60.)))
+        });
+        div()
+            .flex()
+            .flex_col()
+            .gap_1p5()
+            .child(div().text_xs().text_color(muted).child(title))
+            .child(
+                div()
+                    .relative()
+                    .w(STAGE.width)
+                    .h(STAGE.height)
+                    .overflow_hidden()
+                    .rounded_lg()
+                    .border_1()
+                    .border_color(cx.theme().border)
+                    .bg(cx.theme().background)
+                    .p_6()
+                    .flex()
+                    .flex_col()
+                    .gap_3()
+                    .children((0..8).map(|line| {
+                        div()
+                            .h(px(8.))
+                            .w(px(120. + (line * 53 % 300) as f32))
+                            .rounded_full()
+                            .bg(cx.theme().secondary)
+                    }))
+                    .child(rail_element)
+                    .children(card),
+            )
+            .into_any_element()
+    }
+}
+
+impl Render for TurnNavigationPreview {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let live_card = self.live_hovered.map(|index| (index, index % 2 == 0));
+        let stages = vec![
+            self.stage(
+                "At rest, current turn 3",
+                0,
+                None,
+                Some(2),
+                None,
+                false,
+                window,
+                cx,
+            ),
+            self.stage(
+                "Hovered turn 5: two neighbors widen on each side",
+                1,
+                Some(4),
+                Some(4),
+                None,
+                false,
+                window,
+                cx,
+            ),
+            self.stage(
+                "Hovered turn 7 apart from current turn 2, with a long card",
+                2,
+                Some(6),
+                Some(1),
+                Some((6, true)),
+                false,
+                window,
+                cx,
+            ),
+            self.stage(
+                "A stopped, scheduled run with no response or recorded model",
+                3,
+                Some(2),
+                Some(8),
+                Some((2, false)),
+                false,
+                window,
+                cx,
+            ),
+            self.stage(
+                "60 turns: the rail scrolls on its own",
+                4,
+                Some(30),
+                Some(59),
+                None,
+                false,
+                window,
+                cx,
+            ),
+            self.stage(
+                "Live: hover and click the markers",
+                5,
+                self.live_hovered,
+                Some(self.live_current),
+                live_card,
+                true,
+                window,
+                cx,
+            ),
+        ];
+        div()
+            .id("turn-navigation-preview")
+            .size_full()
+            .overflow_y_scroll()
+            .bg(cx.theme().sidebar)
+            .text_color(cx.theme().foreground)
+            .child(
+                div()
+                    .p(SPACING)
+                    .flex()
+                    .flex_col()
+                    .gap_4()
+                    .child(div().text_lg().child("Conversation navigation rail"))
+                    .child(div().grid().grid_cols(2).gap(SPACING).children(stages)),
+            )
     }
 }

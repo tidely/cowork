@@ -229,6 +229,7 @@ fn test_cowork(
         timeline_scroll_handle: ScrollHandle::new(),
         timeline_press: None,
         timeline_layout: Default::default(),
+        turn_rail: Default::default(),
         timeline_selection: Default::default(),
         timeline_focus_handle: cx.focus_handle(),
         follow_generation: true,

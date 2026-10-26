@@ -1833,6 +1833,8 @@ impl Cowork {
     ) {
         let delta_y = event.delta.pixel_delta(window.line_height()).y;
         let max_offset = self.timeline_scroll_handle.max_offset().y;
+        // Scrolling by hand takes over from a turn navigated to.
+        self.timeline_layout.borrow_mut().cancel_navigation();
 
         if delta_y > px(0.) && max_offset > px(0.) {
             self.follow_generation = false;

@@ -101,6 +101,7 @@ mod tool_approval;
 mod tool_call_card;
 mod top_bar;
 mod transcript;
+mod turn_navigation;
 mod usage;
 mod welcome;
 
@@ -144,6 +145,9 @@ struct Cowork {
     timeline_layout: Rc<std::cell::RefCell<TimelineLayout>>,
     /// The rows holding the ends of a selection in the timeline.
     timeline_selection: Rc<std::cell::RefCell<timeline_selection::TimelineSelection>>,
+    /// The conversation navigation rail's local state; see
+    /// `turn_navigation`.
+    turn_rail: turn_navigation::TurnRail,
     /// Taken when someone presses on a user message, as agent text takes
     /// focus itself, so that Copy reaches the window's text selection
     /// instead of an editor with nothing selected.
@@ -376,6 +380,14 @@ impl Cowork {
             self.timeline_selection.borrow_mut().clear();
         }
         let comments = Rc::new(comments);
+        // Over the stage, beside the scrolling timeline rather than in it.
+        let navigation = match &active_thread {
+            Some((thread, thread_id)) => {
+                let turns = turn_navigation::conversation_turns(&thread.read(cx).timeline);
+                self.render_turn_navigation(*thread_id, thread, &turns, window, cx)
+            }
+            None => Vec::new(),
+        };
         let (rows, build): (_, BuildRow) = match active_thread {
             Some((thread, thread_id)) => {
                 let (rows, steering_groups) = self.plan_timeline_rows(&thread.read(cx).timeline);
@@ -554,6 +566,7 @@ impl Cowork {
                             )),
                     ),
             )
+            .children(navigation)
     }
 }
 
@@ -605,8 +618,14 @@ impl Render for Cowork {
                     cx.stop_propagation();
                 }
             }))
+            // Closing the turn card is all Escape does while it shows.
+            .capture_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+                if event.keystroke.key == "escape" && this.dismiss_turn_card(cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .capture_action(cx.listener(|this, _: &Escape, window, cx| {
-                if this.escape_empty_draft_item(window, cx) {
+                if this.dismiss_turn_card(cx) || this.escape_empty_draft_item(window, cx) {
                     cx.stop_propagation();
                 }
             }))
@@ -802,6 +821,7 @@ pub fn run() -> anyhow::Result<()> {
                         timeline_scroll_handle: ScrollHandle::new(),
                         timeline_press: None,
                         timeline_layout: Default::default(),
+                        turn_rail: Default::default(),
                         timeline_selection: Default::default(),
                         timeline_focus_handle: cx.focus_handle(),
                         follow_generation: true,
