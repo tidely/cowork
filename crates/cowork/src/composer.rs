@@ -10,7 +10,7 @@ use gpui::{
 };
 use gpui_base::{GlobalState, Textarea, input::TextareaState};
 use gpui_component::{
-    ActiveTheme, Disableable as _, Icon, Sizable as _,
+    ActiveTheme, Disableable as _, Icon, Selectable as _, Sizable as _,
     attachment::Attachment,
     button::{Button, ButtonVariants as _},
     combobox::Combobox,
@@ -300,8 +300,6 @@ impl Cowork {
         let context_indicator =
             has_model.then(|| self.render_context_indicator(active_thread.as_ref(), cx));
 
-        let model_picker_hovered = self.model_picker_hovered;
-        let model_picker_owner = cx.entity().downgrade();
         let model_picker = div()
             .id("model-picker-container")
             .debug_selector(|| "model-picker".to_owned())
@@ -331,49 +329,18 @@ impl Cowork {
                             .unwrap_or_else(|| "Select a model...".into());
                         let provider = selected_model.map(|model| model.model.provider);
                         let unavailable = selected_model.is_some_and(|model| !model.available);
-                        let model_picker_owner = model_picker_owner.clone();
 
                         div().h_full().flex().items_center().child(
-                            div()
-                                .id("model-picker-trigger")
+                            Button::new("model-picker-trigger")
                                 .debug_selector(|| "model-picker-trigger".to_owned())
-                                .h_full()
+                                .ghost()
+                                .small()
+                                .disabled(!can_change_model)
+                                .selected(trigger.is_open())
+                                .accessibility_label(title.clone())
                                 .flex_none()
-                                .whitespace_nowrap()
                                 .px_1p5()
-                                .flex()
-                                .items_center()
-                                .gap_1()
-                                .rounded_md()
-                                .on_hover(move |hovered, _, cx| {
-                                    let _ = model_picker_owner.update(cx, |this, cx| {
-                                        if this.model_picker_hovered != *hovered {
-                                            this.model_picker_hovered = *hovered;
-                                            cx.notify();
-                                        }
-                                    });
-                                })
-                                .when(can_change_model, |this| this.cursor_pointer())
-                                .when(model_picker_hovered && can_change_model, |this| {
-                                    this.bg(cx.theme().tokens.secondary_hover)
-                                })
-                                .when(can_change_model, |this| {
-                                    this.active(|this| this.bg(cx.theme().tokens.secondary_active))
-                                })
-                                .when(trigger.is_open(), |this| {
-                                    this.bg(cx.theme().tokens.secondary_active)
-                                })
-                                .text_sm()
-                                .text_color(if unavailable {
-                                    cx.theme().muted_foreground.opacity(0.7)
-                                } else {
-                                    cx.theme().foreground
-                                })
-                                .when(unavailable, |this| {
-                                    this.tooltip(|window, cx| {
-                                        Tooltip::new(UNAVAILABLE_MODEL_TOOLTIP).build(window, cx)
-                                    })
-                                })
+                                .when(unavailable, |this| this.tooltip(UNAVAILABLE_MODEL_TOOLTIP))
                                 .when_some(provider, |this, provider| {
                                     this.child(
                                         provider
@@ -381,7 +348,15 @@ impl Cowork {
                                             .when(unavailable, |this| this.opacity(0.5)),
                                     )
                                 })
-                                .child(div().child(title)),
+                                .child(
+                                    div()
+                                        .when(unavailable, |this| {
+                                            this.text_color(
+                                                cx.theme().muted_foreground.opacity(0.7),
+                                            )
+                                        })
+                                        .child(title),
+                                ),
                         )
                     }),
             );

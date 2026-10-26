@@ -166,7 +166,7 @@ fn thread_menu_gateway(cx: &mut gpui::VisualTestContext) -> gpui::Bounds<gpui::P
 }
 
 #[gpui::test]
-fn the_model_picker_only_hovers_on_its_trigger(cx: &mut gpui::TestAppContext) {
+fn the_model_picker_opens_from_its_button_not_the_gap(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     cx.run_until_parked();
     let trigger = cx
@@ -174,17 +174,24 @@ fn the_model_picker_only_hovers_on_its_trigger(cx: &mut gpui::TestAppContext) {
         .expect("model picker trigger");
     let project_mode = cx.debug_bounds("project-mode").expect("project mode");
 
-    cx.update(|window, cx| window.simulate_mouse_move(trigger.center(), cx));
-    cx.run_until_parked();
-    assert!(cowork.read_with(cx, |cowork, _| cowork.model_picker_hovered));
-
     let gap = gpui::point(
         (project_mode.right() + trigger.left()) / 2.,
         trigger.center().y,
     );
-    cx.update(|window, cx| window.simulate_mouse_move(gap, cx));
+    cx.simulate_click(gap, gpui::Modifiers::none());
+    cx.simulate_input("qwen");
     cx.run_until_parked();
-    assert!(!cowork.read_with(cx, |cowork, _| cowork.model_picker_hovered));
+    assert!(cowork.read_with(cx, |cowork, cx| {
+        cowork.model_picker.read(cx).query(cx).is_empty()
+    }));
+
+    cx.simulate_click(trigger.center(), gpui::Modifiers::none());
+    cx.simulate_input("qwen");
+    cx.run_until_parked();
+    assert_eq!(
+        cowork.read_with(cx, |cowork, cx| cowork.model_picker.read(cx).query(cx)),
+        "qwen"
+    );
 }
 
 #[gpui::test]

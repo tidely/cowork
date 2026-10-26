@@ -216,7 +216,16 @@ fn fading_row(
                     .invisible()
                     .group_hover(group, |style| style.visible())
                     .child(div().h_full().w(TITLE_FADE_WIDTH).bg(fade_into(buttons_bg)))
-                    .child(h_flex().h_full().pr_1().bg(buttons_bg).child(button)),
+                    // Overflow clipping is rectangular; the opaque overlay
+                    // needs the row's corners too, or it squares off the hover.
+                    .child(
+                        h_flex()
+                            .h_full()
+                            .pr_1()
+                            .rounded_r(theme.radius)
+                            .bg(buttons_bg)
+                            .child(button),
+                    ),
             )
         })
 }
@@ -874,8 +883,8 @@ impl Cowork {
             .h(TOP_BAR_HEIGHT)
             .flex()
             .items_center()
-            // The sidebar's own gutter, for the row to line up with its rows.
-            .px_3()
+            // Keep the hover evenly inset from all four edges of the bar.
+            .p_1()
             .child(
                 div()
                     .absolute()
@@ -890,6 +899,10 @@ impl Cowork {
                     .role(Role::Button)
                     .debug_selector(|| "identity-button".to_owned())
                     .aria_label("Open profile")
+                    .h_full()
+                    // Preserve the sidebar rows' icon and label alignment
+                    // while letting the hover extend into their outer gutter.
+                    .px_4()
                     .gap_1p5()
                     .child(self.render_profile_avatar(AVATAR_SIZE))
                     .child(div().min_w_0().truncate().child(self.profile_name()))

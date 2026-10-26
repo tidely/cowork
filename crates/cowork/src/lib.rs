@@ -237,7 +237,6 @@ struct Cowork {
     projects: projects::Projects,
     /// Always shows the active thread's model; see [`Cowork::sync_model_picker`].
     model_picker: Entity<ModelPickerState>,
-    model_picker_hovered: bool,
     /// The models this app can run, as last discovered.
     models: Arc<ModelCatalog>,
     /// The catalog and selection the picker's rows were built from.
@@ -848,7 +847,6 @@ pub fn run() -> anyhow::Result<()> {
                         new_thread_project: None,
                         projects: projects::Projects::load(projects_file.take()),
                         model_picker,
-                        model_picker_hovered: false,
                         models: Arc::default(),
                         picker_rows: None,
                         _model_picker_subscription: model_picker_subscription,

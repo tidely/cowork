@@ -274,7 +274,6 @@ fn test_cowork(
         new_thread_project: None,
         projects: Default::default(),
         model_picker,
-        model_picker_hovered: false,
         models: Arc::default(),
         picker_rows: None,
         _model_picker_subscription: model_picker_subscription,
