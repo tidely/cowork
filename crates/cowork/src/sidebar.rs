@@ -76,8 +76,8 @@ pub(crate) struct SidebarGroups {
     pub(crate) recents: Vec<ListedThread>,
 }
 
-/// A sidebar action or destination. Selection changes the text weight, not
-/// the background: the background always belongs to hover.
+/// A sidebar action or destination. Only destinations carry selection;
+/// actions such as composing or joining a chat are never active.
 #[derive(Clone)]
 pub(crate) struct SidebarEntry {
     label: SharedString,
@@ -117,8 +117,8 @@ impl SidebarEntry {
     }
 }
 
-/// Keep navigation and thread rows consistent, including their accessible
-/// selection state, without making the current destination look hovered.
+/// Keep navigation and thread rows consistent, including their visible and
+/// accessible selection state.
 fn sidebar_row(
     id: impl Into<gpui::ElementId>,
     active: bool,
@@ -139,7 +139,11 @@ fn sidebar_row(
             this.bg(theme.sidebar_accent.opacity(0.8))
                 .text_color(theme.sidebar_accent_foreground)
         })
-        .when(active, |this| this.font_weight(FontWeight::SEMIBOLD))
+        .when(active, |this| {
+            this.bg(theme.sidebar_accent)
+                .text_color(theme.sidebar_accent_foreground)
+                .font_weight(FontWeight::SEMIBOLD)
+        })
 }
 
 /// A row whose label fades out where it runs out of room, with `button`
@@ -160,7 +164,11 @@ fn fading_row(
     // What the row's background looks like while hovered, for the button
     // to sit on and the label to fade into.
     let buttons_bg = theme.sidebar.blend(hover_bg);
-    let rest_bg = theme.sidebar;
+    let rest_bg = if active {
+        theme.sidebar.blend(theme.sidebar_accent)
+    } else {
+        theme.sidebar
+    };
     let group = SharedString::from(format!("sidebar-{kind}-{key}"));
     let (row_selector, title_selector, buttons_selector) = (
         group.to_string(),
@@ -309,11 +317,15 @@ impl ProjectRow {
             self.on_compose,
             cx,
         );
-        let folder = Icon::new(AssetIconName::Folder)
-            .size_4()
-            .flex_none()
-            .text_color(theme.secondary_foreground)
-            .into_any_element();
+        let folder = Icon::new(if self.open {
+            AssetIconName::FolderOpen
+        } else {
+            AssetIconName::Folder
+        })
+        .size_4()
+        .flex_none()
+        .text_color(theme.secondary_foreground)
+        .into_any_element();
         let header = fading_row(
             "project",
             id.to_string(),
