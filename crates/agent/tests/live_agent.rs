@@ -81,7 +81,6 @@ async fn base_and_dynamic_tools_run_against_ollama() {
             "You do arithmetic only with tools, never in your head. \
              When asked for a number, reply with just that number.",
         )
-        .tool("add")
         .thinking(Thinking::Disabled);
     let started = Arc::new(Mutex::new(Vec::new()));
     let observed = started.clone();

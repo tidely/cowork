@@ -10,9 +10,7 @@ fn agent_builder() -> (
     mpsc::UnboundedReceiver<SamplingRequest>,
 ) {
     let (provider, requests) = test_provider();
-    let definition = AgentDefinition::new(LanguageModel::new("scripted"))
-        .instructions("Use echo.")
-        .tool("echo");
+    let definition = AgentDefinition::new(LanguageModel::new("scripted")).instructions("Use echo.");
     let builder = AgentBuilder::new(Arc::new(BasicHost), provider, definition, "user".into())
         .tool(Echo)
         .unwrap();

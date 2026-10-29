@@ -58,6 +58,7 @@ pub struct AgentBuilder<H: AgentHost> {
     definition: AgentDefinition,
     configuration: Configuration<H::Permissions>,
     registry: HostRegistry<H>,
+    dynamic_tools: bool,
     sections: Vec<SectionInstaller<H>>,
     source: H::Source,
     input_policy: Policy,
@@ -97,6 +98,7 @@ impl<H: AgentHost> AgentBuilder<H> {
             definition,
             configuration: Configuration::default(),
             registry: HostRegistry::<H>::default(),
+            dynamic_tools: true,
             sections: Vec::new(),
             source,
             input_policy: Policy {
@@ -109,8 +111,9 @@ impl<H: AgentHost> AgentBuilder<H> {
         }
     }
 
-    /// Makes a tool available. The definition decides whether it is offered
-    /// directly; otherwise it can still be added as a dynamic tool by name.
+    /// Offers a tool in every request, in the order tools are added, for the
+    /// session's whole life. Tools that come and go are dynamic tools
+    /// ([`DynamicToolChange`](crate::DynamicToolChange)).
     pub fn tool<T>(mut self, tool: T) -> Result<Self, ToolError>
     where
         T: Tool,
@@ -119,6 +122,13 @@ impl<H: AgentHost> AgentBuilder<H> {
     {
         self.registry.register(tool)?;
         Ok(self)
+    }
+
+    /// Leaves out `search_tools` and `call_tool`: the session has only the
+    /// tools added here, and refuses dynamic tools.
+    pub fn without_dynamic_tools(mut self) -> Self {
+        self.dynamic_tools = false;
+        self
     }
 
     pub fn configuration(mut self, configuration: Configuration<H::Permissions>) -> Self {
@@ -221,6 +231,9 @@ impl<H: AgentHost> AgentBuilder<H> {
             self.configuration,
             self.registry,
         )?;
+        if !self.dynamic_tools {
+            session = session.without_dynamic_tools();
+        }
         for add in self.sections {
             session = add(session);
         }

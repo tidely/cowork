@@ -218,7 +218,10 @@ pub struct AgentSession<H: AgentHost> {
     definition: AgentDefinition,
     revision: DefinitionRevision,
     configuration: Configuration<H::Permissions>,
+    /// The base tools, offered in every request; fixed for the session's life.
     registry: HostRegistry<H>,
+    /// Whether `search_tools` and `call_tool` are offered, reaching `dynamic`.
+    dynamic_tools: bool,
     dynamic: HostRegistry<H>,
     /// The current tool snapshot; each step captures it.
     tools: Arc<ToolSnapshot<H>>,
@@ -239,9 +242,13 @@ pub struct AgentSession<H: AgentHost> {
 }
 
 impl<H: AgentHost> AgentSession<H> {
-    /// `registry` holds every tool the host makes available; the definition
-    /// selects which are offered. The built-in context sections (tool policy,
-    /// dynamic tools, model) are installed; add others with `with_section`.
+    /// `registry` holds the session's base tools: each is offered in every
+    /// request, in registration order, after `search_tools` and `call_tool`,
+    /// for the session's whole life, so the prompt prefix stays cacheable.
+    /// Tools that come and go are dynamic tools; see
+    /// [`without_dynamic_tools`](Self::without_dynamic_tools). The built-in
+    /// context sections (tool policy, dynamic tools, model) are installed;
+    /// add others with `with_section`.
     pub fn new(
         host: Arc<H>,
         provider: Arc<dyn LanguageModelProvider>,
@@ -257,8 +264,7 @@ impl<H: AgentHost> AgentSession<H> {
             return Err(SessionError(format!("{name} is a built-in tool name")));
         }
         let dynamic = HostRegistry::<H>::default();
-        let tools =
-            ToolSnapshot::new(&definition, &registry, dynamic.clone()).map_err(SessionError)?;
+        let tools = ToolSnapshot::new(&registry, true, dynamic.clone());
         let (commands, receiver) = mpsc::unbounded();
         Ok((
             Self {
@@ -268,6 +274,7 @@ impl<H: AgentHost> AgentSession<H> {
                 revision: DefinitionRevision::default(),
                 configuration,
                 registry,
+                dynamic_tools: true,
                 dynamic,
                 tools: Arc::new(tools),
                 sections: vec![
@@ -290,6 +297,18 @@ impl<H: AgentHost> AgentSession<H> {
             },
             SessionHandle { commands },
         ))
+    }
+
+    /// Leaves out `search_tools` and `call_tool`, so the session has only its
+    /// base tools and refuses `DynamicTools` requests.
+    pub fn without_dynamic_tools(mut self) -> Self {
+        self.dynamic_tools = false;
+        self.tools = Arc::new(ToolSnapshot::new(
+            &self.registry,
+            false,
+            self.dynamic.clone(),
+        ));
+        self
     }
 
     /// Adds a host context section, rendered after the built-in ones.
@@ -588,15 +607,7 @@ impl<H: AgentHost> AgentSession<H> {
                     .model
                     .validate()
                     .map_err(|error| RequestError::Rejected(error.to_string()))?;
-                if !definition.has_dynamic_tools() && !self.dynamic.is_empty() {
-                    return Err(RequestError::Rejected(
-                        "the session has dynamic tools, which need call_tool".into(),
-                    ));
-                }
-                let tools = ToolSnapshot::new(&definition, &self.registry, self.dynamic.clone())
-                    .map_err(RequestError::Rejected)?;
                 self.definition = definition;
-                self.tools = Arc::new(tools);
                 if let Some(provider) = provider {
                     self.provider = provider;
                 }
@@ -611,9 +622,9 @@ impl<H: AgentHost> AgentSession<H> {
                 Ok(Response::Done)
             }
             RequestKind::DynamicTools(change) => {
-                if !self.definition.has_dynamic_tools() {
+                if !self.dynamic_tools {
                     return Err(RequestError::Rejected(
-                        "the definition does not offer call_tool".into(),
+                        "the session has no dynamic tools".into(),
                     ));
                 }
                 let event = match change {
@@ -621,9 +632,7 @@ impl<H: AgentHost> AgentSession<H> {
                         let tool = tool_runtime::RegisteredTool::new(tool)
                             .map_err(|error| RequestError::Rejected(error.message))?;
                         let name = tool.descriptor.name().to_owned();
-                        if BUILTIN_TOOLS.contains(&name.as_str())
-                            || self.definition.tools.contains(&name)
-                        {
+                        if BUILTIN_TOOLS.contains(&name.as_str()) || self.registry.contains(&name) {
                             return Err(RequestError::Rejected(format!(
                                 "{name} is already offered directly"
                             )));
@@ -640,10 +649,11 @@ impl<H: AgentHost> AgentSession<H> {
                         EventKind::DynamicToolRemoved(name)
                     }
                 };
-                self.tools = Arc::new(
-                    ToolSnapshot::new(&self.definition, &self.registry, self.dynamic.clone())
-                        .expect("the current definition resolves"),
-                );
+                self.tools = Arc::new(ToolSnapshot::new(
+                    &self.registry,
+                    self.dynamic_tools,
+                    self.dynamic.clone(),
+                ));
                 self.emit(event, emit);
                 Ok(Response::Done)
             }

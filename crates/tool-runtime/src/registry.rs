@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::sync::Arc;
 
 use language_model::ToolDefinition;
 use serde_json::Value;
@@ -59,17 +59,16 @@ impl<C: ?Sized, A> RegisteredTool<C, A> {
     }
 }
 
-/// An owned, heterogeneous toolset for host context `C` and host access `A`.
+/// An owned, heterogeneous toolset for host context `C` and host access `A`,
+/// in registration order, which is the order a session offers its tools in.
 /// Cloning shares the implementations.
 pub struct ToolRegistry<C: ?Sized, A> {
-    tools: BTreeMap<String, RegisteredTool<C, A>>,
+    tools: Vec<RegisteredTool<C, A>>,
 }
 
 impl<C: ?Sized, A> Default for ToolRegistry<C, A> {
     fn default() -> Self {
-        Self {
-            tools: BTreeMap::new(),
-        }
+        Self { tools: Vec::new() }
     }
 }
 
@@ -99,30 +98,34 @@ impl<C: ?Sized + 'static, A: 'static> ToolRegistry<C, A> {
 
     /// Refuses a name that is already registered rather than replacing it.
     pub fn insert(&mut self, tool: RegisteredTool<C, A>) -> Result<(), ToolError> {
-        match self.tools.entry(tool.descriptor.name().to_owned()) {
-            std::collections::btree_map::Entry::Vacant(entry) => {
-                entry.insert(tool);
-                Ok(())
-            }
-            std::collections::btree_map::Entry::Occupied(entry) => Err(ToolError::new(
+        if self.contains(tool.descriptor.name()) {
+            return Err(ToolError::new(
                 ToolErrorKind::InvalidArguments,
-                format!("tool {} is already registered", entry.key()),
-            )),
+                format!("tool {} is already registered", tool.descriptor.name()),
+            ));
         }
+        self.tools.push(tool);
+        Ok(())
     }
 }
 
 impl<C: ?Sized, A> ToolRegistry<C, A> {
     pub fn get(&self, name: &str) -> Option<&RegisteredTool<C, A>> {
-        self.tools.get(name)
+        self.tools
+            .iter()
+            .find(|tool| tool.descriptor.name() == name)
     }
 
     pub fn contains(&self, name: &str) -> bool {
-        self.tools.contains_key(name)
+        self.get(name).is_some()
     }
 
     pub fn remove(&mut self, name: &str) -> Option<RegisteredTool<C, A>> {
-        self.tools.remove(name)
+        let index = self
+            .tools
+            .iter()
+            .position(|tool| tool.descriptor.name() == name)?;
+        Some(self.tools.remove(index))
     }
 
     pub fn len(&self) -> usize {
@@ -133,9 +136,9 @@ impl<C: ?Sized, A> ToolRegistry<C, A> {
         self.tools.is_empty()
     }
 
-    /// Registrations in name order.
+    /// Registrations in registration order.
     pub fn iter(&self) -> impl Iterator<Item = &RegisteredTool<C, A>> {
-        self.tools.values()
+        self.tools.iter()
     }
 
     pub fn descriptors(&self) -> impl Iterator<Item = &ToolDescriptor> {

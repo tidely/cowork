@@ -1,4 +1,4 @@
-//! The tools one step offers: the definition's base tools, plus dynamic tools
+//! The tools one step offers: the session's base tools, plus dynamic tools
 //! reached through `search_tools` and `call_tool`. Appending search results to
 //! the conversation never changes the request's `tools`, so discovering tools
 //! keeps the prompt cache with every provider.
@@ -13,7 +13,7 @@ use tool_runtime::{
     ToolRegistry, TypedToolOutput,
 };
 
-use crate::{AgentDefinition, AgentHost};
+use crate::AgentHost;
 
 pub const SEARCH_TOOLS: &str = "search_tools";
 pub const CALL_TOOL: &str = "call_tool";
@@ -28,7 +28,7 @@ pub type HostRegistry<H> = ToolRegistry<H, <H as AgentHost>::Access>;
 pub type HostTool<H> = RegisteredTool<H, <H as AgentHost>::Access>;
 
 /// Adds or removes a dynamic tool. Additions only ever append to the
-/// conversation; base tools change by replacing the definition instead.
+/// conversation; base tools are fixed for the session's life.
 pub enum DynamicToolChange<H: AgentHost> {
     Add(Arc<dyn ToolDyn<H, H::Access>>),
     Remove(String),
@@ -67,44 +67,37 @@ pub(crate) enum Resolved<H: AgentHost> {
 /// The tools of one step, frozen when its request is assembled. Calls in the
 /// step's reply run against this snapshot, even if tools change meanwhile.
 pub(crate) struct ToolSnapshot<H: AgentHost> {
-    /// Base tools in definition order, with the built-ins as `None`.
+    /// Offered tools in request order, with the built-ins as `None`.
     offered: Vec<(String, Option<HostTool<H>>)>,
     dynamic: HostRegistry<H>,
 }
 
 impl<H: AgentHost> ToolSnapshot<H> {
-    /// Resolves every base tool name, so a definition naming an unknown tool
-    /// is refused before it is used.
+    /// The built-ins first, when the session has dynamic tools, then the
+    /// base tools in registration order.
     pub(crate) fn new(
-        definition: &AgentDefinition,
-        registry: &HostRegistry<H>,
+        base: &HostRegistry<H>,
+        dynamic_tools: bool,
         dynamic: HostRegistry<H>,
-    ) -> Result<Self, String> {
-        let mut offered = Vec::with_capacity(definition.tools.len());
-        for name in &definition.tools {
-            if offered.iter().any(|(offered, _)| offered == name) {
-                return Err(format!("tool {name} is listed twice"));
-            }
-            let tool = if BUILTIN_TOOLS.contains(&name.as_str()) {
-                None
-            } else {
-                Some(
-                    registry
-                        .get(name)
-                        .cloned()
-                        .ok_or_else(|| format!("tool {name} is not registered"))?,
-                )
-            };
-            offered.push((name.clone(), tool));
+    ) -> Self {
+        let builtins = BUILTIN_TOOLS
+            .iter()
+            .filter(|_| dynamic_tools)
+            .map(|name| ((*name).to_owned(), None));
+        let tools = base
+            .iter()
+            .map(|tool| (tool.descriptor.name().to_owned(), Some(tool.clone())));
+        Self {
+            offered: builtins.chain(tools).collect(),
+            dynamic,
         }
-        Ok(Self { offered, dynamic })
     }
 
     fn offers(&self, name: &str) -> bool {
         self.offered.iter().any(|(offered, _)| offered == name)
     }
 
-    /// The request's `tools`, in definition order.
+    /// The request's `tools`, in the order they are offered.
     pub(crate) fn definitions(&self) -> Vec<ToolDefinition> {
         self.offered
             .iter()

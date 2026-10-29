@@ -49,22 +49,6 @@ use crate::{
 /// in its own file so it reads and diffs as prose.
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 
-/// The tools every session offers, in this order. They are part of the
-/// prompt prefix, so they never change with the thread, its comments, or
-/// its project; what changes reaches the model in the environment note.
-/// Every tool in [`registry`], which a test checks.
-const TOOLS: [&str; 9] = [
-    RespondToComment::NAME,
-    Calculate::NAME,
-    RunCommand::NAME,
-    RequestPermissions::NAME,
-    ListDirectory::NAME,
-    ReadFile::NAME,
-    ViewImage::NAME,
-    WriteFile::NAME,
-    EditFile::NAME,
-];
-
 /// The system prompt with the platform the host's commands run on, which
 /// decides their shell and tools. The same for every run on this computer, so
 /// it keeps the prompt prefix cacheable.
@@ -94,12 +78,11 @@ fn platform_prompt() -> String {
     )
 }
 
-/// What the prompt is made of for `model`: the system prompt and the tools,
-/// with the thinking and options its provider takes (see
+/// What the prompt is made of for `model`: the system prompt, with the
+/// thinking and options its provider takes (see
 /// `ModelProvider::request_parameters`). Whether the model accepts images
 /// decides whether the runtime sends them or a note in their place; the
-/// tools stay the same either way, so switching models keeps the prompt
-/// prefix.
+/// session's tools stay the same either way.
 fn definition(model: &ModelRef, info: &ModelInfo) -> AgentDefinition {
     let mut language_model = LanguageModel::new(model.id.clone());
     language_model.name = Some(info.name.clone());
@@ -110,13 +93,15 @@ fn definition(model: &ModelRef, info: &ModelInfo) -> AgentDefinition {
     AgentDefinition {
         model: language_model,
         instructions: Some(system_prompt().to_owned()),
-        tools: TOOLS.iter().map(|tool| (*tool).to_owned()).collect(),
         thinking: parameters.thinking,
         options: parameters.options,
     }
 }
 
-/// Every tool the sessions offer.
+/// The tools every session offers, in this order, and nothing else: no
+/// dynamic tools. They come first in the prompt prefix, so they never change
+/// with the thread, its comments, its project, or its model; what changes
+/// reaches the model in the environment note.
 fn registry() -> ToolRegistry<CoworkHost, Needs> {
     let mut registry = ToolRegistry::default();
     let registered = [
@@ -228,6 +213,7 @@ fn start_session(
         registry(),
     )?;
     let session = session
+        .without_dynamic_tools()
         .with_section(EnvironmentSection)
         .with_conversation(conversation, 0)?;
     let requests = handle.clone();
@@ -1321,7 +1307,10 @@ mod tests {
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
-            TOOLS
+            registry()
+                .descriptors()
+                .map(|tool| tool.name())
+                .collect::<Vec<_>>()
         );
         assert_eq!(first.instructions.as_deref(), Some(system_prompt()));
         _ = handle.post(Request::new(RunSource::Host, RequestKind::Shutdown));
@@ -1348,36 +1337,6 @@ mod tests {
         assert_eq!(total.total_tokens, Some(12));
         assert_eq!(total.input_tokens, Some(3));
         assert_eq!(total.output_tokens, None);
-    }
-
-    /// The definition offers exactly the registered tools: each is registered,
-    /// so a session can be built for any model, and none registered is left
-    /// out, which the model would never see.
-    #[test]
-    fn the_definition_offers_the_registered_tools() {
-        let registry = registry();
-        let model = ModelRef {
-            provider: ModelProvider::Ollama,
-            id: "model".into(),
-        };
-        let info = ModelInfo {
-            name: "Model".into(),
-            max_tokens: 1_024,
-            max_output_tokens: None,
-            image_input: None,
-            reasoning: Reasoning::Default,
-        };
-        let offered = definition(&model, &info).tools;
-        for tool in &offered {
-            assert!(registry.contains(tool), "{tool}");
-        }
-        for tool in registry.descriptors() {
-            let name = tool.name();
-            assert!(
-                offered.iter().any(|offered| offered == name),
-                "{name} is not offered"
-            );
-        }
     }
 
     /// The app's session against a local Ollama: a prompt, a tool call, and

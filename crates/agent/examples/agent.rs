@@ -194,8 +194,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "You keep the user's notes with the read_notes and write_note tools. \
              Use tools exactly as the user asks, and keep replies short.",
         )
-        .tool("read_notes")
-        .tool("write_note")
         .thinking(Thinking::Disabled);
     let (events, mut receiver) = tokio::sync::mpsc::unbounded_channel();
     let provider = Arc::new(Ollama::new("http://localhost:11434")?);

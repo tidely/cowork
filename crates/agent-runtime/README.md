@@ -24,11 +24,15 @@ async fn example(provider: impl LanguageModelProvider + 'static) -> Result<(), A
 
 The state is split by what a change costs:
 
-- **`AgentDefinition`** is what the prompt cache depends on: the model, the
-  instructions, the tools offered (by name), thinking, and provider options.
-  Plain data, shareable by many conversations. It is never patched:
-  `ReplaceDefinition` swaps it whole and starts a new `DefinitionRevision`,
-  which each model reply records in its origin.
+- **Tools** come first in the prompt prefix and are fixed for the session's
+  life: the ones registered when it is built (`AgentBuilder::tool`, or the
+  registry given to `AgentSession::new`), in registration order, after
+  `search_tools` and `call_tool` unless it is built `without_dynamic_tools`.
+- **`AgentDefinition`** is the rest of the prefix, which can change at the
+  cost of the prompt cache: the model, the instructions, thinking, and
+  provider options. Plain data, shareable by many conversations. It is never
+  patched: `ReplaceDefinition` swaps it whole, keeping the tools, and starts a
+  new `DefinitionRevision`, which each model reply records in its origin.
 - **`Configuration`** is everything else: the host's permissions, sampling
   controls (`max_output_tokens`, `temperature`, ...), steps per run, and the
   compaction policy. `Configure` requests change one field at a time, so
@@ -89,7 +93,7 @@ A dropped `send` future does not withdraw a request already sent.
 
 ## Tools, approvals, and dynamic tools
 
-The definition's base tools are offered directly in every request. A call is
+The session's base tools are offered directly in every request. A call is
 resolved, its arguments decoded and its access computed, then authorized. On
 `Ask` the session emits `ApprovalRequested` and parks the call until a
 `ResolveApproval` request answers: `AllowOnce`, `AllowForRun` (adds a run grant
@@ -97,15 +101,15 @@ resolved, its arguments decoded and its access computed, then authorized. On
 calls like any unfinished call, and a late answer finds nothing to resolve. The
 tool then runs with exactly the access that was authorized.
 
-Dynamic tools are reached through two built-ins included in every definition by
-default: `search_tools` returns matching tools with their parameter schemas,
+Dynamic tools are reached through two built-ins offered by default:
+`search_tools` returns matching tools with their parameter schemas,
 and `call_tool { name, arguments }` runs one. `DynamicTools` requests add or
 remove them and only ever append to the conversation, so the request's `tools`
 never change and the prompt cache holds with every provider. `call_tool` is
 resolved to the real tool before authorization, so permissions, approvals,
 events (`ToolStarted { tool, .. }`), and output all see that tool; it refuses
-base tools, which are called directly. A definition without `call_tool` has no
-dynamic tools. Each step takes a snapshot of the tools, and the calls in its
+base tools, which are called directly. A session built `without_dynamic_tools`
+has none. Each step takes a snapshot of the tools, and the calls in its
 reply run against it.
 
 Calls run one at a time. Every accepted call gets one correlated result,

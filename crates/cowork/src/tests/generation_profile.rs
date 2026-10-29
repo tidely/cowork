@@ -417,7 +417,6 @@ fn generation_profile() {
                             serde_json::json!({"num_ctx": 4096, "num_predict": num_predict}),
                         );
                         let definition = AgentDefinition {
-                            tools: Vec::new(),
                             thinking: Some(if reasoning { Thinking::Enabled } else { Thinking::Disabled }),
                             options,
                             ..AgentDefinition::new(LanguageModel::new("qwen3.8:27b"))
@@ -425,6 +424,7 @@ fn generation_profile() {
                         let count = Arc::new(AtomicUsize::new(0));
                         let sender = sender.clone();
                         let agent = Agent::builder(agent::Ollama::new(&base)?, definition)
+                            .without_dynamic_tools()
                             .sampling(agent::Sampling { max_output_tokens: None, ..Default::default() })
                             .on_event(move |event| {
                                 let Some(event) = relayed(event) else { return };

@@ -15,9 +15,10 @@ fn note(message: &Message, index: usize) -> &str {
     text
 }
 
-/// Each request is built from the definition, the configuration, and the
-/// conversation. Configuration changes keep the prefix; a replaced definition
-/// is a new revision; the model is told about both through context notes.
+/// Each request is built from the session's tools, the definition, the
+/// configuration, and the conversation. Configuration changes keep the
+/// prefix; a replaced definition is a new revision that keeps the tools; the
+/// model is told about both through context notes.
 #[tokio::test]
 async fn requests_are_assembled_from_definition_configuration_and_conversation() {
     let Fixture {
@@ -84,16 +85,6 @@ async fn requests_are_assembled_from_definition_configuration_and_conversation()
         .event(|kind| matches!(kind, EventKind::RunFinished { .. }))
         .await;
 
-    let unknown = definition().tool("missing");
-    assert!(matches!(
-        harness
-            .request(RequestKind::ReplaceDefinition {
-                definition: unknown,
-                provider: None
-            })
-            .await,
-        Err(RequestError::Rejected(_))
-    ));
     let replaced = AgentDefinition::new(LanguageModel::new("other")).instructions("system");
     let response = harness
         .request(RequestKind::ReplaceDefinition {
@@ -109,7 +100,7 @@ async fn requests_are_assembled_from_definition_configuration_and_conversation()
     harness.submit("third", Delivery::Queue).await;
     let third = recv(&mut requests).await;
     assert_eq!(third.model.id, "other");
-    assert_eq!(names(&third.request.tools), [SEARCH_TOOLS, CALL_TOOL]);
+    assert_eq!(third.request.tools, request.tools);
     let messages = &third.request.messages;
     assert!(note(&messages[messages.len() - 2], 0).contains("different model, other"));
     answer_with(&mut harness, third, "three").await;
@@ -276,39 +267,23 @@ async fn dynamic_tools_are_found_with_search_and_run_through_call_tool() {
 }
 
 #[tokio::test]
-async fn sessions_without_call_tool_have_no_dynamic_tools() {
-    let mut definition = definition();
-    definition.tools = vec!["work".into()];
+async fn sessions_without_dynamic_tools_offer_only_their_own() {
     let Fixture {
-        session, handle, ..
-    } = fixture_with(Mode::Allow, definition);
-    let harness = Harness::start(session, handle);
+        session,
+        handle,
+        mut requests,
+        ..
+    } = fixture(Mode::Allow);
+    let mut harness = Harness::start(session.without_dynamic_tools(), handle);
     assert!(matches!(
         harness
             .request(RequestKind::DynamicTools(DynamicToolChange::add(Echo)))
             .await,
         Err(RequestError::Rejected(_))
     ));
-    harness.finish().await;
-
-    let Fixture {
-        session, handle, ..
-    } = fixture(Mode::Allow);
-    let harness = Harness::start(session, handle);
-    harness
-        .request(RequestKind::DynamicTools(DynamicToolChange::add(Echo)))
-        .await
-        .unwrap();
-    let mut without = super::definition();
-    without.tools = vec!["work".into()];
-    assert!(matches!(
-        harness
-            .request(RequestKind::ReplaceDefinition {
-                definition: without,
-                provider: None
-            })
-            .await,
-        Err(RequestError::Rejected(_))
-    ));
+    harness.submit("hello", Delivery::Queue).await;
+    let request = recv(&mut requests).await;
+    assert_eq!(names(&request.request.tools), ["work"]);
+    answer_with(&mut harness, request, "hi").await;
     harness.finish().await;
 }

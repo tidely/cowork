@@ -30,13 +30,14 @@ change it. Extensions add data at defined points; they don't take over the loop.
 2. **Lifetime decides the layer.** State belongs to the shortest-lived layer that
    contains all of its uses. In order: provider connection, then agent
    definition, conversation, run, step, and tool call.
-3. **The definition is what invalidates the prompt cache.** Providers cache a
-   request's prefix: tools, then instructions, then messages. A change
-   invalidates everything after it. Whatever changes the prompt prefix (the
-   model, instructions, base tools, thinking) belongs in the definition. A new
-   definition replaces the old one whole. Everything else can change during a
-   conversation without invalidating the cache. It is configuration, or it
-   reaches the model as appended messages.
+3. **The prefix is the session's tools, then the definition.** Providers
+   cache a request's prefix: tools, then instructions, then messages. A change
+   invalidates everything after it. The base tools are the ones registered
+   when the session is built, fixed for its life. The rest of the prefix that
+   can change (the model, instructions, thinking, provider options) belongs in
+   the definition, and a new definition replaces the old one whole.
+   Everything else can change during a conversation without invalidating the
+   cache. It is configuration, or it reaches the model as appended messages.
 4. **Providers consume plain data.** A `CompletionRequest` is a flat struct
    built fresh for each step from the layers above it. It is never stored as
    agent state and never mutated once built.
@@ -64,10 +65,11 @@ change it. Extensions add data at defined points; they don't take over the loop.
 flowchart TB
     subgraph Infrastructure
         P["Provider connection (shared, Arc)"]
-        D["Agent definition (prefix: model, instructions, base tools, thinking)"]
+        D["Agent definition (prefix: model, instructions, thinking)"]
         R["Requests (sourced, admitted by host policy)"]
     end
     subgraph Session["Session actor: one conversation"]
+        B["Base tools: registered at construction, first in the prefix"]
         C["Conversation: entries, provenance, compactions, delivered context"]
         K["Configuration: permissions, sampling, limits, policies"]
         T["Dynamic tools: catalog reached through call_tool"]
@@ -82,6 +84,7 @@ flowchart TB
     R --> K
     R --> T
     D --> Q
+    B --> Q
     K --> Q
     C --> Q
     K --> S
@@ -94,7 +97,8 @@ flowchart TB
 | Layer | Owns | Lifetime | Changed by | Effect on the cache |
 | --- | --- | --- | --- | --- |
 | Provider | Connection, credentials, model discovery | Process | Host configuration | None |
-| Definition | Model, instructions, base tools, thinking, provider options | Shared across conversations | `ReplaceDefinition`, whole | Invalidates it |
+| Definition | Model, instructions, thinking, provider options | Shared across conversations | `ReplaceDefinition`, whole | Invalidates it |
+| Base tools | The tools registered when the session is built, in registration order, and whether `search_tools` and `call_tool` come first | One session | Nothing; a new session | Never changes it |
 | Configuration | Permissions, sampling controls, run limits, compaction and input policies | One conversation, seeded from shareable defaults | `Configure` requests | None |
 | Conversation | Entries with provenance, compactions, delivered context, dynamic tools, inbox | One conversation | Requests, model replies, tool results | Appends only, except compaction |
 | Run | Triggering origin, step count, run grants, cancellation | First input until finish | Inbox lifecycle, stop, interrupt | None |
@@ -184,15 +188,14 @@ the provider again. They are not hidden inside `stream`.
 
 ### Agent definition
 
-The definition is the part of an agent whose change invalidates the prompt
-cache. It is plain data, which can be cloned, serialized, and shared by many
-conversations.
+The definition is the part of the prompt prefix that can change within a
+session, at the cost of the cache. It is plain data, which can be cloned and
+shared by many conversations.
 
 | Field | Why it changes the prompt |
 | --- | --- |
 | `model: LanguageModel` | A different model has no cache to share |
 | `instructions` | Second in the prefix, after the tools |
-| `tools: Vec<String>` | First in the prefix. Base tool names. `search_tools` and `call_tool` are included by default for [dynamic tools](#dynamic-tool-discovery). Implementations come from the host's registry. |
 | `thinking` | Anthropic invalidates cached messages when thinking settings change, and chat templates render thinking flags into the prompt |
 | `options` | Provider options can change the prompt, or reload the model (Ollama's `num_ctx`) |
 
@@ -202,15 +205,28 @@ and supplies a new one only if a replacement definition uses a different
 provider.
 
 A definition is never patched. `ReplaceDefinition` swaps it whole and
-increments the conversation's `DefinitionRevision`; a step already running
-keeps the definition and tools it started with. Each model reply records the
-revision it was produced under. The `model` context section tells the model
+increments the conversation's `DefinitionRevision`; the tools stay as they
+are, and a step already running keeps the definition it started with. Each
+model reply records the revision it was produced under. The `model` context section tells the model
 when the model changed.
 Replacing the whole definition keeps the rule simple. Every change is a cache
 miss, so making small changes cheap gains nothing.
 
 What stays out of the definition:
 
+- **Tools.** They come first in the prefix, before the instructions, and are
+  fixed for a session's life: the tools registered when it is built
+  (`AgentBuilder::tool`, or the registry passed to `AgentSession::new`),
+  offered in registration order, after `search_tools` and `call_tool` unless
+  the session is built `without_dynamic_tools`. Tools are named once, where
+  they are registered, and the schemas sent are those the implementations
+  produce. Changing the base tools takes a new session; tools that come and go
+  are [dynamic tools](#dynamic-tool-discovery). Codex and Grok Build likewise
+  rebuild their tool list from code rather than storing it, and put tools that
+  come and go behind tool search. A definition shared between programs (a
+  saved agent profile, say) would carry a selection of tools, resolved against
+  the receiver's implementations; definitions have no compatibility guarantees
+  yet.
 - **Anything that doesn't change the prompt.** That is
   [configuration](#configuration): permissions, `max_output_tokens`,
   `temperature`, `top_p`, `stop`, `seed`, run limits, and the compaction
@@ -395,7 +411,7 @@ Tool state has three parts, each with a different owner:
 | Concern | Owner | Lifetime |
 | --- | --- | --- |
 | What a tool is: name, schema, capabilities, implementation | The tool (`tool-runtime`) | Registration |
-| Which tools this conversation offers | The definition (base tools) and dynamic tools (session) | Revision, conversation |
+| Which tools this conversation offers | The session: base tools fixed when it is built, and dynamic tools | Session, conversation |
 | Whether a particular call may run | Configuration (permissions), plus the run's grants and approvals | Conversation, run |
 
 **The tool contract** (`tool-runtime`): typed `Args` with generated schemas,
@@ -479,9 +495,9 @@ on timing. Cancellation and `yield_wait` stay cooperative and per call.
 
 ### Dynamic tool discovery
 
-Dynamic tools work through two tools in the definition: `search_tools` and
-`call_tool`. These work with every provider, and appending results to the
-conversation never changes the request's prefix. Provider-native tool search
+Dynamic tools work through two built-in tools offered before the base tools:
+`search_tools` and `call_tool`. These work with every provider, and appending
+results to the conversation never changes the request's prefix. Provider-native tool search
 can come later, as an optimization.
 
 The session owns the dynamic tools, a registry separate from the host's base
@@ -494,14 +510,14 @@ pub enum DynamicToolChange<H: AgentHost> {
 }
 ```
 
-- **Base tools and dynamic tools change differently.** Base tools are in the
-  definition. Changing them means replacing the definition, which costs the
-  cache. Dynamic tools change through `DynamicTools(DynamicToolChange)`
-  requests, which only ever add to the conversation. `search_tools` and
-  `call_tool` are in every definition by default, even while the catalog is
-  empty. Adding them when the first dynamic tool appeared would change `tools`
-  and invalidate the cache. A definition that leaves them out has no dynamic
-  tools, and the session rejects `DynamicTools` requests for it.
+- **Base tools and dynamic tools change differently.** Base tools are fixed
+  for the session's life; changing them takes a new session. Dynamic tools
+  change through `DynamicTools(DynamicToolChange)` requests, which only ever
+  add to the conversation. `search_tools` and `call_tool` are offered by
+  default, even while the catalog is empty. Adding them when the first dynamic
+  tool appeared would change `tools` and invalidate the cache. A session built
+  `without_dynamic_tools` leaves them out, has no dynamic tools, and rejects
+  `DynamicTools` requests.
 - **Searching.** `search_tools` returns matching names, descriptions, and full
   schemas as an ordinary tool result. It is the runtime's own read-only
   built-in, so it needs no authorization. Matching is by query words in names
@@ -614,7 +630,7 @@ The assembled request is flat and is never changed after assembly:
 ```rust
 pub struct CompletionRequest {
     pub instructions: Option<String>,   // definition
-    pub tools: Vec<ToolDefinition>,     // definition's base tools, including search_tools and call_tool
+    pub tools: Vec<ToolDefinition>,     // search_tools and call_tool, then the session's base tools
     pub messages: Vec<Message>,         // conversation.model_messages()
     pub thinking: Option<Thinking>,     // definition
     pub options: JsonObject,            // definition
@@ -703,7 +719,8 @@ the agent; collaborators see what the session commits.
 | `AgentHost` | `CoworkHost` ([tool_approval.rs](../crates/cowork/src/tool_approval.rs)): sources are the participant or schedule that started a run, inputs are a submission's content, access is the sandbox's `Needs`, and permissions are the sandbox's project, read when a call starts |
 | Tool contexts | The thread's `sandbox::ThreadSandbox` (commands and file tools) and the run's `tools::RunComments` (`respond_to_comment`) |
 | Authorization | Calls within the project's mode, its folders, and the run's grants run; others ask, and only the host may decide commands, writes, and permission requests. A scheduled run refuses a call that would ask the first time |
-| Definition | The selected model, the system prompt, the tools without `search_tools` and `call_tool`, and the thinking and options the model's provider takes (`ModelProvider::request_parameters` in `providers.rs`: Ollama's `num_ctx`, Anthropic's `max_tokens` and thinking style, OpenAI's `reasoning_effort`). A change of provider or API key hands the session a new connection with the definition. A model change replaces it before the next run |
+| Tools | The tools registered in `generation.rs`'s `registry`, in that order, without dynamic tools (`without_dynamic_tools`) |
+| Definition | The selected model, the system prompt, and the thinking and options the model's provider takes (`ModelProvider::request_parameters` in `providers.rs`: Ollama's `num_ctx`, Anthropic's `max_tokens` and thinking style, OpenAI's `reasoning_effort`). A change of provider or API key hands the session a new connection with the definition. A model change replaces it before the next run |
 | Context sections | `environment`: the project's folders and mode and the scratch folder, sent whenever they changed |
 | Inputs | Cowork keeps its own queue of pending submissions, which collaborators see and cancel, and hands the session one input at a time when no run is going |
 | Compaction | Requested when a request reports the context past the user's threshold, or when a run starts on a full context |
@@ -715,15 +732,18 @@ sandbox's run grants, which later commands of the run get; the runtime's
 
 ## Decisions
 
-- **Definition and configuration.** The definition is exactly what changes the
-  prompt, and it is replaced whole. Configuration is the rest: permissions,
+- **Definition and configuration.** The definition is what can change the
+  prompt within a session, and it is replaced whole. Configuration is the rest: permissions,
   sampling controls, limits, and the compaction policy. It changes one field at
   a time, so independent sources can't undo each other's changes.
 - **Tool contexts and access.** Each tool declares `type Context` and
   `type Access`. The compiler checks, when a tool is registered, that the host
   provides its context and that its access converts into the host's.
-- **Dynamic tools.** Portable `search_tools` and `call_tool` only, included in
-  every definition by default. Escape hatches for particular providers come
+- **Tools.** A session's base tools are the tools registered when it is
+  built, in registration order, fixed for its life and never listed apart
+  from their registration.
+- **Dynamic tools.** Portable `search_tools` and `call_tool` only, offered by
+  default. Escape hatches for particular providers come
   later.
 - **The request shape.** `CompletionRequest` is flat, with its own
   `instructions` field.

@@ -194,12 +194,15 @@ fn registry_provides_typed_context_and_computes_access_before_running() {
     assert_eq!(host.counter.0.load(Ordering::SeqCst), 1);
 }
 
+/// Registration order is the order a session offers its tools in.
 #[test]
-fn duplicate_registration_does_not_replace_the_existing_tool() {
+fn registry_keeps_registration_order_and_refuses_duplicates() {
     let mut registry = Registry::default();
+    registry.register(Streaming).unwrap();
     registry.register(Calculate).unwrap();
-    assert!(registry.register(Calculate).is_err());
-    assert_eq!(registry.len(), 1);
+    assert!(registry.register(Streaming).is_err());
+    let names: Vec<_> = registry.descriptors().map(ToolDescriptor::name).collect();
+    assert_eq!(names, ["streaming", "calculate"]);
 }
 
 /// Needs nothing from the host: `()` context and `()` access.

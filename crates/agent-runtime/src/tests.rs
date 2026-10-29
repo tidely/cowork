@@ -212,9 +212,7 @@ impl Tool for Work {
 }
 
 fn definition() -> AgentDefinition {
-    AgentDefinition::new(LanguageModel::new("scripted"))
-        .instructions("system")
-        .tool("work")
+    AgentDefinition::new(LanguageModel::new("scripted")).instructions("system")
 }
 
 struct Fixture {

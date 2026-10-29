@@ -1,23 +1,25 @@
 use language_model::{JsonObject, LanguageModel, Thinking};
 
-use crate::tools::{CALL_TOOL, SEARCH_TOOLS};
-
-/// The part of an agent whose change invalidates the prompt cache: the model,
-/// the instructions, the tools offered, thinking, and provider options. Plain
-/// data, shareable by many conversations; it holds no connection or tool
-/// implementation (tool names resolve against the session's registry).
+/// The part of an agent that can change within a session, at the cost of the
+/// prompt cache: the model, the instructions, thinking, and provider options.
+/// Plain data, shareable by many conversations; it holds no connection.
+///
+/// Tools are not part of it. A session's tools are the ones registered when
+/// it is built, offered in registration order for its whole life, ahead of
+/// the instructions in every request; see [`AgentSession::new`]. A definition
+/// shared between programs (say, a saved agent profile) would carry a
+/// selection of tools resolved against the receiver's own implementations,
+/// which supply the schemas. Definitions have no compatibility guarantees yet.
 ///
 /// A definition is never patched: `ReplaceDefinition` swaps it whole, which
 /// starts a new [`DefinitionRevision`]. Everything that doesn't change the
 /// prompt is [`Configuration`](crate::Configuration).
+///
+/// [`AgentSession::new`]: crate::AgentSession::new
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentDefinition {
     pub model: LanguageModel,
     pub instructions: Option<String>,
-    /// Tools offered in every request, in this order. Includes
-    /// [`SEARCH_TOOLS`] and [`CALL_TOOL`] by default, which reach the
-    /// session's dynamic tools; without `call_tool` there are none.
-    pub tools: Vec<String>,
     pub thinking: Option<Thinking>,
     /// Provider-specific request options; these can change the prompt or
     /// reload the model (Ollama's `num_ctx`).
@@ -29,7 +31,6 @@ impl AgentDefinition {
         Self {
             model,
             instructions: None,
-            tools: vec![SEARCH_TOOLS.into(), CALL_TOOL.into()],
             thinking: None,
             options: JsonObject::new(),
         }
@@ -40,20 +41,9 @@ impl AgentDefinition {
         self
     }
 
-    /// Adds a base tool, offered directly in every request.
-    pub fn tool(mut self, name: impl Into<String>) -> Self {
-        self.tools.push(name.into());
-        self
-    }
-
     pub fn thinking(mut self, thinking: Thinking) -> Self {
         self.thinking = Some(thinking);
         self
-    }
-
-    /// Whether the session can hold dynamic tools, reached through `call_tool`.
-    pub fn has_dynamic_tools(&self) -> bool {
-        self.tools.iter().any(|name| name == CALL_TOOL)
     }
 }
 
