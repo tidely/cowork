@@ -17,7 +17,6 @@ use std::sync::{
 use agent::{
     AgentHost, CallAuthorization, Decision, Input, RenderInput,
     model::{Content, ToolCallId},
-    tool::Provides,
 };
 use gpui::Context;
 use parking_lot::Mutex;
@@ -132,7 +131,7 @@ impl RenderInput for CoworkInput {
 /// and when to compact.
 pub(crate) struct CoworkHost {
     sandbox: Arc<ThreadSandbox>,
-    comments: Arc<RunComments>,
+    comments: RunComments,
     /// The calls a scheduled run already made once without being asked
     /// about, by tool and arguments (whose keys may come in any order).
     unattended: Mutex<Vec<(String, serde_json::Value)>>,
@@ -156,7 +155,7 @@ impl CoworkHost {
     pub(crate) fn new(sandbox: Arc<ThreadSandbox>) -> Self {
         Self {
             sandbox,
-            comments: Arc::default(),
+            comments: RunComments::default(),
             unattended: Mutex::default(),
             compaction: CompactionTrigger {
                 threshold: AtomicU64::new(u64::MAX),
@@ -193,15 +192,21 @@ impl CoworkHost {
     }
 }
 
-impl Provides<ThreadSandbox> for CoworkHost {
-    fn provide(self: &Arc<Self>) -> Arc<ThreadSandbox> {
-        self.sandbox.clone()
+impl AsRef<ThreadSandbox> for CoworkHost {
+    fn as_ref(&self) -> &ThreadSandbox {
+        &self.sandbox
     }
 }
 
-impl Provides<RunComments> for CoworkHost {
-    fn provide(self: &Arc<Self>) -> Arc<RunComments> {
-        self.comments.clone()
+impl AsRef<RunComments> for CoworkHost {
+    fn as_ref(&self) -> &RunComments {
+        &self.comments
+    }
+}
+
+impl AsRef<()> for CoworkHost {
+    fn as_ref(&self) -> &() {
+        &()
     }
 }
 
@@ -386,7 +391,7 @@ mod tests {
     ) -> Decision
     where
         T: agent::tool::Tool,
-        CoworkHost: Provides<T::Context>,
+        CoworkHost: AsRef<T::Context>,
         Needs: From<T::Access>,
     {
         let tool = Arc::new(tool);

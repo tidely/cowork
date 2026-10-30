@@ -139,6 +139,7 @@ version = "0.1.0"
 dependencies = [
  "agent-runtime",
  "anthropic",
+ "anyhow",
  "futures",
  "language-model",
  "ollama",

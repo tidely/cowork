@@ -13,7 +13,7 @@ A `Tool` has four associated types:
 - `Output`: a `ToolOutput`, keeping structured data apart from the content the
   model sees.
 - `Context`: the host services the tool needs, `()` for none. A registry's host
-  context must provide it (`Provides<T::Context>`), which the compiler checks
+  context must implement `AsRef<T::Context>`, which the compiler checks
   when the tool is registered, rather than a type-map lookup on every call.
 - `Access`: what one call needs to be allowed, `()` when calls differ only by
   tool. `Tool::access` computes it from the arguments; the registry converts it
@@ -26,7 +26,7 @@ use language_model::{ToolCallId, ToolResultContent};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tool_runtime::{
-    CallControl, Provides, Tool, ToolCall, ToolError, ToolOutput, ToolRegistry, collect_output,
+    CallControl, Tool, ToolCall, ToolError, ToolOutput, ToolRegistry, collect_output,
 };
 
 /// A service the host owns and hands to the tools that ask for it.
@@ -34,12 +34,12 @@ struct Ledger;
 
 /// The host context of this registry.
 struct Host {
-    ledger: Arc<Ledger>,
+    ledger: Ledger,
 }
 
-impl Provides<Ledger> for Host {
-    fn provide(self: &Arc<Self>) -> Arc<Ledger> {
-        self.ledger.clone()
+impl AsRef<Ledger> for Host {
+    fn as_ref(&self) -> &Ledger {
+        &self.ledger
     }
 }
 
@@ -70,7 +70,7 @@ impl Tool for Add {
     fn name(&self) -> &str { "add" }
     fn description(&self) -> String { "Add two integers".into() }
     fn access(&self, args: &AddArgs, _: &Ledger) -> Writes { Writes(args.record) }
-    async fn run(&self, call: ToolCall<Writes>, _ledger: Arc<Ledger>, args: AddArgs) -> Result<Sum, ToolError> {
+    async fn run(&self, call: ToolCall<Writes>, _ledger: &Ledger, args: AddArgs) -> Result<Sum, ToolError> {
         // `call.access` is exactly what authorization allowed.
         let _ = call.access;
         Ok(Sum { value: i64::from(args.a) + i64::from(args.b) })
@@ -80,7 +80,7 @@ impl Tool for Add {
 # async fn example() -> Result<(), ToolError> {
 let mut registry = ToolRegistry::<Host, Writes>::default();
 registry.register(Add)?;
-let host = Arc::new(Host { ledger: Arc::new(Ledger) });
+let host = Arc::new(Host { ledger: Ledger });
 // Preparing decodes the arguments and computes access; nothing runs yet.
 let prepared = registry.prepare("add", serde_json::json!({"a": 2, "b": 3, "record": true}), &host)?;
 assert_eq!(prepared.access(), &Writes(true));
@@ -95,7 +95,12 @@ Preparing and executing are separate so a host can authorize a call between
 them: `prepare` never runs the tool, and awaiting `execute` may already run a
 simple one. The prepared call keeps the access value it computed and passes it
 to the tool in `ToolCall::access`, so a tool runs with exactly what was allowed
-even if its context changed meanwhile.
+even if its context changed meanwhile. Execution takes owned arguments and a
+borrowed context; the runtime retains the host's `Arc` while the execution
+future runs and borrows the tool's context through `AsRef`. The service itself
+does not need an `Arc`. Returned progress streams remain owned (`'static`).
+A host can implement `AsRef<T>` for multiple service types. Tools with `Context = ()`
+require an explicit `AsRef<()>` implementation on the host, returning `&()`.
 
 `ToolCall` also carries the local `ToolCallId` and `CallControl`: cooperative
 `cancellation` when the run ends, and `yield_wait` when new input should wake a

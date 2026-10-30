@@ -3,7 +3,7 @@ use std::sync::Arc;
 use language_model::ToolDefinition;
 use serde_json::Value;
 
-use crate::{PreparedCall, Provides, Tool, ToolCapabilities, ToolDyn, ToolError, ToolErrorKind};
+use crate::{PreparedCall, Tool, ToolCapabilities, ToolDyn, ToolError, ToolErrorKind};
 
 /// A registration's model-facing definition and host-facing execution metadata,
 /// captured together when the tool is registered, so policy sees the same
@@ -86,7 +86,7 @@ impl<C: ?Sized + 'static, A: 'static> ToolRegistry<C, A> {
     pub fn register<T>(&mut self, tool: T) -> Result<(), ToolError>
     where
         T: Tool,
-        C: Provides<T::Context>,
+        C: AsRef<T::Context> + Send + Sync,
         A: From<T::Access>,
     {
         self.register_dyn(Arc::new(tool))

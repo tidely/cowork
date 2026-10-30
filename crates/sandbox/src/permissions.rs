@@ -9,8 +9,6 @@
 //! and reports everything granted back to the model. Like `run_command`'s,
 //! the definition never changes and names no host paths.
 
-use std::sync::Arc;
-
 use agent::tool::{Tool, ToolCall, ToolError, ToolErrorKind};
 use serde::Deserialize;
 
@@ -98,7 +96,7 @@ impl Tool for RequestPermissions {
     async fn run(
         &self,
         call: ToolCall<Needs>,
-        sandbox: Arc<ThreadSandbox>,
+        sandbox: &Self::Context,
         _: Self::Args,
     ) -> Result<Self::Output, ToolError> {
         let Needs::Permissions(grant) = call.access else {
@@ -119,6 +117,8 @@ impl Tool for RequestPermissions {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use serde_json::json;
 
     use super::*;

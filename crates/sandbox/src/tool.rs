@@ -5,7 +5,7 @@
 //! project's folders and mode, reaches the model as an environment note in
 //! the conversation instead; see [`Sandboxes::environment_note`].
 
-use std::{num::NonZeroU64, sync::Arc, time::Duration};
+use std::{num::NonZeroU64, time::Duration};
 
 use agent::tool::{Tool, ToolCall, ToolError, ToolErrorKind};
 use serde::Deserialize;
@@ -135,7 +135,7 @@ impl Tool for RunCommand {
     async fn run(
         &self,
         call: ToolCall<Needs>,
-        sandbox: Arc<ThreadSandbox>,
+        sandbox: &Self::Context,
         args: RunCommandArgs,
     ) -> Result<CommandOutput, ToolError> {
         let Needs::Command { access, folders } = call.access else {
@@ -159,6 +159,8 @@ impl Tool for RunCommand {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use agent::tool::ToolErrorKind;
     use serde_json::json;
 

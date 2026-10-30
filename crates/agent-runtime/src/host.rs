@@ -65,7 +65,7 @@ pub enum Decision {
 /// The session never checks authority itself: [`AgentHost::admit`] sees every
 /// request with its source first. Tool contexts come from the host too: a
 /// tool whose `Context` is `T` can be registered when the host implements
-/// `Provides<T>`.
+/// `AsRef<T>`.
 pub trait AgentHost: Send + Sync + Sized + 'static {
     /// Who sent a request. Recorded on conversation entries and runs.
     type Source: Clone + PartialEq + Debug + Send + Sync + 'static;
@@ -106,6 +106,12 @@ pub trait AgentHost: Send + Sync + Sized + 'static {
 /// need no context, and permissions by tool name.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BasicHost;
+
+impl AsRef<()> for BasicHost {
+    fn as_ref(&self) -> &() {
+        &()
+    }
+}
 
 impl AgentHost for BasicHost {
     type Source = String;

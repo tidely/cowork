@@ -9,8 +9,8 @@ use language_model::{ToolArguments, ToolCall, ToolDefinition};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tool_runtime::{
-    Provides, RegisteredTool, Tool, ToolDescriptor, ToolDyn, ToolError, ToolErrorKind,
-    ToolRegistry, TypedToolOutput,
+    RegisteredTool, Tool, ToolDescriptor, ToolDyn, ToolError, ToolErrorKind, ToolRegistry,
+    TypedToolOutput,
 };
 
 use crate::AgentHost;
@@ -38,7 +38,7 @@ impl<H: AgentHost> DynamicToolChange<H> {
     pub fn add<T>(tool: T) -> Self
     where
         T: Tool,
-        H: Provides<T::Context>,
+        H: AsRef<T::Context>,
         H::Access: From<T::Access>,
     {
         Self::Add(Arc::new(tool))

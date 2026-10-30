@@ -7,7 +7,7 @@ mod output;
 mod registry;
 mod tool;
 
-pub use call::{CallControl, Provides, ToolCall};
+pub use call::{CallControl, ToolCall};
 pub use capabilities::ToolCapabilities;
 pub use error::{ToolError, ToolErrorKind};
 pub use output::{BuiltinToolOutput, ToolOutput, TypedToolOutput};

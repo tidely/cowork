@@ -136,8 +136,7 @@ impl Reply {
                 Content::Text { text } => Some(text.as_str()),
                 _ => None,
             })
-            .collect::<Vec<_>>()
-            .join("")
+            .collect::<String>()
     }
 }
 

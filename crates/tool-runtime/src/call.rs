@@ -1,5 +1,3 @@
-use std::sync::Arc;
-
 use language_model::ToolCallId;
 use tokio_util::sync::CancellationToken;
 
@@ -23,18 +21,4 @@ pub struct ToolCall<A> {
     pub id: ToolCallId,
     pub access: A,
     pub control: CallControl,
-}
-
-/// A host context that can hand a tool the services it declares as its
-/// `Tool::Context`. Registering a tool requires this, so a tool's dependencies
-/// are checked when it is registered rather than looked up on every call.
-/// Tools that need nothing use `()`, which every context provides.
-pub trait Provides<T: ?Sized> {
-    fn provide(self: &Arc<Self>) -> Arc<T>;
-}
-
-impl<C: ?Sized> Provides<()> for C {
-    fn provide(self: &Arc<Self>) -> Arc<()> {
-        Arc::new(())
-    }
 }

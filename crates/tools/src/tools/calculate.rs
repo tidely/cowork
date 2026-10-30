@@ -1,7 +1,5 @@
 use std::fmt;
 
-use std::sync::Arc;
-
 use agent::tool::{Tool, ToolCall, ToolError, ToolErrorKind, ToolOutput};
 use serde::{Deserialize, Serialize};
 
@@ -100,7 +98,7 @@ impl Tool for Calculate {
     async fn run(
         &self,
         _call: ToolCall<()>,
-        _context: Arc<()>,
+        _context: &(),
         args: Self::Args,
     ) -> Result<Self::Output, ToolError> {
         Self::calculate(args)

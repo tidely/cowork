@@ -266,7 +266,7 @@ impl Tool for RespondToComment {
     async fn run(
         &self,
         _call: ToolCall<()>,
-        comments: Arc<RunComments>,
+        comments: &RunComments,
         args: Self::Args,
     ) -> Result<Self::Output, ToolError> {
         Ok(Self::respond(&comments.current(), args)?)

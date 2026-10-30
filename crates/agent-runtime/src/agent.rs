@@ -6,7 +6,7 @@ use std::collections::HashSet;
 
 use futures::future::BoxFuture;
 use language_model::{LanguageModelProvider, ToolCallId};
-use tool_runtime::{Provides, Tool, ToolError};
+use tool_runtime::{Tool, ToolError};
 
 use crate::{
     AgentDefinition, AgentEvent, AgentHost, AgentSession, BasicHost, Compaction, CompactionError,
@@ -117,7 +117,7 @@ impl<H: AgentHost> AgentBuilder<H> {
     pub fn tool<T>(mut self, tool: T) -> Result<Self, ToolError>
     where
         T: Tool,
-        H: Provides<T::Context>,
+        H: AsRef<T::Context>,
         H::Access: From<T::Access>,
     {
         self.registry.register(tool)?;

@@ -343,7 +343,7 @@ this as `InputAuthority::{HumanIntent, ModelAuthoredUntrusted, RuntimeControl}`
 on each input. The inbox and session assume whatever reaches them was admitted.
 
 The host is also where tools get their context: a tool whose `Context` is `T`
-can be registered when the host implements `Provides<T>`. `BasicHost` covers
+can be registered when the host implements `AsRef<T>`. `BasicHost` covers
 single-user programs: string sources and inputs, tools that need no context,
 and permissions by tool name.
 
@@ -431,7 +431,7 @@ and declared `ToolCapabilities`, plus:
       type Access: Clone + Default + Send + Sync + 'static;
 
       fn access(&self, args: &Self::Args, cx: &Self::Context) -> Self::Access;
-      async fn run(&self, call: ToolCall<Self::Access>, cx: Arc<Self::Context>, args: Self::Args)
+      async fn run(&self, call: ToolCall<Self::Access>, cx: &Self::Context, args: Self::Args)
           -> Result<Self::Output, ToolError>;
   }
 
@@ -450,22 +450,20 @@ and declared `ToolCapabilities`, plus:
   converts:
 
   ```rust
-  pub trait Provides<T: ?Sized> {
-      fn provide(self: &Arc<Self>) -> Arc<T>;
-  }
-  impl<C: ?Sized> Provides<()> for C { /* ... */ }
 
   impl<C, A> ToolRegistry<C, A> {
       pub fn register<T: Tool>(&mut self, tool: T) -> Result<(), ToolError>
-      where C: Provides<T::Context>, A: From<T::Access>;
+      where C: AsRef<T::Context> + Send + Sync, A: From<T::Access>;
   }
   ```
 
   In a session, `C` is the host itself and `A` is `H::Access`. The compiler
   checks a tool's dependencies when it is registered, rather than through a
-  type-map lookup on each call. The context is an `Arc`, so streaming tools can
-  move it into their `'static` stream. Progress travels in the tool's stream,
-  not a separate sink. The run's origin is not in `ToolCall`: authorization is
+  type-map lookup on each call. The runtime retains the host's `Arc` and
+  borrows each tool's context through `AsRef<T>`. A host can implement this
+  for multiple service types; context-free tools require `AsRef<()>`.
+  Returned streams remain owned (`'static`), so tools must own any state
+  their streams retain. Progress travels in the tool's stream, not a separate sink. The run's origin is not in `ToolCall`: authorization is
   what uses it (to treat a scheduled run differently from a participant's
   prompt, for example), and keeping it out keeps `Tool` free of the host's
   source type.
@@ -690,7 +688,7 @@ Where each concept lives:
 | --- | --- |
 | Provider contract, `CompletionRequest`, `CachePoint`, `FinishReason`, model metadata | [language-model](../crates/language-model/src/lib.rs) |
 | Adapters: instructions, cache points, finish reasons, discovery | [anthropic](../crates/providers/anthropic/types/src/conversion.rs), [ollama](../crates/providers/ollama/types/src/conversion.rs), [openai-compatible](../crates/providers/openai-compatible/types/src/conversion.rs) |
-| `Tool` with `Context` and `Access`, `Provides`, `ToolCall`, prepared calls, `ToolRegistry<C, A>` | [tool-runtime](../crates/tool-runtime/src/tool.rs) |
+| `Tool` with `Context` and `Access`, `AsRef`, `ToolCall`, prepared calls, `ToolRegistry<C, A>` | [tool-runtime](../crates/tool-runtime/src/tool.rs) |
 | Delivery lanes and reservations | [agent-input](../crates/agent-input/src/lib.rs) |
 | `AgentHost`, `BasicHost`, `ToolPermissions` | [host.rs](../crates/agent-runtime/src/host.rs) |
 | `AgentDefinition`, `DefinitionRevision` | [definition.rs](../crates/agent-runtime/src/definition.rs) |

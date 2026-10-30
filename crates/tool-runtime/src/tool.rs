@@ -7,8 +7,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::{
-    CallControl, Provides, ToolCall, ToolCapabilities, ToolError, ToolErrorKind, ToolOutput,
-    TypedToolOutput,
+    CallControl, ToolCall, ToolCapabilities, ToolError, ToolErrorKind, ToolOutput, TypedToolOutput,
 };
 
 /// One typed tool. Simple tools implement `run`; streaming tools override
@@ -18,7 +17,7 @@ pub trait Tool: Send + Sync + 'static {
     type Args: DeserializeOwned + JsonSchema + Send + 'static;
     type Output: ToolOutput + Send + 'static;
     /// Host services this tool needs; `()` when it needs none. A registry's
-    /// context must provide it (see [`Provides`]).
+    /// context must implement `AsRef<Self::Context>` (including `AsRef<()>`).
     type Context: ?Sized + Send + Sync + 'static;
     /// What one call needs to be allowed, in this tool's terms; `()` when
     /// calls differ only by tool. A registry converts it into the host's
@@ -55,10 +54,12 @@ pub trait Tool: Send + Sync + 'static {
         Self::Access::default()
     }
 
+    /// Borrows the host context for this execution; the runtime retains its
+    /// owner while the future runs. Arguments belong to this call.
     fn run(
         &self,
         _call: ToolCall<Self::Access>,
-        _context: Arc<Self::Context>,
+        _context: &Self::Context,
         _args: Self::Args,
     ) -> impl Future<Output = Result<Self::Output, ToolError>> + Send {
         async {
@@ -72,7 +73,7 @@ pub trait Tool: Send + Sync + 'static {
     fn execute(
         &self,
         call: ToolCall<Self::Access>,
-        context: Arc<Self::Context>,
+        context: &Self::Context,
         args: Self::Args,
     ) -> impl Future<Output = ToolStream<Self::Output>> + Send {
         async move { finished_only(self.run(call, context, args).await) }
@@ -205,7 +206,7 @@ pub trait ToolDyn<C: ?Sized, A>: Send + Sync {
 impl<T, C, A> ToolDyn<C, A> for T
 where
     T: Tool,
-    C: Provides<T::Context> + ?Sized,
+    C: AsRef<T::Context> + Send + Sync + ?Sized + 'static,
     A: From<T::Access>,
 {
     fn definition(&self) -> ToolDefinition {
@@ -223,8 +224,8 @@ where
     ) -> Result<PreparedCall<A>, ToolError> {
         let args = serde_json::from_value::<T::Args>(args)
             .map_err(|error| ToolError::new(ToolErrorKind::InvalidArguments, error.to_string()))?;
-        let context = context.provide();
-        let access = self.access(&args, &context);
+        let access = self.access(&args, context.as_ref().as_ref());
+        let context = Arc::clone(context);
         Ok(PreparedCall::new(
             A::from(access.clone()),
             move |id, control| {
@@ -235,7 +236,7 @@ where
                         access,
                         control,
                     };
-                    Tool::execute(&*self, call, context, args)
+                    Tool::execute(&*self, call, context.as_ref().as_ref(), args)
                         .await
                         .map(move |item| match item {
                             ToolStreamItem::Progress(progress) => {

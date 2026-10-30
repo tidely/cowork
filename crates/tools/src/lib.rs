@@ -7,16 +7,22 @@ pub use tools::comments::*;
 mod tests {
     use std::sync::Arc;
 
-    use agent::tool::{Provides, ToolErrorKind, ToolRegistry};
+    use agent::tool::{ToolErrorKind, ToolRegistry};
     use serde_json::json;
 
     use super::*;
 
-    struct Host(Arc<RunComments>);
+    struct Host(RunComments);
 
-    impl Provides<RunComments> for Host {
-        fn provide(self: &Arc<Self>) -> Arc<RunComments> {
-            self.0.clone()
+    impl AsRef<RunComments> for Host {
+        fn as_ref(&self) -> &RunComments {
+            &self.0
+        }
+    }
+
+    impl AsRef<()> for Host {
+        fn as_ref(&self) -> &() {
+            &()
         }
     }
 
@@ -26,7 +32,7 @@ mod tests {
         let mut tools = ToolRegistry::<Host, ()>::default();
         tools.register(Calculate).unwrap();
         tools.register(RespondToComment).unwrap();
-        let host = Arc::new(Host(Arc::default()));
+        let host = Arc::new(Host(RunComments::default()));
 
         for (name, mut arguments, expected) in [
             (

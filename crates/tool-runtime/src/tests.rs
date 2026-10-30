@@ -13,15 +13,21 @@ use crate::*;
 
 /// The host-side context: a counter service plus the host's own access type.
 struct Host {
-    counter: Arc<Counter>,
+    counter: Counter,
 }
 
 #[derive(Default)]
 struct Counter(AtomicUsize);
 
-impl Provides<Counter> for Host {
-    fn provide(self: &Arc<Self>) -> Arc<Counter> {
-        self.counter.clone()
+impl AsRef<Counter> for Host {
+    fn as_ref(&self) -> &Counter {
+        &self.counter
+    }
+}
+
+impl AsRef<()> for Host {
+    fn as_ref(&self) -> &() {
+        &()
     }
 }
 
@@ -54,7 +60,7 @@ type Registry = ToolRegistry<Host, HostAccess>;
 
 fn host() -> Arc<Host> {
     Arc::new(Host {
-        counter: Arc::default(),
+        counter: Counter::default(),
     })
 }
 
@@ -111,7 +117,7 @@ impl Tool for Calculate {
     async fn run(
         &self,
         call: ToolCall<Scope>,
-        counter: Arc<Counter>,
+        counter: &Counter,
         args: Args,
     ) -> Result<Answer, ToolError> {
         assert_eq!(call.access == Scope::Write, args.store);
@@ -192,6 +198,19 @@ fn registry_provides_typed_context_and_computes_access_before_running() {
         assert_eq!(run(&registry, &host, name, args).unwrap_err().kind, kind);
     }
     assert_eq!(host.counter.0.load(Ordering::SeqCst), 1);
+
+    // The execution future retains the owner of the tool's borrowed context,
+    // independently of the registry and the caller's host handle.
+    let prepared = registry
+        .prepare("calculate", json!({"value": 4}), &host)
+        .unwrap();
+    let owner = Arc::downgrade(&host);
+    let execution = prepared.execute(ToolCallId::new(), CallControl::default());
+    drop(host);
+    drop(registry);
+    assert!(owner.upgrade().is_some());
+    block_on(async { collect_output(execution.await).await }).unwrap();
+    assert!(owner.upgrade().is_none());
 }
 
 /// Registration order is the order a session offers its tools in.
@@ -220,12 +239,7 @@ impl Tool for Streaming {
     fn description(&self) -> String {
         "Report progress before returning a result".into()
     }
-    async fn execute(
-        &self,
-        _: ToolCall<()>,
-        _: Arc<()>,
-        args: Args,
-    ) -> ToolStream<serde_json::Value> {
+    async fn execute(&self, _: ToolCall<()>, _: &(), args: Args) -> ToolStream<serde_json::Value> {
         with_progress(
             stream::iter([ToolProgress::Text {
                 text: "working".into(),

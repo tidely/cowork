@@ -37,12 +37,7 @@ impl Tool for Add {
     fn description(&self) -> String {
         "Add two integers a and b".into()
     }
-    async fn run(
-        &self,
-        _: ToolCall<()>,
-        _: Arc<()>,
-        args: Numbers,
-    ) -> Result<Self::Output, ToolError> {
+    async fn run(&self, _: ToolCall<()>, _: &(), args: Numbers) -> Result<Self::Output, ToolError> {
         Ok(serde_json::json!({"sum": args.a + args.b}))
     }
 }
@@ -61,12 +56,7 @@ impl Tool for Multiply {
     fn description(&self) -> String {
         "Multiply two integers a and b".into()
     }
-    async fn run(
-        &self,
-        _: ToolCall<()>,
-        _: Arc<()>,
-        args: Numbers,
-    ) -> Result<Self::Output, ToolError> {
+    async fn run(&self, _: ToolCall<()>, _: &(), args: Numbers) -> Result<Self::Output, ToolError> {
         Ok(serde_json::json!({"product": args.a * args.b}))
     }
 }

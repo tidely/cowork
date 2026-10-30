@@ -52,15 +52,14 @@ impl From<FileError> for ToolError {
 /// Runs `work` with the thread's places as they are now, off the async
 /// runtime, as it does blocking file I/O.
 async fn with_places<T: Send + 'static>(
-    sandbox: Arc<ThreadSandbox>,
-    work: impl FnOnce(&Sandboxes, &Places) -> Result<T, FileError> + Send + 'static,
+    sandbox: &ThreadSandbox,
+    work: impl FnOnce(&Sandboxes, &mut Places) -> Result<T, FileError> + Send + 'static,
 ) -> Result<T, FileError> {
-    tokio::task::spawn_blocking(move || {
-        let sandboxes = sandbox.sandboxes();
-        work(sandboxes, &sandboxes.places(sandbox.thread()))
-    })
-    .await
-    .unwrap_or_else(|error| Err(FileError::Failed(error.to_string())))
+    let sandboxes = Arc::clone(sandbox.sandboxes());
+    let thread = sandbox.thread().to_owned();
+    tokio::task::spawn_blocking(move || work(&sandboxes, &mut sandboxes.places(&thread)))
+        .await
+        .unwrap_or_else(|error| Err(FileError::Failed(error.to_string())))
 }
 
 fn location(places: &Places, path: &str, what: &str) -> Result<Location, FileError> {
@@ -116,7 +115,7 @@ impl Tool for ListDirectory {
     async fn run(
         &self,
         _call: ToolCall<Needs>,
-        sandbox: Arc<ThreadSandbox>,
+        sandbox: &Self::Context,
         args: Self::Args,
     ) -> Result<Self::Output, ToolError> {
         Ok(with_places(sandbox, move |_, places| list_directory(places, &args.path)).await?)
@@ -299,7 +298,7 @@ impl Tool for ViewImage {
     async fn run(
         &self,
         _call: ToolCall<Needs>,
-        sandbox: Arc<ThreadSandbox>,
+        sandbox: &Self::Context,
         args: Self::Args,
     ) -> Result<Self::Output, ToolError> {
         Ok(with_places(sandbox, move |_, places| view_image(places, &args.path)).await?)
@@ -477,7 +476,7 @@ impl Tool for ReadFile {
     async fn run(
         &self,
         _call: ToolCall<Needs>,
-        sandbox: Arc<ThreadSandbox>,
+        sandbox: &Self::Context,
         args: Self::Args,
     ) -> Result<Self::Output, ToolError> {
         Ok(with_places(sandbox, move |_, places| {
@@ -649,23 +648,20 @@ impl Tool for WriteFile {
     async fn run(
         &self,
         call: ToolCall<Needs>,
-        sandbox: Arc<ThreadSandbox>,
+        sandbox: &Self::Context,
         args: Self::Args,
     ) -> Result<Self::Output, ToolError> {
         let approved = call.access
             == Needs::Write {
                 path: args.path.clone(),
             };
-        Ok(tokio::task::spawn_blocking(move || {
-            let sandboxes = sandbox.sandboxes();
-            let mut places = sandboxes.places(sandbox.thread());
+        Ok(with_places(sandbox, move |_, places| {
             if approved {
                 places.allow_project_write();
             }
-            write_file(&places, &args.path, &args.content)
+            write_file(places, &args.path, &args.content)
         })
-        .await
-        .unwrap_or_else(|error| Err(FileError::Failed(error.to_string())))?)
+        .await?)
     }
 }
 
@@ -765,23 +761,20 @@ impl Tool for EditFile {
     async fn run(
         &self,
         call: ToolCall<Needs>,
-        sandbox: Arc<ThreadSandbox>,
+        sandbox: &Self::Context,
         args: Self::Args,
     ) -> Result<Self::Output, ToolError> {
         let approved = call.access
             == Needs::Write {
                 path: args.path.clone(),
             };
-        Ok(tokio::task::spawn_blocking(move || {
-            let sandboxes = sandbox.sandboxes();
-            let mut places = sandboxes.places(sandbox.thread());
+        Ok(with_places(sandbox, move |_, places| {
             if approved {
                 places.allow_project_write();
             }
-            edit_file(&places, &args)
+            edit_file(places, &args)
         })
-        .await
-        .unwrap_or_else(|error| Err(FileError::Failed(error.to_string())))?)
+        .await?)
     }
 }
 

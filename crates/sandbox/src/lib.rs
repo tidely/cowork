@@ -624,9 +624,9 @@ pub(crate) fn test_sandboxes() -> (Arc<Sandboxes>, TestRoot) {
 }
 
 #[cfg(test)]
-impl agent::tool::Provides<ThreadSandbox> for ThreadSandbox {
-    fn provide(self: &Arc<Self>) -> Arc<ThreadSandbox> {
-        self.clone()
+impl AsRef<ThreadSandbox> for ThreadSandbox {
+    fn as_ref(&self) -> &ThreadSandbox {
+        self
     }
 }
 

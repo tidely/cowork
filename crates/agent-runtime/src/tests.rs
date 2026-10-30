@@ -19,7 +19,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tool_runtime::{
-    Provides, Tool, ToolCapabilities, ToolProgress, ToolStream, ToolStreamItem, finished_only,
+    Tool, ToolCapabilities, ToolProgress, ToolStream, ToolStreamItem, finished_only,
 };
 
 use crate::*;
@@ -111,9 +111,15 @@ impl std::fmt::Debug for Host {
     }
 }
 
-impl Provides<Probe> for Host {
-    fn provide(self: &Arc<Self>) -> Arc<Probe> {
-        self.probe.clone()
+impl AsRef<Probe> for Host {
+    fn as_ref(&self) -> &Probe {
+        &self.probe
+    }
+}
+
+impl AsRef<()> for Host {
+    fn as_ref(&self) -> &() {
+        &()
     }
 }
 
@@ -194,7 +200,7 @@ impl Tool for Work {
     async fn execute(
         &self,
         call: tool_runtime::ToolCall<Access>,
-        probe: Arc<Probe>,
+        probe: &Probe,
         args: WorkArgs,
     ) -> ToolStream<Value> {
         probe.calls.fetch_add(1, Ordering::SeqCst);

@@ -148,7 +148,7 @@ impl Tool for Echo {
     async fn run(
         &self,
         _: tool_runtime::ToolCall<()>,
-        _: Arc<()>,
+        _: &(),
         args: EchoArgs,
     ) -> Result<Value, tool_runtime::ToolError> {
         Ok(json!({"echo": args.text}))

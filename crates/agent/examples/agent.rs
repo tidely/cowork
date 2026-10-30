@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use agent::tool::{Provides, Tool, ToolCall, ToolCapabilities, ToolDescriptor, ToolError};
+use agent::tool::{Tool, ToolCall, ToolCapabilities, ToolDescriptor, ToolError};
 use agent::{
     Agent, AgentBuilder, AgentDefinition, AgentHost, ApprovalDecision, CallAuthorization,
     ConfigurationChange, Decision, DynamicToolChange, Entry, EventKind, Origin, Request,
@@ -34,9 +34,15 @@ struct Desk {
     notebook: Arc<Notebook>,
 }
 
-impl Provides<Notebook> for Desk {
-    fn provide(self: &Arc<Self>) -> Arc<Notebook> {
-        self.notebook.clone()
+impl AsRef<Notebook> for Desk {
+    fn as_ref(&self) -> &Notebook {
+        &self.notebook
+    }
+}
+
+impl AsRef<()> for Desk {
+    fn as_ref(&self) -> &() {
+        &()
     }
 }
 
@@ -114,7 +120,7 @@ impl Tool for ReadNotes {
     async fn run(
         &self,
         _: ToolCall<Access>,
-        notebook: Arc<Notebook>,
+        notebook: &Notebook,
         _: NoArgs,
     ) -> Result<Value, ToolError> {
         Ok(json!({"notes": *notebook.notes.lock()}))
@@ -147,7 +153,7 @@ impl Tool for WriteNote {
     async fn run(
         &self,
         call: ToolCall<Access>,
-        notebook: Arc<Notebook>,
+        notebook: &Notebook,
         args: NoteArgs,
     ) -> Result<Value, ToolError> {
         // The call carries exactly the access that was authorized.
@@ -172,7 +178,7 @@ impl Tool for WordCount {
     fn description(&self) -> String {
         "Count the words in a text".into()
     }
-    async fn run(&self, _: ToolCall<()>, _: Arc<()>, args: NoteArgs) -> Result<Value, ToolError> {
+    async fn run(&self, _: ToolCall<()>, _: &(), args: NoteArgs) -> Result<Value, ToolError> {
         Ok(json!({"words": args.text.split_whitespace().count()}))
     }
 }

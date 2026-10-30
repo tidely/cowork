@@ -60,7 +60,8 @@ travel in `CompletionRequest::instructions`.
 tool and its arguments, the call's access, the source that started the run,
 the permissions, and the run's grants. `describe_permissions` puts the policy in words for the model.
 Tool contexts come from the host too: a tool whose `Context` is `T` registers
-when the host implements `Provides<T>`.
+when the host implements `AsRef<T>`. A host can expose multiple service types;
+context-free tools require `AsRef<()>`.
 
 `BasicHost` covers single-user programs: string sources and inputs, tools that
 need no context, and `ToolPermissions` by tool name. Its default refuses every
