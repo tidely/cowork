@@ -42,7 +42,7 @@ anthropic-types = { path = "crates/providers/anthropic/types" }
 anthropic = { path = "crates/providers/anthropic/client" }
 
 anyhow = "1"
-base64 = "0.22"
+base64 = "0.23"
 async-channel = "2"
 chrono = { version = "0.4", features = ["serde"] }
 
@@ -78,7 +78,9 @@ mxc-sdk = "1.0.1"
 mime = "0.3"
 nucleo-matcher = "0.3"
 parking_lot = "0.12"
-postcard = { version = "1.1.3", features = ["use-std"] }
+postcard = { version = "1.1.3", default-features = false, features = [
+    "use-std",
+] }
 reqwest = { version = "0.13", default-features = false, features = [
     "json",
     "stream",
@@ -92,7 +94,9 @@ serde_json = "1"
 # Turns a file's old and new text into the unified patch `gpui_component::diff` shows.
 similar = "2.7"
 syntect = { version = "5.3", default-features = false, features = [
-    "default-fancy",
+    "default-syntaxes",
+    "default-themes",
+    "regex-fancy",
 ] }
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
