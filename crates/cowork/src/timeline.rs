@@ -367,6 +367,7 @@ impl AgentToolCall {
             "write_file" => ("Wrote", "Writing", "file"),
             "edit_file" => ("Edited", "Editing", "file"),
             "view_image" => ("Viewed", "Viewing", "image"),
+            "read_pdf" => ("Read", "Reading", "PDF"),
             "list_directory" => ("Listed", "Listing", "directory"),
             _ => return None,
         };
@@ -470,6 +471,7 @@ mod tool_call_tests {
             ("write_file", "Wrote", "Writing", "file"),
             ("edit_file", "Edited", "Editing", "file"),
             ("view_image", "Viewed", "Viewing", "image"),
+            ("read_pdf", "Read", "Reading", "PDF"),
             ("list_directory", "Listed", "Listing", "directory"),
         ] {
             let call = tool_call(name, json!({"path": "zed/src"}));

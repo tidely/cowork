@@ -21,8 +21,8 @@ use agent::{
 use gpui::Context;
 use parking_lot::Mutex;
 use sandbox::{
-    EditFile, ListDirectory, Needs, ReadFile, RequestPermissions, RunCommand, ThreadSandbox,
-    ViewImage, WriteFile,
+    EditFile, ListDirectory, Needs, ReadFile, ReadPdf, RequestPermissions, RunCommand,
+    ThreadSandbox, ViewImage, WriteFile,
 };
 use tools::{Calculate, CommentId, RespondToComment, RunComments};
 use uuid::Uuid;
@@ -45,6 +45,7 @@ pub(crate) const ALWAYS_ALLOWED: &[&str] = &[
     ListDirectory::NAME,
     ReadFile::NAME,
     ViewImage::NAME,
+    ReadPdf::NAME,
 ];
 
 /// What the model is told about a call someone denied.

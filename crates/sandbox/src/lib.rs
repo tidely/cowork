@@ -26,6 +26,7 @@ pub mod grant;
 
 mod output;
 pub mod paths;
+mod pdf;
 mod permissions;
 mod project;
 pub mod settings;
@@ -55,6 +56,7 @@ pub use files::{EditFile, EditFileArgs, ListDirectory, ReadFile, ViewImage, Writ
 pub use grant::{Folders, Grant};
 pub use output::CommandOutput;
 pub use paths::FileError;
+pub use pdf::{PdfMode, ReadPdf, ReadPdfArgs};
 pub use permissions::{RequestPermissions, RequestPermissionsArgs};
 pub use project::{Access, Project, ProjectFolder, folder_name};
 pub use tool::{RunCommand, RunCommandArgs};

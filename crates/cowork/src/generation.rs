@@ -28,7 +28,8 @@ use agent::{
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{App, Context, Entity};
 use sandbox::{
-    EditFile, ListDirectory, Needs, ReadFile, RequestPermissions, RunCommand, ViewImage, WriteFile,
+    EditFile, ListDirectory, Needs, ReadFile, ReadPdf, RequestPermissions, RunCommand, ViewImage,
+    WriteFile,
 };
 use tools::{Calculate, RespondToComment};
 use uuid::Uuid;
@@ -112,6 +113,7 @@ fn registry() -> ToolRegistry<CoworkHost, Needs> {
         registry.register(ListDirectory),
         registry.register(ReadFile),
         registry.register(ViewImage),
+        registry.register(ReadPdf),
         registry.register(WriteFile),
         registry.register(EditFile),
     ];

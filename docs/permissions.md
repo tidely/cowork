@@ -28,7 +28,7 @@ Credential locations are listed in `crates/sandbox/src/settings.rs`.
 
 | File tool | Read | Write | Write + Network |
 |---|---|---|---|
-| `read_file`, `view_image`, `list_directory` | Automatic | Automatic | Automatic |
+| `read_file`, `view_image`, `read_pdf`, `list_directory` | Automatic | Automatic | Automatic |
 | `write_file`, `edit_file` | Ask | Automatic | Automatic |
 
 File tools are app-managed. Reads/listings accept absolute host paths;
@@ -48,6 +48,13 @@ refused before being decoded. The result gives the image's size first, and
 the scaled size if it was scaled. A model that doesn't accept images (Ollama
 reports this per model) is sent a note in place of the image, and the same
 goes for every image in the conversation, attachments included.
+
+`read_pdf` takes the same paths and checks, and reads a PDF's pages as text
+(the default) or as JPEG images rendered at 150 DPI. Without `first_page`
+and `last_page` it reads documents of up to 10 pages whole and otherwise
+returns the page count; one call reads at most 20 pages, and text stops at a
+page boundary past 64 KiB, saying where to go on. Files over 50 MiB are
+refused, and a call taking over 60 seconds fails.
 
 `request_permissions` keeps approved command permissions for the rest of
 one run. Lowering auto-approve affects future calls but does not revoke

@@ -32,7 +32,7 @@ pub const READ_LIMIT: usize = 16 * 1024;
 /// How many entries one `list_directory` call shows.
 pub const LIST_LIMIT: usize = 500;
 
-const PATHS: &str = "Paths start with the name of a project folder, as the latest <environment> \
+pub(crate) const PATHS: &str = "Paths start with the name of a project folder, as the latest <environment> \
 note lists them, followed by a path inside it (`myproject/src/main.rs`), or with `scratch://` for \
 this conversation's scratch folder (`scratch://notes.md`). Absolute paths anywhere on the host \
 can be listed or read, except denied credentials. Writes stay within project and scratch folders.";
@@ -51,7 +51,7 @@ impl From<FileError> for ToolError {
 
 /// Runs `work` with the thread's places as they are now, off the async
 /// runtime, as it does blocking file I/O.
-async fn with_places<T: Send + 'static>(
+pub(crate) async fn with_places<T: Send + 'static>(
     sandbox: &ThreadSandbox,
     work: impl FnOnce(&Sandboxes, &mut Places) -> Result<T, FileError> + Send + 'static,
 ) -> Result<T, FileError> {
@@ -62,7 +62,7 @@ async fn with_places<T: Send + 'static>(
         .unwrap_or_else(|error| Err(FileError::Failed(error.to_string())))
 }
 
-fn location(places: &Places, path: &str, what: &str) -> Result<Location, FileError> {
+pub(crate) fn location(places: &Places, path: &str, what: &str) -> Result<Location, FileError> {
     match places.resolve(path)? {
         Resolved::Path(location) => Ok(location),
         Resolved::Places => Err(FileError::Invalid(format!(
@@ -71,7 +71,7 @@ fn location(places: &Places, path: &str, what: &str) -> Result<Location, FileErr
     }
 }
 
-fn io_error(error: std::io::Error, location: &Location) -> FileError {
+pub(crate) fn io_error(error: std::io::Error, location: &Location) -> FileError {
     let display = location.display();
     match error.kind() {
         std::io::ErrorKind::NotFound => FileError::NotFound(format!("{display} does not exist.")),
