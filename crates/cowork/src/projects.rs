@@ -74,6 +74,9 @@ pub(crate) struct Projects {
     /// project closed (alone, or with the whole section) is removed, so it
     /// shows its first chats again when reopened.
     open: HashMap<ProjectId, usize>,
+    /// The project whose row's menu is open, which keeps the row's buttons
+    /// shown while the pointer is over the menu instead of the row.
+    menu_open: Option<ProjectId>,
 }
 
 impl Default for Projects {
@@ -83,6 +86,7 @@ impl Default for Projects {
             file: None,
             section_open: true,
             open: HashMap::new(),
+            menu_open: None,
         }
     }
 }
@@ -132,6 +136,36 @@ impl Projects {
         Some(id)
     }
 
+    /// Removes the project's record. Its chats are not touched here: the
+    /// caller takes them out of it, as only they record their membership.
+    /// Returns whether it was known.
+    pub(crate) fn remove(&mut self, id: ProjectId) -> bool {
+        let before = self.records.len();
+        self.records.retain(|record| record.id != id);
+        if self.records.len() == before {
+            return false;
+        }
+        self.open.remove(&id);
+        if self.menu_open == Some(id) {
+            self.menu_open = None;
+        }
+        self.save();
+        true
+    }
+
+    pub(crate) fn menu_open(&self) -> Option<ProjectId> {
+        self.menu_open
+    }
+
+    /// Notes that `id`'s menu opened or closed.
+    pub(crate) fn set_menu_open(&mut self, id: ProjectId, open: bool) {
+        if open {
+            self.menu_open = Some(id);
+        } else if self.menu_open == Some(id) {
+            self.menu_open = None;
+        }
+    }
+
     pub(crate) fn section_open(&self) -> bool {
         self.section_open
     }
@@ -163,8 +197,8 @@ impl Projects {
         }
     }
 
-    /// Small and written only when a project is created, so it is written
-    /// in place of waiting on another thread.
+    /// Small and written only when a project is created or removed, so it
+    /// is written in place of waiting on another thread.
     fn save(&self) {
         let Some(path) = &self.file else {
             return;
@@ -309,6 +343,16 @@ mod tests {
             .map(|record| record.id)
             .collect();
         assert_eq!(ids, [third, second, first]);
+
+        // Removing one is saved too.
+        assert!(reopened.remove(second));
+        assert!(!reopened.remove(second));
+        let ids: Vec<_> = Projects::load(Some(path.clone()))
+            .records()
+            .iter()
+            .map(|record| record.id)
+            .collect();
+        assert_eq!(ids, [third, first]);
 
         _ = std::fs::remove_dir_all(path.parent().unwrap());
     }

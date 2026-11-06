@@ -13,9 +13,10 @@ use gpui::{
     Window, div, linear_color_stop, linear_gradient, prelude::*, px, rems,
 };
 use gpui_component::{
-    ActiveTheme, Collapsible, Icon, Sizable as _,
-    button::{Button, ButtonVariants as _},
+    ActiveTheme, Collapsible, Icon, Sizable as _, WindowExt as _,
+    button::{Button, ButtonVariant, ButtonVariants as _},
     h_flex,
+    menu::{DropdownMenu as _, PopupMenuItem},
     sidebar::{Sidebar, SidebarCollapsible, SidebarItem},
     v_flex,
 };
@@ -146,17 +147,20 @@ fn sidebar_row(
         })
 }
 
-/// A row whose label fades out where it runs out of room, with `button`
-/// shown over its end only while the row itself is hovered. Its debug
-/// selectors are `sidebar-{kind}-{key}`, and `-title-` and `-buttons-`
-/// ones for its parts.
+/// A row whose label fades out where it runs out of room, with `buttons`
+/// shown over its end only while the row itself is hovered, or always while
+/// `pinned` (as while one of them has its menu open). Its debug selectors
+/// are `sidebar-{kind}-{key}`, and `-title-` and `-buttons-` ones for its
+/// parts.
+#[allow(clippy::too_many_arguments)]
 fn fading_row(
     kind: &'static str,
     key: String,
     active: bool,
     leading: Option<AnyElement>,
     label: SharedString,
-    button: Option<Button>,
+    buttons: Vec<AnyElement>,
+    pinned: bool,
     cx: &App,
 ) -> gpui::Stateful<gpui::Div> {
     let theme = cx.theme();
@@ -166,6 +170,8 @@ fn fading_row(
     let buttons_bg = theme.sidebar.blend(hover_bg);
     let rest_bg = if active {
         theme.sidebar.blend(theme.sidebar_accent)
+    } else if pinned {
+        buttons_bg
     } else {
         theme.sidebar
     };
@@ -180,6 +186,7 @@ fn fading_row(
         .group(group.clone())
         .debug_selector(move || row_selector)
         .aria_label(label.clone())
+        .when(pinned && !active, |this| this.bg(hover_bg))
         .relative()
         .overflow_hidden()
         .when_some(leading, |this, leading| this.gap_2().child(leading))
@@ -205,7 +212,7 @@ fn fading_row(
                         .group_hover(group.clone(), |style| style.bg(fade_into(buttons_bg))),
                 ),
         )
-        .when_some(button, |this, button| {
+        .when(!buttons.is_empty(), |this| {
             this.child(
                 h_flex()
                     .debug_selector(move || buttons_selector)
@@ -213,8 +220,9 @@ fn fading_row(
                     .top_0()
                     .bottom_0()
                     .right_0()
-                    .invisible()
-                    .group_hover(group, |style| style.visible())
+                    .when(!pinned, |this| {
+                        this.invisible().group_hover(group, |style| style.visible())
+                    })
                     .child(div().h_full().w(TITLE_FADE_WIDTH).bg(fade_into(buttons_bg)))
                     // Overflow clipping is rectangular; the opaque overlay
                     // needs the row's corners too, or it squares off the hover.
@@ -224,7 +232,7 @@ fn fading_row(
                             .pr_1()
                             .rounded_r(theme.radius)
                             .bg(buttons_bg)
-                            .child(button),
+                            .children(buttons),
                     ),
             )
         })
@@ -233,7 +241,7 @@ fn fading_row(
 /// A small icon button for over a row's end, whose click doesn't also
 /// click the row.
 fn row_button(
-    id: &'static str,
+    id: impl Into<gpui::ElementId>,
     selector: String,
     icon: AssetIconName,
     label: &'static str,
@@ -290,7 +298,11 @@ impl ThreadRow {
             self.active,
             None,
             self.title,
-            archive,
+            archive
+                .map(IntoElement::into_any_element)
+                .into_iter()
+                .collect(),
+            false,
             cx,
         )
         .when(self.indented, |this| this.pl(PROJECT_CHAT_INDENT))
@@ -298,8 +310,11 @@ impl ThreadRow {
     }
 }
 
-/// A project's row, toggling whether its chats show below it, with a
-/// button over its end while hovered composing a chat in it.
+type OpenChangeHandler = Rc<dyn Fn(&bool, &mut Window, &mut App)>;
+
+/// A project's row, toggling whether its chats show below it, with buttons
+/// over its end while hovered: a menu (removing the project) and composing
+/// a chat in it.
 #[derive(Clone)]
 struct ProjectRow {
     id: ProjectId,
@@ -307,6 +322,10 @@ struct ProjectRow {
     open: bool,
     on_toggle: ClickHandler,
     on_compose: ClickHandler,
+    /// Whether its menu is open, keeping its buttons shown.
+    menu_open: bool,
+    on_menu_open_change: OpenChangeHandler,
+    on_remove: ClickHandler,
     /// The chats shown while open.
     chats: Vec<ThreadRow>,
     /// While some of its chats are not shown yet.
@@ -318,6 +337,28 @@ impl ProjectRow {
         let id = self.id;
         let theme = cx.theme();
         let on_toggle = self.on_toggle;
+        let on_remove = self.on_remove;
+        let on_menu_open_change = self.on_menu_open_change;
+        let menu_selector = format!("project-menu-{id}");
+        let menu = row_button(
+            SharedString::from(menu_selector.clone()),
+            menu_selector,
+            AssetIconName::Ellipsis,
+            "Project options",
+            // The menu opens on its own; this only keeps the row's toggle
+            // from running too.
+            Rc::new(|_, _, _| {}),
+            cx,
+        )
+        .dropdown_menu(move |menu, _, _| {
+            let on_remove = on_remove.clone();
+            menu.item(
+                PopupMenuItem::new("Remove project")
+                    .icon(AssetIconName::Trash)
+                    .on_click(move |event, window, cx| on_remove(event, window, cx)),
+            )
+        })
+        .on_open_change(move |open, window, cx| on_menu_open_change(open, window, cx));
         let compose = row_button(
             "compose-in-project",
             format!("compose-in-project-{id}"),
@@ -341,7 +382,8 @@ impl ProjectRow {
             false,
             Some(folder),
             self.name,
-            Some(compose),
+            vec![menu.into_any_element(), compose.into_any_element()],
+            self.menu_open,
             cx,
         )
         .aria_expanded(self.open)
@@ -593,6 +635,62 @@ impl Cowork {
         self.show_new_chat(window, cx);
     }
 
+    /// Asks before removing a project; see [`Cowork::remove_project`].
+    pub(crate) fn confirm_remove_project(
+        &mut self,
+        project: ProjectId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(record) = self.projects.record(project) else {
+            return;
+        };
+        let title = format!("Remove {}?", record.name);
+        let cowork = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let cowork = cowork.clone();
+            alert
+                .centered()
+                .title(title.clone())
+                .description(
+                    "This only removes the project from the app. Files on your computer \
+                     and existing chats won't be deleted.",
+                )
+                .ok_text("Remove project")
+                .ok_variant(ButtonVariant::Danger)
+                .show_cancel(true)
+                .on_ok(move |_, _, cx| {
+                    _ = cowork.update(cx, |cowork, cx| cowork.remove_project(project, cx));
+                    true
+                })
+        });
+    }
+
+    /// Removes a project from the sidebar. Its chats, archived ones too,
+    /// are kept, in no project from now on; the new chat being composed in
+    /// it keeps the folders it copied.
+    pub(crate) fn remove_project(&mut self, project: ProjectId, cx: &mut Context<Self>) {
+        if !self.projects.remove(project) {
+            return;
+        }
+        self.new_thread_project.take_if(|new| *new == project);
+
+        let store = self.thread_store.read(cx);
+        let members = store
+            .threads
+            .iter()
+            .chain(&store.archived)
+            .filter(|thread| thread.read(cx).project() == Some(project))
+            .cloned()
+            .collect::<Vec<_>>();
+        for thread in &members {
+            thread.update(cx, |thread, _| thread.set_project(None));
+            // A running chat is saved when its run ends.
+            self.save_thread(thread, cx);
+        }
+        cx.notify();
+    }
+
     fn show_new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.new_thread_draft = ThreadDraft::new(self.local_participant_id);
         self.active_thread_id = None;
@@ -770,6 +868,14 @@ impl Cowork {
                 })),
                 on_compose: Rc::new(cx.listener(move |this, _, window, cx| {
                     this.compose_in_project(id, window, cx);
+                })),
+                menu_open: self.projects.menu_open() == Some(id),
+                on_menu_open_change: Rc::new(cx.listener(move |this, open: &bool, _, cx| {
+                    this.projects.set_menu_open(id, *open);
+                    cx.notify();
+                })),
+                on_remove: Rc::new(cx.listener(move |this, _, window, cx| {
+                    this.confirm_remove_project(id, window, cx);
                 })),
                 chats: self.sidebar_thread_rows(shown_chats, true, cx),
                 on_show_more: (shown_chats.len() < chats.len()).then(|| -> ClickHandler {

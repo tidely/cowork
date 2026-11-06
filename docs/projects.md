@@ -11,7 +11,8 @@ nothing about projects is sent to collaborators.
   hovered, opening the Create project dialog without collapsing the section.
 - Projects are listed newest first, each as a folder icon and its name. A
   project's row toggles whether its chats show below it, indented; while
-  hovered it shows a compose button.
+  hovered it shows a `…` menu button and a compose button. The menu stays
+  shown while it is open.
 - An open project shows its five most recently active chats (activity is
   when a chat's latest run started), and "Show more" reveals five more at a
   time until all are shown. Closing a project, or the whole section, starts
@@ -41,10 +42,19 @@ nothing about projects is sent to collaborators.
 - Saved folders that no longer exist are kept; a chat started with one
   handles it as any chat with a missing folder does.
 
+## Removing a project
+
+- The row's menu has "Remove project", which asks first ("Remove <name>?").
+  Removing deletes only the project's record: its chats, archived and shared
+  ones too, are kept and filed in no project, so they show in Recents (or
+  where they otherwise would). A running chat's change is saved when its run
+  ends. A new chat being composed in the project is no longer in it, but
+  keeps the folders it copied. No files on disk are touched.
+
 ## Saving
 
 - Project records are saved in `~/.cowork/projects.json` when one is
-  created (`crates/cowork/src/projects.rs`), with a format version of their
+  created or removed (`crates/cowork/src/projects.rs`), with a format version of their
   own; a file of another version or unreadable is moved aside.
 - Which project a chat belongs to is saved with the chat, as `project` in its
   `thread.json` (`thread_files.rs`). It is always explicit, never inferred
@@ -55,4 +65,4 @@ nothing about projects is sent to collaborators.
 
 ## Not yet
 
-Editing, renaming, deleting, and reordering projects (see `TODO.md`).
+Editing, renaming, and reordering projects (see `TODO.md`).

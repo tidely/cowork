@@ -601,6 +601,42 @@ fn project_chats_leave_while_shared_or_archived_and_come_back(cx: &mut gpui::Tes
 }
 
 #[gpui::test]
+fn removing_a_project_keeps_its_chats_in_no_project(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let kept = add_project(&cowork, "Docs", Vec::new(), cx);
+    let project = add_project(&cowork, "Site", vec![PathBuf::from("/src/site")], cx);
+    let chat = add_project_thread(&cowork, Some(project), 10, cx);
+    let archived = add_project_thread(&cowork, Some(project), 20, cx);
+    let other = add_project_thread(&cowork, Some(kept), 30, cx);
+    cx.update(|window, cx| {
+        cowork.update(cx, |cowork, cx| {
+            cowork.archive_thread(archived, window, cx);
+            cowork.compose_in_project(project, window, cx);
+        })
+    });
+
+    cx.update(|window, cx| {
+        cowork.update(cx, |cowork, cx| {
+            cowork.confirm_remove_project(project, window, cx)
+        });
+        assert!(window.has_active_dialog(cx), "asks first");
+        window.close_dialog(cx);
+    });
+    cowork.update(cx, |cowork, cx| cowork.remove_project(project, cx));
+
+    assert_eq!(
+        project_groups(&cowork, cx),
+        (vec![(kept, vec![other])], vec![chat])
+    );
+    cowork.update(cx, |cowork, cx| cowork.restore_thread(archived, cx));
+    assert!(project_groups(&cowork, cx).1.contains(&archived));
+    cowork.read_with(cx, |cowork, _| {
+        assert_eq!(cowork.new_thread_project, None);
+        assert_eq!(cowork.new_thread_project_folders.len(), 1);
+    });
+}
+
+#[gpui::test]
 fn a_project_shows_five_more_chats_at_a_time(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     let project = add_project(&cowork, "Site", Vec::new(), cx);

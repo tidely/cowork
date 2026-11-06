@@ -55,6 +55,7 @@ gpui_kit_assets::icon_assets!(
         FolderOpen,
         FolderPlus,
         Trash,
+        Ellipsis,
         Archive,
         ArchiveRestore,
         CalendarClock,
