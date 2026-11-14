@@ -18,7 +18,7 @@ use gpui_base::{
     input::TextareaState,
     text::{CodeBlock, SelectionFormat},
 };
-use gpui_component::{ActiveTheme, Icon, shimmer::ShimmerText};
+use gpui_component::{ActiveTheme, Icon, shimmer::ShimmerText, tooltip::Tooltip};
 use gpui_kit_assets::IconName as AssetIconName;
 
 use uuid::Uuid;
@@ -471,12 +471,15 @@ impl Cowork {
     }
 
     /// Markdown as the timeline shows it: selected as plain text, in the
-    /// timeline's style, with the app's inline icons.
+    /// timeline's style, with the app's inline icons. A link's text is written
+    /// by the model or a peer and may say anything, so hovering it shows the
+    /// URL a click opens.
     fn markdown_view(state: &Entity<TextViewState>, cx: &App) -> TextView {
         TextView::new(state)
             .selection_format(SelectionFormat::Plain)
             .style(Self::markdown_style(cx))
             .plugin(InlineIcons)
+            .link_tooltip(|url, window, cx| Tooltip::new(url.clone()).build(window, cx))
     }
 
     /// The background of the text a comment by `author` is on.
