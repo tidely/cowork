@@ -197,9 +197,11 @@ fn provider_setup_starts_onboarding_with_the_selected_model(cx: &mut gpui::TestA
     let card = cx
         .debug_bounds("setup-model-Ollama-test-default")
         .expect("the discovered model has a setup card");
-    // Nothing is chosen for the user before they click a model, and the
-    // click starts the first chat with it, with no button to continue.
+    // Clicking a model starts the first chat with it, with no button to
+    // continue.
     assert!(cx.debug_bounds("setup-continue").is_none());
+    // `composer_test_cowork` selected this model already; clear it so the
+    // click is what chooses it.
     cowork.update(cx, |cowork, _| cowork.new_thread_model = None);
     cx.simulate_click(card.center(), gpui::Modifiers::default());
     cx.run_until_parked();

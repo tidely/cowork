@@ -206,6 +206,9 @@ fn open_access_popover_redraws_live_defaults_and_participant_rows(cx: &mut gpui:
     assert_eq!(arrival_menu.size, peer_menu.size);
     assert_eq!(arrival_menu.right(), peer_menu.right());
 
+    // Leaving with their access menu open takes the menu along, and a
+    // click outside still dismisses the popover afterwards.
+    click_access_control(&mut session, arrival_selector);
     host_thread.update(session.cx, |thread, cx| {
         thread.participant_left(arrival, cx);
         cx.notify();
@@ -219,7 +222,11 @@ fn open_access_popover_redraws_live_defaults_and_participant_rows(cx: &mut gpui:
         },
     );
     assert_access_menu_open(&mut session);
-    session.cx.simulate_keystrokes("escape");
+    redraw_access_menu(&mut session);
+    let outside = session.cx.debug_bounds("bottom-bar").unwrap().center();
+    session
+        .cx
+        .simulate_click(outside, gpui::Modifiers::default());
     session.settle();
     assert!(session.cx.debug_bounds("thread-sharing-menu").is_none());
 }

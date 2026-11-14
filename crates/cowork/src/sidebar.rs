@@ -266,6 +266,9 @@ fn row_button(
         })
 }
 
+/// Something a row does, whether from a click or its context menu.
+type RowAction = Rc<dyn Fn(&mut Window, &mut App)>;
+
 /// A chat's row, with its archive button over its end and in its context
 /// menu.
 #[derive(Clone)]
@@ -275,9 +278,9 @@ struct ThreadRow {
     active: bool,
     /// Whether it is listed under a project.
     indented: bool,
-    on_open: ClickHandler,
+    on_open: RowAction,
     /// `None` for joined threads, which belong to their host.
-    on_archive: Option<ClickHandler>,
+    on_archive: Option<RowAction>,
 }
 
 impl ThreadRow {
@@ -291,7 +294,7 @@ impl ThreadRow {
                 format!("archive-thread-{thread_id}"),
                 AssetIconName::Archive,
                 "Archive chat",
-                on_archive.clone(),
+                Rc::new(move |_, window, cx| on_archive(window, cx)),
                 cx,
             )
         });
@@ -310,21 +313,19 @@ impl ThreadRow {
             cx,
         )
         .when(self.indented, |this| this.pl(PROJECT_CHAT_INDENT))
-        .on_click(move |event, window, cx| on_open(event, window, cx));
+        .on_click(move |_, window, cx| on_open(window, cx));
         row.context_menu(move |menu, _, _| {
             let open = menu_open.clone();
             let menu = menu.item(
                 PopupMenuItem::new("Open")
                     .icon(AssetIconName::MessageSquare)
-                    .on_click(move |_, window, cx| open(&gpui::ClickEvent::default(), window, cx)),
+                    .on_click(move |_, window, cx| open(window, cx)),
             );
             match menu_archive.clone() {
                 Some(archive) => menu.separator().item(
                     PopupMenuItem::new("Archive chat")
                         .icon(AssetIconName::Archive)
-                        .on_click(move |_, window, cx| {
-                            archive(&gpui::ClickEvent::default(), window, cx)
-                        }),
+                        .on_click(move |_, window, cx| archive(window, cx)),
                 ),
                 None => menu,
             }
@@ -787,19 +788,23 @@ impl Cowork {
         indented: bool,
         cx: &mut Context<Self>,
     ) -> ThreadRow {
+        let cowork = cx.weak_entity();
+        let open = cowork.clone();
         ThreadRow {
             thread_id,
             title: thread.title.clone().into(),
             active: self.main_stage == MainStage::Thread
                 && self.active_thread_id == Some(thread_id),
             indented,
-            on_open: Rc::new(cx.listener(move |this, _, window, cx| {
-                this.open_thread(thread_id, window, cx);
-            })),
-            on_archive: archivable.then(|| -> ClickHandler {
-                Rc::new(cx.listener(move |this, _, window, cx| {
-                    this.request_archive_thread(thread_id, window, cx);
-                }))
+            on_open: Rc::new(move |window, cx| {
+                _ = open.update(cx, |this, cx| this.open_thread(thread_id, window, cx));
+            }),
+            on_archive: archivable.then(|| -> RowAction {
+                Rc::new(move |window, cx| {
+                    _ = cowork.update(cx, |this, cx| {
+                        this.request_archive_thread(thread_id, window, cx)
+                    });
+                })
             }),
         }
     }

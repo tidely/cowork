@@ -24,6 +24,9 @@ pub(crate) const OLLAMA_DOWNLOAD_URL: &str = "https://ollama.com/download";
 /// The model setup suggests pulling when Ollama has none, and recommends
 /// once pulled: one that uses tools well, as the agent needs.
 pub(crate) const OLLAMA_SUGGESTED_MODEL: &str = "qwen3.8:27b";
+/// How much pulling [`OLLAMA_SUGGESTED_MODEL`] downloads, as Ollama's
+/// library lists it, so nobody starts it unawares.
+pub(crate) const OLLAMA_SUGGESTED_MODEL_SIZE: &str = "18 GB";
 /// How often the Ollama setup step looks for Ollama again while it isn't
 /// ready, so starting Ollama or pulling a model shows up on its own. Only
 /// local Ollama is asked; paid providers are never polled.
@@ -216,7 +219,8 @@ pub(crate) struct Providers {
 /// so setup can say which of the three steps is missing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OllamaStatus {
-    /// Answering; whether it has models is the catalog's.
+    /// Answering; whether it has models is the catalog's, and why they
+    /// couldn't be listed, if they couldn't, [`Providers::error`]'s.
     Running,
     /// Not answering, but its app or command is on this computer.
     NotRunning,
@@ -304,15 +308,16 @@ fn ollama_installed() -> bool {
 }
 
 /// The model setup recommends for `provider`, among the `offered` ids:
-/// Ollama's [`OLLAMA_SUGGESTED_MODEL`] (any size of it), or its only model;
-/// the newest Claude Sonnet, a good balance of ability and cost; and the
-/// first of OpenAI's that the built-in list offers, its order being
-/// OpenAI's own ranking.
+/// Ollama's [`OLLAMA_SUGGESTED_MODEL`] (any size of it); the newest Claude
+/// Sonnet, a good balance of ability and cost; and the first of OpenAI's
+/// that the built-in list offers, its order being OpenAI's own ranking.
+/// Otherwise a provider's only model, and nothing when there is a choice.
 pub(crate) fn recommended_model<'a>(
     provider: ModelProvider,
     offered: impl IntoIterator<Item = &'a str>,
 ) -> Option<&'a str> {
     let offered: Vec<&str> = offered.into_iter().collect();
+    let only = || (offered.len() == 1).then(|| offered[0]);
     match provider {
         ModelProvider::Ollama => {
             let family = OLLAMA_SUGGESTED_MODEL.split(':').next().unwrap_or_default();
@@ -326,20 +331,36 @@ pub(crate) fn recommended_model<'a>(
                         .copied()
                         .find(|id| id.split(':').next() == Some(family))
                 })
-                .or_else(|| (offered.len() == 1).then(|| offered[0]))
+                .or_else(only)
         }
-        // Ids end with their version and then a date, so the greatest is
-        // the newest.
         ModelProvider::Anthropic => offered
             .iter()
             .copied()
             .filter(|id| id.contains("sonnet"))
-            .max()
-            .or_else(|| offered.first().copied()),
+            .max_by_key(|id| claude_version(id))
+            .or_else(only),
         ModelProvider::OpenAi => OPENAI_MODELS
             .iter()
-            .find_map(|model| offered.iter().copied().find(|id| *id == model.id)),
+            .find_map(|model| offered.iter().copied().find(|id| *id == model.id))
+            .or_else(only),
     }
+}
+
+/// A Claude id's version, as numbers, and then its date, so that comparing
+/// them puts the newest last: `claude-sonnet-4-5-20250929` is `[4, 5]` of
+/// 2025-09-29, the older `claude-3-7-sonnet-20250219` `[3, 7]`, and an alias
+/// without a date comes before the dated id it stands for.
+fn claude_version(id: &str) -> (Vec<u32>, u32) {
+    let mut version = Vec::new();
+    let mut date = 0;
+    for part in id.split('-') {
+        match part.parse::<u32>() {
+            Ok(number) if part.len() == 8 => date = number,
+            Ok(number) => version.push(number),
+            Err(_) => {}
+        }
+    }
+    (version, date)
 }
 
 /// Ollama's models, run with the configured `window` as Ollama has no
@@ -492,6 +513,26 @@ impl Cowork {
                 .await
                 .map_err(anyhow::Error::from)
                 .and_then(|listed| listed.map_err(anyhow::Error::from));
+            // Not answering at all is Ollama's usual state before setup,
+            // which the setup step explains in place of an error. Any other
+            // failure, from an Ollama that answered, is reported as one.
+            let unanswered = provider == ModelProvider::Ollama
+                && listed.as_ref().err().is_some_and(|error| {
+                    matches!(
+                        error.downcast_ref::<agent::model::Error>(),
+                        Some(agent::model::Error::Transport(_) | agent::model::Error::Timeout)
+                    )
+                });
+            // Looking through the filesystem stays off the UI thread.
+            let installed = if unanswered {
+                Some(
+                    cx.background_executor()
+                        .spawn(async { ollama_installed() })
+                        .await,
+                )
+            } else {
+                None
+            };
             _ = this.update(cx, |this, cx| {
                 // A key removed or replaced meanwhile makes this out of date.
                 if !this.providers.is_current(provider, &connection) {
@@ -516,16 +557,18 @@ impl Cowork {
                         }
                         this.set_provider_models(provider, models, cx);
                     }
-                    // Not answering is Ollama's usual state before setup,
-                    // which the setup step explains in place of the error.
-                    Err(_) if provider == ModelProvider::Ollama => {
-                        this.providers.ollama = Some(if ollama_installed() {
+                    Err(_) if let Some(installed) = installed => {
+                        this.providers.errors.remove(&provider);
+                        this.providers.ollama = Some(if installed {
                             OllamaStatus::NotRunning
                         } else {
                             OllamaStatus::NotInstalled
                         });
                     }
                     Err(error) => {
+                        if provider == ModelProvider::Ollama {
+                            this.providers.ollama = Some(OllamaStatus::Running);
+                        }
                         eprintln!("could not discover {} models: {error:#}", provider.label());
                         let error = format!("Couldn't list {} models: {error:#}", provider.label());
                         this.providers.errors.insert(provider, error.into());
@@ -635,22 +678,35 @@ mod tests {
         );
         assert_eq!(recommended_model(Ollama, ["llama"]), Some("llama"));
         assert_eq!(recommended_model(Ollama, ["llama", "mistral"]), None);
-        // Anthropic: the newest Sonnet.
+        // Anthropic: the newest Sonnet, by version rather than spelling,
+        // whichever way its id is written.
         assert_eq!(
             recommended_model(
                 Anthropic,
                 [
                     "claude-opus-5",
-                    "claude-sonnet-4-5",
-                    "claude-sonnet-5-1",
+                    "claude-3-7-sonnet-20250219",
+                    "claude-sonnet-10-20270101",
+                    "claude-sonnet-9-1",
                     "claude-haiku-5"
                 ]
             ),
-            Some("claude-sonnet-5-1")
+            Some("claude-sonnet-10-20270101")
+        );
+        assert_eq!(
+            recommended_model(
+                Anthropic,
+                ["claude-sonnet-4-5-20250929", "claude-3-7-sonnet-20250219"]
+            ),
+            Some("claude-sonnet-4-5-20250929")
         );
         assert_eq!(
             recommended_model(Anthropic, ["claude-opus-5"]),
             Some("claude-opus-5")
+        );
+        assert_eq!(
+            recommended_model(Anthropic, ["claude-opus-5", "claude-haiku-5"]),
+            None
         );
         // OpenAI: the built-in list's first that the account offers.
         assert_eq!(

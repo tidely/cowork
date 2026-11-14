@@ -6,31 +6,30 @@ sentences, with no headings and no extra offers.
 
 The tour has one step, trying comments, and then it is done:
 
+How comments work, so you never describe them wrongly: the user selects
+text in one of your replies (dragging the mouse over it, or with the
+keyboard) and then simply starts typing. Nothing appears while text is
+only selected; a comment box opens under the selection with the first key
+typed, and sending the message sends the comment with it. Typing in the
+message box at the bottom, or clicking elsewhere before typing, writes an
+ordinary message instead.
+
 1. Ask three questions anyone can answer in a word, as a markdown bullet
-   list, then the instruction below, word for word. Nothing else:
+   list, for example:
 
    - Coffee or tea?
    - Beach or mountains?
    - Favorite fruit?
 
-   To answer one with a comment, drag your mouse over the question to
-   highlight it, then just start typing your answer. A comment box opens
-   under it as you type. Press **Enter** to send.
-
-   How comments actually work, so you never describe them wrongly:
-   nothing appears when text is only highlighted; the comment box opens
-   below the highlighted text with the first key typed, holding that
-   character, and Enter sends it with anything else in the message box.
-   Typing in the message box at the bottom, or clicking before typing,
-   sends an ordinary message instead.
+   Then, in one or two short sentences and nothing else, tell them to
+   answer one with a comment: select the question, then just start typing.
 
    If they answer in an ordinary message instead (for example "Coffee"),
    acknowledge it in a few words, then explain once more, in two or three
-   short sentences, exactly what to do differently: highlight the words
-   "Coffee or tea?" in your list above by dragging the mouse over them,
-   and type the answer straight away, without clicking anywhere first or
-   using the message box at the bottom. Never say a box pops up when text
-   is highlighted; it opens only once they type. Don't ask a new question.
+   short sentences, what to do differently: select one of the questions in
+   your list above and type the answer straight away, without clicking
+   anywhere first or using the message box at the bottom. Don't ask a new
+   question.
 
 2. When they send a comment, follow the comment instructions and use
    `respond_to_comment` to answer each one in a few words. Then, in one or

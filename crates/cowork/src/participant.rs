@@ -30,8 +30,10 @@ const ANIMALS: [&str; 64] = [
     "Walrus", "Weasel", "Wolf", "Wren", "Yak",
 ];
 
-/// Identity colors, behind white initials and cursor name tags: each one
-/// reaches the 4.5:1 contrast small text needs against white.
+/// Identity colors, behind white initials and cursor name tags, and drawn on
+/// the page as carets, comment borders, and highlights: each one reaches the
+/// 4.5:1 contrast small text needs against white, and the 3:1 that marks
+/// need against the dark theme's background (and so against white too).
 const COLORS: [u32; 12] = [
     0xd43e25, 0xa9631e, 0x8d721b, 0x5f7e2c, 0x328354, 0x268181, 0x2276c9, 0x576ae0, 0x865dd0,
     0xac4bc0, 0xcc3c84, 0x837264,
@@ -104,8 +106,8 @@ fn splitmix64(mut value: u64) -> u64 {
 mod tests {
     use super::*;
 
-    /// WCAG 2's contrast of an sRGB color against white.
-    fn contrast_with_white(color: u32) -> f64 {
+    /// WCAG 2's relative luminance of an sRGB color.
+    fn luminance(color: u32) -> f64 {
         let channel = |shift: u32| {
             let value = f64::from((color >> shift) & 0xff) / 255.;
             if value <= 0.03928 {
@@ -114,15 +116,23 @@ mod tests {
                 ((value + 0.055) / 1.055).powf(2.4)
             }
         };
-        let luminance = 0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0);
-        1.05 / (luminance + 0.05)
+        0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0)
     }
 
     #[test]
-    fn identity_colors_keep_white_text_legible() {
+    fn identity_colors_stay_legible_in_both_roles() {
+        let theme: serde_json::Value =
+            serde_json::from_str(include_str!("../themes/cowork-dark.json")).unwrap();
+        let background = theme["colors"]["background"].as_str().unwrap();
+        let background = u32::from_str_radix(background.trim_start_matches('#'), 16).unwrap();
         for color in COLORS {
-            let contrast = contrast_with_white(color);
-            assert!(contrast >= 4.5, "{color:06x} is {contrast:.2}:1");
+            let on_white = 1.05 / (luminance(color) + 0.05);
+            assert!(on_white >= 4.5, "white on {color:06x} is {on_white:.2}:1");
+            let on_dark = (luminance(color) + 0.05) / (luminance(background) + 0.05);
+            assert!(
+                on_dark >= 3.,
+                "{color:06x} on the dark theme is {on_dark:.2}:1"
+            );
         }
     }
 

@@ -81,7 +81,8 @@ pub(crate) struct SharingPanel {
 }
 
 type Action = Rc<dyn Fn(&mut Window, &mut App)>;
-type MenuOpen = Rc<dyn Fn(bool, &mut Window, &mut App)>;
+/// Which access menu opened or closed: the default's (`None`) or a peer's.
+type MenuOpen = Rc<dyn Fn(Option<ParticipantId>, bool, &mut Window, &mut App)>;
 type SetMode = Rc<dyn Fn(Option<ParticipantId>, Option<PeerMode>, &mut Window, &mut App)>;
 
 /// What the panel's controls do: the app's sharing paths, or the preview's.
@@ -186,9 +187,24 @@ impl Cowork {
                     .map(person),
                 local_mode: state.map(Thread::local_mode).unwrap_or_default(),
             };
+            // As `render_sharing_panel` decides: everyone but a collaborator
+            // has the default's menu, even before a thread exists.
+            let has_default_menu = status != SharingStatus::Connected;
 
             let popover = cx.entity().downgrade();
-            let menu_open = window.use_keyed_state("sharing-access-menu-open", cx, |_, _| false);
+            // The access menu that is open, if any: the default's (`None`) or
+            // a peer's. A peer leaving with theirs open takes its row, and
+            // with it the close notice, so a menu no longer drawn is closed.
+            let menu_open = window.use_keyed_state("sharing-access-menu-open", cx, |_, _| {
+                None::<Option<ParticipantId>>
+            });
+            let drawn = |menu: &Option<ParticipantId>| match menu {
+                None => has_default_menu,
+                Some(id) => panel.peers.iter().any(|peer| peer.person.id == *id),
+            };
+            if menu_open.read(cx).as_ref().is_some_and(|menu| !drawn(menu)) {
+                menu_open.update(cx, |open, _| *open = None);
+            }
             let target = AccessTarget {
                 thread: thread.as_ref().map(|thread| thread.downgrade()),
                 cowork: cowork.clone(),
@@ -229,13 +245,21 @@ impl Cowork {
                 }),
                 menu_open: Rc::new({
                     let menu_open = menu_open.clone();
-                    move |open, _, cx| menu_open.update(cx, |state, _| *state = open)
+                    move |menu, open, _, cx| {
+                        menu_open.update(cx, |state, _| {
+                            if open {
+                                *state = Some(menu);
+                            } else if *state == Some(menu) {
+                                *state = None;
+                            }
+                        })
+                    }
                 }),
             };
             div()
                 .w_full()
                 .on_mouse_down_out(move |_, window, cx| {
-                    if !*menu_open.read(cx) {
+                    if menu_open.read(cx).is_none() {
                         _ = popover.update(cx, |popover, cx| popover.dismiss(window, cx));
                     }
                 })
@@ -389,7 +413,7 @@ pub(crate) fn render_sharing_panel(
         Anchor::TopLeft,
         mode_items("default", Some(panel.default_mode), None, None, actions),
     )
-    .on_open_change(menu_open(actions));
+    .on_open_change(menu_open(actions, None));
 
     let people = (!panel.peers.is_empty()).then(|| {
         div()
@@ -569,14 +593,17 @@ fn peer_row(peer: &PeerRow, default: PeerMode, actions: &SharingActions, cx: &Ap
                     actions,
                 ),
             )
-            .on_open_change(menu_open(actions)),
+            .on_open_change(menu_open(actions, Some(peer.person.id))),
         )
         .into_any_element()
 }
 
-fn menu_open(actions: &SharingActions) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
+fn menu_open(
+    actions: &SharingActions,
+    menu: Option<ParticipantId>,
+) -> impl Fn(&bool, &mut Window, &mut App) + 'static {
     let menu_open = actions.menu_open.clone();
-    move |open, window, cx| menu_open(*open, window, cx)
+    move |open, window, cx| menu_open(menu, *open, window, cx)
 }
 
 /// The button opening a mode menu; its label is left-aligned with the caret
@@ -745,7 +772,7 @@ mod tests {
                 toggle: Rc::new(|_, _| {}),
                 copy: Rc::new(|_, _| {}),
                 set_mode: Rc::new(|_, _, _, _| {}),
-                menu_open: Rc::new(|_, _, _| {}),
+                menu_open: Rc::new(|_, _, _, _| {}),
             };
             div()
                 .w(PANEL_WIDTH)

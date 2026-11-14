@@ -492,12 +492,15 @@ input has `Host` provenance and no user group in the timeline. Later replies and
 the ordinary submission path below, and the session resumes the seeded
 transcript. This needs no tutorial-specific draft or wire state.
 
-Pressing Enter in any composer editor or at the draft position (Shift-Enter
-starts a new line; Ctrl-Enter, Cmd-Enter on macOS, also sends), or clicking
-Send, submits the whole draft for everyone,
+Pressing Ctrl-Enter (Cmd-Enter on macOS) in any composer editor or at the
+draft position, or clicking Send, submits the whole draft for everyone,
 provided the submitter is `Admin`. `Write` permits editing, not consuming
 anyone's draft. The host checks the requester's current permission, not the
-local viewer's mode.
+local viewer's mode. While nobody else is in the chat, plain Enter sends too
+and Shift-Enter starts a new line, as in most chat apps. Once anyone else is
+there, Enter starts a new line: a submission takes everyone's blocks, so a
+habitual Enter must not send others' unfinished text. The send button's
+tooltip names whichever key sends.
 
 Send is available only to the host and `Admin` peers, and requires:
 
@@ -590,7 +593,7 @@ not saved across app restarts, though the host's threads are (see
 
 The composer shows the red Stop control while generating with an empty draft.
 With any non-empty block, comment, or attachment it shows the blue Steer
-control. Enter (or Cmd/Ctrl+Enter) steers; Cmd/Ctrl+Shift+Enter queues. Clicking steers,
+control. Cmd/Ctrl+Enter (or Enter, while alone) steers; Cmd/Ctrl+Shift+Enter queues. Clicking steers,
 and Shift-clicking queues. The tooltip names both choices and the Stop shortcut.
 Idle Send uses the same blue enabled accent. Pending blocks have muted centered
 Steering or Queued labels in dashed
@@ -1225,11 +1228,12 @@ Unless stated otherwise, peers inherit the initial `Admin` default.
 **Submission while typing**
 
 1. Alice and Bob each have a non-empty block. Bob is mid-sentence.
-2. Alice presses Enter. One user message with both blocks appears for
+2. Alice presses Ctrl-Enter. One user message with both blocks appears for
    everyone, and exactly one agent run starts.
 3. Bob's characters typed after the host's snapshot are discarded, and his
    caret moves to the draft position.
-4. Bob pressing Enter at the same moment starts no second run.
+4. Bob pressing Ctrl-Enter at the same moment starts no second run. Plain
+   Enter only gives either of them a new line.
 
 **Comments**
 

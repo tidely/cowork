@@ -166,6 +166,42 @@ fn a_submitted_block_moves_its_typist_to_the_draft_position(cx: &mut gpui::TestA
     assert_eq!(focused(&mut session), Some(EditorSlot::DraftPosition));
 }
 
+#[gpui::test]
+fn enter_starts_a_new_line_while_others_are_in_the_chat(cx: &mut gpui::TestAppContext) {
+    // Enter sends everyone's blocks when alone (see the onboarding test),
+    // but in a shared draft it would send others' unfinished text.
+    let mut session = Collaboration::start(cx);
+    let host_thread = session.host_thread.clone();
+    let host = session.host.clone();
+    session.focus(&host);
+    session.settle();
+    let submissions = |session: &mut Collaboration| {
+        host_thread.read_with(session.cx, |thread, _| thread.submission_count())
+    };
+    session.cx.simulate_input("one");
+    session.cx.simulate_keystrokes("enter");
+    session.cx.simulate_input("two");
+    session.settle();
+    assert_eq!(submissions(&mut session), 0);
+    assert!(
+        session
+            .bodies(&host_thread)
+            .iter()
+            .any(|body| body.ends_with("one\ntwo")),
+        "Enter started a new line"
+    );
+
+    session
+        .cx
+        .simulate_keystrokes(if cfg!(target_os = "macos") {
+            "cmd-enter"
+        } else {
+            "ctrl-enter"
+        });
+    session.settle();
+    assert_eq!(submissions(&mut session), 1);
+}
+
 #[test]
 fn caret_labels_only_reappear_when_the_caret_moves() {
     let mut draft = ThreadDraft::new(ParticipantId::new());

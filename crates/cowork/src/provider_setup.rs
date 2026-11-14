@@ -4,6 +4,15 @@
 //! and closing button; the steps, cards, and buttons between them are here.
 //! A provider that needs an API key asks for it above its models; keeping
 //! the key is `providers.rs`'s.
+//!
+//! A provider's card goes straight on to its models, each provider's
+//! recommended one ([`recommended_model`]) marked. On the welcome screen,
+//! clicking a model starts the first chat with it; the Providers settings
+//! page instead picks the model new chats start with, and can always
+//! discover models again. Ollama's step says what is missing (installing
+//! it, starting it, or pulling a model) and looks again on its own every
+//! [`OLLAMA_RECHECK`] while it isn't ready; no other provider is polled,
+//! as they are paid.
 
 use std::sync::Arc;
 
@@ -22,8 +31,8 @@ use crate::{
     Cowork, MainStage,
     models::{ModelCatalog, ModelProvider, ModelRef},
     providers::{
-        OLLAMA_DOWNLOAD_URL, OLLAMA_RECHECK, OLLAMA_SUGGESTED_MODEL, OllamaStatus,
-        recommended_model,
+        OLLAMA_DOWNLOAD_URL, OLLAMA_RECHECK, OLLAMA_SUGGESTED_MODEL, OLLAMA_SUGGESTED_MODEL_SIZE,
+        OllamaStatus, recommended_model,
     },
     usage::format_token_count,
 };
@@ -176,6 +185,9 @@ impl Cowork {
             (ProviderSetupPlace::Settings, ProviderStep::Providers) => "providers-page",
             (ProviderSetupPlace::Settings, ProviderStep::Models(_)) => "provider-models-page",
         };
+        if step == ProviderStep::Models(ModelProvider::Ollama) {
+            self.watch_ollama_setup(window, cx);
+        }
         let has_intro = intro.is_some();
         let body = match step {
             ProviderStep::Providers => self.render_provider_step(place, cx),
@@ -253,10 +265,9 @@ impl Cowork {
                         selected == Some(provider),
                         cx,
                     )
-                    .on_click(cx.listener(move |this, _, window, cx| {
+                    .on_click(cx.listener(move |this, _, _, cx| {
                         this.selected_provider = Some(provider);
                         this.show_provider_step(place, ProviderStep::Models(provider), cx);
-                        this.watch_ollama_setup(window, cx);
                     }))
                     .children(setup_card_content(
                         provider,
@@ -283,34 +294,40 @@ impl Cowork {
         step == ProviderStep::Models(ModelProvider::Ollama)
     }
 
+    /// Whether Ollama answers and has models, so its setup step has nothing
+    /// left to wait for.
+    fn ollama_ready(&self) -> bool {
+        self.providers.ollama_status() == Some(OllamaStatus::Running)
+            && self
+                .models
+                .providers()
+                .any(|(provider, _)| provider == ModelProvider::Ollama)
+    }
+
     /// While Ollama's models step shows and Ollama isn't ready (not
     /// installed, not running, or without models), looks for it again every
-    /// [`OLLAMA_RECHECK`], so installing, starting, or pulling shows up
-    /// without pressing anything. Only Ollama, which is local and free, is
-    /// asked.
-    pub(crate) fn watch_ollama_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.showing_ollama_setup() || self.ollama_watch.is_some() {
+    /// [`OLLAMA_RECHECK`] after the last look ended, so installing,
+    /// starting, or pulling shows up without pressing anything. Started by
+    /// the step as it draws, however it was reached. Only Ollama, which is
+    /// local and free, is asked.
+    fn watch_ollama_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.showing_ollama_setup() || self.ollama_watch.is_some() || self.ollama_ready() {
             return;
         }
         self.ollama_watch = Some(cx.spawn_in(window, async move |this, cx| {
             loop {
                 cx.background_executor().timer(OLLAMA_RECHECK).await;
-                let keep_watching = this.update(cx, |this, cx| {
-                    let ready = this.providers.ollama_status() == Some(OllamaStatus::Running)
-                        && this
-                            .models
-                            .providers()
-                            .any(|(provider, _)| provider == ModelProvider::Ollama);
-                    if !this.showing_ollama_setup() || ready {
+                let look = this.update(cx, |this, cx| {
+                    if !this.showing_ollama_setup() || this.ollama_ready() {
                         this.ollama_watch = None;
-                        return false;
+                        return None;
                     }
-                    this.discover_provider_models(ModelProvider::Ollama, cx)
-                        .detach();
-                    true
+                    Some(this.discover_provider_models(ModelProvider::Ollama, cx))
                 });
-                if !matches!(keep_watching, Ok(true)) {
-                    return;
+                // One look at a time, however long Ollama takes to answer.
+                match look {
+                    Ok(Some(look)) => look.await,
+                    _ => return,
                 }
             }
         }));
@@ -613,13 +630,27 @@ impl Cowork {
                     .child("Open the Ollama app, or run `ollama serve` in a terminal.")
                     .into_any_element(),
             ),
+            Some(OllamaStatus::Running)
+                if let Some(error) = self.providers.error(ModelProvider::Ollama) =>
+            {
+                (
+                    "Ollama couldn't list its models",
+                    div()
+                        .text_color(cx.theme().danger)
+                        .child(error)
+                        .into_any_element(),
+                )
+            }
             Some(OllamaStatus::Running) => (
                 "Ollama has no models yet",
                 div()
                     .flex()
                     .flex_col()
                     .gap_2()
-                    .child("Download one by running this in a terminal. It can take a while.")
+                    .child(format!(
+                        "Download one by running this in a terminal. It's a \
+                         {OLLAMA_SUGGESTED_MODEL_SIZE} download, so it can take a while."
+                    ))
                     .child(self.render_pull_command(cx))
                     .into_any_element(),
             ),
@@ -724,8 +755,8 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) {
         match place {
-            // Picking is choosing: the first chat starts with it. Nothing is
-            // selected, or saved, before the user clicks a model.
+            // Picking is choosing: the first chat starts with it. A model
+            // the catalog lacks is refused by both.
             ProviderSetupPlace::Welcome => {
                 self.select_model(model, cx);
                 self.start_onboarding(window, cx);

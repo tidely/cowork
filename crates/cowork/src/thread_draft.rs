@@ -73,6 +73,10 @@ pub(crate) struct DraftEditorState {
     pub(crate) synced_text: HashMap<EntityId, String>,
     pub(crate) draft_position: Option<Entity<TextareaState>>,
     pub(crate) comments_folded: bool,
+    /// Whether Enter in the editors starts a new line rather than sending,
+    /// as it does while others are in the chat; see
+    /// [`crate::Cowork::enter_sends_draft`].
+    pub(crate) enter_inserts_newline: bool,
 }
 
 impl Deref for ThreadDraft {

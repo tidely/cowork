@@ -1,5 +1,11 @@
 //! The archive: the user's own threads put away from the sidebar, where
 //! they can be restored or deleted for good.
+//!
+//! Archiving ends a thread's run and sharing, so it asks first when that
+//! would disconnect people or stop a run. Deleting always asks
+//! ([`confirm_destructive`], also used for deleting a schedule), and removes
+//! the thread's folder too; the profile's statistics keep counting deleted
+//! threads.
 
 use gpui::{
     App, Context, Entity, FontWeight, IntoElement, SharedString, Window, div, prelude::*, px,
@@ -56,6 +62,10 @@ impl Cowork {
         let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
             return;
         };
+        // Joined chats are their host's to archive; nothing to ask about.
+        if !thread.read(cx).is_host() {
+            return;
+        }
         let (peers, running, title) = {
             let thread = thread.read(cx);
             let peers = thread
@@ -364,24 +374,20 @@ impl Cowork {
             )),
         }
         let cowork = cx.entity().downgrade();
-        window.open_alert_dialog(cx, move |alert, _, _| {
-            let cowork = cowork.clone();
-            let thread_ids = thread_ids.clone();
-            alert
-                .title("Delete all archived chats?")
-                .description(description.clone())
-                .ok_text("Delete all")
-                .ok_variant(ButtonVariant::Danger)
-                .show_cancel(true)
-                .on_ok(move |_, _, cx| {
-                    _ = cowork.update(cx, |cowork, cx| {
-                        for &thread_id in &thread_ids {
-                            cowork.delete_archived_thread(thread_id, cx);
-                        }
-                    });
-                    true
-                })
-        });
+        confirm_destructive(
+            "Delete all archived chats?",
+            description,
+            "Delete all",
+            window,
+            cx,
+            move |_, cx| {
+                _ = cowork.update(cx, |cowork, cx| {
+                    for &thread_id in &thread_ids {
+                        cowork.delete_archived_thread(thread_id, cx);
+                    }
+                });
+            },
+        );
     }
 
     /// Keeps a deleted thread's longest stretch of generating for the

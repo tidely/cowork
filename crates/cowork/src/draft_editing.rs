@@ -25,7 +25,8 @@ use crate::{
 impl Cowork {
     /// An auto-growing editor holding `text`, with the caret at its end.
     /// Enter sends the draft (see [`Cowork::draft_editor_event`]) and
-    /// Shift-Enter starts a new line, as in most chat apps.
+    /// Shift-Enter starts a new line, as in most chat apps, until
+    /// [`Cowork::prepare_draft`] turns that off while others are in the chat.
     pub(crate) fn new_draft_editor(
         text: &str,
         window: &mut Window,
@@ -93,8 +94,9 @@ impl Cowork {
                     && window.focused(cx).is_none_or(|focused| focused == *focus)
             })
             .map(|(_, editor, _)| *editor);
-        let Some((missing, draft_position, shown, lost_focus)) =
-            self.update_draft_editors(draft_id, cx, |items, draft| {
+        let enter_sends = self.enter_sends_draft(draft_id, cx);
+        let Some((missing, draft_position, shown, lost_focus, enter_changed)) = self
+            .update_draft_editors(draft_id, cx, |items, draft| {
                 draft
                     .editors
                     .retain(|id, _| items.iter().any(|item| item.id == *id));
@@ -114,7 +116,15 @@ impl Cowork {
                         None => missing.push(item.clone()),
                     }
                 }
-                (missing, draft.draft_position.clone(), shown, lost_focus)
+                let enter_changed = draft.enter_inserts_newline == enter_sends;
+                draft.enter_inserts_newline = !enter_sends;
+                (
+                    missing,
+                    draft.draft_position.clone(),
+                    shown,
+                    lost_focus,
+                    enter_changed,
+                )
             })
         else {
             return;
@@ -145,6 +155,9 @@ impl Cowork {
                     editor.unmark_text(window, cx);
                 }
                 editor.set_readonly(!can_edit, cx);
+                if enter_changed {
+                    editor.set_submit_on_enter(enter_sends, cx);
+                }
             });
         }
 
@@ -170,14 +183,24 @@ impl Cowork {
                     ))
                 };
                 for editor in editors.all() {
-                    editor.update(cx, |editor, cx| editor.set_readonly(!can_edit, cx));
+                    editor.update(cx, |editor, cx| {
+                        editor.set_readonly(!can_edit, cx);
+                        if !enter_sends {
+                            editor.set_submit_on_enter(false, cx);
+                        }
+                    });
                 }
                 (item.id, editors)
             })
             .collect::<Vec<_>>();
         let draft_position = draft_position.is_none().then(|| {
             let editor = Self::new_routed_draft_editor(draft_id, "", window, cx);
-            editor.update(cx, |editor, cx| editor.set_readonly(!can_edit, cx));
+            editor.update(cx, |editor, cx| {
+                editor.set_readonly(!can_edit, cx);
+                if !enter_sends {
+                    editor.set_submit_on_enter(false, cx);
+                }
+            });
             editor
         });
         self.update_draft_editors(draft_id, cx, |items, draft| {
@@ -366,9 +389,13 @@ impl Cowork {
                 self.typing_in = Some((draft_id, editor_id, editor.focus_handle(cx)));
             }
             // Enter sends from any of the draft's editors, steering a run
-            // that is going, as the send button does. Shift-Enter has
-            // already started a new line.
-            InputEvent::PressEnter { shift: false, .. } => self.submit_composer(window, cx),
+            // that is going, as the send button does, unless others are in
+            // the chat. Shift-Enter has already started a new line, and
+            // Ctrl/Cmd-Enter goes on to the `SubmitComposer` binding.
+            InputEvent::PressEnter {
+                secondary: false,
+                shift: false,
+            } if self.enter_sends_draft(draft_id, cx) => self.submit_composer(window, cx),
             InputEvent::Blur | InputEvent::PressEnter { .. } => {}
         }
     }
@@ -726,6 +753,25 @@ impl Cowork {
             let thread = thread.read(cx);
             thread.draft().id == draft_id && thread.can_edit_draft()
         })
+    }
+
+    /// Whether Enter sends the draft `draft_id`: only while nobody else is
+    /// in its chat. Everyone's blocks go with a submission, so in a shared
+    /// draft a habitual Enter for a new line would send others' unfinished
+    /// text; there Enter starts a new line and Ctrl/Cmd-Enter sends.
+    pub(crate) fn enter_sends_draft(&self, draft_id: Uuid, cx: &App) -> bool {
+        self.thread_store
+            .read(cx)
+            .threads
+            .iter()
+            .map(|thread| thread.read(cx))
+            .find(|thread| thread.draft().id == draft_id)
+            .is_none_or(|thread| {
+                thread
+                    .participants()
+                    .iter()
+                    .all(|participant| *participant == thread.participant_id())
+            })
     }
 
     /// The draft the composer currently edits, or `None` for read-only threads.

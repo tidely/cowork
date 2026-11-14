@@ -322,10 +322,12 @@ fn archiving_a_shared_thread_disconnects_its_collaborators(cx: &mut gpui::TestAp
         host.update(cx, |host, cx| {
             host.archive_thread(host_thread_id, window, cx)
         });
-        // Ignored, as the collaborator doesn't own its mirror.
+        // Ignored, without asking, as the collaborator doesn't own its
+        // mirror.
         collaborator.update(cx, |collaborator, cx| {
-            collaborator.archive_thread(mirror_id, window, cx)
+            collaborator.request_archive_thread(mirror_id, window, cx)
         });
+        assert!(!window.has_active_dialog(cx));
     });
 
     assert_eq!(

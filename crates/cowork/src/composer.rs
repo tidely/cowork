@@ -22,7 +22,7 @@ use gpui_kit_assets::IconName as AssetIconName;
 use uuid::Uuid;
 
 use crate::{
-    Cowork, QueueComposer, StopGeneration,
+    Cowork, QueueComposer, StopGeneration, SubmitComposer,
     composer_attachments::{AttachmentCard, PendingAttachment},
     model_picker::{LanguageModel, UNAVAILABLE_MODEL_TOOLTIP},
     participant::ParticipantId,
@@ -99,6 +99,9 @@ impl Cowork {
                 .into_any_element();
         }
         let ready = disabled_reason.is_none();
+        let enter_sends = self
+            .readable_draft_id(cx)
+            .is_none_or(|draft_id| self.enter_sends_draft(draft_id, cx));
         div()
             .id("send-message-tooltip")
             .tooltip(move |window, cx| {
@@ -119,8 +122,13 @@ impl Cowork {
                             } else {
                                 "Send message"
                             })
-                            // Enter in the draft sends, which no key binding names.
-                            .children(gpui::Keystroke::parse("enter").ok().map(Kbd::new)),
+                            // Enter in the draft sends, which no key binding
+                            // names, except while others are in the chat.
+                            .children(if enter_sends {
+                                gpui::Keystroke::parse("enter").ok().map(Kbd::new)
+                            } else {
+                                Kbd::binding_for_action(&SubmitComposer, None, window)
+                            }),
                     );
                     if generating {
                         content = content
@@ -343,7 +351,7 @@ impl Cowork {
                                 .px_1p5()
                                 .when(unavailable, |this| this.tooltip(UNAVAILABLE_MODEL_TOOLTIP))
                                 .when(!can_change_model, |this| {
-                                    this.tooltip("Only people who can run can change the model")
+                                    this.tooltip("Your access to this chat doesn't include changing the model")
                                 })
                                 .when_some(provider, |this, provider| {
                                     this.child(
