@@ -44,34 +44,21 @@ fn assert_access_menu_open(session: &mut Collaboration<'_>) {
     assert!(session.cx.debug_bounds("peer-access-settings").is_none());
 }
 
-fn click_access_mode(session: &mut Collaboration<'_>, selector: &str) {
-    click_access_control(session, selector);
+/// Picks `choice` (a mode's label, or `inherit`) from the menu of `id`
+/// (`default` or a participant), which opens over the sharing popover and
+/// must leave it open.
+fn pick_access_mode(session: &mut Collaboration<'_>, id: &str, choice: &str) {
+    click_access_control(session, &format!("{id}-mode-menu"));
+    click_access_control(session, &format!("{id}-{choice}"));
+    redraw_access_menu(session);
     assert_access_menu_open(session);
 }
 
-fn access_track_width(session: &mut Collaboration<'_>, id: &str) -> gpui::Pixels {
-    let modes = ["Read only", "Write", "Admin"].map(|mode| {
-        session
-            .cx
-            .debug_bounds(Box::leak(format!("{id}-{mode}").into_boxed_str()))
-            .expect("mode pill should be rendered")
-    });
-    for pair in modes.windows(2) {
-        assert_eq!(pair[0].size, pair[1].size, "icon pills have equal sizes");
-        assert_eq!(pair[0].top(), pair[1].top());
-        assert!(pair[0].right() <= pair[1].left());
-    }
-    if id != "default" {
-        let reset = session
-            .cx
-            .debug_bounds(Box::leak(format!("{id}-inherit").into_boxed_str()))
-            .expect("inheritance reset should be rendered");
-        assert!(
-            modes[2].right() <= reset.left(),
-            "the reset belongs outside the three-mode track"
-        );
-    }
-    modes[2].right() - modes[0].left()
+fn person_menu(session: &mut Collaboration<'_>, id: &str) -> gpui::Bounds<gpui::Pixels> {
+    session
+        .cx
+        .debug_bounds(Box::leak(format!("{id}-mode-menu").into_boxed_str()))
+        .expect("a person's access menu should be rendered")
 }
 
 #[gpui::test]
@@ -88,33 +75,38 @@ fn host_access_popover_changes_live_defaults_overrides_and_inheritance(
 
     // Resetting an already inheriting peer is disabled, not an explicit
     // override of the effective default.
-    click_access_mode(&mut session, &format!("{}-inherit", actor.as_uuid()));
+    let peer = actor.as_uuid().to_string();
+    pick_access_mode(&mut session, &peer, "inherit");
     assert_eq!(
         mirror.read_with(session.cx, |thread, _| thread
             .peer_permissions()
             .override_for(actor)),
         None
     );
-    click_access_mode(&mut session, "default-Write");
+    pick_access_mode(&mut session, "default", "Write");
     assert_eq!(
         mirror.read_with(session.cx, |thread, _| thread.local_mode()),
         PeerMode::Write
     );
 
-    click_access_mode(&mut session, &format!("{}-Admin", actor.as_uuid()));
+    pick_access_mode(&mut session, &peer, "Admin");
     assert_eq!(
         mirror.read_with(session.cx, |thread, _| thread.local_mode()),
         PeerMode::Admin
     );
-    click_access_mode(&mut session, "default-Read only");
+    pick_access_mode(&mut session, "default", "Read only");
+    assert_eq!(
+        mirror.read_with(session.cx, |thread, _| thread.local_mode()),
+        PeerMode::Admin,
+        "an override outlives a default change"
+    );
 
-    redraw_access_menu(&mut session);
-    click_access_mode(&mut session, &format!("{}-inherit", actor.as_uuid()));
+    pick_access_mode(&mut session, &peer, "inherit");
     mirror.read_with(session.cx, |thread, _| {
         assert_eq!(thread.peer_permissions().override_for(actor), None);
         assert_eq!(thread.local_mode(), PeerMode::ReadOnly);
     });
-    click_access_mode(&mut session, "default-Admin");
+    pick_access_mode(&mut session, "default", "Admin");
     session.cx.simulate_keystrokes("escape");
     session.settle();
 
@@ -136,25 +128,16 @@ fn host_access_popover_changes_live_defaults_overrides_and_inheritance(
     );
     click_access_control(&mut session, "thread-menu-trigger");
     assert_access_menu_open(&mut session);
-    for mode in ["Read only", "Write", "Admin"] {
-        for id in ["default".to_owned(), actor.as_uuid().to_string()] {
-            assert!(
-                session
-                    .cx
-                    .debug_bounds(Box::leak(format!("{id}-{mode}").into_boxed_str()))
-                    .is_none(),
-                "an Admin collaborator must not have permission setters"
-            );
-        }
+    for id in ["default".to_owned(), peer.clone()] {
+        assert!(
+            session
+                .cx
+                .debug_bounds(Box::leak(format!("{id}-mode-menu").into_boxed_str()))
+                .is_none(),
+            "an Admin collaborator must not have permission setters"
+        );
     }
-    assert!(
-        session
-            .cx
-            .debug_bounds(Box::leak(
-                format!("{}-inherit", actor.as_uuid()).into_boxed_str()
-            ))
-            .is_none()
-    );
+    assert!(session.cx.debug_bounds("your-peer-access").is_some());
     assert!(session.cx.debug_bounds("copy-endpoint-id").is_none());
     click_access_control(&mut session, "toggle-sharing");
     session.wait_until("disconnect removes the mirrored thread", |this| {
@@ -174,12 +157,8 @@ fn open_access_popover_redraws_live_defaults_and_participant_rows(cx: &mut gpui:
     show_host_access_controls(&mut session);
     click_access_control(&mut session, "thread-menu-trigger");
     assert_access_menu_open(&mut session);
-    // The pinned GPUI test helper requires static selector strings.
-    let inherit_selector: &'static str =
-        Box::leak(format!("{}-inherit", actor.as_uuid()).into_boxed_str());
-
-    // External policy changes redraw the open menu, but icon tracks and the
-    // reset stay fixed-width rather than growing with the default's name.
+    // External policy changes redraw the open menu, but a person's access
+    // menu keeps its place rather than resizing with the mode's name.
     let peer_id = actor.as_uuid().to_string();
     let panel_width = session
         .cx
@@ -187,18 +166,11 @@ fn open_access_popover_redraws_live_defaults_and_participant_rows(cx: &mut gpui:
         .unwrap()
         .size
         .width;
-    let default_width = access_track_width(&mut session, "default");
-    let peer_width = access_track_width(&mut session, &peer_id);
-    let reset_size = session.cx.debug_bounds(inherit_selector).unwrap().size;
+    let peer_menu = person_menu(&mut session, &peer_id);
     set_default(&mut session, PeerMode::ReadOnly);
     redraw_access_menu(&mut session);
     assert_access_menu_open(&mut session);
-    assert_eq!(access_track_width(&mut session, "default"), default_width);
-    assert_eq!(access_track_width(&mut session, &peer_id), peer_width);
-    assert_eq!(
-        session.cx.debug_bounds(inherit_selector).unwrap().size,
-        reset_size
-    );
+    assert_eq!(person_menu(&mut session, &peer_id), peer_menu);
     assert_eq!(
         session
             .cx
@@ -210,8 +182,9 @@ fn open_access_popover_redraws_live_defaults_and_participant_rows(cx: &mut gpui:
     );
 
     let arrival = ParticipantId::new();
+    // The pinned GPUI test helper requires static selector strings.
     let arrival_selector: &'static str =
-        Box::leak(format!("{}-Read only", arrival.as_uuid()).into_boxed_str());
+        Box::leak(format!("{}-mode-menu", arrival.as_uuid()).into_boxed_str());
     assert!(session.cx.debug_bounds(arrival_selector).is_none());
     host_thread.update(session.cx, |thread, cx| {
         thread.emit_for_test(joined(arrival), cx);
@@ -227,10 +200,11 @@ fn open_access_popover_redraws_live_defaults_and_participant_rows(cx: &mut gpui:
     );
     redraw_access_menu(&mut session);
     assert_access_menu_open(&mut session);
-    assert_eq!(
-        access_track_width(&mut session, &arrival.as_uuid().to_string()),
-        peer_width
-    );
+    // Menus line up down the list.
+    let arrival_menu = person_menu(&mut session, &arrival.as_uuid().to_string());
+    let peer_menu = person_menu(&mut session, &peer_id);
+    assert_eq!(arrival_menu.size, peer_menu.size);
+    assert_eq!(arrival_menu.right(), peer_menu.right());
 
     host_thread.update(session.cx, |thread, cx| {
         thread.participant_left(arrival, cx);

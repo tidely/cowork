@@ -253,27 +253,31 @@ then-current default. Profiles and creators do not grant authority.
 `peer_access.rs` renders a nonmodal `gpui_component::Popover`, approximately
 300 px wide, below the right-aligned titlebar gateway beside the participant avatars.
 The 28 px button sits in the existing 40 px header; there is no extra access bar.
-The host menu has the same sharing header, copy-link control, default access track,
-and sharing action before and after sharing. Copy link is disabled until shared;
-Share thread becomes Stop sharing, and starting or retrying sharing keeps the
-menu open so the link is immediately accessible. Defaults can be configured before sharing,
-materializing a local thread if necessary while preserving its draft.
-Connected peers add override rows. Share, copy link, and stop sharing use this
-same menu rather than separate titlebar buttons. Collaborators see **Your access** with their mode icon and Disconnect,
-never the host's permission controls.
+The host's menu, following Apple's sharing popover, opens with a **Share thread**
+header whose switch shows and changes whether the thread is shared, with a line
+saying what that means ("Only you can see this thread.", "Anyone with the link
+can join.", or that sharing failed). Turning the switch on or off starts, retries,
+or stops sharing and keeps the menu open; the switch is disabled while the link
+is being created. While sharing, **Copy link** is the menu's one primary button,
+loading until the link exists. Below it, a sentence summarizes the default mode
+("Anyone who joins can edit") and opens a menu of the modes. The default can be
+set before sharing, materializing a local thread if necessary while preserving
+its draft. Collaborators see whose thread it is, a **Leave** button, and their
+own mode set by the host, never the host's permission controls.
 
-For the host, **Default** and connected peer names label fixed-width,
-three-mode icon tracks: Eye (`ReadOnly`), Pencil (`Write`), and Shield (`Admin`).
-Hover tooltips explain each mode, and the selected pill shows the effective
-mode, including for inheriting peers. Each peer has a separate RotateCcw reset
-outside the track. Its tooltip describes inheritance of the current default;
-it is disabled when already inherited. Resetting removes the override, while
-choosing a mode explicitly creates one even if it equals the default. No
-long, changing inheritance label widens the controls.
+Modes are named by what they allow: **Can view** (`ReadOnly`), **Can edit**
+(`Write`), and **Can run** (`Admin`), each described in its menu. Each connected
+peer has a row with their avatar and name, "Default access" or "Custom access"
+under it, and a fixed-width menu showing their effective mode, so menus line up
+and don't move when a mode with a longer name is picked. Its last item, **Use
+default**, removes the override, while choosing a mode explicitly creates one
+even if it equals the default. Long names truncate rather than push the menus.
 
 Changes apply immediately and keep the popover open; policy changes and peer
 joins/leaves redraw it live. Escape or an outside click dismisses it without a
-modal backdrop or moving the page. The popover's element identity is scoped
+modal backdrop or moving the page; a click in an open access menu, which may
+extend past the popover, doesn't count as outside. `cargo run -p cowork
+--example share_preview` shows the popover in each state. The popover's element identity is scoped
 to the active draft, so switching threads closes any stale menu while materializing
 a new thread for sharing preserves the open menu. Read-only
 editors stay live and selectable, editing and attachment actions are gated,

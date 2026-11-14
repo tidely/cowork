@@ -52,6 +52,7 @@ mod caret;
 pub mod component_preview;
 mod composer;
 mod composer_attachments;
+pub mod share_preview;
 
 mod draft_editing;
 mod file_change_view;

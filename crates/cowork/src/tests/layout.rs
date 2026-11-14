@@ -697,12 +697,22 @@ fn unshared_menu_can_configure_access_before_starting_sharing(cx: &mut gpui::Tes
     cx.simulate_click(gateway.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     cx.update(|window, cx| window.draw(cx).clear(cx));
-    for selector in ["copy-endpoint-id", "default-mode-track", "toggle-sharing"] {
+    for selector in ["default-mode-menu", "toggle-sharing"] {
         assert!(cx.debug_bounds(selector).is_some(), "missing {selector}");
     }
+    assert!(
+        cx.debug_bounds("copy-endpoint-id").is_none(),
+        "there is no link to copy before sharing"
+    );
+    let menu = cx.debug_bounds("default-mode-menu").unwrap();
+    cx.simulate_click(menu.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
     let read_only = cx.debug_bounds("default-Read only").unwrap();
     cx.simulate_click(read_only.center(), gpui::Modifiers::default());
     cx.run_until_parked();
+    cx.update(|window, cx| window.draw(cx).clear(cx));
+    assert!(cx.debug_bounds("thread-sharing-menu").is_some());
     cowork.read_with(cx, |cowork, cx| {
         let thread = cowork.active_thread(cx).expect("configured local thread");
         let thread = thread.read(cx);

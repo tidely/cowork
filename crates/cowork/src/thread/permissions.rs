@@ -48,6 +48,23 @@ impl PeerMode {
             Self::Admin => "Admin",
         }
     }
+
+    /// What someone with this mode can do, as the sharing popover says it.
+    pub(crate) const fn ability(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "Can view",
+            Self::Write => "Can edit",
+            Self::Admin => "Can run",
+        }
+    }
+
+    pub(crate) const fn description(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "Follow the thread as it happens",
+            Self::Write => "Also edit the draft and attachments",
+            Self::Admin => "Also submit, stop, and change models",
+        }
+    }
 }
 
 /// Missing overrides inherit the *current* default, not the default at join.
@@ -166,7 +183,7 @@ impl Thread {
         self.ownership == ThreadOwnership::Local
     }
 
-    pub(super) fn host_id(&self) -> Option<ParticipantId> {
+    pub(crate) fn host_id(&self) -> Option<ParticipantId> {
         if self.is_host() {
             Some(self.participant_id)
         } else {
