@@ -66,9 +66,11 @@ impl ModelProvider {
     /// Shown under the name on the provider's setup card.
     pub(crate) fn description(self) -> &'static str {
         match self {
-            Self::Ollama => "Run models locally",
-            Self::Anthropic => "Claude models, with an API key",
-            Self::OpenAi => "GPT models, with an API key",
+            Self::Ollama => {
+                "Free and private, on your computer. Needs Ollama and a model download."
+            }
+            Self::Anthropic => "Claude models. Pay as you go with an Anthropic account.",
+            Self::OpenAi => "GPT models. Pay as you go with an OpenAI account.",
         }
     }
 }

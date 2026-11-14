@@ -21,6 +21,10 @@ use gpui_component::{
 use crate::{
     Cowork, MainStage,
     models::{ModelCatalog, ModelProvider, ModelRef},
+    providers::{
+        OLLAMA_DOWNLOAD_URL, OLLAMA_RECHECK, OLLAMA_SUGGESTED_MODEL, OllamaStatus,
+        recommended_model,
+    },
     usage::format_token_count,
 };
 
@@ -96,14 +100,16 @@ pub(crate) fn provider_setup_intro(
         .into_any_element()
 }
 
-/// A provider or model card, outlined while selected.
+/// A provider or model card, outlined while selected. At least as tall as a
+/// one-line description needs, and taller when it wraps; cards in a row
+/// stretch to the tallest.
 fn setup_card(id: String, selected: bool, cx: &App) -> Stateful<gpui::Div> {
     let selector = id.clone();
     div()
         .id(id)
         .debug_selector(move || selector.clone())
         .w(px(238.))
-        .h(px(92.))
+        .min_h(px(92.))
         .p_4()
         .rounded_lg()
         .border_1()
@@ -222,7 +228,8 @@ impl Cowork {
             )
     }
 
-    /// The provider cards, and continuing to the selected one's models.
+    /// The provider cards, each going straight on to its models. The one
+    /// last chosen stays outlined.
     fn render_provider_step(
         &self,
         place: ProviderSetupPlace,
@@ -246,9 +253,10 @@ impl Cowork {
                         selected == Some(provider),
                         cx,
                     )
-                    .on_click(cx.listener(move |this, _, _, cx| {
+                    .on_click(cx.listener(move |this, _, window, cx| {
                         this.selected_provider = Some(provider);
-                        cx.notify();
+                        this.show_provider_step(place, ProviderStep::Models(provider), cx);
+                        this.watch_ollama_setup(window, cx);
                     }))
                     .children(setup_card_content(
                         provider,
@@ -257,25 +265,65 @@ impl Cowork {
                         cx,
                     ))
                 }));
-        let continue_button = Button::new("provider-continue")
-            .primary()
-            .label("Continue")
-            .disabled(selected.is_none())
-            .debug_selector(|| "provider-continue".to_owned())
-            .mt_8()
-            .px_6()
-            .h_11()
-            .rounded_lg()
-            .on_click(cx.listener(move |this, _, _, cx| {
-                if let Some(provider) = this.selected_provider {
-                    this.show_provider_step(place, ProviderStep::Models(provider), cx);
-                }
-            }));
         vec![
             section_label("AVAILABLE PROVIDERS", cx),
             cards.into_any_element(),
-            continue_button.into_any_element(),
         ]
+    }
+
+    /// Whether Ollama's models step is showing, at either place.
+    fn showing_ollama_setup(&self) -> bool {
+        let step = match self.main_stage {
+            MainStage::ProviderSetup(provider) => ProviderStep::Models(provider),
+            MainStage::Settings(crate::settings::SettingsPage::Providers) => {
+                self.settings_provider_step
+            }
+            _ => return false,
+        };
+        step == ProviderStep::Models(ModelProvider::Ollama)
+    }
+
+    /// While Ollama's models step shows and Ollama isn't ready (not
+    /// installed, not running, or without models), looks for it again every
+    /// [`OLLAMA_RECHECK`], so installing, starting, or pulling shows up
+    /// without pressing anything. Only Ollama, which is local and free, is
+    /// asked.
+    pub(crate) fn watch_ollama_setup(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.showing_ollama_setup() || self.ollama_watch.is_some() {
+            return;
+        }
+        self.ollama_watch = Some(cx.spawn_in(window, async move |this, cx| {
+            loop {
+                cx.background_executor().timer(OLLAMA_RECHECK).await;
+                let keep_watching = this.update(cx, |this, cx| {
+                    let ready = this.providers.ollama_status() == Some(OllamaStatus::Running)
+                        && this
+                            .models
+                            .providers()
+                            .any(|(provider, _)| provider == ModelProvider::Ollama);
+                    if !this.showing_ollama_setup() || ready {
+                        this.ollama_watch = None;
+                        return false;
+                    }
+                    this.discover_provider_models(ModelProvider::Ollama, cx)
+                        .detach();
+                    true
+                });
+                if !matches!(keep_watching, Ok(true)) {
+                    return;
+                }
+            }
+        }));
+    }
+
+    fn recommended(catalog: &ModelCatalog, provider: ModelProvider) -> Option<ModelRef> {
+        let (_, models) = catalog
+            .providers()
+            .find(|(listed, _)| *listed == provider)?;
+        recommended_model(provider, models.keys().map(String::as_str)).map(|id| ModelRef {
+            provider,
+            id: id.to_owned(),
+        })
     }
 
     /// `provider`'s API key: a field to save a new one, removing the saved
@@ -439,12 +487,20 @@ impl Cowork {
             .collect::<Vec<_>>();
         let has_models = !models.is_empty();
         let reachable = !provider.needs_api_key() || self.providers.has_api_key(provider);
+        let recommended = Self::recommended(&catalog, provider);
         let empty_message = if provider == ModelProvider::Ollama {
-            "No Ollama models found. Start Ollama, then try again.".to_owned()
+            self.render_ollama_help(cx)
         } else if reachable {
-            format!("No {} models found.", provider.label())
+            div()
+                .child(format!("No {} models found.", provider.label()))
+                .into_any_element()
         } else {
-            format!("Save an API key to see {}'s models.", provider.label())
+            div()
+                .child(format!(
+                    "Save an API key to see {}'s models.",
+                    provider.label()
+                ))
+                .into_any_element()
         };
 
         let cards = div()
@@ -454,7 +510,12 @@ impl Cowork {
             .gap_3()
             .children(models.into_iter().map(|(model, name, max_tokens)| {
                 let full_name = name.clone();
-                let context = format!("{} context tokens", format_token_count(max_tokens));
+                let context = format!("Reads up to {} tokens", format_token_count(max_tokens));
+                let context = if recommended.as_ref() == Some(&model) {
+                    format!("Recommended · {context}")
+                } else {
+                    context
+                };
                 setup_card(
                     format!("setup-model-{}-{}", model.provider.label(), model.id),
                     selected.as_ref() == Some(&model),
@@ -462,8 +523,8 @@ impl Cowork {
                 )
                 .children(setup_card_content(model.provider, name, context, cx))
                 .tooltip(move |window, cx| Tooltip::new(full_name.clone()).build(window, cx))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.pick_setup_model(place, model.clone(), cx);
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.pick_setup_model(place, model.clone(), window, cx);
                 }))
             }))
             .when(!has_models, |this| {
@@ -480,8 +541,11 @@ impl Cowork {
             });
         // The welcome screen offers discovering again only when it found
         // nothing; settings always do, for models pulled since. Without a
-        // key there is nothing to discover.
-        let show_refresh = reachable && (!has_models || place == ProviderSetupPlace::Settings);
+        // key there is nothing to discover. Ollama's step looks again on its
+        // own while it has nothing.
+        let show_refresh = reachable
+            && (place == ProviderSetupPlace::Settings
+                || (!has_models && provider != ModelProvider::Ollama));
         let buttons = div()
             .mt_6()
             .flex()
@@ -517,6 +581,104 @@ impl Cowork {
         ]
     }
 
+    /// What is missing before Ollama can run a model, and how to do it:
+    /// installing it, starting it, or pulling a model. Checked again on its
+    /// own while showing; see [`Cowork::watch_ollama_setup`].
+    fn render_ollama_help(&self, cx: &Context<Self>) -> AnyElement {
+        let muted = cx.theme().muted_foreground;
+        let (title, detail): (&str, AnyElement) = match self.providers.ollama_status() {
+            None => ("Looking for Ollama…", div().into_any_element()),
+            Some(OllamaStatus::NotInstalled) => (
+                "Ollama isn't installed",
+                div()
+                    .flex()
+                    .flex_wrap()
+                    .gap_1()
+                    .child("Ollama runs models on your computer, for free.")
+                    .child(
+                        div()
+                            .id("ollama-download")
+                            .debug_selector(|| "ollama-download".to_owned())
+                            .cursor_pointer()
+                            .text_color(cx.theme().link)
+                            .hover(|this| this.underline())
+                            .child("Download Ollama")
+                            .on_click(|_, _, cx| cx.open_url(OLLAMA_DOWNLOAD_URL)),
+                    )
+                    .into_any_element(),
+            ),
+            Some(OllamaStatus::NotRunning) => (
+                "Ollama isn't running",
+                div()
+                    .child("Open the Ollama app, or run `ollama serve` in a terminal.")
+                    .into_any_element(),
+            ),
+            Some(OllamaStatus::Running) => (
+                "Ollama has no models yet",
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .child("Download one by running this in a terminal. It can take a while.")
+                    .child(self.render_pull_command(cx))
+                    .into_any_element(),
+            ),
+        };
+        div()
+            .id("ollama-help")
+            .debug_selector(|| "ollama-help".to_owned())
+            .flex()
+            .flex_col()
+            .gap_1()
+            .child(div().text_color(cx.theme().foreground).child(title))
+            .child(div().text_sm().text_color(muted).child(detail))
+            .when(self.providers.ollama_status().is_some(), |this| {
+                this.child(
+                    div()
+                        .mt_2()
+                        .text_xs()
+                        .text_color(muted)
+                        .child("This updates on its own once Ollama is ready."),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// The command pulling the suggested model, with a button copying it.
+    fn render_pull_command(&self, cx: &Context<Self>) -> AnyElement {
+        let command = format!("ollama pull {OLLAMA_SUGGESTED_MODEL}");
+        let copied = self.copied_pull_command;
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(cx.theme().secondary)
+                    .font_family(cx.theme().mono_font_family.clone())
+                    .text_color(cx.theme().foreground)
+                    .truncate()
+                    .child(command.clone()),
+            )
+            .child(
+                Button::new("copy-pull-command")
+                    .debug_selector(|| "copy-pull-command".to_owned())
+                    .outline()
+                    .label(if copied { "Copied" } else { "Copy" })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.write_to_clipboard(gpui::ClipboardItem::new_string(command.clone()));
+                        this.copied_pull_command = true;
+                        cx.notify();
+                    })),
+            )
+            .into_any_element()
+    }
+
     /// Moves to `step`, discovering the provider's models when it shows them.
     pub(crate) fn show_provider_step(
         &mut self,
@@ -536,6 +698,7 @@ impl Cowork {
         // A half-typed key never carries over to another visit.
         self.api_key_input = None;
         if let ProviderStep::Models(_) = step {
+            self.copied_pull_command = false;
             self.refresh_models(cx);
         }
         cx.notify();
@@ -557,10 +720,16 @@ impl Cowork {
         &mut self,
         place: ProviderSetupPlace,
         model: ModelRef,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match place {
-            ProviderSetupPlace::Welcome => self.select_model(model, cx),
+            // Picking is choosing: the first chat starts with it. Nothing is
+            // selected, or saved, before the user clicks a model.
+            ProviderSetupPlace::Welcome => {
+                self.select_model(model, cx);
+                self.start_onboarding(window, cx);
+            }
             ProviderSetupPlace::Settings => {
                 if self.models.contains(&model) {
                     self.set_new_thread_model(model);

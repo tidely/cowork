@@ -244,6 +244,8 @@ fn test_cowork(
         main_stage: MainStage::Thread,
         stage_before_settings: MainStage::Thread,
         selected_provider: None,
+        ollama_watch: None,
+        copied_pull_command: false,
         settings_provider_step: Default::default(),
         providers: Default::default(),
         api_key_input: None,

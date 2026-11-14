@@ -19,6 +19,15 @@ use crate::{
 
 /// Where the app finds Ollama.
 const OLLAMA_URL: &str = "http://localhost:11434";
+/// Where to download Ollama when it isn't installed.
+pub(crate) const OLLAMA_DOWNLOAD_URL: &str = "https://ollama.com/download";
+/// The model setup suggests pulling when Ollama has none, and recommends
+/// once pulled: one that uses tools well, as the agent needs.
+pub(crate) const OLLAMA_SUGGESTED_MODEL: &str = "qwen3.8:27b";
+/// How often the Ollama setup step looks for Ollama again while it isn't
+/// ready, so starting Ollama or pulling a model shows up on its own. Only
+/// local Ollama is asked; paid providers are never polled.
+pub(crate) const OLLAMA_RECHECK: std::time::Duration = std::time::Duration::from_secs(2);
 const ANTHROPIC_URL: &str = "https://api.anthropic.com/v1";
 const OPENAI_URL: &str = "https://api.openai.com/v1";
 
@@ -199,6 +208,19 @@ pub(crate) struct Providers {
     /// Why the provider's models couldn't be listed, or its key saved,
     /// until it next succeeds.
     errors: HashMap<ModelProvider, SharedString>,
+    /// What the last look for Ollama found, `None` before the first one.
+    ollama: Option<OllamaStatus>,
+}
+
+/// Whether Ollama answered, and if not, whether it seems to be installed,
+/// so setup can say which of the three steps is missing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OllamaStatus {
+    /// Answering; whether it has models is the catalog's.
+    Running,
+    /// Not answering, but its app or command is on this computer.
+    NotRunning,
+    NotInstalled,
 }
 
 impl Providers {
@@ -229,6 +251,10 @@ impl Providers {
         self.errors.get(&provider).cloned()
     }
 
+    pub(crate) fn ollama_status(&self) -> Option<OllamaStatus> {
+        self.ollama
+    }
+
     /// Whether `connection` is still `provider`'s, so what it found applies.
     fn is_current(
         &self,
@@ -238,6 +264,81 @@ impl Providers {
         self.connections
             .get(&provider)
             .is_some_and(|current| Arc::ptr_eq(current, connection))
+    }
+}
+
+/// Whether Ollama's app or command is on this computer: on the `PATH`, or
+/// where its installers put it (an app launched from the desktop may not
+/// have the shell's `PATH`).
+fn ollama_installed() -> bool {
+    let command = if cfg!(windows) {
+        "ollama.exe"
+    } else {
+        "ollama"
+    };
+    let mut places: Vec<std::path::PathBuf> = std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .map(|dir| dir.join(command))
+                .collect()
+        })
+        .unwrap_or_default();
+    places.extend(
+        [
+            "/usr/local/bin/ollama",
+            "/usr/bin/ollama",
+            "/opt/homebrew/bin/ollama",
+        ]
+        .map(std::path::PathBuf::from),
+    );
+    if cfg!(target_os = "macos") {
+        places.push("/Applications/Ollama.app".into());
+        if let Some(home) = std::env::home_dir() {
+            places.push(home.join("Applications/Ollama.app"));
+        }
+    }
+    if let Some(local) = std::env::var_os("LOCALAPPDATA") {
+        places.push(std::path::Path::new(&local).join("Programs/Ollama/ollama.exe"));
+    }
+    places.iter().any(|place| place.exists())
+}
+
+/// The model setup recommends for `provider`, among the `offered` ids:
+/// Ollama's [`OLLAMA_SUGGESTED_MODEL`] (any size of it), or its only model;
+/// the newest Claude Sonnet, a good balance of ability and cost; and the
+/// first of OpenAI's that the built-in list offers, its order being
+/// OpenAI's own ranking.
+pub(crate) fn recommended_model<'a>(
+    provider: ModelProvider,
+    offered: impl IntoIterator<Item = &'a str>,
+) -> Option<&'a str> {
+    let offered: Vec<&str> = offered.into_iter().collect();
+    match provider {
+        ModelProvider::Ollama => {
+            let family = OLLAMA_SUGGESTED_MODEL.split(':').next().unwrap_or_default();
+            offered
+                .iter()
+                .copied()
+                .find(|id| *id == OLLAMA_SUGGESTED_MODEL)
+                .or_else(|| {
+                    offered
+                        .iter()
+                        .copied()
+                        .find(|id| id.split(':').next() == Some(family))
+                })
+                .or_else(|| (offered.len() == 1).then(|| offered[0]))
+        }
+        // Ids end with their version and then a date, so the greatest is
+        // the newest.
+        ModelProvider::Anthropic => offered
+            .iter()
+            .copied()
+            .filter(|id| id.contains("sonnet"))
+            .max()
+            .or_else(|| offered.first().copied()),
+        ModelProvider::OpenAi => OPENAI_MODELS
+            .iter()
+            .find_map(|model| offered.iter().copied().find(|id| *id == model.id)),
     }
 }
 
@@ -370,7 +471,7 @@ impl Cowork {
 
     /// Asks `provider` which models it offers, and makes them its part of
     /// the catalog.
-    fn discover_provider_models(
+    pub(crate) fn discover_provider_models(
         &mut self,
         provider: ModelProvider,
         cx: &mut Context<Self>,
@@ -410,7 +511,19 @@ impl Cowork {
                             }
                         };
                         this.providers.errors.remove(&provider);
+                        if provider == ModelProvider::Ollama {
+                            this.providers.ollama = Some(OllamaStatus::Running);
+                        }
                         this.set_provider_models(provider, models, cx);
+                    }
+                    // Not answering is Ollama's usual state before setup,
+                    // which the setup step explains in place of the error.
+                    Err(_) if provider == ModelProvider::Ollama => {
+                        this.providers.ollama = Some(if ollama_installed() {
+                            OllamaStatus::NotRunning
+                        } else {
+                            OllamaStatus::NotInstalled
+                        });
                     }
                     Err(error) => {
                         eprintln!("could not discover {} models: {error:#}", provider.label());
@@ -502,6 +615,50 @@ impl Cowork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn setup_recommends_a_capable_model_per_provider() {
+        use ModelProvider::*;
+        let family = OLLAMA_SUGGESTED_MODEL.split(':').next().unwrap();
+        let other_size = format!("{family}:8b");
+        // Ollama: the suggested model, any size of it, or the only model.
+        assert_eq!(
+            recommended_model(
+                Ollama,
+                ["llama", OLLAMA_SUGGESTED_MODEL, other_size.as_str()]
+            ),
+            Some(OLLAMA_SUGGESTED_MODEL)
+        );
+        assert_eq!(
+            recommended_model(Ollama, ["llama", other_size.as_str()]),
+            Some(other_size.as_str())
+        );
+        assert_eq!(recommended_model(Ollama, ["llama"]), Some("llama"));
+        assert_eq!(recommended_model(Ollama, ["llama", "mistral"]), None);
+        // Anthropic: the newest Sonnet.
+        assert_eq!(
+            recommended_model(
+                Anthropic,
+                [
+                    "claude-opus-5",
+                    "claude-sonnet-4-5",
+                    "claude-sonnet-5-1",
+                    "claude-haiku-5"
+                ]
+            ),
+            Some("claude-sonnet-5-1")
+        );
+        assert_eq!(
+            recommended_model(Anthropic, ["claude-opus-5"]),
+            Some("claude-opus-5")
+        );
+        // OpenAI: the built-in list's first that the account offers.
+        assert_eq!(
+            recommended_model(OpenAi, ["gpt-5.4-mini", OPENAI_MODELS[1].id]),
+            Some(OPENAI_MODELS[1].id)
+        );
+        assert_eq!(recommended_model(OpenAi, []), None);
+    }
 
     fn info(reasoning: Reasoning, max_output_tokens: Option<u64>) -> ModelInfo {
         ModelInfo {

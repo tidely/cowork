@@ -22,7 +22,7 @@ use gpui_kit_assets::IconName as AssetIconName;
 use uuid::Uuid;
 
 use crate::{
-    Cowork, QueueComposer, StopGeneration, SubmitComposer,
+    Cowork, QueueComposer, StopGeneration,
     composer_attachments::{AttachmentCard, PendingAttachment},
     model_picker::{LanguageModel, UNAVAILABLE_MODEL_TOOLTIP},
     participant::ParticipantId,
@@ -119,7 +119,8 @@ impl Cowork {
                             } else {
                                 "Send message"
                             })
-                            .children(Kbd::binding_for_action(&SubmitComposer, None, window)),
+                            // Enter in the draft sends, which no key binding names.
+                            .children(gpui::Keystroke::parse("enter").ok().map(Kbd::new)),
                     );
                     if generating {
                         content = content

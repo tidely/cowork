@@ -80,6 +80,8 @@ fn api_keys_are_saved_and_removed_from_the_providers_page(cx: &mut gpui::TestApp
         cowork.set_models(catalog_of(&[ollama_qwen(), claude.clone()]), cx);
     });
     cx.run_until_parked();
+    // The model cards change the centered page's height, moving the button.
+    cx.update(|window, cx| window.draw(cx).clear(cx));
 
     let remove = cx.debug_bounds("api-key-remove").expect("removing the key");
     cx.simulate_click(remove.center(), gpui::Modifiers::none());
@@ -182,13 +184,8 @@ fn provider_setup_starts_onboarding_with_the_selected_model(cx: &mut gpui::TestA
     let card = cx
         .debug_bounds("setup-provider-Ollama")
         .expect("Ollama is offered even before model setup");
+    // A provider's card goes straight on to its models.
     cx.simulate_click(card.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
-
-    let continue_button = cx
-        .debug_bounds("provider-continue")
-        .expect("continue follows the provider card");
-    cx.simulate_click(continue_button.center(), gpui::Modifiers::default());
     cx.run_until_parked();
 
     cowork.read_with(cx, |cowork, _| {
@@ -200,6 +197,10 @@ fn provider_setup_starts_onboarding_with_the_selected_model(cx: &mut gpui::TestA
     let card = cx
         .debug_bounds("setup-model-Ollama-test-default")
         .expect("the discovered model has a setup card");
+    // Nothing is chosen for the user before they click a model, and the
+    // click starts the first chat with it, with no button to continue.
+    assert!(cx.debug_bounds("setup-continue").is_none());
+    cowork.update(cx, |cowork, _| cowork.new_thread_model = None);
     cx.simulate_click(card.center(), gpui::Modifiers::default());
     cx.run_until_parked();
 
@@ -210,12 +211,6 @@ fn provider_setup_starts_onboarding_with_the_selected_model(cx: &mut gpui::TestA
             Some(recommended_qwen())
         );
     });
-
-    let continue_button = cx
-        .debug_bounds("setup-continue")
-        .expect("continue follows the model cards");
-    cx.simulate_click(continue_button.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
 
     // The greeting streams in as previews of the seeded run, and ends it,
     // with no "Working for" line to vanish when it does.
@@ -279,12 +274,9 @@ fn provider_setup_starts_onboarding_with_the_selected_model(cx: &mut gpui::TestA
 
     // The first reply uses this thread's seeded conversation, not a new chat.
     // The Tokio runtime is deliberately not driven: no live model is needed.
+    // Enter sends, as the greeting says.
     cx.simulate_input("hi");
-    cx.simulate_keystrokes(if cfg!(target_os = "macos") {
-        "cmd-enter"
-    } else {
-        "ctrl-enter"
-    });
+    cx.simulate_keystrokes("enter");
     cx.run_until_parked();
     cowork.read_with(cx, |cowork, cx| {
         let thread = cowork.active_thread(cx).unwrap();
@@ -318,15 +310,12 @@ fn provider_can_be_set_up_without_discovered_models(cx: &mut gpui::TestAppContex
         .expect("provider remains available without models");
     cx.simulate_click(card.center(), gpui::Modifiers::default());
     cx.run_until_parked();
-    let continue_button = cx.debug_bounds("provider-continue").unwrap();
-    cx.simulate_click(continue_button.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
 
+    // Ollama's step says what is missing and looks again on its own, in
+    // place of a button to try again.
     assert!(cx.debug_bounds("provider-setup-stage").is_some());
-    assert!(cx.debug_bounds("setup-refresh").is_some());
-    let continue_button = cx.debug_bounds("setup-continue").unwrap();
-    cx.simulate_click(continue_button.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
+    assert!(cx.debug_bounds("ollama-help").is_some());
+    assert!(cx.debug_bounds("setup-refresh").is_none());
     cowork.read_with(cx, |cowork, _| {
         assert_eq!(
             cowork.main_stage,
@@ -338,6 +327,12 @@ fn provider_can_be_set_up_without_discovered_models(cx: &mut gpui::TestAppContex
     cx.simulate_click(back.center(), gpui::Modifiers::default());
     cx.run_until_parked();
     assert!(cx.debug_bounds("welcome-stage").is_some());
+
+    // Someone invited to a chat can join from here, without a provider.
+    let join = cx.debug_bounds("welcome-join").unwrap();
+    cx.simulate_click(join.center(), gpui::Modifiers::default());
+    cx.run_until_parked();
+    assert!(cx.update(gpui_component::WindowExt::has_active_dialog));
 }
 
 #[gpui::test]
@@ -361,9 +356,6 @@ fn providers_settings_pick_the_new_chats_model(cx: &mut gpui::TestAppContext) {
 
     let card = cx.debug_bounds("setup-provider-Ollama").unwrap();
     cx.simulate_click(card.center(), gpui::Modifiers::default());
-    cx.run_until_parked();
-    let continue_button = cx.debug_bounds("provider-continue").unwrap();
-    cx.simulate_click(continue_button.center(), gpui::Modifiers::default());
     cx.run_until_parked();
 
     cowork.read_with(cx, |cowork, _| {

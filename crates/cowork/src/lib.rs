@@ -174,6 +174,11 @@ struct Cowork {
     /// The provider card selected on the welcome screen or the Providers
     /// settings page, to continue to its models.
     selected_provider: Option<models::ModelProvider>,
+    /// Looking for Ollama again while its setup step shows it isn't ready;
+    /// see `Cowork::watch_ollama_setup`.
+    ollama_watch: Option<gpui::Task<()>>,
+    /// The Ollama setup step's pull command was copied.
+    copied_pull_command: bool,
     /// Which step the Providers settings page shows.
     settings_provider_step: ProviderStep,
     /// The connections to providers, with their API keys; see
@@ -906,6 +911,8 @@ pub fn run() -> anyhow::Result<()> {
                         main_stage: MainStage::Welcome,
                         stage_before_settings: MainStage::Welcome,
                         selected_provider: None,
+                        ollama_watch: None,
+                        copied_pull_command: false,
                         settings_provider_step: ProviderStep::default(),
                         providers: Default::default(),
                         api_key_input: None,

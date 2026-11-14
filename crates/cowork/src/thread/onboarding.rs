@@ -43,7 +43,7 @@ fn stream_chunks(text: &str) -> Vec<String> {
         .collect()
 }
 
-const WELCOME_MESSAGE: &str = concat!(
+const WELCOME_MESSAGE: &str =
     "Welcome to Cowork! I can help with almost any kind of work: writing, research, \
 planning, budgets, organizing files, or building software.
 
@@ -52,13 +52,7 @@ planning, budgets, organizing files, or building software.
 ![Schedules](icon:schedule) **Schedules** run tasks on their own, daily or weekly.\\
 ![Comments](icon:comment) **Comments** on my replies point at exactly what to change.
 
-Type **hi** and press **",
-    cfg_select!(
-        target_os = "macos" => "Cmd-Enter",
-        _ => "Ctrl-Enter",
-    ),
-    "** for a quick tour."
-);
+Type **hi** and press **Enter** for a quick tour.";
 
 impl Cowork {
     /// Whether the user is new to Cowork: no threads of their own, open or

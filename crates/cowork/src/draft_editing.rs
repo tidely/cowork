@@ -24,13 +24,17 @@ use crate::{
 
 impl Cowork {
     /// An auto-growing editor holding `text`, with the caret at its end.
+    /// Enter sends the draft (see [`Cowork::draft_editor_event`]) and
+    /// Shift-Enter starts a new line, as in most chat apps.
     pub(crate) fn new_draft_editor(
         text: &str,
         window: &mut Window,
         cx: &mut App,
     ) -> Entity<TextareaState> {
         cx.new(|cx| {
-            let mut editor = TextareaState::new(window, cx).auto_grow(1, usize::MAX);
+            let mut editor = TextareaState::new(window, cx)
+                .auto_grow(1, usize::MAX)
+                .submit_on_enter(true);
             editor.set_editor_style(InputEditorStyle {
                 caret: cx.theme().caret,
                 ..Default::default()
@@ -361,6 +365,10 @@ impl Cowork {
             InputEvent::Focus => {
                 self.typing_in = Some((draft_id, editor_id, editor.focus_handle(cx)));
             }
+            // Enter sends from any of the draft's editors, steering a run
+            // that is going, as the send button does. Shift-Enter has
+            // already started a new line.
+            InputEvent::PressEnter { shift: false, .. } => self.submit_composer(window, cx),
             InputEvent::Blur | InputEvent::PressEnter { .. } => {}
         }
     }
@@ -934,6 +942,8 @@ pub(crate) mod tests {
                         main_stage: MainStage::Thread,
                         stage_before_settings: MainStage::Thread,
                         selected_provider: None,
+                        ollama_watch: None,
+                        copied_pull_command: false,
                         settings_provider_step: Default::default(),
                         providers: Default::default(),
                         api_key_input: None,
