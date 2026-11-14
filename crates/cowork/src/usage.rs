@@ -463,7 +463,7 @@ pub(crate) fn format_stat_count(count: u64) -> String {
             ((count as f64 / unit * 10.).round() / 10., suffix)
         });
     let text = format!("{value:.1}");
-    format!("{}{suffix}", text.strip_suffix(".0").unwrap_or(&text))
+    format!("{}{suffix}", text.trim_suffix(".0"))
 }
 
 /// A token count shortened to at most a few digits, such as `950`, `4.1k`,
@@ -473,7 +473,7 @@ pub(crate) fn format_token_count(tokens: u64) -> String {
         let value = tokens as f64 / unit as f64;
         if value < 9.95 {
             let text = format!("{value:.1}");
-            format!("{}{suffix}", text.strip_suffix(".0").unwrap_or(&text))
+            format!("{}{suffix}", text.trim_suffix(".0"))
         } else {
             format!("{value:.0}{suffix}")
         }

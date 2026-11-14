@@ -47,9 +47,8 @@ impl Decoder {
                         self.data.pop();
                         self.frames.push_back(std::mem::take(&mut self.data));
                     }
-                } else if line.starts_with(b"data:") {
-                    let value = line[5..].strip_prefix(b" ").unwrap_or(&line[5..]);
-                    self.data.extend_from_slice(value);
+                } else if let Some(value) = line.strip_prefix(b"data:") {
+                    self.data.extend_from_slice(value.trim_prefix(b" "));
                     self.data.push(b'\n');
                 }
             } else {

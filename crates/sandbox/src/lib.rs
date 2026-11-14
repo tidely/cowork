@@ -35,6 +35,7 @@ mod tool;
 use std::{
     collections::HashMap,
     io::Read,
+    mem::DropGuard,
     path::{Path, PathBuf},
     sync::{
         Arc, OnceLock,
@@ -293,8 +294,11 @@ impl Sandboxes {
             None => Folders::default(),
         };
         let request = request(command, &project, &folders, &scratch, &environment)?;
-        let stop = StopOnDrop(Arc::new(AtomicBool::new(false)));
-        let stopped = stop.0.clone();
+        // Tells the command's blocking task, when its run is stopped, to kill it.
+        let stop = DropGuard::new(Arc::new(AtomicBool::new(false)), |stop| {
+            stop.store(true, Ordering::Release);
+        });
+        let stopped = Arc::clone(&stop);
         let result = tokio::task::spawn_blocking(move || execute(request, &stopped, timeout)).await;
         drop(stop);
         result.unwrap_or_else(|error| Err(SandboxError::Failed(error.to_string())))
@@ -328,15 +332,6 @@ impl Sandboxes {
                 Ok(())
             })
             .clone()
-    }
-}
-
-/// Tells a command's blocking task, when its run is stopped, to kill it.
-struct StopOnDrop(Arc<AtomicBool>);
-
-impl Drop for StopOnDrop {
-    fn drop(&mut self) {
-        self.0.store(true, Ordering::Release);
     }
 }
 

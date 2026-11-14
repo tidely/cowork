@@ -912,7 +912,7 @@ impl Cowork {
         .label_toggle(
             self.recents_open,
             cx.listener(|this, _, _, cx| {
-                this.recents_open = !this.recents_open;
+                this.recents_open.toggle();
                 cx.notify();
             }),
         )

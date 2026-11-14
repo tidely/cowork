@@ -172,7 +172,7 @@ impl Projects {
 
     /// Opens or closes the section. Closing it closes every project too.
     pub(crate) fn toggle_section(&mut self) {
-        self.section_open = !self.section_open;
+        self.section_open.toggle();
         if !self.section_open {
             self.open.clear();
         }

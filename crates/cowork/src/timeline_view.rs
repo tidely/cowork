@@ -335,7 +335,7 @@ impl Cowork {
     fn toggle_comment_group(&mut self, group_id: Uuid, cx: &mut Context<Self>) {
         if self
             .update_draft_editors(group_id, cx, |_, state| {
-                state.comments_folded = !state.comments_folded;
+                state.comments_folded.toggle();
             })
             .is_some()
         {
@@ -352,7 +352,7 @@ impl Cowork {
                     }
                     _ => None,
                 }) {
-                    message.ui.comments_folded = !message.ui.comments_folded;
+                    message.ui.comments_folded.toggle();
                     return true;
                 }
                 thread.toggle_pending_comments(group_id)
@@ -1206,7 +1206,7 @@ impl Cowork {
         };
         thread.update(cx, |thread, _| {
             if let Some(message) = thread.agent_message_mut(message_id.into_bytes()) {
-                message.ui.work_expanded = !message.ui.work_expanded;
+                message.ui.work_expanded.toggle();
             }
         });
         cx.notify();

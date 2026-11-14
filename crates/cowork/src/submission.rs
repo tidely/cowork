@@ -80,7 +80,7 @@ impl Thread {
             .iter_mut()
             .find(|pending| pending.group.id == id)
         {
-            pending.group.comments_folded = !pending.group.comments_folded;
+            pending.group.comments_folded.toggle();
             true
         } else {
             false

@@ -103,8 +103,7 @@ impl Occurrences {
 /// `rule` as `rrule` reads it, counted from `start`. Accepts the rule with
 /// or without its `RRULE:` prefix.
 fn custom_rule(rule: &str, start: NaiveDateTime) -> Result<RRuleSet, String> {
-    let rule = rule.trim();
-    let rule = rule.strip_prefix("RRULE:").unwrap_or(rule);
+    let rule = rule.trim().trim_prefix("RRULE:");
     if rule.is_empty() {
         return Err("Enter a recurrence rule.".into());
     }
@@ -154,8 +153,7 @@ impl When {
                 format!("Monthly on the {} at {}", ordinal(*day), time(at))
             }
             Self::Custom { rule, .. } => {
-                let rule = rule.trim();
-                format!("Custom: {}", rule.strip_prefix("RRULE:").unwrap_or(rule))
+                format!("Custom: {}", rule.trim().trim_prefix("RRULE:"))
             }
         }
     }

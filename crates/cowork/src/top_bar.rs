@@ -38,7 +38,7 @@ impl Cowork {
                 SidebarToggleButton::new()
                     .collapsed(!self.sidebar_open)
                     .on_click(cx.listener(|this, _, _, cx| {
-                        this.sidebar_open = !this.sidebar_open;
+                        this.sidebar_open.toggle();
                         cx.notify();
                     })),
             )

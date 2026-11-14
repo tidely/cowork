@@ -58,7 +58,7 @@ impl TurnComments {
     /// Creates aliases `comment_1` through `comment_{comment_count}`.
     pub fn new(comment_count: usize) -> Self {
         Self {
-            comment_ids: (0..comment_count).map(CommentId::for_index).collect(),
+            comment_ids: Vec::from_fn(comment_count, CommentId::for_index),
             state: Mutex::new(TurnCommentsState::default()),
         }
     }
@@ -71,9 +71,9 @@ impl TurnComments {
     /// Stable aliases for a later submission in this run. A host-owned
     /// namespace keeps cancellation from renumbering other submissions.
     pub fn group_ids(namespace: &str, count: usize) -> Vec<CommentId> {
-        (0..count)
-            .map(|index| CommentId(format!("comment_{namespace}_{}", index + 1)))
-            .collect()
+        Vec::from_fn(count, |index| {
+            CommentId(format!("comment_{namespace}_{}", index + 1))
+        })
     }
 
     /// Registers the aliases of a later submission once the model has it,
