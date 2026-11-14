@@ -14,6 +14,11 @@ use crate::{
     timeline::MessageAuthor,
 };
 
+/// The smallest text the app draws, the desktop minimum.
+const MIN_TEXT: gpui::Pixels = px(10.);
+/// The smallest avatar that fits two initials at [`MIN_TEXT`].
+const MIN_TWO_INITIALS: gpui::Pixels = px(20.);
+
 impl Cowork {
     /// Everyone's profile in `thread`, with the local user's current one
     /// under each id they have there.
@@ -60,6 +65,15 @@ impl Cowork {
                 .child(img(picture).size_full().rounded_full());
         }
         let appearance = appearance(participant, profile);
+        // Never below the 10 px text minimum; avatars too small for two
+        // letters at that size show one, so they never come down to color
+        // alone.
+        let initials = appearance.initials();
+        let initials = if size < MIN_TWO_INITIALS {
+            initials.chars().take(1).collect()
+        } else {
+            initials
+        };
         div()
             .size(size)
             .flex()
@@ -68,11 +82,13 @@ impl Cowork {
             .justify_center()
             .rounded_full()
             .bg(rgb(appearance.color()))
-            .text_size(px(9.))
+            .text_size((size * 0.42).max(MIN_TEXT))
+            .line_height(size)
             .font_weight(FontWeight::SEMIBOLD)
-            // Identity colors are independent of the theme; keep contrasting white initials.
+            // Identity colors are independent of the theme, and each one keeps
+            // white initials at 4.5:1 (see `participant::COLORS`).
             .text_color(rgb(0xffffff))
-            .child(appearance.initials())
+            .child(initials)
     }
 
     /// The agent's avatar shows the logo of the provider whose model wrote
@@ -112,8 +128,8 @@ impl Cowork {
         cx: &App,
     ) -> gpui::Div {
         const MAX_OTHERS: usize = 2;
-        const SMALL: gpui::Pixels = px(14.);
-        const STEP: f32 = 10.;
+        const SMALL: gpui::Pixels = px(16.);
+        const STEP: f32 = 12.;
 
         let hidden = others.len().saturating_sub(MAX_OTHERS);
         let mut layered = others
@@ -121,7 +137,6 @@ impl Cowork {
             .take(MAX_OTHERS)
             .map(|&participant| {
                 self.render_participant_avatar(participant, SMALL)
-                    .text_size(px(6.))
                     .border_1()
                     .border_color(cx.theme().background)
             })
@@ -138,7 +153,7 @@ impl Cowork {
                     .border_1()
                     .border_color(cx.theme().background)
                     .bg(cx.theme().secondary_active)
-                    .text_size(px(7.))
+                    .text_size(MIN_TEXT)
                     .text_color(cx.theme().secondary_foreground)
                     .child(format!("+{hidden}")),
             );
@@ -150,7 +165,7 @@ impl Cowork {
             .children(layered.into_iter().enumerate().map(|(index, avatar)| {
                 // Centered under the primary avatar, fanned out sideways.
                 let offset = (index as f32 - (count as f32 - 1.) / 2.) * STEP;
-                avatar.absolute().top(px(14.)).left(px(11. - 7. + offset))
+                avatar.absolute().top(px(13.)).left(px(11. - 8. + offset))
             }))
     }
 }

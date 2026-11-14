@@ -434,8 +434,7 @@ impl Cowork {
             || "A scheduled task".to_owned(),
             |task| task.settings().title.clone(),
         );
-        let message =
-            format!("“{title}” wants to use {tool}. Open the thread to allow or deny it.");
+        let message = format!("“{title}” wants to use {tool}. Open the chat to allow or deny it.");
         let cowork = cx.entity().downgrade();
         // Deferred, as showing it updates the window this update is part of.
         cx.defer(move |cx| {

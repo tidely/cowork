@@ -16,7 +16,7 @@ use gpui_component::{
     ActiveTheme, Collapsible, Icon, Sizable as _, WindowExt as _,
     button::{Button, ButtonVariant, ButtonVariants as _},
     h_flex,
-    menu::{DropdownMenu as _, PopupMenuItem},
+    menu::{ContextMenuExt as _, DropdownMenu as _, PopupMenuItem},
     sidebar::{Sidebar, SidebarCollapsible, SidebarItem},
     v_flex,
 };
@@ -148,8 +148,9 @@ fn sidebar_row(
 }
 
 /// A row whose label fades out where it runs out of room, with `buttons`
-/// shown over its end only while the row itself is hovered, or always while
-/// `pinned` (as while one of them has its menu open). Its debug selectors
+/// shown over its end while the row itself is hovered, and always while
+/// it's `active` or `pinned` (as while one of them has its menu open), so
+/// the open chat's actions can be found without hovering. Its debug selectors
 /// are `sidebar-{kind}-{key}`, and `-title-` and `-buttons-` ones for its
 /// parts.
 #[allow(clippy::too_many_arguments)]
@@ -220,7 +221,7 @@ fn fading_row(
                     .top_0()
                     .bottom_0()
                     .right_0()
-                    .when(!pinned, |this| {
+                    .when(!pinned && !active, |this| {
                         this.invisible().group_hover(group, |style| style.visible())
                     })
                     .child(div().h_full().w(TITLE_FADE_WIDTH).bg(fade_into(buttons_bg)))
@@ -265,7 +266,8 @@ fn row_button(
         })
 }
 
-/// A thread's row also shows its archive button only while hovered.
+/// A chat's row, with its archive button over its end and in its context
+/// menu.
 #[derive(Clone)]
 struct ThreadRow {
     thread_id: Uuid,
@@ -282,17 +284,19 @@ impl ThreadRow {
     fn render(self, cx: &App) -> impl IntoElement {
         let thread_id = self.thread_id;
         let on_open = self.on_open;
+        let menu_archive = self.on_archive.clone();
         let archive = self.on_archive.map(|on_archive| {
             row_button(
                 "archive-thread",
                 format!("archive-thread-{thread_id}"),
                 AssetIconName::Archive,
-                "Archive thread",
-                on_archive,
+                "Archive chat",
+                on_archive.clone(),
                 cx,
             )
         });
-        fading_row(
+        let menu_open = on_open.clone();
+        let row = fading_row(
             "thread",
             thread_id.to_string(),
             self.active,
@@ -306,7 +310,25 @@ impl ThreadRow {
             cx,
         )
         .when(self.indented, |this| this.pl(PROJECT_CHAT_INDENT))
-        .on_click(move |event, window, cx| on_open(event, window, cx))
+        .on_click(move |event, window, cx| on_open(event, window, cx));
+        row.context_menu(move |menu, _, _| {
+            let open = menu_open.clone();
+            let menu = menu.item(
+                PopupMenuItem::new("Open")
+                    .icon(AssetIconName::MessageSquare)
+                    .on_click(move |_, window, cx| open(&gpui::ClickEvent::default(), window, cx)),
+            );
+            match menu_archive.clone() {
+                Some(archive) => menu.separator().item(
+                    PopupMenuItem::new("Archive chat")
+                        .icon(AssetIconName::Archive)
+                        .on_click(move |_, window, cx| {
+                            archive(&gpui::ClickEvent::default(), window, cx)
+                        }),
+                ),
+                None => menu,
+            }
+        })
     }
 }
 
@@ -776,7 +798,7 @@ impl Cowork {
             })),
             on_archive: archivable.then(|| -> ClickHandler {
                 Rc::new(cx.listener(move |this, _, window, cx| {
-                    this.archive_thread(thread_id, window, cx);
+                    this.request_archive_thread(thread_id, window, cx);
                 }))
             }),
         }
@@ -824,7 +846,7 @@ impl Cowork {
             vec![
                 new_chat.clone(),
                 SidebarEntry::new(
-                    "Join shared thread",
+                    "Join shared chat",
                     AssetIconName::UsersRound,
                     false,
                     cx.listener(|this, _, window, cx| {

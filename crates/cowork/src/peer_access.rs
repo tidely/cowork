@@ -299,7 +299,7 @@ pub(crate) fn render_sharing_panel(
 
     let on = matches!(panel.status, SharingStatus::Sharing | SharingStatus::Shared);
     let caption_text = match panel.status {
-        SharingStatus::NotShared | SharingStatus::Connected => "Only you can see this thread.",
+        SharingStatus::NotShared | SharingStatus::Connected => "Only you can see this chat.",
         SharingStatus::Sharing => "Creating a link…",
         SharingStatus::Shared => "Anyone with the link can join.",
         SharingStatus::Failed => "Sharing failed. Turn it on to try again.",
@@ -316,7 +316,7 @@ pub(crate) fn render_sharing_panel(
                 .min_w_0()
                 .flex()
                 .flex_col()
-                .child(title("Share thread"))
+                .child(title("Share chat"))
                 .child(
                     caption(caption_text, cx).when(panel.status == SharingStatus::Failed, |this| {
                         this.text_color(cx.theme().danger)
@@ -331,7 +331,7 @@ pub(crate) fn render_sharing_panel(
                     Switch::new("toggle-sharing")
                         .checked(on)
                         .disabled(panel.status == SharingStatus::Sharing)
-                        .accessibility_label("Share thread")
+                        .accessibility_label("Share chat")
                         .on_click(move |_, window, cx| toggle(window, cx)),
                 ),
         );
@@ -422,8 +422,8 @@ fn collaborator_rows(panel: &SharingPanel, actions: &SharingActions, cx: &App) -
     let host_name = panel
         .host
         .as_ref()
-        .map(|host| SharedString::from(format!("{}'s thread", host.name())))
-        .unwrap_or_else(|| "Shared thread".into());
+        .map(|host| SharedString::from(format!("{}'s chat", host.name())))
+        .unwrap_or_else(|| "Shared chat".into());
     let header = row()
         .id("sharing-header")
         .debug_selector(|| "sharing-header".to_owned())

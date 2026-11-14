@@ -270,9 +270,15 @@ fn tasks_are_edited_paused_and_deleted_from_their_rows(cx: &mut gpui::TestAppCon
         }
     ));
 
-    // Toggling and deleting don't open the editor.
+    // Toggling doesn't open the editor; deleting asks first, and only then
+    // deletes.
     click(selector("toggle-scheduled-task", paused), cx);
+    assert!(!dialog_open(cx));
     click(selector("delete-scheduled-task", deleted), cx);
+    assert!(dialog_open(cx));
+    assert_eq!(tasks(&cowork, cx).len(), 4);
+    cx.simulate_keystrokes("enter");
+    cx.run_until_parked();
     assert!(!dialog_open(cx));
     let ids: Vec<_> = tasks(&cowork, cx).iter().map(|task| task.id).collect();
     assert_eq!(ids, [edited, paused, kept]);

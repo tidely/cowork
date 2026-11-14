@@ -317,7 +317,7 @@ impl Cowork {
         let (status_label, status_text, status_color): (&str, String, Option<Hsla>) = match status {
             TaskStatus::Running => ("Now", "Running".into(), Some(theme.primary)),
             TaskStatus::WaitingForApproval => ("Now", "Needs approval".into(), Some(theme.warning)),
-            TaskStatus::WaitingForThread => ("Next run", "Waiting for its thread".into(), None),
+            TaskStatus::WaitingForThread => ("Next run", "Waiting for its chat".into(), None),
             TaskStatus::WaitingForModels => ("Next run", "Waiting for models".into(), None),
             TaskStatus::Queued => ("Next run", "Queued".into(), None),
             TaskStatus::Due(at) if at <= now => ("Next run", "Due now".into(), None),
@@ -344,12 +344,12 @@ impl Cowork {
         let (open_thread, open_tooltip) = {
             let store = self.thread_store.read(cx);
             match last_thread {
-                None => (None, "No thread yet. The first run creates one."),
-                Some(id) if store.thread(id, cx).is_some() => (Some(id), "Open its thread"),
+                None => (None, "No chat yet. The first run creates one."),
+                Some(id) if store.thread(id, cx).is_some() => (Some(id), "Open its chat"),
                 Some(id) if store.archived_thread(id, cx).is_some() => {
-                    (None, "Its thread is archived.")
+                    (None, "Its chat is archived.")
                 }
-                Some(_) => (None, "Its thread was deleted."),
+                Some(_) => (None, "Its chat was deleted."),
             }
         };
         // The buttons' icons have their own color, which would hide the
@@ -393,6 +393,7 @@ impl Cowork {
         .collect::<Vec<_>>()
         .join(" \u{b7} ");
         let queued = task.queued().is_some();
+        let title = settings.title.clone();
 
         h_flex()
             .id(task_id)
@@ -471,7 +472,7 @@ impl Cowork {
                             )
                             .disabled(open_thread.is_none())
                             .debug_selector(move || format!("open-scheduled-thread-{task_id}"))
-                            .accessibility_label("Open its thread")
+                            .accessibility_label("Open its chat")
                             .tooltip(open_tooltip)
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 cx.stop_propagation();
@@ -524,9 +525,22 @@ impl Cowork {
                             .debug_selector(move || format!("delete-scheduled-task-{task_id}"))
                             .accessibility_label("Delete schedule")
                             .tooltip("Delete schedule")
-                            .on_click(cx.listener(move |this, _, _, cx| {
+                            .on_click(cx.listener(move |_, _, window, cx| {
                                 cx.stop_propagation();
-                                this.delete_scheduled_task(task_id, cx);
+                                let cowork = cx.entity().downgrade();
+                                crate::archive::confirm_destructive(
+                                    format!("Delete “{}”?", title),
+                                    "The scheduled task and its run history will be deleted. \
+                                     Its chat stays. This can't be undone.",
+                                    "Delete",
+                                    window,
+                                    cx,
+                                    move |_, cx| {
+                                        _ = cowork.update(cx, |cowork, cx| {
+                                            cowork.delete_scheduled_task(task_id, cx)
+                                        });
+                                    },
+                                );
                             })),
                     ),
             )
@@ -1310,6 +1324,7 @@ impl Render for ScheduleEditor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let settings = self.settings(cx);
         let can_save = settings.is_ok();
+        let save_problem = settings.as_ref().err().cloned();
         let model_problem = settings
             .err()
             .filter(|problem| problem.contains("model") || problem.contains("provider"));
@@ -1363,7 +1378,7 @@ impl Render for ScheduleEditor {
                     .items_start()
                     .gap_4()
                     .child(
-                        Self::field("Thread", cx)
+                        Self::field("Chat", cx)
                             .flex_1()
                             .min_w_0()
                             .child(self.render_choice(
@@ -1372,13 +1387,13 @@ impl Render for ScheduleEditor {
                                 [
                                     (
                                         ThreadMode::NewEachRun,
-                                        "New thread each run",
+                                        "New chat each run",
                                         "Starts fresh with only the prompt.",
                                     ),
                                     (
                                         ThreadMode::ContinueLast,
-                                        "Continue the last thread",
-                                        "Adds to one thread, seeing its history.",
+                                        "Continue the last chat",
+                                        "Adds to one chat, seeing its history.",
                                     ),
                                 ],
                                 |this, thread| this.thread = thread,
@@ -1429,6 +1444,7 @@ impl Render for ScheduleEditor {
                         .primary()
                         .label(save_label)
                         .disabled(!can_save)
+                        .when_some(save_problem, |this, problem| this.tooltip(problem))
                         .debug_selector(|| "save-schedule".to_owned())
                         .on_click(cx.listener(|this, _, window, cx| this.save(window, cx))),
                 ),

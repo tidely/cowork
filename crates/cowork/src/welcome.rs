@@ -57,6 +57,9 @@ impl Cowork {
             .primary()
             .label("Continue")
             .disabled(!self.active_model_is_runnable(cx))
+            .when(!self.active_model_is_runnable(cx), |this| {
+                this.tooltip("Choose an available model to continue")
+            })
             .debug_selector(|| "setup-continue".to_owned())
             .mt_8()
             .px_6()

@@ -305,6 +305,19 @@ fn archiving_a_shared_thread_disconnects_its_collaborators(cx: &mut gpui::TestAp
     );
 
     let (host, collaborator) = (session.host.clone(), session.collaborator.clone());
+    // Archiving from the sidebar asks first, since it disconnects people.
+    session.cx.update(|window, cx| {
+        host.update(cx, |host, cx| {
+            host.request_archive_thread(host_thread_id, window, cx)
+        });
+        assert!(window.has_active_dialog(cx));
+        window.close_dialog(cx);
+    });
+    assert_eq!(
+        thread_ids(&session.host, session.cx).1,
+        Vec::<Uuid>::new(),
+        "cancelling keeps the thread"
+    );
     session.cx.update(|window, cx| {
         host.update(cx, |host, cx| {
             host.archive_thread(host_thread_id, window, cx)
@@ -377,7 +390,15 @@ fn archived_threads_are_restored_or_deleted_from_the_archive(cx: &mut gpui::Test
         (vec![restored, open], vec![deleted])
     );
 
+    // Deleting for good asks first.
     click(selector("delete-thread", deleted), cx);
+    assert!(cx.update(|window, cx| window.has_active_dialog(cx)));
+    assert_eq!(
+        thread_ids(&cowork, cx),
+        (vec![restored, open], vec![deleted])
+    );
+    cx.simulate_keystrokes("enter");
+    draw(cx);
     assert_eq!(thread_ids(&cowork, cx), (vec![restored, open], vec![]));
     assert!(
         cx.debug_bounds(selector("archived-thread", deleted))

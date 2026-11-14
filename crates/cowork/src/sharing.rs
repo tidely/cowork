@@ -610,8 +610,7 @@ impl Cowork {
     }
 
     pub(crate) fn open_join_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let endpoint_token =
-            cx.new(|cx| InputState::new(window, cx).placeholder("Paste endpoint token"));
+        let endpoint_token = cx.new(|cx| InputState::new(window, cx).placeholder("Paste the link"));
         let join_dialog = cx.new(|_| JoinDialog {
             endpoint_token: endpoint_token.clone(),
             status: JoinStatus::Idle,
@@ -665,10 +664,10 @@ impl Cowork {
                     content
                         .child(
                             DialogHeader::new()
-                                .child(DialogTitle::new().child("Join shared thread"))
+                                .child(DialogTitle::new().child("Join shared chat"))
                                 .child(
                                     DialogDescription::new()
-                                        .child("Paste the endpoint token shared with you."),
+                                        .child("Paste the link the host copied for you."),
                                 ),
                         )
                         .child(
@@ -705,7 +704,7 @@ impl Cowork {
                                 .child(
                                     Button::new("confirm-join")
                                         .primary()
-                                        .label(if joining { "Joining…" } else { "Join thread" })
+                                        .label(if joining { "Joining…" } else { "Join chat" })
                                         .loading(joining)
                                         .disabled(!has_endpoint_id_length)
                                         .on_click({
@@ -759,7 +758,9 @@ impl Cowork {
             Ok(endpoint_id) => endpoint_id,
             Err(_) => {
                 dialog.update(cx, |dialog, _| {
-                    dialog.status = JoinStatus::Failed("Enter a valid endpoint token.".into());
+                    dialog.status = JoinStatus::Failed(
+                        "That isn't a valid chat link. Ask the host to copy it again.".into(),
+                    );
                 });
                 cx.notify();
                 return;

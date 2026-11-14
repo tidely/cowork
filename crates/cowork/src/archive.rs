@@ -15,7 +15,100 @@ use uuid::Uuid;
 
 use crate::{Cowork, MainStage, thread::Thread};
 
+/// Asks before something that can't be undone, or that ends what others
+/// are doing, with the action's own name on its button.
+pub(crate) fn confirm_destructive(
+    title: impl Into<SharedString>,
+    description: impl Into<SharedString>,
+    action: &'static str,
+    window: &mut Window,
+    cx: &mut App,
+    on_confirm: impl Fn(&mut Window, &mut App) + 'static,
+) {
+    let title = title.into();
+    let description = description.into();
+    let on_confirm = std::rc::Rc::new(on_confirm);
+    window.open_alert_dialog(cx, move |alert, _, _| {
+        let on_confirm = on_confirm.clone();
+        alert
+            .title(title.clone())
+            .description(description.clone())
+            .ok_text(action)
+            .ok_variant(ButtonVariant::Danger)
+            .show_cancel(true)
+            .on_ok(move |_, window, cx| {
+                on_confirm(window, cx);
+                true
+            })
+    });
+}
+
 impl Cowork {
+    /// Archives one of the user's own chats from the sidebar, first asking
+    /// when that would disconnect collaborators or stop a run, since
+    /// restoring brings back neither.
+    pub(crate) fn request_archive_thread(
+        &mut self,
+        thread_id: Uuid,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+            return;
+        };
+        let (peers, running, title) = {
+            let thread = thread.read(cx);
+            let peers = thread
+                .participants()
+                .iter()
+                .filter(|participant| **participant != thread.participant_id())
+                .count();
+            (
+                peers,
+                thread.is_generating(),
+                self.shown_title(thread_id, cx),
+            )
+        };
+        let consequence = match (peers, running) {
+            (0, false) => {
+                self.archive_thread(thread_id, window, cx);
+                return;
+            }
+            (0, true) => "Archiving stops the current run.".to_owned(),
+            (1, false) => "Archiving stops sharing with 1 person.".to_owned(),
+            (peers, false) => format!("Archiving stops sharing with {peers} people."),
+            (1, true) => {
+                "Archiving stops sharing with 1 person and stops the current run.".to_owned()
+            }
+            (peers, true) => {
+                format!("Archiving stops sharing with {peers} people and stops the current run.")
+            }
+        };
+        let cowork = cx.entity().downgrade();
+        confirm_destructive(
+            format!("Archive “{title}”?"),
+            format!("{consequence} You can restore the chat from the archive."),
+            "Archive",
+            window,
+            cx,
+            move |window, cx| {
+                _ = cowork.update(cx, |cowork, cx| {
+                    cowork.archive_thread(thread_id, window, cx)
+                });
+            },
+        );
+    }
+
+    /// A chat's title as the sidebar and archive show it.
+    pub(crate) fn shown_title(&self, thread_id: Uuid, cx: &App) -> String {
+        let store = self.thread_store.read(cx);
+        store
+            .thread(thread_id, cx)
+            .or_else(|| store.archived_thread(thread_id, cx))
+            .map(|thread| thread.read(cx).summary.title.clone())
+            .unwrap_or_else(|| "this chat".to_owned())
+    }
+
     /// Moves one of the user's own threads to the archive, ending everything
     /// it was doing: its agent run, its sharing, and its sandbox. Joined
     /// threads belong to their host, so they can't be archived.
@@ -143,7 +236,20 @@ impl Cowork {
             .map(|task| (task.id, task.settings().title.clone()))
             .collect();
         if continuing.is_empty() {
-            self.delete_archived_thread(thread_id, cx);
+            let title = self.shown_title(thread_id, cx);
+            let cowork = cx.entity().downgrade();
+            confirm_destructive(
+                format!("Delete “{title}”?"),
+                "The chat and its files will be deleted. This can't be undone.",
+                "Delete",
+                window,
+                cx,
+                move |_, cx| {
+                    _ = cowork.update(cx, |cowork, cx| {
+                        cowork.delete_archived_thread(thread_id, cx)
+                    });
+                },
+            );
             return;
         }
         let names = continuing
@@ -154,16 +260,16 @@ impl Cowork {
         let (description, delete_tasks) = if continuing.len() == 1 {
             (
                 format!(
-                    "The scheduled task {names} continues this thread. Its next run will start a new thread."
+                    "The scheduled task {names} continues this chat. Its next run will start a new chat. This can't be undone."
                 ),
-                "Delete Thread and Schedule",
+                "Delete chat and schedule",
             )
         } else {
             (
                 format!(
-                    "The scheduled tasks {names} continue this thread. Their next runs will start a new thread."
+                    "The scheduled tasks {names} continue this chat. Their next runs will start a new chat. This can't be undone."
                 ),
-                "Delete Thread and Schedules",
+                "Delete chat and schedules",
             )
         };
         let task_ids: Vec<Uuid> = continuing.into_iter().map(|(task_id, _)| task_id).collect();
@@ -184,7 +290,7 @@ impl Cowork {
                         .child(
                             DialogHeader::new()
                                 .child(
-                                    DialogTitle::new().child("Delete a thread used by a schedule?"),
+                                    DialogTitle::new().child("Delete a chat used by a schedule?"),
                                 )
                                 .child(DialogDescription::new().child(description.clone())),
                         )
@@ -214,7 +320,7 @@ impl Cowork {
                                 .child(
                                     Button::new("delete-thread-only")
                                         .danger()
-                                        .label("Delete Thread")
+                                        .label("Delete chat")
                                         .debug_selector(|| "delete-thread-only".to_owned())
                                         .on_click(move |_, window, cx| {
                                             _ = delete_thread.update(cx, |cowork, cx| {
@@ -241,8 +347,8 @@ impl Cowork {
             return;
         }
         let mut description = match thread_ids.len() {
-            1 => "The archived thread will be deleted. This can't be undone.".to_owned(),
-            count => format!("All {count} archived threads will be deleted. This can't be undone."),
+            1 => "The archived chat will be deleted. This can't be undone.".to_owned(),
+            count => format!("All {count} archived chats will be deleted. This can't be undone."),
         };
         let continued = thread_ids
             .iter()
@@ -251,10 +357,10 @@ impl Cowork {
         match continued {
             0 => {}
             1 => description.push_str(
-                " A scheduled task continues one of them; its next run will start a new thread.",
+                " A scheduled task continues one of them; its next run will start a new chat.",
             ),
             count => description.push_str(&format!(
-                " {count} scheduled tasks continue them; their next runs will start new threads."
+                " {count} scheduled tasks continue them; their next runs will start new chats."
             )),
         }
         let cowork = cx.entity().downgrade();
@@ -262,9 +368,9 @@ impl Cowork {
             let cowork = cowork.clone();
             let thread_ids = thread_ids.clone();
             alert
-                .title("Delete all archived threads?")
+                .title("Delete all archived chats?")
                 .description(description.clone())
-                .ok_text("Delete All")
+                .ok_text("Delete all")
                 .ok_variant(ButtonVariant::Danger)
                 .show_cancel(true)
                 .on_ok(move |_, _, cx| {
@@ -317,8 +423,8 @@ impl Cowork {
         let empty = archived.is_empty();
         let count = match archived.len() {
             0 => "Nothing archived".to_owned(),
-            1 => "1 thread".to_owned(),
-            count => format!("{count} threads"),
+            1 => "1 chat".to_owned(),
+            count => format!("{count} chats"),
         };
 
         let header = h_flex()
@@ -335,7 +441,7 @@ impl Cowork {
                             .text_size(px(20.))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(cx.theme().secondary_foreground)
-                            .child("Archived threads"),
+                            .child("Archived chats"),
                     )
                     .child(
                         div()
@@ -383,11 +489,11 @@ impl Cowork {
                     .gap_2()
                     .text_color(cx.theme().muted_foreground)
                     .child(Icon::new(AssetIconName::Archive).size_8())
-                    .child(div().text_sm().child("No archived threads"))
+                    .child(div().text_sm().child("No archived chats"))
                     .child(
                         div()
                             .text_xs()
-                            .child("Threads you archive from the sidebar show up here."),
+                            .child("Chats you archive from the sidebar show up here."),
                     )
                     .into_any_element()
             } else {

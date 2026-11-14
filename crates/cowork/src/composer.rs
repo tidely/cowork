@@ -316,7 +316,7 @@ impl Cowork {
             .child(
                 Combobox::new(&self.model_picker)
                     .disabled(!can_change_model)
-                    .search_placeholder("Search models...")
+                    .search_placeholder("Search models…")
                     .menu_width(px(360.))
                     .menu_max_h(rems(24.))
                     .appearance(false)
@@ -326,7 +326,7 @@ impl Cowork {
                         let selected_model = trigger.selection().first().map(|(_, model)| model);
                         let title = selected_model
                             .map(LanguageModel::title)
-                            .unwrap_or_else(|| "Select a model...".into());
+                            .unwrap_or_else(|| "Select a model…".into());
                         let provider = selected_model.map(|model| model.model.provider);
                         let unavailable = selected_model.is_some_and(|model| !model.available);
 
@@ -341,6 +341,9 @@ impl Cowork {
                                 .flex_none()
                                 .px_1p5()
                                 .when(unavailable, |this| this.tooltip(UNAVAILABLE_MODEL_TOOLTIP))
+                                .when(!can_change_model, |this| {
+                                    this.tooltip("Only people who can run can change the model")
+                                })
                                 .when_some(provider, |this, provider| {
                                     this.child(
                                         provider

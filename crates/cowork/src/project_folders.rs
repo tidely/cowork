@@ -224,7 +224,7 @@ impl ProjectFolders {
                         .on_click(move |_, window, cx| open(&open_path, window, cx)),
                 )
                 .item(
-                    PopupMenuItem::new("Remove Project")
+                    PopupMenuItem::new("Remove from chat")
                         .icon(IconName::Trash)
                         .on_click(move |_, window, cx| remove(&remove_path, window, cx)),
                 )

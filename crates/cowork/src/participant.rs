@@ -30,10 +30,11 @@ const ANIMALS: [&str; 64] = [
     "Walrus", "Weasel", "Wolf", "Wren", "Yak",
 ];
 
-/// Avatar backgrounds that stay legible behind light text on the dark theme.
+/// Identity colors, behind white initials and cursor name tags: each one
+/// reaches the 4.5:1 contrast small text needs against white.
 const COLORS: [u32; 12] = [
-    0xe26d5a, 0xd9822b, 0xc9a227, 0x7fa83a, 0x3fa66b, 0x2f9e9e, 0x3a8dde, 0x5b6ee1, 0x8a63d2,
-    0xb45cc6, 0xd45a97, 0x8c7a6b,
+    0xd43e25, 0xa9631e, 0x8d721b, 0x5f7e2c, 0x328354, 0x268181, 0x2276c9, 0x576ae0, 0x865dd0,
+    0xac4bc0, 0xcc3c84, 0x837264,
 ];
 
 impl ParticipantId {
@@ -102,6 +103,28 @@ fn splitmix64(mut value: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WCAG 2's contrast of an sRGB color against white.
+    fn contrast_with_white(color: u32) -> f64 {
+        let channel = |shift: u32| {
+            let value = f64::from((color >> shift) & 0xff) / 255.;
+            if value <= 0.03928 {
+                value / 12.92
+            } else {
+                ((value + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        let luminance = 0.2126 * channel(16) + 0.7152 * channel(8) + 0.0722 * channel(0);
+        1.05 / (luminance + 0.05)
+    }
+
+    #[test]
+    fn identity_colors_keep_white_text_legible() {
+        for color in COLORS {
+            let contrast = contrast_with_white(color);
+            assert!(contrast >= 4.5, "{color:06x} is {contrast:.2}:1");
+        }
+    }
 
     #[test]
     fn names_and_colors_are_derived_deterministically() {

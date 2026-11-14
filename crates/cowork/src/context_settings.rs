@@ -8,9 +8,10 @@ use gpui::{
 };
 use gpui_base::input::{InputEvent, InputState};
 use gpui_component::{
-    ActiveTheme as _, Disableable as _, Sizable as _, button::Button, input::Input,
+    ActiveTheme as _, Disableable as _, Icon, Sizable as _, button::Button, input::Input,
     progress::ProgressCircle,
 };
+use gpui_kit_assets::IconName;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -292,7 +293,8 @@ pub(crate) fn controls<T: 'static>(
                 .gap_2()
                 .child(
                     Button::new((key, 0usize))
-                        .label("−")
+                        .icon(Icon::new(IconName::Minus))
+                        .accessibility_label("Decrease")
                         .small()
                         .outline()
                         .disabled(disabled_down)
@@ -301,7 +303,8 @@ pub(crate) fn controls<T: 'static>(
                 .child(div().min_w(px(92.)).text_center().text_sm().child(value))
                 .child(
                     Button::new((key, 1usize))
-                        .label("+")
+                        .icon(Icon::new(IconName::Plus))
+                        .accessibility_label("Increase")
                         .small()
                         .outline()
                         .disabled(disabled_up)

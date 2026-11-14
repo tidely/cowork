@@ -275,8 +275,8 @@ pub(crate) enum ThreadMode {
 impl ThreadMode {
     pub(crate) fn label(self) -> &'static str {
         match self {
-            Self::NewEachRun => "New thread each run",
-            Self::ContinueLast => "Continues one thread",
+            Self::NewEachRun => "New chat each run",
+            Self::ContinueLast => "Continues one chat",
         }
     }
 }

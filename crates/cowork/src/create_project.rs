@@ -257,6 +257,9 @@ impl Render for CreateProjectDialog {
                             .primary()
                             .label("Create project")
                             .disabled(!can_create)
+                            .when(!can_create, |this| {
+                                this.tooltip("Name the project to create it")
+                            })
                             .debug_selector(|| "create-project".to_owned())
                             .on_click(cx.listener(|this, _, window, cx| this.create(window, cx))),
                     ),

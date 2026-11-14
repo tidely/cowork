@@ -598,10 +598,10 @@ impl Cowork {
     ) -> Result<Uuid, String> {
         let state = thread.read(cx);
         if !state.is_host() {
-            return Err("Only your own threads can be continued.".into());
+            return Err("Only your own chats can be continued.".into());
         }
         if state.is_generating() {
-            return Err("The thread was already running.".into());
+            return Err("The chat was already running.".into());
         }
         if state.model() != Some(model) {
             // Ignored when the catalog lacks the model, which is caught below.
@@ -655,7 +655,7 @@ impl Cowork {
                 },
                 cx,
             )
-            .ok_or("The thread is gone.")?;
+            .ok_or("The chat is gone.")?;
         self.thread_updated(thread_id, cx);
         Ok(message_id)
     }

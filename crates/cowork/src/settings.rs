@@ -46,7 +46,7 @@ impl SettingsPage {
             SettingsPage::Profile => "Profile",
             SettingsPage::Providers => "Providers",
             SettingsPage::Context => "Context",
-            SettingsPage::Archive => "Archived threads",
+            SettingsPage::Archive => "Archived chats",
         }
     }
 

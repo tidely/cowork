@@ -253,9 +253,9 @@ then-current default. Profiles and creators do not grant authority.
 `peer_access.rs` renders a nonmodal `gpui_component::Popover`, approximately
 300 px wide, below the right-aligned titlebar gateway beside the participant avatars.
 The 28 px button sits in the existing 40 px header; there is no extra access bar.
-The host's menu, following Apple's sharing popover, opens with a **Share thread**
+The host's menu, following Apple's sharing popover, opens with a **Share chat**
 header whose switch shows and changes whether the thread is shared, with a line
-saying what that means ("Only you can see this thread.", "Anyone with the link
+saying what that means ("Only you can see this chat.", "Anyone with the link
 can join.", or that sharing failed). Turning the switch on or off starts, retries,
 or stops sharing and keeps the menu open; the switch is disabled while the link
 is being created. While sharing, **Copy link** is the menu's one primary button,

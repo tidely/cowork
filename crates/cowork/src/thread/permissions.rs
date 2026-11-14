@@ -60,7 +60,7 @@ impl PeerMode {
 
     pub(crate) const fn description(self) -> &'static str {
         match self {
-            Self::ReadOnly => "Follow the thread as it happens",
+            Self::ReadOnly => "Follow the chat as it happens",
             Self::Write => "Also edit the draft and attachments",
             Self::Admin => "Also submit, stop, and change models",
         }

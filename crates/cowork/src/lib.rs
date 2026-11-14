@@ -115,7 +115,12 @@ actions!(
         SubmitComposer,
         QueueComposer,
         StopGeneration,
-        OpenSearchPalette
+        OpenSearchPalette,
+        NewChat,
+        OpenSettings,
+        JoinSharedThread,
+        OpenScheduled,
+        ArchiveChat
     ]
 );
 
@@ -276,7 +281,7 @@ impl Cowork {
         cx: &mut App,
     ) -> Entity<Thread> {
         Self::new_local_thread(
-            "New thread".into(),
+            "New chat".into(),
             Vec::new(),
             draft,
             participant_id,
@@ -460,7 +465,7 @@ impl Cowork {
                         .justify_center()
                         .text_xs()
                         .text_color(cx.theme().muted_foreground.opacity(0.7))
-                        .child("Read-only thread")
+                        .child("Read-only chat")
                         .child(
                             canvas(
                                 move |bounds, _, _| {
@@ -604,6 +609,21 @@ impl Render for Cowork {
             .on_action(cx.listener(|this, _: &OpenSearchPalette, window, cx| {
                 this.open_search_palette(window, cx);
             }))
+            .on_action(cx.listener(|this, _: &NewChat, window, cx| this.start_new_chat(window, cx)))
+            .on_action(cx.listener(|this, _: &OpenSettings, window, cx| {
+                this.open_settings(SettingsPage::Profile, window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &JoinSharedThread, window, cx| {
+                this.open_join_dialog(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &OpenScheduled, window, cx| {
+                this.open_schedules(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ArchiveChat, window, cx| {
+                if let Some(thread_id) = this.active_thread_id {
+                    this.request_archive_thread(thread_id, window, cx);
+                }
+            }))
             .on_key_down(cx.listener(Self::begin_inline_comment))
             // Run before the focused editor's own handling, which they
             // extend to the composer as a whole.
@@ -715,6 +735,55 @@ fn bind_app_keys(cx: &mut App) {
             OpenSearchPalette,
             None,
         ),
+        KeyBinding::new(
+            cfg_select! {
+                target_os = "macos" => "cmd-n",
+                _ => "ctrl-n",
+            },
+            NewChat,
+            None,
+        ),
+        KeyBinding::new(
+            cfg_select! {
+                target_os = "macos" => "cmd-,",
+                _ => "ctrl-,",
+            },
+            OpenSettings,
+            None,
+        ),
+        KeyBinding::new(
+            cfg_select! {
+                target_os = "macos" => "cmd-shift-a",
+                _ => "ctrl-shift-a",
+            },
+            ArchiveChat,
+            None,
+        ),
+    ]);
+    // Every command is in the menu bar, as macOS expects, showing its
+    // shortcut. Elsewhere the sidebar and the shortcuts reach them.
+    #[cfg(target_os = "macos")]
+    cx.set_menus([
+        gpui::Menu::new("Cowork").items([
+            gpui::MenuItem::action("Settings…", OpenSettings),
+            gpui::MenuItem::separator(),
+            gpui::MenuItem::action("Quit Cowork", Quit),
+        ]),
+        gpui::Menu::new("File").items([
+            gpui::MenuItem::action("New Chat", NewChat),
+            gpui::MenuItem::action("Join Shared Chat…", JoinSharedThread),
+            gpui::MenuItem::separator(),
+            gpui::MenuItem::action("Archive Chat", ArchiveChat),
+        ]),
+        gpui::Menu::new("Chat").items([
+            gpui::MenuItem::action("Send", SubmitComposer),
+            gpui::MenuItem::action("Queue", QueueComposer),
+            gpui::MenuItem::action("Stop", StopGeneration),
+        ]),
+        gpui::Menu::new("Go").items([
+            gpui::MenuItem::action("Search Chats…", OpenSearchPalette),
+            gpui::MenuItem::action("Scheduled", OpenScheduled),
+        ]),
     ]);
 }
 

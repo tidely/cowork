@@ -3,9 +3,10 @@
 
 use gpui::{AnyElement, App, Context, IntoElement, canvas, div, prelude::*, px, size};
 use gpui_component::{
-    ActiveTheme as _, Sizable as _,
+    ActiveTheme as _, Icon, Sizable as _,
     button::{Button, ButtonVariants as _},
 };
+use gpui_kit_assets::IconName as AssetIconName;
 use uuid::Uuid;
 
 use crate::{Cowork, composer_attachments::AttachmentCard};
@@ -75,7 +76,7 @@ impl Cowork {
                             Button::new(format!("cancel-pending-{pending_id}"))
                                 .ghost()
                                 .small()
-                                .label("×")
+                                .icon(Icon::new(AssetIconName::X).size_3p5())
                                 .debug_selector(move || format!("cancel-pending-{pending_id}"))
                                 .text_color(cx.theme().muted_foreground)
                                 .accessibility_label("Cancel pending message")
