@@ -229,7 +229,7 @@ impl RenderOnce for ToolCallCard {
                     .flex_none()
                     .gap_1()
                     .child(
-                        Button::new(SharedString::from(deny.clone()))
+                        Button::new(SharedString::from(&deny))
                             .debug_selector(move || deny.clone())
                             .ghost()
                             .xsmall()
@@ -237,7 +237,7 @@ impl RenderOnce for ToolCallCard {
                             .on_click(move |event, window, cx| on_deny(event, window, cx)),
                     )
                     .child(
-                        Button::new(SharedString::from(allow.clone()))
+                        Button::new(SharedString::from(&allow))
                             .debug_selector(move || allow.clone())
                             .primary()
                             .xsmall()
@@ -346,7 +346,7 @@ fn access_badge(id: &SharedString, shown: &ExtraAccess, cx: &App) -> AnyElement 
     let selector = format!("{id}-access");
     let tooltip = SharedString::from(format!("{} {} access", shown.tooltip, shown.access.label()));
     h_flex()
-        .id(SharedString::from(selector.clone()))
+        .id(SharedString::from(&selector))
         .debug_selector(move || selector.clone())
         .flex_none()
         .gap_1()

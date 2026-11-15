@@ -121,7 +121,7 @@ mod tests {
                 attachments: Vec::new(),
             },
         ];
-        let names = HashMap::from([(bob, SharedString::from("Bob"))]);
+        let names = HashMap::from([(bob, SharedString::new_static("Bob"))]);
         let content = agent_message(Some("Comments first."), &blocks, &files, &names);
         let texts = content
             .iter()

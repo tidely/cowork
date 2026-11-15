@@ -495,7 +495,7 @@ mod tests {
             .filter_map(|(title, texts)| {
                 query.row(
                     PaletteTarget::Chat(Uuid::new_v4()),
-                    SharedString::from(title.to_string()),
+                    SharedString::from(*title),
                     None,
                     texts.iter().copied(),
                 )

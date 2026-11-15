@@ -183,7 +183,7 @@ impl Cowork {
         let selector = format!("project-mode-{}", option.key());
         let warning_selector = format!("{selector}-warning");
         h_flex()
-            .id(SharedString::from(selector.clone()))
+            .id(SharedString::from(&selector))
             .debug_selector(move || selector.clone())
             .flex_1()
             .gap_2()

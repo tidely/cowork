@@ -364,7 +364,7 @@ impl ProjectRow {
         let on_menu_open_change = self.on_menu_open_change;
         let menu_selector = format!("project-menu-{id}");
         let menu = row_button(
-            SharedString::from(menu_selector.clone()),
+            SharedString::from(&menu_selector),
             menu_selector,
             AssetIconName::Ellipsis,
             "Project options",

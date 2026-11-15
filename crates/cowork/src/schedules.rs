@@ -128,7 +128,7 @@ impl Cowork {
                         provider,
                         id: id.clone(),
                     };
-                    (model, SharedString::from(info.name.clone()))
+                    (model, SharedString::from(&info.name))
                 })
             })
             .collect();

@@ -41,7 +41,7 @@ impl Cowork {
                 ..Default::default()
             });
             if !text.is_empty() {
-                editor.set_value(SharedString::from(text.to_owned()), window, cx);
+                editor.set_value(SharedString::from(text), window, cx);
                 editor.set_selected_range(text.len()..text.len(), cx);
             }
             editor
@@ -256,7 +256,7 @@ impl Cowork {
         // Replacing the value also clears the editor's undo history, which
         // keeps undo from reverting anyone else's edits.
         editor.update(cx, |editor, cx| {
-            editor.set_value(SharedString::from(text.to_owned()), window, cx);
+            editor.set_value(SharedString::from(text), window, cx);
             editor.set_selected_range(selection, cx);
         });
         true

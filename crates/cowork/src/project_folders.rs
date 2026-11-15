@@ -186,7 +186,7 @@ impl ProjectFolders {
         let folder_id = format!("{id}-folder-{ix}");
         let (Some(actions), Some(path)) = (actions, folder.path) else {
             return h_flex()
-                .id(SharedString::from(folder_id.clone()))
+                .id(SharedString::from(&folder_id))
                 .debug_selector(move || folder_id.clone())
                 .min_w_0()
                 .gap_1p5()
@@ -206,7 +206,7 @@ impl ProjectFolders {
         let on_open = actions.on_open.clone();
         let on_remove = actions.on_remove.clone();
         let path = Rc::new(path);
-        Button::new(SharedString::from(folder_id.clone()))
+        Button::new(SharedString::from(&folder_id))
             .debug_selector(move || folder_id.clone())
             .icon(Icon::new(IconName::Folder))
             .label(folder.name)
@@ -245,7 +245,7 @@ impl RenderOnce for ProjectFolders {
         let add = self.actions.map(|actions| {
             let on_add = actions.on_add;
             let add_id = format!("{id}-add");
-            Button::new(SharedString::from(add_id.clone()))
+            Button::new(SharedString::from(&add_id))
                 .debug_selector(move || add_id.clone())
                 .icon(Icon::new(IconName::FolderPlus))
                 .ghost()

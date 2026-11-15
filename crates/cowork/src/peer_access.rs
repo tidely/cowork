@@ -610,7 +610,7 @@ fn menu_open(
 /// at the right edge.
 fn mode_menu(key: &str, label: AnyElement) -> Button {
     let selector = format!("{key}-mode-menu");
-    Button::new(SharedString::from(selector.clone()))
+    Button::new(SharedString::from(&selector))
         .debug_selector(move || selector.clone())
         .ghost()
         .small()
@@ -785,7 +785,7 @@ mod tests {
         Person {
             id: ParticipantId::new(),
             profile: name.map(|name| Profile {
-                name: Some(SharedString::from(name.to_owned())),
+                name: Some(SharedString::from(name)),
                 ..Default::default()
             }),
         }

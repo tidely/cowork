@@ -69,7 +69,7 @@ fn preview_person(name: Option<&str>) -> Person {
     Person {
         id: ParticipantId::new(),
         profile: name.map(|name| Profile {
-            name: Some(SharedString::from(name.to_owned())),
+            name: Some(SharedString::from(name)),
             ..Default::default()
         }),
     }

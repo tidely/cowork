@@ -1140,7 +1140,7 @@ mod tests {
         thread.profiles.insert(
             ParticipantId::new(),
             Profile {
-                name: Some(SharedString::from("Ada")),
+                name: Some(SharedString::new_static("Ada")),
                 ..Profile::default()
             },
         );
