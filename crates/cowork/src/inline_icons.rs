@@ -40,7 +40,7 @@ impl MarkdownPlugin for InlineIcons {
             return None;
         };
         let icon = icon_named(image.url.strip_prefix("icon:")?)?;
-        Some(MarkdownNode::new(NODE, icon).accessibility_label(image.alt.clone()))
+        Some(MarkdownNode::new(NODE, icon).accessibility_label(&image.alt))
     }
 
     fn render_inline(

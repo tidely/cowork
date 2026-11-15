@@ -255,7 +255,7 @@ fn excerpt(text: &str, matched: Range<usize>) -> Excerpt {
         text: if end < text.len() {
             format!("{excerpt}…").into()
         } else {
-            excerpt.to_owned().into()
+            SharedString::from(excerpt)
         },
         matched: matched_start..matched_end,
     }

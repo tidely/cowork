@@ -156,7 +156,7 @@ pub(crate) fn language_model_groups(
         let group = groups.entry(provider).or_default();
         let start = group.len();
         group.extend(models.iter().map(|(id, info)| LanguageModel {
-            name: info.name.clone().into(),
+            name: SharedString::from(&info.name),
             model: ModelRef {
                 provider,
                 id: id.clone(),

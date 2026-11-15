@@ -517,7 +517,7 @@ impl Cowork {
         }
         self.set_profile(
             Profile {
-                name: Some(value.trim().to_owned().into()),
+                name: Some(SharedString::from(value.trim())),
                 ..self.profile.clone()
             },
             cx,
