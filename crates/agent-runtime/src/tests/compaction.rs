@@ -284,7 +284,10 @@ async fn manual_compaction_failures_preserve_context_and_do_not_fail_the_session
         let commands = harness.handle.clone();
         let compact = tokio::spawn(async move {
             commands
-                .send(Request::new("human".into(), RequestKind::Compact))
+                .send(Request::new(
+                    "human".into(),
+                    RequestKind::Compact { run: None },
+                ))
                 .await
         });
         let request = recv(&mut requests).await;
@@ -320,6 +323,48 @@ async fn manual_compaction_failures_preserve_context_and_do_not_fail_the_session
         assert_eq!(result.conversation.model_messages(), initial);
         assert!(result.conversation.compactions().is_empty());
     }
+}
+
+/// A request for a run's compaction can be read only once that run is over:
+/// an owner posting it from the run's events races the run failing. Compacting
+/// then, outside any run, would change the context unseen by an owner that
+/// follows runs.
+#[tokio::test]
+async fn a_compaction_requested_for_an_ended_run_is_refused() {
+    let Fixture {
+        session,
+        handle,
+        mut requests,
+        ..
+    } = seeded(false);
+    let mut harness = Harness::start(session, handle);
+    harness.submit("new request", Delivery::Queue).await;
+    let run = harness.run().await;
+    respond(recv(&mut requests).await, text("answer"));
+    harness
+        .event(|kind| matches!(kind, EventKind::RunFinished { .. }))
+        .await;
+    let answer = tokio::time::timeout(
+        WAIT,
+        harness.request(RequestKind::Compact { run: Some(run) }),
+    )
+    .await
+    .expect("refused without sampling a summary");
+    assert!(matches!(
+        answer,
+        Err(RequestError::Compaction(CompactionError::Cancelled))
+    ));
+    assert_eq!(harness.handle.snapshot().await.unwrap().phase, Phase::Idle);
+    let (result, events) = harness.finish().await;
+    assert!(requests.try_recv().is_err(), "no summary was sampled");
+    assert!(result.conversation.compactions().is_empty());
+    assert_eq!(
+        count(&events, |kind| matches!(
+            kind,
+            EventKind::CompactionStarted { .. }
+        )),
+        0
+    );
 }
 
 #[tokio::test]

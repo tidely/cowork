@@ -213,9 +213,14 @@ fn start_session(
         .with_section(EnvironmentSection)
         .with_conversation(conversation, 0)?;
     let requests = handle.clone();
-    let request_compaction = move |host: &CoworkHost| {
+    // Scoped to the run asking, so a request the session reads only after
+    // that run ended is refused instead of compacting outside any run.
+    let request_compaction = move |host: &CoworkHost, run: RunId| {
         if !host.compaction.requested.swap(true, Ordering::AcqRel) {
-            _ = requests.post(Request::new(RunSource::Host, RequestKind::Compact));
+            _ = requests.post(Request::new(
+                RunSource::Host,
+                RequestKind::Compact { run: Some(run) },
+            ));
         }
     };
     tokio.spawn(session.run(move |event| {
@@ -223,14 +228,18 @@ fn start_session(
         match &event.kind {
             EventKind::RunStarted => {
                 host.run_started();
-                if compaction.at_start.swap(false, Ordering::AcqRel) {
-                    request_compaction(&host);
+                if compaction.at_start.swap(false, Ordering::AcqRel)
+                    && let Some(run) = event.run
+                {
+                    request_compaction(&host, run);
                 }
             }
             EventKind::UsageReported(usage)
                 if usage_tokens(usage) >= compaction.threshold.load(Ordering::Acquire) =>
             {
-                request_compaction(&host);
+                if let Some(run) = event.run {
+                    request_compaction(&host, run);
+                }
             }
             EventKind::Compacted(_) | EventKind::CompactionFailed(_) => {
                 compaction.requested.store(false, Ordering::Release);

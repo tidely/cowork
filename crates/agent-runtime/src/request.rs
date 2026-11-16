@@ -62,8 +62,13 @@ pub enum RequestKind<H: AgentHost> {
         run: RunId,
     },
     Resume,
-    /// Compact at the next safe boundary, including while idle.
-    Compact,
+    /// Compact at the next safe boundary. With `run`, only during that run:
+    /// a request read after it ended is refused rather than compacting while
+    /// idle, as an owner that asks from the run's events can't know whether
+    /// the run ends first. Without, including while idle.
+    Compact {
+        run: Option<RunId>,
+    },
     /// Stop the active run and accept no more requests.
     Shutdown,
 
