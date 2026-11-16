@@ -24,7 +24,6 @@ use crate::{
     usage::TokenActivity,
 };
 
-/// A fresh folder for Cowork's files, removed when dropped.
 struct Root(PathBuf);
 
 impl Root {
@@ -39,7 +38,6 @@ impl Drop for Root {
     }
 }
 
-/// A runtime that drives the writer while the test blocks on it.
 fn runtime() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
@@ -48,7 +46,6 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("test runtime")
 }
 
-/// The database and the chats it lists.
 fn open(root: &Root, runtime: &tokio::runtime::Runtime) -> (ChatDb, Vec<ListedRow>) {
     let (db, saved) = ChatDb::open(root.0.clone(), runtime.handle()).unwrap();
     (db, saved.chats)
@@ -62,7 +59,6 @@ fn flush(db: &ChatDb) {
     futures::executor::block_on(db.flush());
 }
 
-/// Loads `id` as opening it would.
 fn load(db: &ChatDb, id: Uuid, cx: &mut gpui::App) -> Thread {
     let meta = ChatMeta {
         id,
@@ -178,7 +174,6 @@ fn thread_with_history(
     (thread, records.into_iter().next().unwrap())
 }
 
-/// Adds a run stopped partway through its reply.
 fn add_stopped_run(thread: &mut Thread, host: &mut ScriptedHost, cx: &mut gpui::App) {
     let run = Uuid::new_v4();
     let mut events = host.start(run, "Again");

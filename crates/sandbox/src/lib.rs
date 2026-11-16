@@ -4,17 +4,16 @@
 //! Every setting is in [`settings`]. In short: the user's own shell, tools,
 //! and environment; the thread's project folders at their real paths,
 //! read-only unless the project is writable (see [`Project`]); a scratch
-//! folder per thread; global reads except denied credentials; no network unless the command's
-//! [`Access`] is `Network`. A command the host granted more ([`grant`]) may
-//! also have more access to the project, and other host folders.
+//! folder per thread; global reads except denied credentials; no network unless
+//! the command's [`Access`] is `Network`. A command the host granted more
+//! ([`grant`]) may also have more access to the project, and other host folders.
 //!
 //! Each command is a sandbox of its own, made from the thread's project as
 //! it is when the command starts, so a thread's commands may run at the same
 //! time and a project change needs no restart. Nothing runs before the first
-//! command: the login shell environment is captured then, and the scratch
-//! folders are created as threads first need them. Each thread's scratch
-//! folder is in that thread's own folder, whose owner removes it with the
-//! thread.
+//! command: the login shell environment is captured then, and scratch folders
+//! are created as threads first need them. A thread's scratch folder lives in
+//! the thread's own folder, whose owner removes it with the thread.
 //!
 //! The file tools ([`files`]) reach the same folders from the host process
 //! itself, with every path they accept mapped in [`paths`].
@@ -240,7 +239,6 @@ impl Sandboxes {
         note
     }
 
-    /// The places `thread`'s file tools reach now; see [`paths`].
     pub(crate) fn places(&self, thread: &str) -> paths::Places {
         paths::Places::new(
             &self.project(thread),
@@ -317,7 +315,6 @@ impl Sandboxes {
         self.root.join(thread).join(settings::SCRATCH_DIR)
     }
 
-    /// Checks, once, that this computer has a sandbox.
     fn ready(&self) -> Result<(), SandboxError> {
         self.ready
             .get_or_init(|| {
@@ -350,7 +347,6 @@ fn resolved(path: &Path) -> Option<PathBuf> {
     Some(path)
 }
 
-/// The project's folders that exist, by name and resolved path.
 fn resolved_folders(project: &Project) -> Vec<(String, PathBuf)> {
     project
         .folders
@@ -519,7 +515,6 @@ fn system_read_paths() -> Result<Vec<PathBuf>, SandboxError> {
     Ok(vec![PathBuf::from("/")])
 }
 
-/// Runs `request` to its end, until `stopped`, or until its runtime expires.
 fn execute(
     request: ContainerRequest,
     stopped: &AtomicBool,
@@ -611,8 +606,6 @@ impl Output {
     }
 }
 
-/// Sandboxes under a fresh temporary root, with this process's environment,
-/// and the root's guard.
 #[cfg(test)]
 pub(crate) fn test_sandboxes() -> (Arc<Sandboxes>, TestRoot) {
     let root = TestRoot::new();
@@ -627,8 +620,7 @@ impl AsRef<ThreadSandbox> for ThreadSandbox {
     }
 }
 
-/// Prepares a call of `tool` with `arguments` in `sandbox`, as a session
-/// does before authorizing it: its arguments decoded and its needs known.
+/// Prepares a call as a session does before authorizing it.
 #[cfg(test)]
 pub(crate) fn prepare<T>(
     tool: T,
@@ -642,8 +634,7 @@ where
     agent::tool::ToolDyn::<ThreadSandbox, Needs>::prepare(Arc::new(tool), arguments, sandbox)
 }
 
-/// Runs a call of `tool` with `arguments` in `sandbox` as if the host
-/// allowed it, returning what the model reads.
+/// Runs a call as if the host allowed it, returning what the model reads.
 #[cfg(test)]
 pub(crate) async fn call<T>(
     tool: T,
@@ -672,7 +663,6 @@ where
         .collect())
 }
 
-/// A temporary folder removed on drop.
 #[cfg(test)]
 pub(crate) struct TestRoot(pub(crate) PathBuf);
 
@@ -701,9 +691,7 @@ impl Drop for TestRoot {
 mod tests {
     use super::*;
 
-    /// Exercise native denied-path enforcement with synthetic content even on
-    /// hosts without credential folders: content reads, directory entries,
-    /// file metadata (a known file's existence), and writes are protected.
+    /// Uses synthetic content so it runs on hosts without credential folders.
     /// Writes are checked on the real file: macOS refuses them, while Linux
     /// masks a denied folder with an empty tmpfs, where a write succeeds
     /// but is discarded with the command.
@@ -1052,8 +1040,6 @@ mod tests {
         assert!(!filesystem.readonly_paths.contains(&zed_path));
     }
 
-    /// Folders granted outside the project are added as asked, whatever
-    /// the project's own access.
     #[test]
     fn requests_add_the_folders_granted_outside_the_project() {
         let root = TestRoot::new();

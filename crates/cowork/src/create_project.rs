@@ -25,7 +25,6 @@ use crate::{
     projects::{add_folder_paths, project_name},
 };
 
-/// The dialog's form.
 pub(crate) struct CreateProjectDialog {
     cowork: WeakEntity<Cowork>,
     name: Entity<InputState>,
@@ -75,7 +74,6 @@ impl CreateProjectDialog {
         .detach();
     }
 
-    /// Adds folders chosen in the picker, skipping ones already chosen.
     pub(crate) fn add_folders(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
         if add_folder_paths(&mut self.folders, paths) {
             cx.notify();
@@ -89,7 +87,6 @@ impl CreateProjectDialog {
         }
     }
 
-    /// Creates the project and closes the dialog, unless the name is blank.
     fn create(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.name.read(cx).value();
         let folders = self.folders.clone();
@@ -110,7 +107,6 @@ impl CreateProjectDialog {
             .child(text)
     }
 
-    /// A large area inviting the first folders.
     fn render_empty_folders(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         v_flex()
@@ -144,7 +140,6 @@ impl CreateProjectDialog {
             .on_click(cx.listener(|this, _, window, cx| this.pick_folders(window, cx)))
     }
 
-    /// The chosen folders, each removable, then a row adding more.
     fn render_folder_list(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let rows = self.folders.iter().enumerate().map(|(index, path)| {

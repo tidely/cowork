@@ -51,7 +51,6 @@ pub fn run() -> anyhow::Result<()> {
 }
 
 struct SharePreview {
-    /// The popover's states, by column.
     implemented: Vec<SharingPanel>,
 }
 

@@ -1,6 +1,5 @@
-//! The Cowork app as a library, so that `src/main.rs` runs it with [`run`]
-//! and examples (`cargo run -p cowork --example component_preview`) can
-//! reach its components.
+//! The Cowork app as a library, so `src/main.rs` runs it with [`run`] and
+//! examples can reach its components.
 
 use std::{
     cell::Cell,
@@ -128,21 +127,17 @@ actions!(
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum MainStage {
-    /// Choosing a provider before the first chat.
     Welcome,
-    /// Choosing one of the provider's models before the first chat.
     ProviderSetup(models::ModelProvider),
     Thread,
     /// A settings page, with the sidebar showing settings; see `settings.rs`.
     Settings(SettingsPage),
-    /// The scheduled prompts.
     Schedules,
 }
 
 struct Cowork {
     sidebar_open: bool,
     recents_open: bool,
-    /// How many Recents rows the sidebar draws; see `sidebar.rs`.
     recents_shown: usize,
     new_thread_draft: ThreadDraft,
     attachment_errors: Vec<AttachmentError>,
@@ -151,12 +146,9 @@ struct Cowork {
     /// A pressed pointer can anchor a drag before GPUI reports a nonempty
     /// selection; see [`TimelinePress`].
     timeline_press: Option<TimelinePress>,
-    /// The measured heights of the active thread's timeline rows.
     timeline_layout: Rc<std::cell::RefCell<TimelineLayout>>,
-    /// The rows holding the ends of a selection in the timeline.
     timeline_selection: Rc<std::cell::RefCell<timeline_selection::TimelineSelection>>,
-    /// The conversation navigation rail's local state; see
-    /// `turn_navigation`.
+    /// The conversation navigation rail's local state.
     turn_rail: turn_navigation::TurnRail,
     /// Taken when someone presses on a user message, as agent text takes
     /// focus itself, so that Copy reaches the window's text selection
@@ -170,9 +162,7 @@ struct Cowork {
     render_generation: u64,
     copied_endpoint_id: Option<Uuid>,
     join_dialog: Option<Entity<JoinDialog>>,
-    /// Which page occupies the center stage.
     main_stage: MainStage,
-    /// Where "Back to app" returns to from settings.
     stage_before_settings: MainStage,
     /// The provider card selected on the welcome screen or the Providers
     /// settings page, to continue to its models.
@@ -180,12 +170,9 @@ struct Cowork {
     /// Looking for Ollama again while its setup step shows it isn't ready;
     /// see `Cowork::watch_ollama_setup`.
     ollama_watch: Option<gpui::Task<()>>,
-    /// The Ollama setup step's pull command was copied.
     copied_pull_command: bool,
-    /// Which step the Providers settings page shows.
     settings_provider_step: ProviderStep,
-    /// The connections to providers, with their API keys; see
-    /// `providers.rs`.
+    /// The connections to providers, with their API keys.
     providers: providers::Providers,
     /// The API key field of the provider whose models show, made when it
     /// first shows; see `provider_setup.rs`.
@@ -196,17 +183,14 @@ struct Cowork {
     /// start of every render; see [`Cowork::profiles_for`].
     shown_profiles: HashMap<ParticipantId, Profile>,
     profile_error: Option<SharedString>,
-    /// Watches the open profile name dialog's input.
     profile_name_subscription: Option<Subscription>,
     tokio_handle: tokio::runtime::Handle,
-    /// Where the agent's shell commands run and its file tools reach, with
-    /// each hosted thread's project and scratch folder.
+    /// Where the agent's commands run, with each hosted thread's project.
     sandboxes: Arc<sandbox::Sandboxes>,
     active_generations: HashMap<Uuid, ActiveGeneration>,
     /// The first chat's greeting while it streams in; see
     /// `thread/onboarding.rs`.
     onboarding_intro: Option<thread::OnboardingIntro>,
-    /// The agent session of each local or hosted thread that has run.
     agents: HashMap<Uuid, ThreadAgent>,
     /// What the profile's statistics still count of the user's deleted
     /// threads; the rest they count from the threads themselves. See
@@ -216,24 +200,18 @@ struct Cowork {
     profile_statistics: Option<statistics::ProfileStatistics>,
     /// What the search palette found in unloaded chats; see `search_palette.rs`.
     saved_chat_search: search_palette::SavedChatSearch,
-    /// Where the user's own threads, and the rest of what outlasts a
-    /// launch, are saved; `None` keeps them in memory, as in tests and
-    /// ephemeral launches. See `chat_db.rs`.
+    /// Where the user's own threads and other persistent state are saved;
+    /// `None` keeps them in memory, as in tests and ephemeral launches.
     chat_db: Option<chat_db::ChatDb>,
     /// The scheduled tasks, and the queue running them; see `scheduler.rs`.
     scheduler: scheduler::Scheduler,
-    /// The period the profile page's token activity chart shows.
     activity_range: ActivityRange,
-    /// Who the local user is in the threads this app creates and hosts.
     local_participant_id: ParticipantId,
-    /// The draft editor the user is typing in, so that when its item is
-    /// removed, by a submission or by someone else, the caret can move to
-    /// the draft position instead of vanishing.
+    /// The draft editor the user is typing in, so the caret can move to the
+    /// draft position when its item is removed instead of vanishing.
     typing_in: Option<(Uuid, EntityId, gpui::FocusHandle)>,
-    /// The presence last sent for each shared thread, by instance id.
     published_presence: HashMap<Uuid, protocol::Presence>,
     caret_label_refresh: Option<gpui::Task<()>>,
-    /// The next redraw of a running agent's "Working for" line.
     working_refresh: Option<gpui::Task<()>>,
     /// The model new threads start with: the last one selected locally,
     /// saved for the next launch; see [`Cowork::set_new_thread_model`].
@@ -244,17 +222,14 @@ struct Cowork {
     /// The mode chosen before the thread exists, which moves into it with
     /// the folders; see [`Thread::project_mode`].
     new_thread_project_mode: ProjectMode,
-    /// The sidebar project the thread about to be created is composed in,
-    /// which it is filed under when it is created; see
-    /// [`Cowork::compose_in_project`].
+    /// The sidebar project the thread about to be created is composed in; it
+    /// is filed under it on creation.
     new_thread_project: Option<projects::ProjectId>,
     /// The sidebar's projects; see `projects.rs`.
     projects: projects::Projects,
     /// Always shows the active thread's model; see [`Cowork::sync_model_picker`].
     model_picker: Entity<ModelPickerState>,
-    /// The models this app can run, as last discovered.
     models: Arc<ModelCatalog>,
-    /// The catalog and selection the picker's rows were built from.
     picker_rows: Option<(Arc<ModelCatalog>, Option<ModelRef>)>,
     _model_picker_subscription: Subscription,
     _window_activation_subscription: Subscription,
@@ -302,11 +277,9 @@ impl Cowork {
         )
     }
 
-    /// What a launch opens on, once the saved threads and settings are
-    /// loaded. Models are discovered either way, once the API keys are
-    /// read. A new user is onboarded (see `thread/onboarding.rs`); anyone
-    /// else gets a new chat, with the saved model or none yet, to pick in
-    /// the composer.
+    /// What a launch opens on, once saved threads and settings are loaded. A
+    /// new user is onboarded; anyone else gets a new chat with the saved model
+    /// or none yet. Models are discovered either way.
     fn open_start_stage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let discovered = self.start_providers(cx);
         if self.needs_onboarding(cx) {
@@ -397,7 +370,6 @@ impl Cowork {
             self.timeline_selection.borrow_mut().clear();
         }
         let comments = Rc::new(comments);
-        // Over the stage, beside the scrolling timeline rather than in it.
         let navigation = match &active_thread {
             Some((thread, thread_id)) => {
                 let turns = turn_navigation::conversation_turns(&thread.read(cx).timeline);
@@ -458,7 +430,6 @@ impl Cowork {
         let pending_rows = active_thread_id
             .map(|thread_id| self.render_pending_messages(thread_id, message_count, cx))
             .unwrap_or_default();
-        // What follows the rows in the scroll flow, laid out natively.
         let tail = div()
             .w_full()
             .flex()
@@ -798,8 +769,6 @@ fn bind_app_keys(cx: &mut App) {
     ]);
 }
 
-/// What every window of the app needs before it opens: components, the
-/// theme, and quitting with cmd-q on macOS.
 fn init_app(cx: &mut App) {
     gpui_component::init(cx);
     theme::init(cx);
@@ -810,7 +779,6 @@ fn init_app(cx: &mut App) {
     }
 }
 
-/// Runs the app until its last window closes.
 pub fn run() -> anyhow::Result<()> {
     // Run by the user's login shell to read its environment for the agent's
     // commands; see `sandbox::environment`.

@@ -12,7 +12,6 @@ use gpui_component::{
     progress::ProgressCircle,
 };
 use gpui_kit_assets::IconName;
-use serde::{Deserialize, Serialize};
 
 use crate::{
     Cowork,
@@ -20,13 +19,11 @@ use crate::{
 };
 
 const MIN_CONTEXT_TOKENS: u64 = 1_024;
-/// The compaction percentages the steppers offer.
 const THRESHOLD_PERCENTS: std::ops::RangeInclusive<u8> = 5..=95;
 
 /// Policy local to the host, like provider selection, and kept across
 /// launches.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ContextSettings {
     /// Requested Ollama window for local threads; mirrored in model catalogs.
     pub(crate) window_tokens: u64,
@@ -73,7 +70,6 @@ impl ContextSettings {
     }
 }
 
-/// The same small context ring used beside the model picker.
 pub(crate) fn context_ring(
     usage: ContextUsage,
     compacting: bool,
@@ -91,7 +87,6 @@ pub(crate) fn context_ring(
         .size(px(16.))
 }
 
-/// Context usage and its marker at the configured compaction percentage.
 pub(crate) fn context_details(
     usage: ContextUsage,
     settings: Option<ContextSettings>,
@@ -373,7 +368,6 @@ pub(crate) fn controls<T: 'static>(
 }
 
 impl Cowork {
-    /// Applies `settings` and saves them for the next launch.
     pub(crate) fn set_context_settings(
         &mut self,
         settings: ContextSettings,

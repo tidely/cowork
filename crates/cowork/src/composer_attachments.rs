@@ -30,7 +30,6 @@ use crate::{
     thread_draft::{AttachmentTarget, EditorSlot, ThreadDraft},
 };
 
-/// What an attachment card shows, read out of a thread for rendering.
 pub(crate) struct AttachmentCard {
     pub(crate) id: AttachmentId,
     pub(crate) name: String,
@@ -40,7 +39,6 @@ pub(crate) struct AttachmentCard {
     transfer: Option<Transfer>,
 }
 
-/// A file on its way, with the percent done.
 #[derive(Clone, Copy)]
 enum Transfer {
     Uploading(f32),
@@ -132,8 +130,6 @@ impl Cowork {
                 .unwrap_or(false)
     }
 
-    /// Where dropped files attach to when not dropped onto a block: the
-    /// focused prompt block, or otherwise a new block.
     pub(crate) fn attachment_target_at_focus(&self, window: &Window, cx: &App) -> AttachmentTarget {
         match self.focused_draft_editor(window, cx) {
             Some((_, EditorSlot::Prompt(id), _)) => AttachmentTarget::Block(id),
@@ -418,7 +414,6 @@ impl Cowork {
         }
     }
 
-    /// The thread whose draft is `draft_id`, if it has one yet.
     fn draft_thread(&self, draft_id: Uuid, cx: &App) -> Option<Entity<Thread>> {
         self.thread_store
             .read(cx)
@@ -578,8 +573,6 @@ impl Cowork {
             )
     }
 
-    /// An attachment card, with a remove button when `removal` names the
-    /// draft and block it can be removed from.
     pub(crate) fn render_attachment(
         &self,
         attachment: &AttachmentCard,

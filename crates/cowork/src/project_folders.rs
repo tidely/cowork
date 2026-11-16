@@ -26,10 +26,8 @@ use gpui_kit_assets::IconName;
 
 use crate::{Cowork, project_mode::ProjectMode, thread::Thread};
 
-/// One folder of a project.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProjectFolder {
-    /// What the folder is shown as, and all collaborators learn of it.
     pub(crate) name: SharedString,
     /// Where the folder is on this machine. `None` in a thread mirrored from
     /// someone else, whose folders are on the host's machine.
@@ -47,7 +45,6 @@ impl ProjectFolder {
         }
     }
 
-    /// The folders of a host's project, by the names it sent.
     pub(crate) fn mirrored(names: Vec<String>) -> Vec<Self> {
         names
             .into_iter()
@@ -63,10 +60,9 @@ impl ProjectFolder {
 /// were added in. Returns whether any was added.
 ///
 /// Each is named by its last component, cleaned up by
-/// [`sandbox::folder_name`], and given a `-2`, `-3`, ... suffix when another
-/// folder already has the name, so that names tell folders apart for
-/// collaborators and the agent. Names stay as they are when other folders are
-/// removed.
+/// [`sandbox::folder_name`], with a `-2`, `-3`, ... suffix when another
+/// folder has the name, so names tell folders apart for collaborators and
+/// the agent. Names stay as they are when other folders are removed.
 pub(crate) fn add_folders(
     project: &mut Vec<ProjectFolder>,
     paths: impl IntoIterator<Item = PathBuf>,
@@ -114,7 +110,6 @@ pub(crate) fn sandbox_project(thread: &Thread) -> sandbox::Project {
     }
 }
 
-/// Returns whether the folder was in the project.
 pub(crate) fn remove_folder(project: &mut Vec<ProjectFolder>, path: &Path) -> bool {
     let before = project.len();
     project.retain(|folder| folder.path.as_deref() != Some(path));
@@ -133,7 +128,6 @@ const OPEN_FOLDER_LABEL: &str = if cfg!(target_os = "macos") {
 type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 type FolderHandler = Rc<dyn Fn(&Path, &mut Window, &mut App)>;
 
-/// What the host can do with its project.
 struct FolderActions {
     on_add: ClickHandler,
     on_open: FolderHandler,
@@ -161,7 +155,6 @@ impl ProjectFolders {
         }
     }
 
-    /// Lets the folders be changed, as only the host may.
     pub(crate) fn editable(
         mut self,
         on_add: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,

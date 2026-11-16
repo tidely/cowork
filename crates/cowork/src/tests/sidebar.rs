@@ -5,12 +5,10 @@ use gpui_component::WindowExt as _;
 use super::*;
 use crate::projects::{ProjectId, SHOWN_CHATS_STEP};
 
-/// The debug selector `name` gives `thread_id`'s row or button.
 fn selector(name: &str, thread_id: Uuid) -> &'static str {
     Box::leak(format!("{name}-{thread_id}").into_boxed_str())
 }
 
-/// Adds one of the user's own threads, whose one run took `seconds`.
 fn add_thread(cowork: &Entity<Cowork>, seconds: u64, cx: &mut gpui::VisualTestContext) -> Uuid {
     cowork.update(cx, |cowork, cx| {
         let thread_id = Uuid::new_v4();
@@ -53,7 +51,6 @@ fn click(selector: &'static str, cx: &mut gpui::VisualTestContext) {
     draw(cx);
 }
 
-/// The debug selector `name` gives `project`'s row or button.
 fn project_selector(name: &str, project: ProjectId) -> &'static str {
     Box::leak(format!("{name}-{project}").into_boxed_str())
 }
@@ -66,7 +63,6 @@ fn hover(selector: &'static str, cx: &mut gpui::VisualTestContext) {
     draw(cx);
 }
 
-/// Creates a project named `name` starting chats with `folders`.
 fn add_project(
     cowork: &Entity<Cowork>,
     name: &str,
@@ -103,7 +99,6 @@ fn add_project_thread(
     thread_id
 }
 
-/// The ids of the threads in each project, and in Recents.
 fn project_groups(
     cowork: &Entity<Cowork>,
     cx: &mut gpui::VisualTestContext,
@@ -138,7 +133,6 @@ fn open_archive_settings(cowork: &Entity<Cowork>, cx: &mut gpui::VisualTestConte
     draw(cx);
 }
 
-/// The ids of the sidebar's threads, then of the archived ones, in order.
 fn thread_ids(cowork: &Entity<Cowork>, cx: &mut gpui::VisualTestContext) -> (Vec<Uuid>, Vec<Uuid>) {
     cowork.read_with(cx, |cowork, cx| {
         let store = cowork.thread_store.read(cx);
@@ -146,7 +140,6 @@ fn thread_ids(cowork: &Entity<Cowork>, cx: &mut gpui::VisualTestContext) -> (Vec
     })
 }
 
-/// Archives `thread_id` by hovering its row and pressing its button.
 fn archive_from_sidebar(thread_id: Uuid, cx: &mut gpui::VisualTestContext) {
     let row = cx
         .debug_bounds(selector("sidebar-thread", thread_id))

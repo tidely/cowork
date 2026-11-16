@@ -39,7 +39,7 @@ impl std::fmt::Debug for Client {
 
 impl Client {
     /// `base_url` is the API root, including `/v1` where the server needs it.
-    /// Construction performs no network I/O.
+    /// Performs no network I/O.
     pub fn new(base_url: &str) -> Result<Self, Error> {
         let http = reqwest::Client::builder()
             .build()
@@ -200,9 +200,8 @@ fn transport(error: reqwest::Error) -> Error {
     }
 }
 
-/// The error and its causes, e.g. "error sending request: client error
-/// (Connect): tcp connect error: Connection refused", so a stopped server is
-/// distinguishable from other failures.
+/// The error with its causes, so a refused connection is distinguishable from
+/// other failures.
 fn error_chain(error: &(dyn std::error::Error + 'static)) -> String {
     let mut text = error.to_string();
     let mut source = error.source();

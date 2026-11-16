@@ -117,8 +117,8 @@ fn option<T: serde::de::DeserializeOwned>(value: Value, key: &str) -> Result<T, 
         .map_err(|_| Error::InvalidRequest(format!("invalid value for Ollama option {key}")))
 }
 
-/// Correlation belongs to the conversation, not to one message's projection.
-/// Resolve omitted native fields here before converting messages independently.
+/// Correlation belongs to the conversation, not to one message's projection, so
+/// omitted native fields are resolved here before messages convert independently.
 fn normalize_tool_results(messages: &mut [Message]) -> Result<(), Error> {
     let mut calls = HashMap::<ToolCallId, (String, Option<String>)>::new();
     let mut pending = VecDeque::new();

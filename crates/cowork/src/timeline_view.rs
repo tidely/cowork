@@ -69,11 +69,8 @@ pub(crate) struct MessageSegment {
     pub(crate) comments: Vec<Uuid>,
 }
 
-/// The segments a message is shown split into.
 pub(crate) struct ShownSegments {
-    /// `None` while the message is still shown whole.
     pub(crate) segments: Option<Vec<MessageSegment>>,
-    /// Since when newer segments have been waiting to be parsed.
     pub(crate) pending_since: Option<Instant>,
     pub(crate) rendered_at: u64,
 }
@@ -220,7 +217,6 @@ impl Cowork {
             .get(&thread_message_id)
             .and_then(|shown| shown.segments.as_deref())
             .unwrap_or_default();
-        // Each segment's view renders a slice of the message's Markdown.
         let mut selected_ranges = segments.iter().filter_map(|segment| {
             let range = segment.state.read(cx).selected_source_range()?;
             let start = segment.source_range.start;
@@ -487,7 +483,6 @@ impl Cowork {
             .link_tooltip(|url, window, cx| Tooltip::new(url.clone()).build(window, cx))
     }
 
-    /// The background of the text a comment by `author` is on.
     fn comment_highlight(&self, author: ParticipantId) -> gpui::Hsla {
         gpui::Hsla::from(rgb(self.color_of(author))).opacity(0.3)
     }
@@ -619,7 +614,6 @@ impl Cowork {
         }
     }
 
-    /// A submitted user message; `cards` holds each block's attachments.
     pub(crate) fn render_user_message_group(
         &self,
         index: usize,
@@ -723,7 +717,6 @@ impl Cowork {
         }
     }
 
-    /// The distinct authors of `comments`, in the order they first commented.
     pub(crate) fn comment_authors(comments: &[UserComment]) -> Vec<ParticipantId> {
         comments.iter().fold(Vec::new(), |mut authors, comment| {
             if !authors.contains(&comment.author) {
@@ -756,7 +749,6 @@ impl Cowork {
             .relative()
     }
 
-    /// Paints other participants' carets and selections over `editor`.
     pub(crate) fn render_remote_carets(
         &self,
         editor: &Entity<TextareaState>,
@@ -1675,7 +1667,6 @@ impl Cowork {
             .into_any_element()
     }
 
-    /// The attachment cards of each of `group`'s blocks.
     fn user_group_cards(
         &self,
         thread_id: Uuid,
@@ -1823,7 +1814,6 @@ impl Cowork {
         pieces
     }
 
-    /// The timeline entry `row` captured.
     pub(crate) fn render_timeline_message(
         &mut self,
         thread_id: Uuid,

@@ -62,8 +62,6 @@ pub(crate) fn offset_near_x(editor: &TextareaState, x: gpui::Pixels, last: bool)
         .map_or(edge, |(offset, _)| offset)
 }
 
-/// The rectangles covering `selection` of `editor`'s text, one per visual
-/// line, in window coordinates.
 pub(crate) fn selection_rects(
     editor: &TextareaState,
     text: &str,
@@ -122,7 +120,6 @@ pub(crate) fn selection_rects(
     }
 }
 
-/// A participant's name in their color, just above their caret at `origin`.
 pub(crate) fn paint_caret_label(
     color: u32,
     name: SharedString,

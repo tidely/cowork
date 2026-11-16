@@ -21,13 +21,11 @@ use crate::{
 
 const INSTRUCTIONS: &str = include_str!("../../prompts/onboarding.md");
 
-/// How often the greeting grows while it streams in.
 const STREAM_FRAME: Duration = Duration::from_millis(16);
 /// At most this many frames, so the whole greeting shows in well under a
 /// second and nobody feels kept waiting.
 const STREAM_FRAMES: usize = 40;
 
-/// The greeting still streaming into the onboarding thread's seeded run.
 pub(crate) struct OnboardingIntro {
     thread_id: Uuid,
     message_id: Uuid,

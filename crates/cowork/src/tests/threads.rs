@@ -25,8 +25,6 @@ fn thread_titles_normalize_whitespace_and_truncate_by_character() {
     );
 }
 
-/// An empty local thread, in a window as the app's are, to apply host
-/// events to.
 fn empty_thread(
     cx: &mut gpui::TestAppContext,
     models: Arc<ModelCatalog>,
@@ -49,7 +47,6 @@ fn agent_ended(id: Uuid, outcome: protocol::RunOutcome) -> protocol::HostMessage
     ScriptedHost::default().ended(id, outcome)
 }
 
-/// Whether `event` previews text of the answer.
 fn previews_text(event: &protocol::HostMessage) -> bool {
     matches!(
         event,
@@ -905,8 +902,6 @@ fn collaborator_requests_select_models_and_stop_only_the_running_generation(
     });
 }
 
-/// The text parts of the prompt the agent is sent for `thread`'s last
-/// submission.
 fn last_prompt_texts(thread: &Thread) -> Vec<String> {
     let group = thread
         .timeline

@@ -247,8 +247,7 @@ impl<H: AgentHost> AgentSession<H> {
     /// for the session's whole life, so the prompt prefix stays cacheable.
     /// Tools that come and go are dynamic tools; see
     /// [`without_dynamic_tools`](Self::without_dynamic_tools). The built-in
-    /// context sections (tool policy, dynamic tools, model) are installed;
-    /// add others with `with_section`.
+    /// context sections are installed; add others with `with_section`.
     pub fn new(
         host: Arc<H>,
         provider: Arc<dyn LanguageModelProvider>,

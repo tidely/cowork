@@ -3,16 +3,10 @@
 A scheduled task runs a saved prompt at a given time or interval. This lists
 the options a task has and how runs behave.
 
-## Status
-
-Implemented: the Scheduled page (`schedules.rs`, opened from the sidebar),
-the task model and its occurrence policy (`scheduled_task.rs`), and the
-scheduler running the queue and saving tasks (`scheduler.rs`), with every
-option and behavior below. Tasks and their run history are saved in the
-chats' database (`scheduled_tasks`, `scheduled_runs`; see
-`docs/sqlite-storage.md`), whole whenever one changes. A **continue the last thread** task finds its
-thread by id after a restart too, as threads are saved (see
-[Saved threads](collaboration.md#saved-threads)).
+Tasks and their run history are saved in the app's database (`scheduled_tasks`,
+`scheduled_runs`; see `docs/sqlite-storage.md`), whole whenever one changes. The
+code is the Scheduled page (`schedules.rs`), the task model and occurrence
+policy (`scheduled_task.rs`), and the queue (`scheduler.rs`).
 
 ## Task options
 
@@ -169,15 +163,11 @@ approval, for its thread, or for models.
   goes through the same code path as anyone else's (see
   [collaboration.md](collaboration.md)) and doesn't touch the shared draft. A
   shared thread's collaborators see the run like any other.
-- The tasks file is written whole, replacing the old one only once written.
-  One that can't be read, or has another format version, is moved aside
-  rather than overwritten.
 - A **continue the last thread** run after a restart goes on in the thread
   as it was last saved. A thread that is gone, deleted or unreadable, gets a
   new one, which later runs continue.
 
-## Open questions
+## Known limitation
 
-- **Waiting blocks the queue.** A run waiting for approval holds up every run
-  queued behind it, possibly for hours. Should it stay blocked, or should a
-  waiting run step aside after some time?
+A run waiting for approval holds up every run queued behind it, possibly for
+hours. A waiting run does not step aside.

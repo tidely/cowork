@@ -81,7 +81,6 @@ impl Fixture {
         Self::build(cx, response, false)
     }
 
-    /// History whose every reply has finished, open work.
     fn with_open_work(
         cx: &mut gpui::TestAppContext,
     ) -> (Self, tokio::runtime::Runtime, &mut VisualTestContext) {
@@ -183,7 +182,6 @@ impl Fixture {
         settle(cx);
     }
 
-    /// Only rows near the view are built, wherever it is.
     fn assert_culled(&self, cx: &mut VisualTestContext) {
         let visible = self
             .users
@@ -208,13 +206,10 @@ impl Fixture {
         assert_selection(cx);
     }
 
-    /// The debug selector of the read's details in the reply at `index`.
     fn read_details(&self, index: usize, cx: &VisualTestContext) -> &'static str {
         self.read_selector("tool-call-details", index, cx)
     }
 
-    /// The debug selector `{prefix}-{reply id}-1` of the read in the reply at
-    /// `index`.
     fn read_selector(&self, prefix: &str, index: usize, cx: &VisualTestContext) -> &'static str {
         let id = self.thread.read_with(cx, |thread, _| {
             let TimelineMessage::Agent(message) = &thread.timeline[index] else {
@@ -225,8 +220,6 @@ impl Fixture {
         Box::leak(format!("{prefix}-{id}-1").into_boxed_str())
     }
 
-    /// Changes the local view state of the reply at `index`, as its toggles
-    /// do, and redraws.
     fn update_reply(
         &self,
         index: usize,
@@ -280,7 +273,6 @@ impl Fixture {
     }
 }
 
-/// Scrolls to the middle of the history, where no row has been measured.
 fn middle(fixture: &Fixture, cx: &mut VisualTestContext) {
     let (_, max) = fixture.geometry(cx);
     fixture.cowork.update(cx, |cowork, cx| {
@@ -293,8 +285,6 @@ fn middle(fixture: &Fixture, cx: &mut VisualTestContext) {
     settle(cx);
 }
 
-/// A prompt's text, or a reply's work summary or tool call, in the view, and
-/// where it is.
 fn visible_row(fixture: &Fixture, cx: &mut VisualTestContext) -> (&'static str, Pixels) {
     let mut selectors = fixture
         .users
@@ -404,14 +394,12 @@ fn history_builds_only_rows_near_the_view(cx: &mut gpui::TestAppContext) {
         "the bottom stays the bottom as its rows are measured"
     );
 
-    // Redraws leave an interior offset and the extent unchanged.
     middle(&fixture, cx);
     let before = fixture.geometry(cx);
     for _ in 0..8 {
         fixture.redraw(cx);
         assert_same_geometry(fixture.geometry(cx), before);
     }
-    // Repeated parking exercises the idle path without a wall-clock assertion.
     cx.run_until_parked();
     assert_same_geometry(fixture.geometry(cx), before);
 }
@@ -495,7 +483,6 @@ fn folding_work_above_the_view_keeps_the_view_still(cx: &mut gpui::TestAppContex
         Some(top)
     );
     fixture.top(cx);
-    // Scroll down to the folded row, measuring the rows on the way.
     for _ in 0..200 {
         if cx.debug_bounds(summary).is_some() {
             break;
@@ -625,7 +612,6 @@ fn growing_rows_keep_follow_bottom_pinned(cx: &mut gpui::TestAppContext) {
 }
 
 impl Fixture {
-    /// The id of the user group at timeline `index`: a turn of the rail.
     fn group_id(&self, index: usize, cx: &VisualTestContext) -> Uuid {
         self.thread
             .read_with(cx, |thread, _| match &thread.timeline[index] {
@@ -645,7 +631,6 @@ impl Fixture {
         })
     }
 
-    /// The top of the timeline's view.
     fn view_top(&self, cx: &VisualTestContext) -> Pixels {
         self.cowork
             .read_with(cx, |cowork, _| cowork.timeline_scroll_handle.bounds().top())
@@ -668,7 +653,6 @@ fn navigating_to_a_turn_reaches_rows_never_drawn(cx: &mut gpui::TestAppContext) 
     );
     assert_eq!(fixture.current_turn(cx), Some(fixture.group_id(0, cx)));
 
-    // The rail shows the current turn; scroll it to the target's marker.
     let rail = cx.debug_bounds("turn-rail").expect("the rail shows");
     let marker = cx
         .debug_bounds(fixture.marker(index, cx))
@@ -789,7 +773,6 @@ fn a_long_rail_scrolls_without_the_conversation(cx: &mut gpui::TestAppContext) {
         assert!((scroll.offset().y + scroll.max_offset().y).abs() < px(1.));
     });
 
-    // There is no lone end marker in an empty conversation.
     fixture.thread.update(cx, |thread, cx| {
         thread.timeline.clear();
         cx.notify();

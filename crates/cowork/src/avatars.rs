@@ -14,9 +14,7 @@ use crate::{
     timeline::MessageAuthor,
 };
 
-/// The smallest text the app draws, the desktop minimum.
 const MIN_TEXT: gpui::Pixels = px(10.);
-/// The smallest avatar that fits two initials at [`MIN_TEXT`].
 const MIN_TWO_INITIALS: gpui::Pixels = px(20.);
 
 impl Cowork {
@@ -41,7 +39,6 @@ impl Cowork {
         appearance(participant, self.shown_profiles.get(&participant)).color()
     }
 
-    /// A participant's avatar, identical wherever they appear.
     pub(crate) fn render_participant_avatar(
         &self,
         participant: ParticipantId,
@@ -50,7 +47,6 @@ impl Cowork {
         Self::render_avatar_for(participant, self.shown_profiles.get(&participant), size)
     }
 
-    /// The picture a participant chose, or their initials in their color.
     pub(crate) fn render_avatar_for(
         participant: ParticipantId,
         profile: Option<&Profile>,

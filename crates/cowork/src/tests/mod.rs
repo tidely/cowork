@@ -107,7 +107,6 @@ impl Thread {
             .expect("a valid thread snapshot");
     }
 
-    /// What someone joining now is sent, under an id of their own.
     fn welcome_for_test(&self) -> protocol::Welcome {
         protocol::Welcome {
             draft_generation: 0,
@@ -119,7 +118,6 @@ impl Thread {
         }
     }
 
-    /// The thread someone joining with `welcome` gets.
     fn join_for_test(welcome: protocol::Welcome, cx: &mut impl AppContext) -> Self {
         Self::from_welcome(
             welcome,
@@ -145,7 +143,6 @@ fn ollama_qwen() -> ModelRef {
     ollama_model("test-other")
 }
 
-/// A catalog offering `models`, named after their ids.
 fn catalog_of(models: &[ModelRef]) -> ModelCatalog {
     let mut catalog = ModelCatalog::default();
     for provider in models.iter().map(|model| model.provider).unique() {
@@ -170,12 +167,10 @@ fn catalog_of(models: &[ModelRef]) -> ModelCatalog {
     catalog
 }
 
-/// A catalog offering both test models.
 fn test_catalog() -> ModelCatalog {
     catalog_of(&[recommended_qwen(), ollama_qwen()])
 }
 
-/// Every row of the picker, as (group, name, available).
 fn picker_rows(items: &ModelPickerItems) -> Vec<(usize, String, bool)> {
     use gpui_component::searchable_list::SearchableListDelegate as _;
 
@@ -290,7 +285,6 @@ fn test_cowork(
     }
 }
 
-/// `participant` joining with the profile derived from their id.
 fn joined(participant: ParticipantId) -> protocol::HostMessage {
     protocol::HostMessage::ParticipantJoined {
         participant: participant.into_bytes(),
@@ -353,7 +347,6 @@ impl Render for EmptyThreadTestView {
     }
 }
 
-/// A full `Cowork` window showing the draft of a new thread.
 pub(crate) fn composer_test_cowork(
     cx: &mut gpui::TestAppContext,
 ) -> (
@@ -625,7 +618,6 @@ impl<'a> Collaboration<'a> {
         panic!("gave up waiting until {what}");
     }
 
-    /// Lets everything in flight settle.
     fn settle(&mut self) {
         for _ in 0..5 {
             self.cx.run_until_parked();

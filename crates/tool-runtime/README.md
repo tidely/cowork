@@ -92,35 +92,28 @@ let result = collect_output(stream).await?;
 ```
 
 Preparing and executing are separate so a host can authorize a call between
-them: `prepare` never runs the tool, and awaiting `execute` may already run a
-simple one. The prepared call keeps the access value it computed and passes it
-to the tool in `ToolCall::access`, so a tool runs with exactly what was allowed
-even if its context changed meanwhile. Execution takes owned arguments and a
-borrowed context; the runtime retains the host's `Arc` while the execution
-future runs and borrows the tool's context through `AsRef`. The service itself
-does not need an `Arc`. Returned progress streams remain owned (`'static`).
-A host can implement `AsRef<T>` for multiple service types. Tools with `Context = ()`
-require an explicit `AsRef<()>` implementation on the host, returning `&()`.
+them: `prepare` never runs the tool, and the prepared call passes the access it
+computed to the tool in `ToolCall::access`, so a tool runs with exactly what was
+allowed. The runtime retains the host's `Arc` while the execution future runs and
+borrows each tool's context through `AsRef`; a host can implement `AsRef<T>` for
+several service types, and `Context = ()` tools need `AsRef<()>`. Returned
+progress streams are owned (`'static`).
 
 `ToolCall` also carries the local `ToolCallId` and `CallControl`: cooperative
 `cancellation` when the run ends, and `yield_wait` when new input should wake a
 blocking wait without stopping what it observes. Neither promises rollback or
-that external work stopped. Provider-issued call IDs belong to the transcript.
+that external work stopped.
 
 ## Outputs and streams
 
-`BuiltinToolOutput` is the enum application code matches for known built-in
-results. It has only `Dynamic(Value)` so far, which also serves custom and
-dynamic tools. Custom outputs usually need only `impl ToolOutput for MyOutput {}`:
-the default serializes the result once and presents its JSON to the model. An
-explicit `model_output` returns text, JSON, or images; an empty projection is an
-error. No JSON-shape heuristics turn result fields into special content.
+Custom outputs usually need only `impl ToolOutput for MyOutput {}`: the default
+serializes the result once and presents its JSON to the model. An explicit
+`model_output` returns text, JSON, or images; an empty projection is an error.
 
 Simple tools implement `run`. Streaming tools implement `execute`, returning
-`Progress` events followed by exactly one `Finished(Result<Output, ToolError>)`.
-`finished_only`, `deferred_result`, and `with_progress` build common stream
-shapes. `collect_output` discards progress and rejects missing or repeated final
-results and events after completion; progress is never an accepted result.
+`Progress` events followed by exactly one `Finished(Result<Output, ToolError>)`;
+`collect_output` rejects missing or repeated final results, and progress is never
+an accepted result.
 
 `ToolError` separates dispatch and execution failures from successful domain
 results: a shell command's nonzero exit can be structured output, while a
@@ -135,7 +128,6 @@ listing and lookups never regenerate it. Only `definition` is sent to a model.
 `ToolDyn` is the object-safe form; typed tools implement it through a blanket
 impl, and dynamic tools (from MCP, for example) can implement it by hand.
 
-`ToolCapabilities` declares cancellation and progress support, read-only
-behavior, maximum concurrency, and a suggested timeout. They describe the
-implementation, not one call, and grant nothing: read-only calls still need
-authorization. No timeout or limiter runs implicitly.
+`ToolCapabilities` describes the implementation, not one call, and grants
+nothing: read-only calls still need authorization. No timeout or concurrency
+limiter runs implicitly.

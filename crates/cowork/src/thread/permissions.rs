@@ -120,7 +120,6 @@ pub(crate) enum DenialReason {
     StaleDraftGeneration,
 }
 
-/// A runtime command rejection, distinct from the stable join rejection.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PermissionDenied {
     pub(crate) participant: uuid::Bytes,

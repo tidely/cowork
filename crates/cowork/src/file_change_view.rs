@@ -1,17 +1,14 @@
-//! A `write_file` or `edit_file` call shown as the change it makes: a
-//! unified diff (gpui-component's [`Diff`]). The timeline row's summary
-//! names the file, so its details are the diff alone; the approval card
-//! puts [`card_body`]'s label, what the call does to which file ("Edit
-//! zed/a.rs") and its line counts, above it in place of a title.
+//! A `write_file` or `edit_file` call shown as the change it makes: a unified
+//! diff (gpui-component's [`Diff`]). The timeline row's summary names the
+//! file, so its details are the diff alone; the approval card puts
+//! [`card_body`]'s label and line counts above it.
 //!
-//! Every copy of a thread computes the diff from the call's arguments
-//! alone, never from the file: an edit's `old_string` becomes its
-//! `new_string`, and a write shows its whole content as added, whatever the
-//! file held. An edit shows only the text it replaces, without the file's
-//! line numbers, which its arguments don't give. Each call keeps one view
-//! (see `AgentMessage::show_file_changes`), both the approval card's body
-//! and the timeline row's details, so its scrolling and selection carry
-//! over once the call is decided.
+//! Every copy of a thread computes the diff from the call's arguments alone,
+//! never from the file: an edit shows only the text it replaces, without the
+//! file's line numbers, and a write shows its whole content as added. Each
+//! call keeps one view (see `AgentMessage::show_file_changes`), so scrolling
+//! and selection carry over from the approval card to the timeline row once
+//! the call is decided.
 
 use std::time::Duration;
 
@@ -36,20 +33,16 @@ const DIFF_TIMEOUT: Duration = Duration::from_millis(100);
 /// Rows the diff grows to before it scrolls, so a card stays a card.
 const MAX_ROWS: usize = 14;
 
-/// What a file call changes, from its arguments.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct FileChange {
     pub(crate) path: String,
     pub(crate) kind: ChangeKind,
-    /// A unified patch [`DiffFile::parse`] reads.
     pub(crate) patch: String,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ChangeKind {
-    /// `write_file`: the whole content, as added lines.
     Write,
-    /// `edit_file`: the replaced text and its replacement.
     Edit { replace_all: bool },
 }
 
@@ -100,7 +93,6 @@ impl FileChange {
 }
 
 pub(crate) struct FileChangeView {
-    /// Prefixes the debug selectors of the view's parts.
     id: SharedString,
     path: String,
     kind: ChangeKind,
@@ -112,7 +104,6 @@ pub(crate) struct FileChangeView {
 }
 
 impl FileChangeView {
-    /// The view of `call`, or `None` when it isn't a file change.
     pub(crate) fn of(
         id: impl Into<SharedString>,
         call: &ToolCall,

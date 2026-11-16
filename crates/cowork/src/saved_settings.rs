@@ -8,7 +8,6 @@ use gpui::Context;
 
 use crate::{Cowork, context_settings::ContextSettings, models::ModelRef};
 
-/// The user's saved settings.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Settings {
     /// The model new chats start with: the last one selected locally. Kept
@@ -39,7 +38,6 @@ impl Cowork {
         self.save_settings();
     }
 
-    /// Saves the settings as they are now, unless nothing is saved.
     pub(crate) fn save_settings(&self) {
         let Some(db) = &self.chat_db else {
             return;

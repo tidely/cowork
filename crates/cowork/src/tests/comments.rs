@@ -7,8 +7,6 @@ use super::*;
 /// highlight as the range and text of the rendered text it paints.
 type HighlightedSegment = (String, Vec<(Range<usize>, String)>);
 
-/// Renders `markdown` as an agent message `wrap_width` wide, with a comment
-/// on each of `ranges`, and returns its segments.
 fn highlighted_segments(
     cx: &mut gpui::TestAppContext,
     markdown: &'static str,
@@ -103,7 +101,6 @@ fn highlighted_segments(
     })
 }
 
-/// The text each highlight of a one-segment message paints.
 fn highlighted_texts(
     cx: &mut gpui::TestAppContext,
     markdown: &'static str,
@@ -116,7 +113,6 @@ fn highlighted_texts(
     highlights.iter().map(|(_, text)| text.clone()).collect()
 }
 
-/// The range of `markdown` from `start` through the next `end`.
 fn through(markdown: &str, start: &str, end: &str) -> Range<usize> {
     let start_offset = markdown.find(start).expect("selection start");
     let end_offset = markdown[start_offset..]

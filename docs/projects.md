@@ -48,8 +48,9 @@ nothing about projects is sent to collaborators.
   Removing deletes only the project's record: its chats, archived and shared
   ones too, are kept and filed in no project, so they show in Recents (or
   where they otherwise would). Their saved rows are unfiled in the
-  transaction that removes the project. A new chat being composed in the project is no longer in it, but
-  keeps the folders it copied. No files on disk are touched.
+  transaction that removes the project. A new chat being composed in the
+  project is no longer in it, but keeps the folders it copied. No files on disk
+  are touched.
 
 ## Saving
 

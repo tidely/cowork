@@ -64,10 +64,8 @@ pub(crate) enum SharingStatus {
     Failed,
 }
 
-/// The host's end of a collaborator connection.
 pub(crate) type HostPeer = protocol::Peer<protocol::HostMessage, protocol::CollaboratorMessage>;
 
-/// A collaborator's end of its connection to a thread's host.
 pub(crate) type ThreadHost = protocol::Peer<protocol::CollaboratorMessage, protocol::HostMessage>;
 
 pub(crate) enum ThreadSharing {
@@ -609,7 +607,6 @@ impl Thread {
         true
     }
 
-    /// Builds the local mirror of a thread hosted by someone else.
     pub(crate) fn from_prepared_welcome(
         prepared: PreparedWelcome,
         draft: ThreadDraft,
@@ -1067,7 +1064,6 @@ impl Thread {
         ids
     }
 
-    /// Takes a piece of a file a collaborator is uploading.
     pub(crate) fn receive_upload(
         &mut self,
         uploader: ParticipantId,
@@ -1241,7 +1237,6 @@ impl Thread {
         timeline.chain(pending).chain(draft).collect()
     }
 
-    /// Marks a file as held by the host and tells everyone.
     fn publish_stored(&mut self, id: AttachmentId, uploader: ParticipantId) {
         self.draft.stored.insert(id);
         self.publish(protocol::HostMessage::AttachmentStored {
@@ -1250,7 +1245,6 @@ impl Thread {
         });
     }
 
-    /// Tells the other participants where the local user is in the draft.
     pub(crate) fn publish_presence(
         &mut self,
         presence: protocol::Presence,
@@ -1375,7 +1369,6 @@ impl Thread {
         );
     }
 
-    /// How many submissions this thread has accepted.
     pub(crate) fn submission_count(&self) -> u64 {
         self.submission_sequence
     }
@@ -1467,13 +1460,10 @@ impl Thread {
         Some((model, self.models.get(model)?))
     }
 
-    /// The size of the selected model's context window, or 0 when it cannot
-    /// run.
     pub(crate) fn max_tokens(&self) -> u64 {
         self.runnable_model().map_or(0, |(_, info)| info.max_tokens)
     }
 
-    /// The agent message currently being generated, if any.
     pub(crate) fn running_agent_message_id(&self) -> Option<Uuid> {
         self.timeline.iter().rev().find_map(|entry| match entry {
             TimelineMessage::Agent(message) if message.is_generating() => Some(message.record.id),
@@ -1797,7 +1787,6 @@ impl Thread {
         });
     }
 
-    /// How long the agent has spent generating in this thread.
     pub(crate) fn generation_time(&self) -> Duration {
         self.timeline
             .iter()

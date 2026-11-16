@@ -3,9 +3,8 @@
 //!
 //! The agent asks for these for one command (`run_command`'s `access`,
 //! `read_folders`, and `write_folders`), or for the rest of its run
-//! (`request_permissions`), as Codex's agent asks for additional
-//! permissions. Either way the host decides, and the command is granted
-//! exactly a [`Grant`]; the sandbox never sees an unresolved path.
+//! (`request_permissions`). Either way the host decides, and the command is
+//! granted exactly a [`Grant`]; the sandbox never sees an unresolved path.
 //!
 //! The folders the model names are resolved here, on the host, before
 //! anyone is asked: `~` is the user's real home (as it is for commands, whose

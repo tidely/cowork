@@ -11,7 +11,6 @@ use serde_json::json;
 
 use crate::*;
 
-/// The host-side context: a counter service plus the host's own access type.
 struct Host {
     counter: Counter,
 }

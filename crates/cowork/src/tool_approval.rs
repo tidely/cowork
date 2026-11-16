@@ -48,7 +48,6 @@ pub(crate) const ALWAYS_ALLOWED: &[&str] = &[
     ReadPdf::NAME,
 ];
 
-/// What the model is told about a call someone denied.
 pub(crate) const DENIED: &str = "The user denied this tool call.";
 
 /// What a scheduled run's model is told about a call it makes the first
@@ -56,10 +55,9 @@ pub(crate) const DENIED: &str = "The user denied this tool call.";
 pub(crate) const UNATTENDED: &str = "This tool call was not run: it needs the user's permission, and this is a scheduled run that nobody may be watching. Carry on without it if you can. If the call is necessary, make it again with exactly the same arguments: the user will then be notified and asked, and the run waits for their answer.";
 
 /// Tools whose calls only the host may allow: they act on the host's computer
-/// (its shell and tools, for `run_command`, its files, for `write_file` and
-/// `edit_file`, and
-/// what later commands may do there, for `request_permissions`), so an
-/// `Admin` peer may not decide for it.
+/// (its shell and tools for `run_command`, its files for `write_file` and
+/// `edit_file`, and what later commands may do there for
+/// `request_permissions`), so an `Admin` peer may not decide for it.
 pub(crate) const HOST_ONLY: &[&str] = &[
     RunCommand::NAME,
     WriteFile::NAME,
@@ -79,9 +77,7 @@ pub(crate) fn host_only(tool: &str) -> bool {
 /// their cards show.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct ApprovalRights {
-    /// May approve tool calls at all: the host, or an `Admin` peer.
     approves_tools: bool,
-    /// Is the host, who alone decides [`HOST_ONLY`] tools.
     is_host: bool,
     /// The project's mode, whose access a waiting command is allowed with
     /// unless it asks for its own.
@@ -143,12 +139,10 @@ pub(crate) struct CoworkHost {
 /// requests report; see `generation.rs`.
 #[derive(Default)]
 pub(crate) struct CompactionTrigger {
-    /// Tokens at which to compact; `u64::MAX` for never.
     pub(crate) threshold: AtomicU64,
     /// Whether the next run compacts as soon as it starts, as the context
     /// was already full.
     pub(crate) at_start: AtomicBool,
-    /// Whether a compaction was asked for and has not settled yet.
     pub(crate) requested: AtomicBool,
 }
 
@@ -169,7 +163,6 @@ impl CoworkHost {
         &self.sandbox
     }
 
-    /// The comments the next run answers.
     pub(crate) fn comments(&self) -> &RunComments {
         &self.comments
     }
@@ -362,7 +355,6 @@ mod tests {
         assert!(!writer.may_decide(Calculate::NAME));
     }
 
-    /// A host for thread `thread` in a project in `access` mode.
     fn host_in(access: Access) -> Arc<CoworkHost> {
         let sandboxes = crate::test_support::unused_sandboxes();
         let host = Arc::new(CoworkHost::new(Arc::new(ThreadSandbox::new(
@@ -416,7 +408,6 @@ mod tests {
         RunSource::Participant([1; 16])
     }
 
-    /// A `run_command` call, asking for `access` of its own if given.
     fn command(access: Option<&str>) -> serde_json::Value {
         let mut arguments = serde_json::json!({ "command": "ls" });
         if let Some(access) = access {

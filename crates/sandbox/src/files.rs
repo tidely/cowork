@@ -1,7 +1,6 @@
-//! The file tools: listing folders, reading files, and writing them in the
-//! host filesystem for reads and project/scratch folders for writes, from the host process
-//! rather than a sandboxed command. Which paths they reach is decided in
-//! [`crate::paths`] alone.
+//! The file tools: listing folders and reading files anywhere on the host, and
+//! writing in project and scratch folders, from the host process rather than a
+//! sandboxed command. Which paths they reach is decided in [`crate::paths`] alone.
 //!
 //! Like `run_command`'s, their definitions never change, so they name no
 //! host paths: the folders' names come from the environment note.
@@ -49,8 +48,8 @@ impl From<FileError> for ToolError {
     }
 }
 
-/// Runs `work` with the thread's places as they are now, off the async
-/// runtime, as it does blocking file I/O.
+/// Runs `work` with the thread's current places, off the async runtime
+/// because it does blocking file I/O.
 pub(crate) async fn with_places<T: Send + 'static>(
     sandbox: &ThreadSandbox,
     work: impl FnOnce(&Sandboxes, &mut Places) -> Result<T, FileError> + Send + 'static,
@@ -203,26 +202,21 @@ pub(crate) fn list_directory(places: &Places, path: &str) -> Result<String, File
     Ok(output)
 }
 
-/// The largest image file `view_image` reads, as for image attachments:
-/// room for uncompressed screenshots (BMP, TIFF).
+/// The largest image file `view_image` reads: room for uncompressed
+/// screenshots (BMP, TIFF).
 const IMAGE_SOURCE_LIMIT: u64 = 64 * 1024 * 1024;
 
-/// The most pixels `view_image` decodes, checked from the header before
-/// decoding, so a small file claiming a huge image is refused rather than
-/// decoded. 50 megapixels covers 8K frames and 48 MP phone photos, and stays
-/// within the decoder's default allocation limit at any pixel format.
+/// The most pixels `view_image` decodes, checked from the header so a small
+/// file claiming a huge image is refused. 50 megapixels covers 8K frames and
+/// 48 MP phone photos, and stays within the decoder's default allocation limit.
 const MAX_IMAGE_PIXELS: u64 = 50_000_000;
 
-/// The longest side of an image as the model is sent it; larger ones are
-/// scaled down to it. Vision models scale images to far less themselves, so
-/// this loses nothing they'd see, and it keeps the result small: the image
-/// stays in the conversation, which is saved, sent to every collaborator,
-/// and sent with every later request.
+/// The longest side of an image as the model is sent it. Vision models scale
+/// images down further themselves, so this loses nothing they'd see, and it
+/// keeps small an image that is saved, shared, and resent with every request.
 const MAX_IMAGE_SIDE: u32 = 2048;
 
-/// The largest encoded image the model is sent. PNG and JPEG files within
-/// it and within [`MAX_IMAGE_SIDE`] go as they are; anything else is
-/// re-encoded, as JPEG when PNG would be larger than this.
+/// The largest encoded image the model is sent; see [`MAX_IMAGE_SIDE`].
 const IMAGE_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 
 const JPEG_QUALITY: u8 = 85;
@@ -242,8 +236,8 @@ impl ViewImage {
     pub const NAME: &'static str = "view_image";
 }
 
-/// The image goes only in the model's content; the structured result keeps
-/// what it was rather than a second copy of its bytes.
+/// The image goes only in the model's content, not as a second copy in the
+/// structured result.
 #[derive(Debug, Serialize)]
 pub struct ViewImageOutput {
     pub path: String,
@@ -257,9 +251,8 @@ pub struct ViewImageOutput {
 }
 
 impl ToolOutput for ViewImageOutput {
-    /// Says what the image is before showing it, so a model that is sent a
-    /// note in place of the image still learns its size, and coordinates in
-    /// a scaled image can be mapped back.
+    /// Describes the image before showing it, so a model sent a note in place
+    /// of the image still learns its size and can map coordinates back.
     fn model_output(&self) -> Option<Vec<ToolResultContent>> {
         let mut text = format!("{} ({} × {} pixels", self.path, self.width, self.height);
         if let Some((width, height)) = self.scaled_to {
@@ -305,11 +298,10 @@ impl Tool for ViewImage {
     }
 }
 
-/// The image at `path` as the model is sent it: a PNG or JPEG file that is
-/// upright and within the size limits as it is, so nothing is lost or
-/// re-encoded; anything else decoded (the first frame of an animation),
-/// turned upright by its EXIF orientation, scaled down to
-/// [`MAX_IMAGE_SIDE`], and encoded again.
+/// The image at `path` as the model is sent it: an upright PNG or JPEG within
+/// the limits unchanged; anything else decoded (the first frame of an
+/// animation), turned upright by its EXIF orientation, scaled down to
+/// [`MAX_IMAGE_SIDE`], and re-encoded.
 fn view_image(places: &Places, path: &str) -> Result<ViewImageOutput, FileError> {
     use image::{ImageDecoder as _, ImageFormat, metadata::Orientation};
 

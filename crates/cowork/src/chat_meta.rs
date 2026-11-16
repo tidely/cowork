@@ -26,7 +26,6 @@ pub(crate) struct ChatMeta {
 }
 
 impl ChatMeta {
-    /// The row a loaded chat saves, derived from it.
     pub(crate) fn of(thread: &Thread) -> Self {
         Self {
             id: thread.instance_id,
@@ -53,7 +52,6 @@ pub(crate) fn no_loader() -> ChatLoader {
 #[cfg(test)]
 type PendingLoad = (ChatMeta, futures::channel::oneshot::Sender<ChatRows>);
 
-/// A loader whose loads finish when a test says so, in any order.
 #[cfg(test)]
 #[derive(Clone, Default)]
 pub(crate) struct ManualLoader {
@@ -75,7 +73,6 @@ impl ManualLoader {
         })
     }
 
-    /// How many loads of `id` were started and not yet finished.
     pub(crate) fn started(&self, id: Uuid) -> usize {
         self.pending.borrow().get(&id).map_or(0, Vec::len)
     }
@@ -89,7 +86,6 @@ impl ManualLoader {
             .is_some_and(|loads| loads.iter().all(|(_, done)| done.is_canceled()))
     }
 
-    /// Finishes the oldest load of `id` with its row, as read.
     pub(crate) fn finish(&self, id: Uuid) {
         let mut pending = self.pending.borrow_mut();
         let loads = pending.get_mut(&id).expect("a load of this chat");

@@ -30,8 +30,8 @@ const CAPTURE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 /// rather than the user's setup, and are left out.
 const SHELL_ONLY: &[&str] = &["SHLVL", "PWD", "OLDPWD", "_"];
 
-/// Prints this process's environment as JSON on standard output. The app
-/// calls it, and exits, when started with [`PRINT_ENV_FLAG`].
+/// Prints this process's environment as JSON on standard output; the app calls
+/// it, and exits, when started with [`PRINT_ENV_FLAG`].
 pub fn print_env() {
     let environment = std::env::vars().collect::<HashMap<_, _>>();
     match serde_json::to_string(&environment) {
@@ -51,12 +51,10 @@ pub enum EnvironmentSource {
     /// must handle that flag. Falls back to this process's environment when
     /// the shell fails to print one.
     LoginShell,
-    /// This process's own: when it was started from a terminal, and so
-    /// already has the shell's, on Windows, and in tests.
+    /// This process's own: when started from a terminal, on Windows, and in tests.
     Process,
 }
 
-/// The environment `source` gives, without the shell's own variables.
 pub(crate) async fn load(source: EnvironmentSource) -> HashMap<String, String> {
     let mut environment = match source {
         EnvironmentSource::Process => None,

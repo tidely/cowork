@@ -92,9 +92,8 @@ pub enum SchemaError {
 }
 
 /// The contents of one generation request, independent of model selection.
-/// Owned input allows providers to finish I/O without borrowing UI entities.
-/// A request is assembled once and consumed by one provider call; it is flat
-/// plain data, not state anyone keeps editing.
+/// It is owned plain data, so providers can finish I/O without borrowing UI
+/// entities; it is assembled once and consumed by one provider call.
 ///
 /// Typed controls are the ones every supported provider adopts; `None` (or an
 /// empty `stop`) preserves provider defaults. `options` contains
@@ -102,9 +101,9 @@ pub enum SchemaError {
 /// control and its raw wire option together is an error.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct CompletionRequest {
-    /// The system prompt. Its own field, rather than a leading `System`
-    /// message, so instructions in the middle of a conversation cannot be
-    /// expressed; `messages` never contain `System` messages.
+    /// The system prompt. Its own field so that instructions in the middle of
+    /// a conversation cannot be expressed; `messages` never contain `System`
+    /// messages.
     pub instructions: Option<String>,
     pub messages: Vec<Message>,
     pub tools: Vec<ToolDefinition>,
@@ -207,8 +206,8 @@ impl CompletionRequest {
     }
 }
 
-/// The end of a stable request prefix, as the runtime knows it. Each adapter
-/// decides how (and whether) its provider can use the hint.
+/// The end of a stable request prefix. Each adapter decides how, and whether,
+/// its provider can use the hint.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CachePoint {
     AfterTools,
@@ -292,8 +291,8 @@ pub struct Completion {
 #[derive(Clone, Debug, PartialEq)]
 pub enum StreamEvent {
     Delta { index: usize, delta: ContentDelta },
-    // One allocation per request keeps every frequent delta compact even when
-    // workspace feature unification changes the size of metadata JSON maps.
+    // Boxed so the frequent deltas stay compact even when feature unification
+    // changes the size of JSON maps.
     Finished(Box<Completion>),
 }
 
@@ -314,13 +313,11 @@ pub type CompletionStream = BoxStream<'static, Result<StreamEvent, Error>>;
 
 /// Information about a model offered by a provider. The ID is scoped to that
 /// provider's connection; this value contains no transport or credentials.
-/// The same weights served elsewhere can report different values.
 ///
 /// Typed fields are the facts code above the provider acts on. Each is
 /// `None` when unknown, which is not the same as unsupported: unknown values
-/// leave the decision to the provider. How a provider's protocol expresses
-/// things (roles, cache markers, finish strings) is not model metadata; it
-/// stays inside the adapter.
+/// leave the decision to the provider. Protocol details such as roles, cache
+/// markers, and finish strings stay inside the adapter.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LanguageModel {
     pub id: String,
@@ -339,7 +336,7 @@ pub struct LanguageModel {
 }
 
 impl LanguageModel {
-    /// Select a known model ID without requiring a discovery request.
+    /// Selects a known model ID without a discovery request.
     pub fn new(id: impl Into<String>) -> Self {
         Self {
             id: id.into(),
@@ -383,10 +380,10 @@ pub trait LanguageModelProvider: Send + Sync {
     ) -> BoxFuture<'a, Result<CompletionStream, Error>>;
 }
 
-/// Drains an existing stream when previews are not needed; no separate request
-/// is made. Also validates completion event ordering for scripted or third-party
-/// adapters. This helper cannot make a raw stream's EOF turn into an error for other consumers;
-/// implementations must enforce that contract in their stream itself.
+/// Drains a stream to its completion when previews are not needed, validating
+/// event ordering for scripted or third-party adapters. It cannot turn a raw
+/// stream's EOF into an error for other consumers; implementations must
+/// enforce that contract in their stream itself.
 pub async fn collect_completion(mut stream: CompletionStream) -> Result<Completion, Error> {
     let mut completion = None;
     while let Some(event) = stream.next().await {

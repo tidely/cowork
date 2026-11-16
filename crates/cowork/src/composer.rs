@@ -33,7 +33,6 @@ use crate::{
 
 const BOTTOM_BAR_DIVIDER_THRESHOLD: gpui::Pixels = px(24.);
 
-/// What the composer shows of a draft, read out of it for rendering.
 pub(crate) struct ComposerModel {
     pub(crate) draft_id: Uuid,
     pub(crate) comments: Vec<UserComment>,
@@ -43,7 +42,6 @@ pub(crate) struct ComposerModel {
     draft_row_visible: bool,
     /// The avatar the draft position row leads with, and those layered on it.
     draft_position_people: (ParticipantId, Vec<ParticipantId>),
-    /// Everyone else's carets at the draft position.
     draft_position_presence: ItemPresence,
     /// Files being read, by the block they will land in; `None` is the draft
     /// position.
@@ -504,8 +502,6 @@ impl Cowork {
                 .any(|pending| draft.pending_block(pending.target).is_none())
     }
 
-    /// Every file being read into the draft: the local user's, and those
-    /// others announce in their presence.
     pub(crate) fn pending_reads(&self, draft: &ThreadDraft) -> Vec<PendingAttachment> {
         let local = self
             .pending_attachments
@@ -566,7 +562,6 @@ impl Cowork {
         }
     }
 
-    /// The thread's participants in join order, for the draft `draft_id`.
     fn draft_participants(&self, draft_id: Uuid, cx: &App) -> Vec<ParticipantId> {
         self.thread_store
             .read(cx)
@@ -577,7 +572,6 @@ impl Cowork {
             .unwrap_or_default()
     }
 
-    /// The bottom-most editor of the composer.
     pub(crate) fn last_composer_editor(
         &self,
         window: &Window,
@@ -669,9 +663,6 @@ impl Cowork {
         })
     }
 
-    /// The composer: the draft's comments, one row per prompt block, and the
-    /// draft position, followed by empty space that leads to the draft
-    /// position when clicked.
     pub(crate) fn render_composer(
         &self,
         composer: ComposerModel,

@@ -19,7 +19,6 @@ pub(crate) fn usage_tokens(usage: &Usage) -> u64 {
     }
 }
 
-/// How much of a thread's context window is in use.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ContextUsage {
     pub(crate) tokens: u64,
@@ -75,7 +74,7 @@ pub(crate) fn format_stat_duration(duration: Duration) -> String {
 }
 
 /// A turn's tokens, dated when its response started generating.
-#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct TokenActivity {
     pub(crate) at: SystemTime,
     /// How long the response took, across which its tokens are spread.
@@ -170,7 +169,6 @@ impl ActivityRange {
 /// responses started in one period.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ActivityBucket {
-    /// Names the period when hovered, uniquely within the chart.
     pub(crate) label: SharedString,
     pub(crate) tokens: f64,
 }
@@ -185,7 +183,6 @@ pub(crate) struct AxisLabel {
 /// What the token activity chart shows for one [`ActivityRange`].
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ActivityChart {
-    /// Oldest first.
     pub(crate) buckets: Vec<ActivityBucket>,
     pub(crate) axis: Vec<AxisLabel>,
 }
@@ -253,7 +250,6 @@ enum BucketUnit {
 }
 
 impl BucketUnit {
-    /// The start of the unit containing `time`.
     fn floor(self, time: DateTime<Local>) -> DateTime<Local> {
         let minute = time
             .with_nanosecond(0)
@@ -387,14 +383,12 @@ impl BucketLayout {
         }
     }
 
-    /// The start of the first bucket.
     pub(crate) fn start(self, now: DateTime<Local>) -> DateTime<Local> {
         self.unit
             .back(self.unit.floor(now), self.count.saturating_sub(1))
     }
 }
 
-/// The tokens used in each period of `range`, and how to label them.
 pub(crate) fn token_activity_chart(
     activity: &[TokenActivity],
     range: ActivityRange,

@@ -11,7 +11,6 @@ use crate::{
 };
 
 impl Cowork {
-    /// Greets the user over the providers.
     pub(crate) fn render_welcome(
         &mut self,
         window: &mut Window,

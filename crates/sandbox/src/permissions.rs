@@ -1,6 +1,5 @@
 //! The tool the model asks for more permissions with, for the rest of its
-//! run, as Codex's `request_permissions`: more access to the project, and
-//! folders outside it.
+//! run: more access to the project, and folders outside it.
 //!
 //! A call needs what it asks for ([`Needs::Permissions`]), resolved before
 //! anyone is asked. The host lets it run when the run has that already or

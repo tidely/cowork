@@ -1,18 +1,14 @@
 //! Choosing an LLM provider, then one of its models: shown by the welcome
 //! screen before the first chat (`welcome.rs`), and by the Providers settings
-//! page without the welcome text (`settings.rs`). Each passes its own intro
-//! and closing button; the steps, cards, and buttons between them are here.
-//! A provider that needs an API key asks for it above its models; keeping
-//! the key is `providers.rs`'s.
+//! page (`settings.rs`). Each passes its own intro and closing button; the
+//! steps, cards, and buttons between them are here. A provider that needs an
+//! API key asks for it above its models; keeping the key is `providers.rs`'s.
 //!
-//! A provider's card goes straight on to its models, each provider's
-//! recommended one ([`recommended_model`]) marked. On the welcome screen,
-//! clicking a model starts the first chat with it; the Providers settings
-//! page instead picks the model new chats start with, and can always
-//! discover models again. Ollama's step says what is missing (installing
-//! it, starting it, or pulling a model) and looks again on its own every
-//! [`OLLAMA_RECHECK`] while it isn't ready; no other provider is polled,
-//! as they are paid.
+//! On the welcome screen, clicking a model starts the first chat with it;
+//! the settings page instead picks the model new chats start with. Ollama's
+//! step says what is missing and looks again on its own every
+//! [`OLLAMA_RECHECK`] while it isn't ready; no other provider is polled, as
+//! they are paid.
 
 use std::sync::Arc;
 
@@ -46,7 +42,6 @@ pub(crate) struct ApiKeyInput {
     _subscription: Subscription,
 }
 
-/// A step's small capitals heading, over the full width.
 fn section_label(label: &'static str, cx: &App) -> AnyElement {
     div()
         .mb_3()
@@ -57,13 +52,10 @@ fn section_label(label: &'static str, cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-/// Which step of setting up a provider is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ProviderStep {
-    /// The providers, one to pick before continuing to its models.
     #[default]
     Providers,
-    /// The models `ModelProvider` offers, discovered when the step opens.
     Models(ModelProvider),
 }
 
@@ -81,7 +73,6 @@ pub(crate) enum ProviderSetupPlace {
     Settings,
 }
 
-/// A page title over the cards, with an optional line below it.
 pub(crate) fn provider_setup_intro(
     title: impl Into<SharedString>,
     subtitle: Option<&'static str>,
@@ -136,7 +127,6 @@ fn setup_card(id: String, selected: bool, cx: &App) -> Stateful<gpui::Div> {
         .hover(|this| this.bg(cx.theme().secondary_hover))
 }
 
-/// A card's icon and name, with a smaller line below.
 fn setup_card_content(
     provider: ModelProvider,
     name: impl Into<SharedString>,
@@ -282,7 +272,6 @@ impl Cowork {
         ]
     }
 
-    /// Whether Ollama's models step is showing, at either place.
     fn showing_ollama_setup(&self) -> bool {
         let step = match self.main_stage {
             MainStage::ProviderSetup(provider) => ProviderStep::Models(provider),
@@ -432,7 +421,6 @@ impl Cowork {
         ]
     }
 
-    /// The API key field for `provider`, made the first time it shows.
     fn api_key_input(
         &mut self,
         provider: ModelProvider,
@@ -466,7 +454,6 @@ impl Cowork {
         state
     }
 
-    /// Saves the key typed in the field, clearing the field.
     fn submit_api_key(&mut self, cx: &mut Context<Self>) {
         let Some(input) = &self.api_key_input else {
             return;
@@ -675,7 +662,6 @@ impl Cowork {
             .into_any_element()
     }
 
-    /// The command pulling the suggested model, with a button copying it.
     fn render_pull_command(&self, cx: &Context<Self>) -> AnyElement {
         let command = format!("ollama pull {OLLAMA_SUGGESTED_MODEL}");
         let copied = self.copied_pull_command;
@@ -710,7 +696,6 @@ impl Cowork {
             .into_any_element()
     }
 
-    /// Moves to `step`, discovering the provider's models when it shows them.
     pub(crate) fn show_provider_step(
         &mut self,
         place: ProviderSetupPlace,
@@ -735,7 +720,6 @@ impl Cowork {
         cx.notify();
     }
 
-    /// The catalog the model cards list, and the model they show selected.
     fn setup_models(
         &self,
         place: ProviderSetupPlace,

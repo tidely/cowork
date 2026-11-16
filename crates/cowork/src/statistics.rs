@@ -24,7 +24,6 @@ pub(crate) struct ProfileStatistics {
     pub(crate) chart: CachedActivityChart,
 }
 
-/// What the profile page counts of deleted chats, or what to add to it.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Statistics {
     pub(crate) tokens_used: u64,
@@ -95,7 +94,6 @@ impl Cowork {
             .fold(self.deleted.tokens_used, u64::saturating_add)
     }
 
-    /// When those tokens were used, turn by turn.
     pub(crate) fn token_activity(&self, cx: &App) -> Vec<TokenActivity> {
         self.deleted
             .token_activity

@@ -17,9 +17,7 @@ use crate::{
     models::{ModelInfo, ModelProvider, Reasoning},
 };
 
-/// Where the app finds Ollama.
 const OLLAMA_URL: &str = "http://localhost:11434";
-/// Where to download Ollama when it isn't installed.
 pub(crate) const OLLAMA_DOWNLOAD_URL: &str = "https://ollama.com/download";
 /// The model setup suggests pulling when Ollama has none, and recommends
 /// once pulled: one that uses tools well, as the agent needs.
@@ -108,13 +106,10 @@ impl OpenAiModel {
 #[derive(Debug, PartialEq)]
 pub(crate) struct RequestParameters {
     pub(crate) thinking: Option<Thinking>,
-    /// Passed through to the provider's API as they are.
     pub(crate) options: JsonObject,
 }
 
 impl ModelProvider {
-    /// Whether the provider needs an API key before it lists or runs
-    /// models.
     pub(crate) fn needs_api_key(self) -> bool {
         match self {
             Self::Ollama => false,
@@ -122,7 +117,6 @@ impl ModelProvider {
         }
     }
 
-    /// Where the user creates an API key, for providers that need one.
     pub(crate) fn api_key_page(self) -> Option<&'static str> {
         match self {
             Self::Ollama => None,
@@ -139,15 +133,9 @@ impl ModelProvider {
         }
     }
 
-    /// What a request to a model with `info` needs that only this
-    /// provider's API takes. Kept apart from the shared definition so every
-    /// provider-specific parameter is decided here:
-    ///
-    /// - Ollama is told the window to run the model with (`num_ctx`).
-    /// - Anthropic requires an output cap, and older models think only
-    ///   within a budget (`thinking.budget_tokens`).
-    /// - OpenAI takes the effort as `reasoning_effort`, and rejects options
-    ///   it doesn't know.
+    /// What a request to a model with `info` needs that only this provider's API
+    /// takes. Kept apart from the shared definition so every provider-specific
+    /// parameter is decided here.
     pub(crate) fn request_parameters(self, info: &ModelInfo) -> RequestParameters {
         let effort = match &info.reasoning {
             Reasoning::Effort(effort) => Some(Thinking::Effort(effort.clone())),
@@ -182,7 +170,6 @@ impl ModelProvider {
     }
 }
 
-/// A connection to `provider`, with `api_key` for those that need one.
 pub(crate) fn connect(
     provider: ModelProvider,
     api_key: Option<&str>,
@@ -201,7 +188,6 @@ pub(crate) fn connect(
     })
 }
 
-/// The app's connections to providers, and what went wrong reaching each.
 #[derive(Default)]
 pub(crate) struct Providers {
     /// Ollama's connection once made, and each other provider's while it
@@ -211,7 +197,6 @@ pub(crate) struct Providers {
     /// Why the provider's models couldn't be listed, or its key saved,
     /// until it next succeeds.
     errors: HashMap<ModelProvider, SharedString>,
-    /// What the last look for Ollama found, `None` before the first one.
     ollama: Option<OllamaStatus>,
 }
 
@@ -222,13 +207,11 @@ pub(crate) enum OllamaStatus {
     /// Answering; whether it has models is the catalog's, and why they
     /// couldn't be listed, if they couldn't, [`Providers::error`]'s.
     Running,
-    /// Not answering, but its app or command is on this computer.
     NotRunning,
     NotInstalled,
 }
 
 impl Providers {
-    /// The connection to `provider`, or why there is none.
     pub(crate) fn connection(
         &mut self,
         provider: ModelProvider,
@@ -246,7 +229,6 @@ impl Providers {
         Ok(connection)
     }
 
-    /// Whether `provider` has the API key it needs.
     pub(crate) fn has_api_key(&self, provider: ModelProvider) -> bool {
         provider.needs_api_key() && self.connections.contains_key(&provider)
     }
@@ -259,7 +241,6 @@ impl Providers {
         self.ollama
     }
 
-    /// Whether `connection` is still `provider`'s, so what it found applies.
     fn is_current(
         &self,
         provider: ModelProvider,

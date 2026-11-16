@@ -1,11 +1,11 @@
 # Agent input
 
-A reusable input lifecycle for the provider-independent agent loop. The
-[agent-runtime](../agent-runtime/README.md) driver uses this layer; Cowork still
-keeps its own pending-submission queue, hands its session one queued input at a
-time, and uses native steering for current-run follow-ups. This crate owns
-pending work and the handoff into a conversation; it has no GPUI, provider,
-tool, async-runtime, or persistence dependency.
+A reusable input lifecycle for the provider-independent agent loop, used by the
+[agent-runtime](../agent-runtime/README.md) driver. Cowork keeps its own
+pending-submission queue and hands its session one queued input at a time,
+sending current-run follow-ups as `Delivery::Steer`. This crate owns pending
+work and the handoff into a conversation; it has no GPUI, provider, tool,
+async-runtime, or persistence dependency.
 
 `Inbox<Source, Payload>` is owned by the session actor. Source and payload are
 application types: adding a scheduler, parent agent, collaborator, background
@@ -126,28 +126,21 @@ pending; reconnect/replay deduplication, crash recovery, event encoding, capacit
 limits and backpressure belong to the session owner/journal. IDs and policies
 here introduce no new wire or storage format.
 
-## Placement in the stack
+## What the host must do
 
-The [agent-runtime](../agent-runtime/README.md) session uses this layer above
-`LanguageModelProvider` and `tool-runtime`. The integration boundaries are:
+The [agent-runtime](../agent-runtime/README.md) session is the reference host.
+The integration rules are:
 
-- Commit the initial input before building `CompletionRequest.messages`.
-- Keep `CompletionEvent` deltas provisional. Steering does not modify a request
-  already streaming, and cancelled previews do not become accepted messages.
+- Commit the initial input before building `CompletionRequest.messages`, and keep
+  `CompletionEvent` deltas provisional. Steering does not modify a request
+  already streaming.
 - After accepting an assistant reply, settle its tool calls and append correlated
-  results before committing a safe-point batch. Preserve complete assistant
-  messages, including provider-native signed thinking/replay data.
+  results before committing a safe-point batch.
 - Before returning a final answer, drain once more, and continue inference if
   inputs arrived. Serialize the final `finish_run` with new admission.
-- On `YieldWait`, wake only a tool implementing that cooperative host service.
-  On `Cancel`, cancel local inference and cooperate with tools, then settle the
-  run. `ToolCapabilities.supports_cancel` does not promise rollback; dropping
-  HTTP work does not prove remote computation stopped. The loop must resolve
-  outstanding tool-call correlation before reusing that history.
+- On `YieldWait`, wake only a tool implementing that cooperative host service. On
+  `Cancel`, cancel local inference and cooperate with tools, then settle the run.
 
-`Payload` is application data; agent-runtime uses its host's typed `Input` and
-renders it to user content only when it is committed, so untrusted source text
-never becomes a privileged message. Application history, permissions,
-formatting and event journaling remain with the host. Providers still execute
-one request; tool-runtime still executes one call. This crate makes no tools or
-model requests itself.
+`Payload` is application data; agent-runtime renders its host's typed `Input` to
+user content only when it is committed, so untrusted source text never becomes a
+privileged message. This crate makes no tool or model requests itself.

@@ -120,7 +120,6 @@ impl Cowork {
         );
     }
 
-    /// A chat's title as the sidebar and archive show it.
     pub(crate) fn shown_title(&self, thread_id: Uuid, cx: &App) -> String {
         self.thread_store
             .read(cx)
@@ -202,8 +201,6 @@ impl Cowork {
         cx.notify();
     }
 
-    /// Restores every archived thread, keeping the archive's order at the top
-    /// of the recents.
     pub(crate) fn restore_all_threads(&mut self, cx: &mut Context<Self>) {
         self.thread_store.update(cx, |store, _| store.restore_all());
         self.save_all_threads(cx);
@@ -344,7 +341,6 @@ impl Cowork {
         });
     }
 
-    /// Asks before deleting every thread the archive shows now.
     fn confirm_delete_all_archived(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let thread_ids: Vec<Uuid> = self
             .thread_store
@@ -389,16 +385,14 @@ impl Cowork {
         );
     }
 
-    /// Keeps a deleted thread's longest stretch of generating for the
-    /// profile's statistics, and removes its folder, with its commands'
-    /// scratch folder. Also called for a thread that left the sidebar and
-    /// when a run of such a thread ends, which adds that run's time. An
-    /// archived thread keeps its folder, so restoring it continues where it
-    /// was; its commands end with its run, as does its agent session.
+    /// Keeps a deleted thread's longest stretch of generating for the profile's
+    /// statistics and removes its folder. Also called for a thread that left
+    /// the sidebar and when a run of such a thread ends, which adds that run's
+    /// time. An archived thread keeps its folder, so restoring it continues
+    /// where it was.
     pub(crate) fn settle_retired_thread(&mut self, thread: &Entity<Thread>, cx: &App) {
         let thread = thread.read(cx);
         let thread_id = thread.instance_id;
-        // Its session ends with it; restoring the thread starts another.
         self.retire_agent(thread_id);
         // Archived. (Listed, loaded or not, rather than loaded: a chat
         // unloaded since would otherwise count as deleted.)

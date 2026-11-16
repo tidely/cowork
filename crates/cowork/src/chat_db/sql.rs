@@ -391,7 +391,6 @@ pub(super) async fn delete(conn: &mut SqliteConnection, id: Uuid) -> anyhow::Res
     Ok(())
 }
 
-/// Everything saved of a chat, or `None` if it isn't.
 pub(super) async fn load(
     conn: &mut SqliteConnection,
     id: Uuid,
@@ -595,7 +594,6 @@ pub(super) async fn load(
     }))
 }
 
-/// A text of a saved chat the search palette may match.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SearchHit {
     pub(crate) thread_id: Uuid,

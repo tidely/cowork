@@ -22,11 +22,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Cowork, thread::Thread};
 
-/// Shown while hovering the Write option.
 pub(crate) const WRITE_WARNING: &str = "The agent can edit files in your project folders. \
      Its commands are sandboxed, but a malicious agent may be able to escape the sandbox.";
 
-/// Shown while hovering the Write + Network option.
 pub(crate) const NETWORK_WARNING: &str = "The agent can edit files in your project folders \
      and access the internet. A malicious agent may leak your files, or run arbitrary code in a sandboxed environment.";
 
@@ -35,7 +33,6 @@ pub(crate) const NETWORK_WARNING: &str = "The agent can edit files in your proje
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum ProjectMode {
     Write,
-    /// The default, so nothing is changed until someone asks for it.
     #[default]
     Read,
     /// Write, and reach the network; labelled "Write + Network".
@@ -72,7 +69,6 @@ impl ProjectMode {
         }
     }
 
-    /// What commands may do in this mode, unless they ask for other access.
     pub(crate) fn access(self) -> sandbox::Access {
         match self {
             Self::Read => sandbox::Access::Read,
@@ -81,7 +77,6 @@ impl ProjectMode {
         }
     }
 
-    /// What choosing this mode allows, for the modes that change things.
     pub(crate) fn warning(self) -> Option<&'static str> {
         match self {
             Self::Network => Some(NETWORK_WARNING),
@@ -172,7 +167,6 @@ impl Cowork {
             .into_any_element()
     }
 
-    /// An option that changes things, warning while hovered what it allows.
     fn render_warned_option(
         option: ProjectMode,
         text: &'static str,

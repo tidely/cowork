@@ -24,12 +24,10 @@ use crate::{
     usage::ContextUsage,
 };
 
-/// How a provider's logo is drawn.
 enum Logo {
     /// A one-color mark, drawn in the theme's text color so it reads on any
     /// background (the files' own fill would be black).
     Monochrome(&'static str),
-    /// A mark in its brand colors, drawn as it is.
     Colored(&'static str),
 }
 
@@ -50,8 +48,6 @@ impl ModelProvider {
         }
     }
 
-    /// The provider's logo, `size` square. Dimming the returned element
-    /// (`opacity`) dims the logo.
     pub(crate) fn icon(self, size: Pixels, cx: &App) -> gpui::Div {
         let logo = match self.logo() {
             Logo::Monochrome(path) => svg()
@@ -64,7 +60,6 @@ impl ModelProvider {
         div().size(size).flex_none().child(logo)
     }
 
-    /// Shown under the name on the provider's setup card.
     pub(crate) fn description(self) -> &'static str {
         match self {
             Self::Ollama => {
@@ -80,7 +75,6 @@ impl ModelProvider {
 pub(crate) const UNAVAILABLE_MODEL_TOOLTIP: &str =
     "This model is no longer available. Pick another to send.";
 
-/// A row in the model picker.
 #[derive(Clone)]
 pub(crate) struct LanguageModel {
     pub(crate) name: SharedString,
@@ -185,7 +179,6 @@ pub(crate) fn language_model_groups(
 }
 
 impl Cowork {
-    /// Creates the model picker and subscribes `Cowork` to the user's picks.
     pub(crate) fn new_model_picker(
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -260,14 +253,12 @@ impl Cowork {
         cx.notify();
     }
 
-    /// The model of the active thread, or of the thread about to be created.
     pub(crate) fn active_model(&self, cx: &App) -> Option<ModelRef> {
         self.active_thread(cx)
             .map(|thread| thread.read(cx).model().cloned())
             .unwrap_or_else(|| self.new_thread_model.clone())
     }
 
-    /// The catalog of the active thread, or of the thread about to be created.
     pub(crate) fn active_catalog(&self, cx: &App) -> Arc<ModelCatalog> {
         self.active_thread(cx).map_or_else(
             || self.models.clone(),
@@ -286,9 +277,8 @@ impl Cowork {
     ///
     /// The picker is shared by every thread, while each thread has its own
     /// catalog and model that collaborators can change at any time, so it is
-    /// re-synced on every render rather than at each of the places either can
-    /// change. Setting the selection does not emit a picker event, so this
-    /// never feeds back into [`Cowork::select_model`].
+    /// re-synced on every render. Setting the selection does not emit a picker
+    /// event, so this never feeds back into [`Cowork::select_model`].
     pub(crate) fn sync_model_picker(&mut self, window: &mut Window, cx: &mut App) {
         let catalog = self.active_catalog(cx);
         let model = self.active_model(cx);
@@ -320,8 +310,6 @@ impl Cowork {
         }
     }
 
-    /// A ring that fills as the active thread nears the end of its model's
-    /// context window. Hovering it shows the numbers.
     pub(crate) fn render_context_indicator(
         &self,
         thread: Option<&Entity<Thread>>,

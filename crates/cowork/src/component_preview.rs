@@ -1,9 +1,7 @@
 //! A window showing the tool call card for each kind of call the agent can
-//! make (about permissions, and file writes' and edits' diffs), in each
-//! project mode,
-//! as the host sees it: a row per call and a
-//! column per mode. Combinations that run without asking show that instead
-//! of a card. `cargo run -p cowork --example component_preview` opens it.
+//! make (about permissions, and file writes' and edits' diffs), in each project
+//! mode as the host sees it: a row per call and a column per mode.
+//! Combinations that run without asking show that instead of a card.
 
 use agent::model::ToolCall;
 use std::rc::Rc;
@@ -20,7 +18,6 @@ use crate::{
     file_change_view::FileChangeView, project_mode::ProjectMode, tool_call_card::ToolCallCard,
 };
 
-/// Runs the preview until its window closes, as the app's own run does.
 pub fn run() -> anyhow::Result<()> {
     gpui_platform::application()
         .with_assets(crate::assets::Assets)
@@ -37,9 +34,7 @@ pub fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// The columns, least access first.
 const MODES: [ProjectMode; 3] = [ProjectMode::Read, ProjectMode::Write, ProjectMode::Network];
-/// Gaps between cells and around the grid.
 const SPACING: Pixels = px(24.);
 
 fn open(cx: &mut App) -> anyhow::Result<()> {
@@ -73,9 +68,7 @@ fn open(cx: &mut App) -> anyhow::Result<()> {
 }
 
 struct ComponentPreview {
-    /// What the last button pressed would have done, to show it is wired.
     last_click: Option<SharedString>,
-    /// The diff views of the file rows' calls, by row.
     file_views: std::collections::HashMap<&'static str, Entity<FileChangeView>>,
 }
 
@@ -212,7 +205,6 @@ fn asks(call: &ToolCall, project: Access) -> bool {
     access > Access::Read || !read.is_empty() || !write.is_empty()
 }
 
-/// The rows: each kind of call the agent can make about permissions.
 fn combinations() -> Vec<(&'static str, &'static str, ToolCall)> {
     vec![
         (
@@ -495,7 +487,6 @@ pub fn run_turn_navigation() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// One stage of the preview: its markers and their own scroll offset.
 struct PreviewRail {
     markers: Vec<uuid::Uuid>,
     scroll: gpui::ScrollHandle,
@@ -512,7 +503,6 @@ impl PreviewRail {
 
 struct TurnNavigationPreview {
     rails: Vec<PreviewRail>,
-    /// The live rail's hovered and current markers.
     live_hovered: Option<usize>,
     live_current: usize,
 }

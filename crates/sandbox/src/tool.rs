@@ -227,9 +227,7 @@ mod tests {
         }
     }
 
-    /// A call needs what it asks for of its own and the folders it names;
-    /// one naming a folder that can't be granted is refused before anyone
-    /// is asked.
+    /// A folder that can't be granted is refused before anyone is asked.
     #[test]
     fn calls_need_the_access_and_folders_they_ask_for() {
         let (sandboxes, _scratch) = test_sandboxes();
@@ -317,8 +315,6 @@ mod tests {
         assert!(folder.join("granted.txt").exists(), "granted write access");
     }
 
-    /// A folder outside the project is writable only for a command naming
-    /// it to write, or once the run was granted it.
     #[tokio::test(flavor = "multi_thread")]
     async fn granted_folders_outside_the_project_are_writable() {
         if !mxc_sdk::v1::platform_support().is_supported {

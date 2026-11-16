@@ -52,7 +52,6 @@ const WEEK: [Weekday; 7] = [
     Weekday::Sun,
 ];
 
-/// Runs listed in a task's dialog, newest first.
 const SHOWN_RUNS: usize = 10;
 
 /// A time relative to `now`: "Today 09:00", "Tomorrow 09:00", "Yesterday
@@ -77,7 +76,6 @@ fn trigger_label(trigger: Trigger) -> &'static str {
     }
 }
 
-/// A run's result in a few words, and whether it is a problem.
 fn result_label(result: &RunResult) -> (String, bool) {
     match result {
         RunResult::Running => ("Running".into(), false),
@@ -101,7 +99,6 @@ fn result_label(result: &RunResult) -> (String, bool) {
     }
 }
 
-/// The most recent run that ran, for the row's "last run" line.
 fn last_run(task: &ScheduledTask) -> Option<&RunRecord> {
     task.history()
         .iter()
@@ -592,15 +589,12 @@ type ModelSelect = SelectState<SearchableVec<SharedString>>;
 /// options change, including whether the task can be saved yet.
 pub(crate) struct ScheduleEditor {
     cowork: WeakEntity<Cowork>,
-    /// The task being edited; `None` while creating one.
     editing: Option<Uuid>,
     name: Entity<InputState>,
     prompt: Entity<TextareaState>,
     kind: WhenKind,
     frequency: Frequency,
-    /// The date and time of a one-time task.
     once: Entity<DatePickerState>,
-    /// The time of day of the other presets.
     time: Entity<TimeFieldState>,
     weekly_days: Vec<Weekday>,
     month_day: Entity<InputState>,
@@ -611,7 +605,6 @@ pub(crate) struct ScheduleEditor {
     every: Entity<InputState>,
     unit: IntervalUnit,
     interval_start: Entity<DatePickerState>,
-    /// The models the select offers, in its order.
     models: Vec<ModelRef>,
     model: Entity<ModelSelect>,
     thread: ThreadMode,
@@ -884,7 +877,6 @@ impl ScheduleEditor {
             )
     }
 
-    /// The schedule the form describes, or what to fix in it.
     fn when(&self, cx: &App) -> Result<When, String> {
         let time = self.time.read(cx).time();
         let when = match (self.kind, self.frequency) {
@@ -945,7 +937,6 @@ impl ScheduleEditor {
         when.validate().map(|()| when)
     }
 
-    /// The settings the form describes, or what keeps them from being saved.
     fn settings(&self, cx: &App) -> Result<TaskSettings, String> {
         let prompt = self.prompt.read(cx).value().trim().to_owned();
         let when = self.when(cx);

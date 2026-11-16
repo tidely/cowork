@@ -5,7 +5,7 @@
 //! received; changed sections render a note. Notes are committed to the
 //! conversation (never injected for one request only, which would change the
 //! next request's prefix), each wrapped in its own `<section_id>` tags inside
-//! one user entry with an `Origin::Context`, as Codex does with its fragments.
+//! one user entry with an `Origin::Context`.
 
 use std::collections::BTreeMap;
 

@@ -284,8 +284,6 @@ impl Fixture {
     }
 }
 
-/// What the agent's event reports for the thread, as the host relays it:
-/// previews, committed entries, and usage.
 fn relayed(event: agent::AgentEvent<agent::BasicHost>) -> Option<RunEvent> {
     Some(match event.kind {
         EventKind::Preview { index, delta } => RunEvent::Preview(Preview {

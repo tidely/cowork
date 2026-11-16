@@ -46,7 +46,6 @@ impl Extent {
         }
     }
 
-    /// Whether `self` holds no more than `other` of anything.
     pub(crate) fn within(self, other: Self) -> bool {
         self.messages <= other.messages && self.transcript.within(other.transcript)
     }
@@ -89,7 +88,6 @@ pub(crate) struct Head {
     pub(crate) streamed_bytes: i64,
     pub(crate) generation_ns: i64,
     pub(crate) last_run_at: Option<DateTime<Utc>>,
-    /// Name and path, in order.
     pub(crate) folders: Vec<(String, String)>,
     /// Sorted by participant.
     pub(crate) profiles: Vec<ProfileRow>,
@@ -188,7 +186,6 @@ impl Head {
     }
 }
 
-/// One timeline message's rows.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum MessageRow {
     User {
@@ -231,7 +228,6 @@ pub(crate) struct CommentRow {
     pub(crate) body: String,
 }
 
-/// An agent run, which had ended when it was saved.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RunRow {
     pub(crate) comment_group_id: Option<Uuid>,
@@ -434,7 +430,6 @@ pub(crate) struct Tail {
 }
 
 impl Tail {
-    /// What `thread` holds past `from`, which must be within it.
     pub(crate) fn after(thread: &Thread, from: Extent) -> anyhow::Result<Self> {
         let messages = thread.timeline[from.messages..]
             .iter()
@@ -492,7 +487,6 @@ pub(crate) struct ChatRows {
 }
 
 impl ChatRows {
-    /// How much of the chat the rows hold.
     pub(crate) fn extent(&self) -> Extent {
         Extent {
             messages: self.messages.len(),
@@ -503,7 +497,6 @@ impl ChatRows {
         }
     }
 
-    /// A chat with nothing but its row, for tests of loading.
     #[cfg(test)]
     pub(crate) fn of_meta(meta: &ChatMeta) -> Self {
         Self {
@@ -668,7 +661,6 @@ impl ChatRows {
     }
 }
 
-/// A `threads` row as startup reads it, before it is a [`ChatMeta`].
 pub(crate) struct MetaRow {
     pub(crate) id: Uuid,
     pub(crate) title: String,

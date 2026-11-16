@@ -115,8 +115,8 @@ impl wire::ChatCompletionRequest {
     }
 }
 
-/// Validate correlation across the sequence and resolve optional wire identities
-/// before mapping each message independently.
+/// Validates correlation across the sequence and resolves optional wire identities
+/// before each message is mapped independently.
 fn resolve_history(messages: &mut [Message]) -> Result<(), Error> {
     let mut calls = HashMap::new();
     let mut resolved = HashSet::new();

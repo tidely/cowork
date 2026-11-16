@@ -18,7 +18,6 @@ use crate::{participant::ParticipantId, protocol};
 /// than the image limit so uncompressed screenshots (BMP, TIFF) can still be
 /// converted to PNG.
 const MAX_ATTACHMENT_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
-/// Largest encoded image sent to the model, in line with common provider limits.
 pub(crate) const MAX_IMAGE_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Text is inlined into the prompt; cap each attachment independently of the
@@ -52,7 +51,6 @@ impl FileAttachment {
         }
     }
 
-    /// The file's bytes as they travel between participants.
     pub(crate) fn bytes(&self) -> &[u8] {
         match &self.content {
             FileAttachmentContent::Text(text) => text.as_bytes(),
@@ -68,7 +66,6 @@ impl FileAttachment {
         }
     }
 
-    /// Rebuilds a file another participant sent.
     pub(crate) fn from_bytes(
         name: String,
         kind: AttachmentKind,
@@ -90,7 +87,6 @@ impl FileAttachment {
     }
 }
 
-/// The largest file of a kind anyone may attach.
 pub(crate) fn max_attachment_size(kind: AttachmentKind) -> u64 {
     match kind {
         AttachmentKind::Text => MAX_TEXT_ATTACHMENT_BYTES,
@@ -134,7 +130,6 @@ pub(crate) fn record_from_protocol(record: protocol::AttachmentRef) -> Attachmen
     }
 }
 
-/// A file whose bytes are still arriving from another participant.
 pub(crate) struct IncomingFile {
     pub(crate) name: String,
     pub(crate) kind: AttachmentKind,
@@ -271,8 +266,6 @@ fn read_attachment_file(
     Ok(bytes)
 }
 
-/// Classifies an attachment by its content rather than its extension: images
-/// are recognized by their signature, anything else must be UTF-8 text.
 fn attachment_from_bytes(name: String, bytes: Vec<u8>) -> anyhow::Result<FileAttachment> {
     match image_content(bytes) {
         Ok(content) => {

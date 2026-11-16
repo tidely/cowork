@@ -2,11 +2,11 @@
 
 Secure & collaborative agentic workspace.
 
-Share an agent thread with your collaborators. You can write the next prompt together, comment on the agent's replies, and decide what the agent may do. Connections are peer-to-peer and end-to-end encrypted, so nobody else can read your threads. Models run locally through [Ollama](https://ollama.com), so your work never has to leave the computers of the people in the thread. The agent's shell commands run with your own tools, inside your operating system's sandbox, and anything beyond the project's mode waits until the host allows it.
+Share an agent chat with your collaborators. You can write the next prompt together, comment on the agent's replies, and decide what the agent may do. Connections are peer-to-peer and end-to-end encrypted, so nobody else can read your chats. Models can run locally through [Ollama](https://ollama.com), so your work never has to leave the computers of the people in the chat, or through Anthropic or OpenAI with the host's own API key, which stays in the host's keychain. The agent's shell commands run with your own tools, inside your operating system's sandbox, and anything beyond the project's mode waits until the host allows it.
 
 ## Installation
 
-Cowork doesn't have releases yet, so you need to build it yourself. Install [Rust](https://rust-lang.org) and [Ollama](https://ollama.com), then run:
+Cowork doesn't have releases yet, so you need to build it yourself. Install [Rust](https://rust-lang.org) and, for local models, [Ollama](https://ollama.com), then run:
 
 ```sh
 git clone https://github.com/tidely/cowork

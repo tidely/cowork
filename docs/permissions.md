@@ -36,25 +36,13 @@ writes stay in project or scratch folders. Approving a write in Read permits
 that call without changing auto-approve. Credential and path checks still
 apply.
 
-`view_image` accepts a `path` string with the same paths and checks as
-`read_file`: project-folder paths (`<folder name>/…`), `scratch://…`, or
-absolute host paths. It supports PNG, JPEG, GIF, WebP, BMP, and TIFF.
-PNG and JPEG files up to 2048 pixels on a side and 4 MiB are sent as they
-are. Anything else is decoded (the first frame of an animation), turned
-upright by its EXIF orientation, scaled down to 2048 pixels on its longest
-side, and sent as PNG, or as JPEG for photos and for images whose PNG would
-be over 4 MiB. Files over 64 MiB, or over 50 megapixels by their header, are
-refused before being decoded. The result gives the image's size first, and
-the scaled size if it was scaled. A model that doesn't accept images (Ollama
-reports this per model) is sent a note in place of the image, and the same
-goes for every image in the conversation, attachments included.
-
-`read_pdf` takes the same paths and checks, and reads a PDF's pages as text
-(the default) or as JPEG images rendered at 150 DPI. Without `first_page`
-and `last_page` it reads documents of up to 10 pages whole and otherwise
-returns the page count; one call reads at most 20 pages, and text stops at a
-page boundary past 64 KiB, saying where to go on. Files over 50 MiB are
-refused, and a call taking over 60 seconds fails.
+`view_image` and `read_pdf` take the same paths and checks as `read_file`
+(project-folder paths, `scratch://…`, or absolute host paths). Large images are
+decoded, scaled down and re-encoded before being sent, and a model that doesn't
+accept images (Ollama reports this per model) is sent a note in place of any image
+in the conversation, attachments included. `read_pdf` reads pages as text or as
+rendered images, with caps on pages per call, output size, file size and time. The
+limits are constants in `crates/sandbox/src/files.rs` and `pdf.rs`.
 
 `request_permissions` keeps approved command permissions for the rest of
 one run. Lowering auto-approve affects future calls but does not revoke

@@ -6,14 +6,10 @@
 //! own terms passes its own [`ToolCallCard::body`] (file writes and edits
 //! pass their diff, `crate::file_change_view`); `run_command` and
 //! `request_permissions` are shown in theirs here, and every other tool gets
-//! its arguments listed.
-//!
-//! It keeps to a title, what the call would do, and the decision. A tool's
-//! own body names the call itself, so it takes the title's place, keeping
-//! the card small. Only a
-//! call asking for more than the thread's mode gets a badge beside the
-//! title, naming only the additional permissions, and a quiet note beside
-//! the decision of how long it lasts.
+//! its arguments listed. A tool's own body names the call itself, so it
+//! takes the title's place. Only a call asking for more than the thread's
+//! mode gets a badge beside the title, naming only the additional
+//! permissions, and a quiet note beside the decision of how long it lasts.
 
 use std::rc::Rc;
 
@@ -38,14 +34,11 @@ use crate::highlight::highlight_code_block_in_mode;
 
 type ClickHandler = Rc<dyn Fn(&ClickEvent, &mut Window, &mut App)>;
 
-/// What the card offers under the call.
 enum Decision {
-    /// Allow and Deny, for someone who may approve tool calls.
     Offered {
         on_allow: ClickHandler,
         on_deny: ClickHandler,
     },
-    /// A note that the call waits for someone who may.
     Waiting,
 }
 
@@ -128,10 +121,8 @@ impl ToolCallCard {
     }
 }
 
-/// The badge for a call asking for more than the thread's mode.
 struct ExtraAccess {
     access: ExtraRights,
-    /// Starts the badge's tooltip, before the access's name.
     tooltip: &'static str,
     /// How long the access lasts, as the note beside the decision says it;
     /// `None` when the title already says.
@@ -341,7 +332,6 @@ fn added_rights(requested: Access, baseline: Access, extra_folders: bool) -> Opt
     }
 }
 
-/// The rights the approval adds, in the warning color.
 fn access_badge(id: &SharedString, shown: &ExtraAccess, cx: &App) -> AnyElement {
     let selector = format!("{id}-access");
     let tooltip = SharedString::from(format!("{} {} access", shown.tooltip, shown.access.label()));
@@ -372,7 +362,6 @@ fn escalation_note(id: &SharedString, scope: &'static str, cx: &App) -> AnyEleme
 /// a call with long arguments stays a card rather than a page.
 const MAX_ARGUMENTS_HEIGHT: Pixels = px(112.);
 
-/// The call's arguments as pretty-printed JSON, in a block of their own.
 fn arguments_view(id: &SharedString, call: &ToolCall, cx: &App) -> AnyElement {
     // A `Value` always encodes.
     let json =
@@ -479,7 +468,6 @@ fn permissions_view(
         .into_any_element()
 }
 
-/// Monospace content that scrolls past a few lines, for a card's body.
 pub(crate) fn code_block(
     id: impl Into<SharedString>,
     text: impl IntoElement,
@@ -549,7 +537,6 @@ mod tests {
         }
     }
 
-    /// A command's card in a project with `project` access.
     struct AccessView {
         call: ToolCall,
         project: Access,

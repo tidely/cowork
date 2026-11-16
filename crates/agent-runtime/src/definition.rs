@@ -4,12 +4,9 @@ use language_model::{JsonObject, LanguageModel, Thinking};
 /// prompt cache: the model, the instructions, thinking, and provider options.
 /// Plain data, shareable by many conversations; it holds no connection.
 ///
-/// Tools are not part of it. A session's tools are the ones registered when
-/// it is built, offered in registration order for its whole life, ahead of
-/// the instructions in every request; see [`AgentSession::new`]. A definition
-/// shared between programs (say, a saved agent profile) would carry a
-/// selection of tools resolved against the receiver's own implementations,
-/// which supply the schemas. Definitions have no compatibility guarantees yet.
+/// Tools are not part of it: a session's tools are the ones registered when it
+/// is built and stay fixed for its whole life; see [`AgentSession::new`].
+/// Definitions have no compatibility guarantees yet.
 ///
 /// A definition is never patched: `ReplaceDefinition` swaps it whole, which
 /// starts a new [`DefinitionRevision`]. Everything that doesn't change the

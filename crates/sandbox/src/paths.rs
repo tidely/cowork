@@ -7,7 +7,7 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::{Project, settings};
 
-/// How a path in the thread's scratch folder starts.
+/// The prefix of a path in the thread's scratch folder.
 pub const SCRATCH: &str = "scratch://";
 
 /// Inputs meaning the list of places rather than a path in one, as models
@@ -63,12 +63,10 @@ struct Place {
     real: PathBuf,
 }
 
-/// The places a thread's file tools reach, as they are at one call.
 pub(crate) struct Places {
     folders: Vec<Place>,
     scratch: Place,
     writable: bool,
-    /// Resolved credential locations that exist.
     denied: Vec<PathBuf>,
 }
 

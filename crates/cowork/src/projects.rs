@@ -1,17 +1,14 @@
 //! Projects: named groups of the user's own chats in the sidebar, each with
 //! the folders its new chats start with. See `docs/projects.md`.
 //!
-//! A project is only local organization. Its record (name, starting
-//! folders, when it was made) is saved in the chats' database
-//! (`chat_db/app_state.rs`); which project a chat belongs to is the chat's
-//! own [`Thread::project`], saved with the chat in its row, which refers to
-//! the project's, and never sent to collaborators. Membership is always
-//! explicit: it is never inferred from folders.
+//! A project is only local organization. Its record is saved in the chats'
+//! database (`chat_db/app_state.rs`); which project a chat belongs to is the
+//! chat's own [`Thread::project`], saved with the chat and never sent to
+//! collaborators. Membership is always explicit: never inferred from folders.
 //!
 //! A project's folders are not the folders its chats work in. Those are
-//! each chat's own ([`Thread::project_folders`], what `sandbox::Project` is
-//! built from); composing in a project only copies the project's folders
-//! into the new chat, which changes them independently from then on.
+//! each chat's own ([`Thread::project_folders`]); composing in a project only
+//! copies the project's folders into the new chat.
 //!
 //! [`Thread::project`]: crate::thread::Thread::project
 //! [`Thread::project_folders`]: crate::thread::Thread::project_folders
@@ -22,7 +19,6 @@ use uuid::Uuid;
 
 use crate::chat_db::StateSaver;
 
-/// Identifies a project, in its record and in the chats filed under it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ProjectId(Uuid);
 
@@ -46,7 +42,6 @@ impl std::fmt::Display for ProjectId {
     }
 }
 
-/// A project as it is saved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProjectRecord {
     pub(crate) id: ProjectId,
@@ -68,12 +63,10 @@ pub(crate) const SHOWN_CHATS_STEP: usize = 5;
 /// saved: on every launch the section starts open and each project closed,
 /// showing its first [`SHOWN_CHATS_STEP`] chats once opened.
 pub(crate) struct Projects {
-    /// Newest first.
     records: Vec<ProjectRecord>,
     /// Saves changes to the records; `None` keeps them in memory, as in
     /// tests and ephemeral launches.
     saver: Option<StateSaver>,
-    /// Whether the sidebar's Projects section lists the projects.
     section_open: bool,
     /// The open projects, each with how many of its chats it shows. A
     /// project closed (alone, or with the whole section) is removed, so it
@@ -97,7 +90,6 @@ impl Default for Projects {
 }
 
 impl Projects {
-    /// The saved `records`, with changes saved by `saver` from now on.
     pub(crate) fn new(mut records: Vec<ProjectRecord>, saver: Option<StateSaver>) -> Self {
         records.sort_by_key(|record| std::cmp::Reverse(record.created_at));
         Self {
@@ -107,7 +99,6 @@ impl Projects {
         }
     }
 
-    /// Newest first.
     pub(crate) fn records(&self) -> &[ProjectRecord] {
         &self.records
     }
@@ -163,7 +154,6 @@ impl Projects {
         self.menu_open
     }
 
-    /// Notes that `id`'s menu opened or closed.
     pub(crate) fn set_menu_open(&mut self, id: ProjectId, open: bool) {
         if open {
             self.menu_open = Some(id);
@@ -189,7 +179,6 @@ impl Projects {
         self.open.get(&id).copied()
     }
 
-    /// Opens the project on its first chats, or closes it.
     pub(crate) fn toggle(&mut self, id: ProjectId) {
         if self.open.remove(&id).is_none() {
             self.open.insert(id, SHOWN_CHATS_STEP);
@@ -204,7 +193,6 @@ impl Projects {
     }
 }
 
-/// `name` trimmed, or `None` when that leaves nothing.
 pub(crate) fn project_name(name: &str) -> Option<String> {
     let name = name.trim();
     (!name.is_empty()).then(|| name.to_owned())

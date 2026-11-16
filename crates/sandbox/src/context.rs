@@ -37,7 +37,6 @@ pub enum Needs {
     Refused(String),
 }
 
-/// Tools that need nothing, such as a calculator, need nothing here either.
 impl From<()> for Needs {
     fn from(_: ()) -> Self {
         Self::Nothing
@@ -67,7 +66,6 @@ impl ThreadSandbox {
         &self.thread
     }
 
-    /// The project the thread's next command sees.
     pub fn project(&self) -> Project {
         self.sandboxes.project(&self.thread)
     }

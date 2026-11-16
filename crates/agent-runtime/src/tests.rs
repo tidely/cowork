@@ -41,7 +41,6 @@ pub(crate) struct SamplingRequest {
     pub response: oneshot::Sender<CompletionStream>,
 }
 
-/// A provider whose every request waits for the test to answer it.
 struct Scripted {
     requests: mpsc::UnboundedSender<SamplingRequest>,
 }
@@ -78,7 +77,6 @@ fn test_provider() -> (
     (Arc::new(Scripted { requests }), receiver)
 }
 
-/// The test host's access: the path a call works on.
 #[derive(Clone, Debug, Default, PartialEq)]
 struct Access(String);
 

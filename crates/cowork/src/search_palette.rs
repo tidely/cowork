@@ -1,21 +1,17 @@
 //! The search palette: a command palette, opened from the sidebar, that
 //! finds things and opens them.
 //!
-//! Its rows come in categories, each shown as a titled group. Only chats
-//! exist so far; another category is another [`PaletteTarget`] variant and
-//! another section built in [`Cowork::search_palette_sections`].
+//! Rows come in categories shown as titled groups; another category is
+//! another [`PaletteTarget`] variant and another section built in
+//! [`Cowork::search_palette_sections`]. Matching is done here, not by
+//! `Command`'s substring filter; see [`PaletteQuery`].
 //!
-//! The palette does its own matching instead of `Command`'s substring
-//! filter; see [`PaletteQuery`].
-//!
-//! Titles, and the text of loaded chats (joined ones included), are matched
-//! in memory as the query is typed. The text of chats that aren't loaded is
-//! in the database, searched on Tokio for each query ([`SavedChatSearch`]):
-//! its rows join the group when the search answers, after the rows matched
-//! by title, so nothing under the pointer moves. The database only narrows;
-//! every text it returns is matched by [`PaletteQuery`] like any other, so
-//! matching is the same either way. Its index needs three characters, so a
-//! shorter query matches unloaded chats by title only.
+//! Titles and the text of loaded chats are matched in memory as the query is
+//! typed. The text of unloaded chats is searched in the database on Tokio
+//! ([`SavedChatSearch`]); its rows join the group after the title matches,
+//! so nothing under the pointer moves. The database only narrows: every text
+//! it returns is matched by [`PaletteQuery`] like any other. Its index needs
+//! three characters, so a shorter query matches unloaded chats by title only.
 
 use std::{cell::Cell, cmp::Reverse, iter, ops::Range, rc::Rc};
 
@@ -44,12 +40,9 @@ use crate::{
     timeline::{AgentMessage, TimelineMessage},
 };
 
-/// What the database found in unloaded chats' text for the latest query.
 #[derive(Default)]
 pub(crate) struct SavedChatSearch {
-    /// The query, trimmed, that `found` and `searching` are for.
     phrase: String,
-    /// The texts found, per chat, in each chat's order.
     found: std::collections::HashMap<Uuid, Vec<String>>,
     /// The search under way. Replacing it drops it, so an older query's
     /// answer is never applied.
@@ -64,18 +57,14 @@ const EXCERPT_LEAD_CHARS: usize = 32;
 /// shows, so that the row's own truncation, not this, cuts it off.
 const EXCERPT_TAIL_CHARS: usize = 200;
 
-/// What confirming a palette row does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PaletteTarget {
-    /// Open the chat with this instance id.
     Chat(Uuid),
 }
 
 pub(crate) struct PaletteRow {
     pub(crate) target: PaletteTarget,
-    /// Shown, and matched against the query.
     pub(crate) label: SharedString,
-    /// Muted text at the right end of the row.
     pub(crate) detail: Option<SharedString>,
     /// The byte ranges of `label` the query matched, sorted, to be drawn
     /// highlighted.
@@ -85,23 +74,18 @@ pub(crate) struct PaletteRow {
     pub(crate) excerpt: Option<Excerpt>,
 }
 
-/// A stretch of text around a match, on one line.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Excerpt {
     pub(crate) text: SharedString,
-    /// The byte range of `text` the query matched.
     pub(crate) matched: Range<usize>,
 }
 
-/// A category of rows, shown as one titled group.
 pub(crate) struct PaletteSection {
     pub(crate) label: SharedString,
     pub(crate) rows: Vec<PaletteRow>,
 }
 
-/// A row that matched, and how well its label did.
 pub(crate) struct RankedRow {
-    /// `None` when only the row's other text matched.
     label_score: Option<u32>,
     row: PaletteRow,
 }
@@ -118,7 +102,6 @@ pub(crate) struct RankedRow {
 /// diacritics unless the query has one.
 pub(crate) struct PaletteQuery {
     words: Pattern,
-    /// `None` for a blank query, which matches every row.
     phrase: Option<Atom>,
     matcher: Matcher,
     chars: Vec<char>,
@@ -317,7 +300,6 @@ fn message_texts(message: &TimelineMessage) -> impl Iterator<Item = &str> {
     }
 }
 
-/// `text` with `ranges` drawn in `highlight`.
 fn highlighted(
     text: SharedString,
     ranges: &[Range<usize>],
@@ -585,7 +567,6 @@ impl Cowork {
 mod tests {
     use super::*;
 
-    /// The chats `query` finds among `chats` of (title, messages), in order.
     fn search(chats: &[(&str, &[&str])], query: &str) -> Vec<PaletteRow> {
         let mut query = PaletteQuery::new(query);
         let rows = chats

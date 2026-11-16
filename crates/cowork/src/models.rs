@@ -7,17 +7,13 @@ use serde::{Deserialize, Serialize};
 
 /// A provider the app can run models on.
 ///
-/// Providers are known at compile time, so the variant is the provider's
-/// identity: a catalog lists each at most once, and a model reference cannot
-/// name a provider that does not exist. Its name and icon are fixed per
-/// variant (see `ModelProvider::label` in `model_picker.rs`) and never travel over the
-/// wire. How the app connects to each, and what its requests need, is in
-/// `providers.rs`. A generic OpenAI-compatible endpoint would be one more
-/// variant.
+/// Providers are known at compile time, so a catalog lists each at most once
+/// and a model reference cannot name one that does not exist. Names and icons
+/// are fixed per variant and never travel over the wire; connecting to each is
+/// in `providers.rs`.
 ///
-/// Declaration order is the order providers are listed in. New variants go
-/// last: saved settings and schedules name providers, and the wire numbers
-/// them.
+/// Declaration order is the listing order. New variants go last: saved
+/// settings and schedules name providers, and the wire numbers them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub(crate) enum ModelProvider {
     Ollama,
@@ -30,17 +26,14 @@ impl ModelProvider {
     pub(crate) const ALL: [Self; 3] = [Self::Ollama, Self::Anthropic, Self::OpenAi];
 }
 
-/// Identifies a model: its provider, and the id that provider knows it by.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub(crate) struct ModelRef {
     pub(crate) provider: ModelProvider,
     pub(crate) id: String,
 }
 
-/// What a catalog knows about one of its models.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ModelInfo {
-    /// Shown in the picker.
     pub(crate) name: String,
     /// The context window the model is run with.
     pub(crate) max_tokens: u64,
@@ -51,7 +44,6 @@ pub(crate) struct ModelInfo {
     /// when it didn't say. A model known not to is sent a note in place of
     /// each image (see the agent runtime's model metadata).
     pub(crate) image_input: Option<bool>,
-    /// How requests ask the model to reason.
     pub(crate) reasoning: Reasoning,
 }
 
@@ -115,8 +107,6 @@ impl ModelCatalog {
         self.get(model).is_some()
     }
 
-    /// Every provider that offers models, in declaration order, with its
-    /// models keyed by id.
     pub(crate) fn providers(
         &self,
     ) -> impl Iterator<Item = (ModelProvider, &BTreeMap<String, ModelInfo>)> {

@@ -21,35 +21,32 @@
 //!   64 KiB. Selected cases may contain at most 16 MiB of response source text.
 //!
 //! CSV durations are microseconds, median and nearest-rank p95. `stage_frame`
-//! includes CPU layout, prepaint, paint/scene building, and arena cleanup, not
-//! GPU presentation. `stage_draw` and `stage_arena_clear` split that frame.
-//! A forwarding element around the editor records `editor_request_layout_nodes`,
-//! `editor_prepaint`, and `editor_paint`, inclusive of their descendant calls.
-//! request_layout includes deferred Markdown element construction and layout-node
-//! building, NOT Taffy's layout computation (which happens later in stage_draw).
-//! These phases are not an exhaustive partition of the frame; timers add overhead.
-//! `editor_construct` times only render_main_editor and its
-//! returned element construction, not layout/paint or destruction; it runs
-//! inside Render so the element arena is active, and clears it after each draw.
-//! `timeline_clone` excludes dropping the clone. `placeholder_frame` is a crude
-//! ablation with one plain fixed-height row per message, not a matched-height
-//! substitute or a cost that can meaningfully be subtracted from stage_frame.
-//! `reply_only_selectable_frame` and `reply_only_unselectable_frame` are NOT the
-//! production stage: they omit user prompts, avatars, and the composer. They use
-//! the same persistent AgentMessage text_view entities with fit-content TextViews,
-//! identical default Markdown styling, a fixed 14 px font, and production-equivalent
-//! wrap width. Only selectable differs, isolating selection overhead with matched
-//! views. No Stage phase metrics are reported for controls. CSV message counts are
-//! total source messages; each reply-only control renders count/2 replies.
-//! To compare selection independently at size 1000 with short replies:
+//! is CPU layout, prepaint, paint and arena cleanup, not GPU presentation;
+//! `stage_draw` and `stage_arena_clear` split it. A forwarding element around
+//! the editor records `editor_request_layout_nodes`, `editor_prepaint` and
+//! `editor_paint`, inclusive of descendants. request_layout covers element
+//! construction, not Taffy's layout computation, which happens later in
+//! stage_draw. These phases are not a partition of the frame, and timers add
+//! overhead. `editor_construct` times only render_main_editor and its returned
+//! element, inside Render so the element arena is active. `timeline_clone`
+//! excludes dropping the clone. `placeholder_frame` is a crude ablation with
+//! one fixed-height row per message, not a cost that can be subtracted from
+//! stage_frame.
+//!
+//! `reply_only_selectable_frame` and `reply_only_unselectable_frame` are not
+//! the production stage: they omit prompts, avatars and the composer, and use
+//! the same AgentMessage text_view entities with fit-content TextViews, default
+//! Markdown styling, a 14 px font and production wrap width. Only selectable
+//! differs, isolating selection overhead. No stage phases are reported for
+//! them, and each renders count/2 replies. To compare selection at size 1000
+//! with short replies:
 //! `COWORK_TIMELINE_BENCH_CONTROL=1 COWORK_TIMELINE_BENCH_SIZES=1000 COWORK_TIMELINE_BENCH_VARIANTS=short cargo test --release -p cowork timeline_bench -- --ignored --nocapture --test-threads=1`.
 //!
-//! These are WARM measurements: fixture creation, initial rendering, Markdown
-//! parsing/highlighting background tasks, and warmup draws are outside samples.
-//! run_until_parked drains background work before measurement and between warmup
-//! draws. They do not measure cold startup/parsing, scrolling, or streaming.
-//! The viewport starts at the top; the production editor still constructs every
-//! message row. Synthetic completed replies have no transcript/tool history.
+//! These are warm measurements: fixture creation, initial rendering, Markdown
+//! background tasks and warmup draws are outside the samples, and
+//! run_until_parked drains background work before measuring. They do not
+//! measure cold startup, scrolling, or streaming. The viewport starts at the
+//! top. Synthetic replies have no transcript or tool history.
 
 use std::{
     cell::Cell,

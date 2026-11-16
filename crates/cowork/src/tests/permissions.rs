@@ -439,7 +439,6 @@ fn set_override(session: &mut Collaboration<'_>, mode: Option<PeerMode>) {
 
 #[gpui::test]
 fn write_peers_cannot_submit_by_keyboard_or_direct_actions(cx: &mut gpui::TestAppContext) {
-    // Collaborators join as Write, which may edit but not control runs.
     let mut session = Collaboration::start(cx);
     let collaborator = session.collaborator.clone();
     session.focus(&collaborator);
@@ -564,7 +563,6 @@ fn direct_cancel_only_aborts_the_run_it_names(cx: &mut gpui::TestAppContext) {
 fn unauthorized_wire_controls_do_not_mutate_state_or_disconnect_the_peer(
     cx: &mut gpui::TestAppContext,
 ) {
-    // Collaborators join as Write, which may edit but not control runs.
     let mut session = Collaboration::start(cx);
     let mirror = session.collaborator_thread().expect("joined");
     let host_thread = session.host_thread.clone();

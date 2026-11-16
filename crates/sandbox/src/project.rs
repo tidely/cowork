@@ -3,11 +3,10 @@
 //! They are the host's real folders at their real paths: commands see the
 //! host's changes as they happen, and when the project is writable the host
 //! sees theirs, immediately and without review. Each command is contained by
-//! the project as it is when the command starts, with the access it was
-//! granted in place of the project's when it has one (see
+//! the project as it is when it starts, with the access it was granted in place
+//! of the project's when it has one (see
 //! [`Sandboxes::run_with`](crate::Sandboxes::run_with)), so a change applies
-//! from the next command on, and commands already running keep the access
-//! they started with.
+//! from the next command on.
 
 use std::path::{Path, PathBuf};
 

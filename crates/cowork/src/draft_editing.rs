@@ -24,8 +24,7 @@ use crate::{
 
 impl Cowork {
     /// An auto-growing editor holding `text`, with the caret at its end.
-    /// Enter sends the draft (see [`Cowork::draft_editor_event`]) and
-    /// Shift-Enter starts a new line, as in most chat apps, until
+    /// Enter sends the draft (see [`Cowork::draft_editor_event`]) until
     /// [`Cowork::prepare_draft`] turns that off while others are in the chat.
     pub(crate) fn new_draft_editor(
         text: &str,
@@ -48,7 +47,6 @@ impl Cowork {
         })
     }
 
-    /// A draft editor whose input events are routed to the draft `draft_id`.
     fn new_routed_draft_editor(
         draft_id: Uuid,
         text: &str,
@@ -56,7 +54,6 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) -> Entity<TextareaState> {
         let editor = Self::new_draft_editor(text, window, cx);
-        // Ends by itself once the editor is dropped along with its item.
         cx.subscribe_in(&editor, window, move |this, editor, event, window, cx| {
             this.draft_editor_event(draft_id, editor, event, window, cx);
         })
@@ -64,9 +61,8 @@ impl Cowork {
         editor
     }
 
-    /// Brings a draft's editors in line with its document: creates editors
-    /// for new items and the draft position, drops those of removed items,
-    /// and shows text changed by anything other than the editor itself.
+    /// Brings a draft's editors in line with its document, including text
+    /// changed by anything other than the editor itself.
     pub(crate) fn prepare_draft(
         &mut self,
         draft_id: Uuid,
@@ -100,8 +96,6 @@ impl Cowork {
                 draft
                     .editors
                     .retain(|id, _| items.iter().any(|item| item.id == *id));
-                // The item being typed in is gone: submitted, or removed by
-                // someone else.
                 let lost_focus = focused.is_some_and(|editor| draft.slot_of(editor).is_none());
                 let mut missing = Vec::new();
                 let mut shown = Vec::new();
@@ -133,8 +127,6 @@ impl Cowork {
             self.typing_in = None;
         }
 
-        // Existing editors outlive theme changes; refresh their projected
-        // caret style without touching text, selection, or collaboration state.
         let style = InputEditorStyle {
             caret: cx.theme().caret,
             ..Default::default()
@@ -228,10 +220,8 @@ impl Cowork {
 
     /// Replaces an editor's text, keeping its selection on the same text.
     ///
-    /// Waits while an IME composition is in progress: its marked text is in
-    /// the editor but not yet in the document, and replacing it would cancel
-    /// the composition. The text catches up once the composition commits.
-    ///
+    /// Waits while an IME composition is in progress: replacing its marked text
+    /// would cancel the composition, so the text catches up once it commits.
     /// Returns whether the editor shows `text` afterwards.
     fn show_text(
         editor: &Entity<TextareaState>,
@@ -400,7 +390,6 @@ impl Cowork {
         }
     }
 
-    /// Reads the draft `draft_id` wherever it lives, including read-only mirrors.
     pub(crate) fn read_draft<R>(
         &self,
         draft_id: Uuid,
@@ -418,7 +407,6 @@ impl Cowork {
             .map(|thread| read(thread.draft()))
     }
 
-    /// The focused editor of the draft the composer shows.
     pub(crate) fn focused_draft_editor(
         &self,
         window: &Window,
@@ -433,7 +421,6 @@ impl Cowork {
         })?
     }
 
-    /// Focuses an editor of a draft, optionally moving its caret.
     pub(crate) fn focus_draft_editor(
         &mut self,
         draft_id: Uuid,
@@ -466,8 +453,6 @@ impl Cowork {
         true
     }
 
-    /// Focuses where the user most likely continues typing: the last prompt
-    /// block if there is one, otherwise the draft position.
     pub(crate) fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(draft_id) = self.writable_draft_id(cx) else {
             return;
@@ -490,14 +475,12 @@ impl Cowork {
         };
     }
 
-    /// Puts the caret into the composer unless it is already in the draft.
     pub(crate) fn ensure_composer_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.focused_draft_editor(window, cx).is_none() {
             self.focus_composer(window, cx);
         }
     }
 
-    /// Where the local user is in `thread`'s draft, as others should see it.
     fn local_presence(&self, thread: &Thread, cx: &App) -> protocol::Presence {
         if !thread.can_edit_draft() {
             return protocol::Presence::default();
@@ -553,8 +536,6 @@ impl Cowork {
         }
     }
 
-    /// Sends the local user's presence in every shared thread whose has
-    /// changed since it was last sent.
     pub(crate) fn publish_presence(&mut self, cx: &mut Context<Self>) {
         let threads = self
             .thread_store
@@ -586,7 +567,6 @@ impl Cowork {
             .retain(|thread_id, _| collaborating.contains(thread_id));
     }
 
-    /// Redraws once the caret labels shown now have expired.
     pub(crate) fn schedule_caret_label_refresh(&mut self, cx: &mut Context<Self>) {
         if self.caret_label_refresh.is_some() {
             return;
@@ -618,7 +598,6 @@ impl Cowork {
         }));
     }
 
-    /// Whether files are still being read into the block `id`.
     fn has_pending_reads(&self, draft_id: Uuid, id: ItemId, cx: &App) -> bool {
         self.read_draft(draft_id, cx, |draft| {
             self.pending_attachments.iter().any(|pending| {
@@ -628,8 +607,6 @@ impl Cowork {
         .unwrap_or(false)
     }
 
-    /// Moves between the composer's editors when Up or Down leaves the first
-    /// or last visual line. Returns whether it moved.
     pub(crate) fn move_between_draft_editors(
         &mut self,
         up: bool,
@@ -639,7 +616,6 @@ impl Cowork {
         let Some((draft_id, slot, editor)) = self.focused_draft_editor(window, cx) else {
             return false;
         };
-        // A selection collapses first, as it does inside an editor.
         if !editor.read(cx).selected_range().is_empty() {
             return false;
         }
@@ -667,7 +643,6 @@ impl Cowork {
         self.focus_draft_editor(draft_id, target_slot, Some(caret), window, cx)
     }
 
-    /// Escape in an empty item removes it and returns to the draft position.
     pub(crate) fn escape_empty_draft_item(
         &mut self,
         window: &mut Window,
@@ -695,8 +670,6 @@ impl Cowork {
         .unwrap_or(false)
     }
 
-    /// Backspace in an empty item removes it, and in the empty draft position
-    /// steps back; either way the caret moves to the end of the editor above.
     pub(crate) fn backspace_out_of_empty_draft_item(
         &mut self,
         window: &mut Window,
@@ -748,7 +721,6 @@ impl Cowork {
         }
     }
 
-    /// Whether the local actor may edit this destination, not the active thread.
     pub(crate) fn draft_can_edit(&self, draft_id: Uuid, cx: &App) -> bool {
         if self.new_thread_draft.id == draft_id {
             return true;
@@ -777,7 +749,6 @@ impl Cowork {
             })
     }
 
-    /// The draft the composer currently edits, or `None` for read-only threads.
     pub(crate) fn writable_draft_id(&self, cx: &App) -> Option<Uuid> {
         self.readable_draft_id(cx)
             .filter(|id| self.draft_can_edit(*id, cx))
@@ -824,7 +795,6 @@ impl Cowork {
         cx.notify();
     }
 
-    /// Maintains UI projection caches without requiring or granting edit access.
     pub(crate) fn update_draft_editors<R>(
         &mut self,
         draft_id: Uuid,

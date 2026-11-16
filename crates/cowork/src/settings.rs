@@ -26,14 +26,11 @@ pub(crate) enum SettingsPage {
     /// The LLM providers and their models, to pick the model new chats start
     /// with and discover models again; see `provider_setup.rs`.
     Providers,
-    /// The default context window and when conversations are summarized.
     Context,
-    /// The user's archived threads, to restore or delete for good.
     Archive,
 }
 
 impl SettingsPage {
-    /// Every page, in the order the sidebar lists their tabs.
     pub(crate) const ALL: [SettingsPage; 4] = [
         SettingsPage::Profile,
         SettingsPage::Providers,
@@ -160,7 +157,6 @@ impl Cowork {
         )
     }
 
-    /// The settings sidebar's tabs, one per [`SettingsPage`].
     pub(crate) fn settings_sidebar_tabs(&self, cx: &mut Context<Self>) -> CoworkSidebarSection {
         let menu = SettingsPage::ALL
             .into_iter()

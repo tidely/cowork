@@ -34,7 +34,6 @@ use crate::{
     transcript::RunSource,
 };
 
-/// Who asks for a submission, whose authority is checked as it is taken.
 pub(crate) struct SubmissionRequest {
     pub(crate) actor: ParticipantId,
     pub(crate) submitted_locally: bool,
@@ -159,7 +158,6 @@ impl Cowork {
         self.submit_composer_mode(protocol::SubmissionMode::Queue, window, cx);
     }
 
-    /// Submits the active draft, steering the running agent by default.
     pub(crate) fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.submit_composer_mode(protocol::SubmissionMode::Steering, window, cx);
     }
@@ -438,7 +436,6 @@ impl Cowork {
         true
     }
 
-    /// Adds `group` to the end of the thread's pending submissions.
     fn defer_submission(
         &mut self,
         thread: &Entity<Thread>,

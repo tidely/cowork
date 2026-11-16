@@ -52,8 +52,6 @@ fn raw_counts(draft: &Draft) -> (u32, u32) {
     (draft.order.len(&txn), draft.items.len(&txn))
 }
 
-// 1. Creating, listing and removing items
-
 #[test]
 fn create_and_list_items_in_order() {
     let draft = Draft::new();
@@ -125,8 +123,6 @@ fn remove_items_updates_order_and_items() {
     assert_eq!(raw_counts(&draft), (0, 0));
 }
 
-// 2. Body editing
-
 #[test]
 fn set_body_with_multibyte_text() {
     let draft = Draft::new();
@@ -178,8 +174,6 @@ fn edit_body_validates_ranges() {
     assert!(draft.edit_body(id, &edit(0..0, "")));
     assert_eq!(draft.body(id).as_deref(), Some("hello 🌍!"));
 }
-
-// 4. Attachments
 
 #[test]
 fn attachments() {
@@ -258,8 +252,6 @@ fn is_empty_semantics() {
     let comment = draft.create_comment(me, target("q"), "hm");
     assert!(!draft.item(comment).unwrap().is_empty());
 }
-
-// 5. Replication
 
 #[test]
 fn concurrent_appends_converge() {
@@ -385,8 +377,6 @@ fn invalid_replication_input_is_an_error() {
     assert!(draft.apply_update(&[0xff, 0xff, 0xff]).is_err());
     assert_eq!(draft.items().len(), 1);
 }
-
-// 6. Malformed data
 
 #[test]
 fn malformed_items_are_skipped() {
@@ -546,8 +536,6 @@ fn body_with_embed_refuses_edits() {
     assert_eq!(draft.set_body(id, "abc"), None);
     assert_eq!(draft.body(id).as_deref(), Some("ab"));
 }
-
-// 7. Local updates
 
 fn take(draft: &Draft) -> Vec<u8> {
     draft.take_local_update().expect("expected a local update")
@@ -825,8 +813,6 @@ fn host_relays_between_collaborators() {
     host.validate().unwrap();
 }
 
-// 8. Validation
-
 #[test]
 fn validate_accepts_api_documents() {
     let draft = Draft::new();
@@ -1093,8 +1079,6 @@ fn validate_rejects_extra_roots() {
     assert!(error.contains("unexpected root \"extra\""), "{error}");
 }
 
-// 9. Change verification
-
 /// Runs `change` on `draft` and verifies it as made by `author`.
 fn change_by(draft: &Draft, author: Uuid, change: impl FnOnce()) -> Result<()> {
     let before = draft.items();
@@ -1217,8 +1201,6 @@ fn verify_change_rejects_forbidden_changes() {
     });
     rejected(&after, "was modified");
 }
-
-// 10. Anchors
 
 fn text_edit(range: std::ops::Range<usize>, insert: &str) -> TextEdit {
     TextEdit {

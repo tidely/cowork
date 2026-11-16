@@ -43,7 +43,6 @@ pub(crate) fn load_profile_picture(path: &Path) -> anyhow::Result<gpui::Image> {
     profile_picture(&bytes).with_context(|| format!("{name} is not a supported image"))
 }
 
-/// Center-crops an image to a square and re-encodes it as a JPEG.
 pub(crate) fn profile_picture(bytes: &[u8]) -> anyhow::Result<gpui::Image> {
     let square = image::load_from_memory(bytes)?
         .resize_to_fill(
@@ -107,7 +106,6 @@ pub(crate) fn validate_profile(profile: &protocol::Profile) -> anyhow::Result<()
     Ok(())
 }
 
-/// Why `name` cannot be a display name, if it cannot.
 pub(crate) fn display_name_error(name: &str) -> Option<String> {
     let name = name.trim();
     if name.is_empty() {
@@ -121,12 +119,9 @@ pub(crate) fn display_name_error(name: &str) -> Option<String> {
     }
 }
 
-/// How a participant presents themselves; see [`protocol::Profile`].
 #[derive(Clone, Default)]
 pub(crate) struct Profile {
-    /// Replaces the name derived from the participant id when set.
     pub(crate) name: Option<SharedString>,
-    /// Replaces the initials avatar when set.
     pub(crate) picture: Option<Arc<gpui::Image>>,
     /// What the fallback name, initials, and color are derived from; see
     /// [`protocol::Profile::appearance`].

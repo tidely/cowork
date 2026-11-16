@@ -49,7 +49,6 @@ const TITLE_FADE_WIDTH: gpui::Pixels = px(24.);
 /// its folder icon.
 const PROJECT_CHAT_INDENT: gpui::Pixels = px(32.);
 
-/// A fade from transparent into `color`, left to right.
 fn fade_into(color: Hsla) -> gpui::Background {
     linear_gradient(
         90.,
@@ -79,7 +78,6 @@ pub(crate) struct SidebarGroups {
     /// Every project, newest first, each with its chats that aren't shared,
     /// most recently active first.
     pub(crate) projects: Vec<(ProjectId, Vec<ListedThread>)>,
-    /// The user's chats that aren't shared and in no known project.
     pub(crate) recents: Vec<ListedThread>,
 }
 
@@ -272,7 +270,6 @@ fn row_button(
         })
 }
 
-/// Something a row does, whether from a click or its context menu.
 type RowAction = Rc<dyn Fn(&mut Window, &mut App)>;
 
 /// A chat's row, with its archive button over its end and in its context
@@ -282,7 +279,6 @@ struct ThreadRow {
     thread_id: Uuid,
     title: SharedString,
     active: bool,
-    /// Whether it is listed under a project.
     indented: bool,
     on_open: RowAction,
     /// `None` for joined threads, which belong to their host.
@@ -351,13 +347,10 @@ struct ProjectRow {
     open: bool,
     on_toggle: ClickHandler,
     on_compose: ClickHandler,
-    /// Whether its menu is open, keeping its buttons shown.
     menu_open: bool,
     on_menu_open_change: OpenChangeHandler,
     on_remove: ClickHandler,
-    /// The chats shown while open.
     chats: Vec<ThreadRow>,
-    /// While some of its chats are not shown yet.
     on_show_more: Option<ClickHandler>,
 }
 
@@ -665,7 +658,6 @@ impl Cowork {
         })
     }
 
-    /// Shows the active chat, as opening it does.
     pub(crate) fn show_active_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(thread) = self.active_thread(cx) else {
             return;
@@ -904,7 +896,6 @@ impl Cowork {
         }
     }
 
-    /// The sidebar's usual content: actions and threads.
     fn app_sidebar(
         &self,
         sidebar: Sidebar<CoworkSidebarSection>,

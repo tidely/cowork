@@ -94,7 +94,6 @@ pub(crate) fn text_attachment(name: &str, text: &str) -> FileAttachment {
     }
 }
 
-/// Records for `files`, and the files by id, as a thread holds them.
 pub(crate) fn attached(
     files: impl IntoIterator<Item = FileAttachment>,
 ) -> (Vec<AttachmentRecord>, HashMap<AttachmentId, FileAttachment>) {
@@ -113,7 +112,6 @@ pub(crate) fn attached(
         .unzip()
 }
 
-/// A fragment a scripted model streams: part `id` of the reply.
 #[derive(Clone)]
 pub(crate) enum Streamed {
     Text {
@@ -131,7 +129,6 @@ pub(crate) enum Streamed {
     },
 }
 
-/// A fragment of thinking, streamed as part `id`, or of the answer.
 pub(crate) fn streamed_text(id: &str, text: &str, thinking: bool) -> Streamed {
     if thinking {
         Streamed::Thinking {
@@ -146,7 +143,6 @@ pub(crate) fn streamed_text(id: &str, text: &str, thinking: bool) -> Streamed {
     }
 }
 
-/// A call of the `name` tool with `arguments`, as part `id`.
 pub(crate) fn streamed_tool_call(id: &str, name: &str, arguments: serde_json::Value) -> Streamed {
     Streamed::Call {
         id: id.into(),
@@ -167,7 +163,6 @@ pub(crate) struct ScriptedHost {
 }
 
 impl ScriptedHost {
-    /// The run producing message `id` starts.
     pub(crate) fn started(
         &self,
         id: Uuid,
@@ -181,7 +176,6 @@ impl ScriptedHost {
         }
     }
 
-    /// The run producing message `id` ends with `outcome`.
     pub(crate) fn ended(&self, id: Uuid, outcome: protocol::RunOutcome) -> protocol::HostMessage {
         protocol::HostMessage::AgentEnded {
             id: id.into_bytes(),
@@ -209,7 +203,6 @@ impl ScriptedHost {
         )
     }
 
-    /// The run producing message `id` commits `text` as its prompt.
     pub(crate) fn prompt(&mut self, id: Uuid, text: &str) -> protocol::HostMessage {
         self.commit(
             id,
@@ -223,7 +216,6 @@ impl ScriptedHost {
         )
     }
 
-    /// The run producing message `id` starts, with `text` as its prompt.
     pub(crate) fn start(&mut self, id: Uuid, text: &str) -> Vec<protocol::HostMessage> {
         vec![self.started(id, None), self.prompt(id, text)]
     }
@@ -322,7 +314,6 @@ impl ScriptedHost {
         events
     }
 
-    /// Each call of the last reply returning `output`, in order.
     pub(crate) fn results(&mut self, id: Uuid, output: &str) -> Vec<protocol::HostMessage> {
         std::mem::take(&mut self.calls)
             .into_iter()
@@ -349,7 +340,6 @@ impl ScriptedHost {
             .collect()
     }
 
-    /// The calls of the last reply still waiting for their results.
     pub(crate) fn pending_calls(&self) -> &[ToolCall] {
         &self.calls
     }

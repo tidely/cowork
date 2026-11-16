@@ -2,23 +2,20 @@
 //! back to its saved row, and the only way to make it.
 //!
 //! A chat may be unloaded only when everything it holds that isn't saved can
-//! be dropped: see "Unloading" in `docs/sqlite-storage.md`. The rule is
-//! derived from existing state, never from flags kept beside it. The
-//! thread's own fields are judged by [`Thread::unload_blocker`], whose
-//! exhaustive destructure makes a new field fail to compile until it is
-//! classified; the per-chat state on `Cowork` is judged here.
+//! be dropped (see `docs/sqlite-storage.md`). The rule is derived from
+//! existing state, never from flags kept beside it: the thread's own fields
+//! are judged by [`Thread::unload_blocker`], whose exhaustive destructure
+//! makes a new field fail to compile until it is classified; the per-chat
+//! state on `Cowork` is judged here.
 //!
 //! "Idle" is measured by the sweep itself: a chat's clock starts the first
-//! time a sweep finds nothing keeping it loaded, and any blocker resets it.
-//! So no code path has to remember to touch a timestamp, and a chat is
-//! unloaded after between [`UNLOAD_AFTER`] and one [`SWEEP_EVERY`] more of
-//! being continuously idle.
+//! time a sweep finds nothing keeping it loaded, and any blocker resets it,
+//! so no code path has to remember to touch a timestamp.
 //!
 //! A chat goes back to its row only once everything it holds is confirmed
 //! saved (`ChatDb::is_saved`). An eligible chat that isn't is saved by the
-//! sweep and unloaded by a later one, if it is still eligible and nothing
-//! changed meanwhile. A failed save just leaves it loaded. Without a
-//! database nothing is unloaded.
+//! sweep and unloaded by a later one. A failed save leaves it loaded, and
+//! without a database nothing is unloaded.
 //!
 //! [`ThreadStore::unload`] takes an [`Idle`], which only this module makes,
 //! and only from a check passed in the same synchronous update, so nothing
@@ -36,15 +33,11 @@ use uuid::Uuid;
 
 use crate::{Cowork, thread::Thread};
 
-/// How long a chat stays loaded once nothing needs it.
 pub(crate) const UNLOAD_AFTER: Duration = Duration::from_secs(5 * 60);
-/// How often loaded chats are checked.
 pub(crate) const SWEEP_EVERY: Duration = Duration::from_secs(60);
 
-/// Why a chat stays loaded.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum UnloadBlocker {
-    /// Showing.
     Active,
     /// Someone else's: never saved here.
     Joined,
@@ -56,9 +49,7 @@ pub(crate) enum UnloadBlocker {
     PendingSubmissions,
     /// A draft with something in it, which isn't saved.
     DraftNotEmpty,
-    /// File bytes still being sent or received.
     Transferring,
-    /// Files still being read into its draft.
     ReadingAttachments,
     /// A scheduled task's run continuing it is queued.
     QueuedScheduledRun,
@@ -80,7 +71,6 @@ impl Idle<'_> {
     }
 }
 
-/// When each loaded chat was first found idle, continuously since.
 #[derive(Default)]
 pub(crate) struct IdleClock {
     since: HashMap<Uuid, Instant>,
@@ -88,7 +78,6 @@ pub(crate) struct IdleClock {
 }
 
 impl Cowork {
-    /// Checks loaded chats once every [`SWEEP_EVERY`].
     pub(crate) fn start_unload_sweep(&mut self, cx: &mut Context<Self>) {
         self.idle_clock._sweeping = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -314,7 +303,6 @@ mod tests {
         });
     }
 
-    /// The Cowork-side rules, and the sweep's clock, on one app.
     #[gpui::test]
     fn the_sweep_unloads_only_chats_idle_for_the_whole_wait(cx: &mut TestAppContext) {
         let (cowork, _runtime, cx) = crate::tests::composer_test_cowork(cx);

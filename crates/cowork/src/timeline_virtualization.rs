@@ -1,30 +1,26 @@
 //! Full virtualization of the timeline's rows inside its scroll container.
 //!
-//! [`VirtualTimeline`] stands in for the column of rows: it reports their
-//! total height to the scroll container and builds, lays out and paints only
-//! the rows near the viewport, plus pinned ones. Each frame's cost is the
-//! rows it builds, not the history's length.
+//! [`VirtualTimeline`] reports the rows' total height to the scroll container
+//! and builds, lays out and paints only the rows near the viewport, plus
+//! pinned ones, so a frame costs the rows it builds, not the history's length.
 //!
 //! Heights are measured when a row is built, at the width it is drawn at,
-//! and kept in [`TimelineLayout`]; a row never built yet counts as the
-//! average measured row. Those are hints: every row drawn is measured again,
-//! and when a measurement differs, the rows are placed around an anchor (the
-//! first visible row, or the end of the history while the view is at the
-//! bottom) and the scroll offset moves by the same amount, so that what is
-//! on screen stays put while the extent converges. Nothing invalidates an
-//! offscreen height: whatever changed is measured when the row is next
-//! drawn. Width and typography changes cost only the rows drawn.
+//! and kept in [`TimelineLayout`]; a row never built counts as the average
+//! measured row. Those are hints: every row drawn is measured again, and when
+//! a measurement differs, the rows are placed around an anchor (the first
+//! visible row, or the end of the history while the view is at the bottom)
+//! and the scroll offset moves by the same amount, so that what is on screen
+//! stays put while the extent converges. Nothing invalidates an offscreen
+//! height: it is measured when the row is next drawn.
 //!
 //! Selection doesn't build the history either: the row a press lands in
-//! stays built while the button is held (see [`TimelinePress`]), and the
-//! rows holding a selection's ends while it lasts. Copy takes the rows
-//! between them from the thread; see `timeline_selection`.
+//! stays built while the button is held (see [`TimelinePress`]), as do the
+//! rows holding a selection's ends. See `timeline_selection`.
 //!
-//! The same placement serves the conversation navigation rail
-//! (`turn_navigation`): each frame notes which turn the top of the view is
-//! in, and a turn navigated to becomes the anchor, placed at the top of the
-//! view, until its rows' heights stop changing. Rows on the way are never
-//! built: the target is found by identity, at its estimated position.
+//! The same placement serves the navigation rail (`turn_navigation`): a turn
+//! navigated to becomes the anchor, placed at the top of the view, until its
+//! rows' heights stop changing. It is found by identity at its estimated
+//! position, so rows on the way are never built.
 
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
@@ -54,14 +50,12 @@ const DEFAULT_ROW_HEIGHT: Pixels = px(120.);
 /// element drags count it. A click's jitter stays below it.
 const DRAG_THRESHOLD: f64 = 2.;
 
-/// The left-button press in progress anywhere in the window.
 pub(crate) struct TimelinePress {
     origin: Point<Pixels>,
     /// The message whose timeline row the press landed in. The row stays
     /// built and painted, and with it the selection participant a later drag
     /// anchors on, while the button is held, even when it scrolls offscreen.
     pub(crate) row: Option<Uuid>,
-    /// Whether the pointer has moved past [`DRAG_THRESHOLD`] while held.
     pub(crate) dragging: bool,
 }
 
@@ -74,7 +68,6 @@ impl TimelinePress {
         }
     }
 
-    /// Notes the held pointer at `position`; true when this starts a drag.
     pub(crate) fn moved_to(&mut self, position: Point<Pixels>) -> bool {
         let started = !self.dragging && (position - self.origin).magnitude() > DRAG_THRESHOLD;
         self.dragging |= started;
@@ -92,7 +85,6 @@ const TARGET_FRAMES: u8 = 8;
 pub(crate) struct TimelineLayout {
     thread: Option<Uuid>,
     heights: HashMap<Uuid, Pixels>,
-    /// The sum of `heights`, for the estimate of rows never measured.
     measured_total: Pixels,
     /// The turn row (see [`TimelineRowSlot::turn`]) the top of the view was
     /// in when last drawn; see `turn_navigation`.
@@ -103,7 +95,6 @@ pub(crate) struct TimelineLayout {
 }
 
 impl TimelineLayout {
-    /// The turn the top of `thread`'s view was in when it was last drawn.
     pub(crate) fn current_turn(&self, thread: Uuid) -> Option<Uuid> {
         self.current_turn.filter(|_| self.thread == Some(thread))
     }
@@ -116,12 +107,10 @@ impl TimelineLayout {
         self.target = Some((message_id, TARGET_FRAMES));
     }
 
-    /// Lets go of a navigation target, as scrolling by hand does.
     pub(crate) fn cancel_navigation(&mut self) {
         self.target = None;
     }
 
-    /// Forgets another thread's heights.
     fn show_thread(&mut self, thread: Uuid) {
         if self.thread != Some(thread) {
             *self = Self {
@@ -159,9 +148,7 @@ impl TimelineLayout {
 pub(crate) struct TimelineRowSlot {
     pub(crate) index: usize,
     pub(crate) message_id: Uuid,
-    /// Built and painted even offscreen; see [`TimelinePress::row`].
     pub(crate) pinned: bool,
-    /// The user group that started a run: a turn of the navigation rail.
     pub(crate) turn: bool,
 }
 
@@ -224,7 +211,6 @@ pub(crate) struct VirtualTimeline {
     selection: Rc<RefCell<TimelineSelection>>,
     scroll: ScrollHandle,
     owner: WeakEntity<Cowork>,
-    /// This frame's built rows: their slot, element and bounds.
     built: Vec<(usize, AnyElement, Bounds<Pixels>)>,
 }
 
@@ -255,7 +241,6 @@ impl VirtualTimeline {
 }
 
 pub(crate) struct VirtualTimelineLayout {
-    /// Each row's height as this frame's layout placed it.
     heights: Vec<Pixels>,
     /// The typography rows inherit, re-entered when they are built in
     /// prepaint, where divs no longer apply it.

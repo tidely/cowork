@@ -1,12 +1,12 @@
-//! Running the agent for a thread, and forwarding what it does to everyone
-//! in it; see `transcript.rs` for how that is folded.
+//! Running the agent for a thread and forwarding what it does to everyone in
+//! it; `transcript.rs` folds the events.
 //!
-//! The host runs one agent session per thread ([`ThreadAgent`]), created
-//! with the thread's first run and kept for its later ones, so the session
-//! keeps what it told the model (such as the environment note) between
-//! runs. Cowork keeps its own queue of pending submissions and hands the
-//! session one queued input at a time. Steering uses the session's native
-//! safe-point lane; Cowork removes it from pending only once committed.
+//! The host runs one agent session per thread ([`ThreadAgent`]), created with
+//! the thread's first run and kept so the session remembers what it told the
+//! model (such as the environment note). Cowork keeps its own queue of pending
+//! submissions and hands the session one at a time. Steering uses the
+//! session's safe-point lane; Cowork removes a steer from pending only once
+//! the session commits it.
 
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
@@ -48,8 +48,7 @@ use crate::{
     usage::{TokenActivity, usage_tokens},
 };
 
-/// The system prompt every run starts with, before [`platform_prompt`]. Kept
-/// in its own file so it reads and diffs as prose.
+/// The system prompt every run starts with, before [`platform_prompt`].
 const SYSTEM_PROMPT: &str = include_str!("../prompts/system.md");
 
 /// The system prompt with the platform the host's commands run on, which
@@ -82,10 +81,8 @@ fn platform_prompt() -> String {
 }
 
 /// What the prompt is made of for `model`: the system prompt, with the
-/// thinking and options its provider takes (see
-/// `ModelProvider::request_parameters`). Whether the model accepts images
-/// decides whether the runtime sends them or a note in their place; the
-/// session's tools stay the same either way.
+/// thinking and options its provider takes. Image support decides whether the
+/// runtime sends images or a note in their place.
 fn definition(model: &ModelRef, info: &ModelInfo) -> AgentDefinition {
     let mut language_model = LanguageModel::new(model.id.clone());
     language_model.name = Some(info.name.clone());
@@ -145,7 +142,6 @@ impl ContextSection<CoworkHost> for EnvironmentSection {
     }
 }
 
-/// How queued inputs behave: Cowork hands the session one at a time.
 const INPUT_POLICY: Policy = Policy {
     access: QueueAccess::Protected,
     fallback: Fallback::Queue,
@@ -162,14 +158,11 @@ const STEERING_POLICY: Policy = Policy {
     lifetime: Lifetime::Retain,
 };
 
-/// A thread's agent session on the host, which outlives its runs.
 pub(crate) struct ThreadAgent {
     /// Tells this session's events apart from a later session's.
     id: u64,
     handle: SessionHandle<CoworkHost>,
     host: Arc<CoworkHost>,
-    /// The model the session's definition names, and what the catalog said
-    /// of it (its window and image input).
     model: (ModelRef, ModelInfo),
     /// The connection the session sends requests through; replaced when
     /// the model's provider, or its API key, changes.
@@ -177,7 +170,6 @@ pub(crate) struct ThreadAgent {
 }
 
 impl Drop for ThreadAgent {
-    /// Stops the session and any run it has; its events still arrive.
     fn drop(&mut self) {
         _ = self
             .handle
@@ -186,9 +178,9 @@ impl Drop for ThreadAgent {
 }
 
 /// Starts the session of a thread whose conversation so far is
-/// `conversation`, on the Tokio runtime. Its events reach `events`; the
-/// callback also asks for compaction as the context fills up, as it sees
-/// each request's usage before anything else can start.
+/// `conversation`, on the Tokio runtime. The callback also asks for compaction
+/// as the context fills up, as it sees each request's usage before anything
+/// else can start.
 fn start_session(
     host: Arc<CoworkHost>,
     provider: Arc<dyn LanguageModelProvider>,
@@ -254,21 +246,17 @@ fn start_session(
     Ok(handle)
 }
 
-/// What a finished run took, for the usage statistics.
 pub(crate) struct RunTotals {
     pub(crate) started_at: SystemTime,
     pub(crate) duration: Duration,
     pub(crate) usage: Usage,
 }
 
-/// A run of a local or hosted thread, from the submission that started it
-/// until it ends.
 pub(crate) struct ActiveGeneration {
     message_id: Uuid,
     cancelled: Arc<AtomicBool>,
     /// The thread's session, and who started the run; `None` in tests.
     session: Option<(SessionHandle<CoworkHost>, Arc<CoworkHost>, RunSource)>,
-    /// The session's run producing the message, once it started.
     run: Option<RunId>,
     /// The calls the run waits on a decision for, and whether only the host
     /// may decide each; see [`tool_approval::HOST_ONLY`].
@@ -281,7 +269,6 @@ pub(crate) struct ActiveGeneration {
     /// Monotonic, so the duration survives clock changes.
     started: Instant,
     usage: Usage,
-    /// The decisions handed to the run, for tests without a session.
     #[cfg(test)]
     decisions: Vec<(ToolCallId, bool)>,
 }
@@ -315,12 +302,10 @@ impl ActiveGeneration {
         self.message_id
     }
 
-    /// Whether the run waits for someone to decide one of its calls.
     pub(crate) fn is_waiting_for_approval(&self) -> bool {
         !self.approvals.is_empty()
     }
 
-    /// Whether `call`, if the run waits on it, is one only the host decides.
     pub(crate) fn approval_is_host_only(&self, call: &ToolCallId) -> bool {
         self.approvals.get(call).copied().unwrap_or(false)
     }
@@ -350,7 +335,6 @@ impl ActiveGeneration {
         true
     }
 
-    /// Stops the run, or the run about to start.
     fn stop(&self) {
         self.cancelled.store(true, Ordering::Release);
         if let (Some((handle, _, source)), Some(run)) = (&self.session, self.run) {
@@ -376,13 +360,11 @@ impl ActiveGeneration {
         }
     }
 
-    /// The decisions handed to the run so far.
     pub(crate) fn decisions_for_test(&self) -> &[(ToolCallId, bool)] {
         &self.decisions
     }
 }
 
-/// `usage` plus `more`, counting what either reported.
 fn add_usage(usage: &mut Usage, more: &Usage) {
     let add = |total: &mut Option<u64>, more: Option<u64>| {
         if let Some(more) = more {
@@ -396,7 +378,6 @@ fn add_usage(usage: &mut Usage, more: &Usage) {
     add(&mut usage.reasoning_tokens, more.reasoning_tokens);
 }
 
-/// How a session's finished run ended, for everyone.
 fn run_outcome(outcome: agent::RunOutcome, error: Option<agent::RunError>) -> protocol::RunOutcome {
     match outcome {
         agent::RunOutcome::Completed => protocol::RunOutcome::Completed,
@@ -420,14 +401,14 @@ impl Cowork {
     }
 
     /// Hands the run each pending steer it doesn't have yet. Called right
-    /// after the run's prompt is posted, so steers left from a stopped run
-    /// join the new run at its first safe point, before its first request
-    /// (the session's `Admission::Next`), and again for each steer accepted
-    /// during the run. A stopping run takes none; they stay pending.
+    /// after the run's prompt is posted, so steers left from a stopped run join
+    /// the new run at its first safe point (the session's `Admission::Next`),
+    /// and again for each steer accepted during the run. A stopping run takes
+    /// none; they stay pending.
     ///
     /// The input's ID is its group's (see [`crate::transcript::steered_group`]).
-    /// Its comment aliases are named here and join the run's comments only
-    /// when it commits ([`CoworkHost`]'s `inputs_committed`).
+    /// Its comment aliases join the run's comments only when it commits
+    /// ([`CoworkHost`]'s `inputs_committed`).
     pub(super) fn offer_steering(&mut self, thread: &Entity<Thread>, cx: &mut Context<Self>) {
         let state = thread.read(cx);
         let Some(generation) = self.active_generations.get_mut(&state.instance_id) else {
@@ -507,8 +488,6 @@ impl Cowork {
             .is_ok()
     }
 
-    /// Starts the agent on a submission, returning the agent message it
-    /// produces.
     pub(super) fn start_generation(
         &mut self,
         plan: GenerationPlan,
@@ -558,8 +537,6 @@ impl Cowork {
             host.compaction
                 .threshold
                 .store(threshold, Ordering::Release);
-            // A context already full is summarized before the run's
-            // first request.
             host.compaction.at_start.store(
                 state.transcript.len() > 0 && state.live_context_tokens().unwrap_or(0) >= threshold,
                 Ordering::Release,
@@ -596,8 +573,6 @@ impl Cowork {
         Some(message_id)
     }
 
-    /// The thread's agent session, started for its selected model or
-    /// switched to it.
     fn thread_agent(
         &mut self,
         thread: &Entity<Thread>,
@@ -668,7 +643,6 @@ impl Cowork {
         Ok((handle, host))
     }
 
-    /// Ends `thread_id`'s agent session, stopping any run it has.
     pub(crate) fn retire_agent(&mut self, thread_id: Uuid) {
         self.agents.remove(&thread_id);
     }
@@ -705,8 +679,6 @@ impl Cowork {
         }
     }
 
-    /// Tells everyone in `thread_id` what its session reported about the
-    /// current run.
     fn agent_event(
         &mut self,
         thread_id: Uuid,
@@ -843,8 +815,6 @@ impl Cowork {
         self.thread_updated(thread_id, cx);
     }
 
-    /// Ends the run producing `message_id` with `outcome`, telling everyone,
-    /// counting its usage, and letting the scheduled run queue go on.
     pub(crate) fn finish_generation(
         &mut self,
         thread: &Entity<Thread>,
@@ -889,7 +859,6 @@ impl Cowork {
             );
         });
         self.record_turn_usage(thread, usage, started_at, duration, cx);
-        // The profile page's statistics may be showing.
         cx.notify();
         if let Entry::Occupied(entry) = self.active_generations.entry(thread_id)
             && entry.get().message_id == message_id
@@ -902,7 +871,6 @@ impl Cowork {
         ) {
             self.settle_retired_thread(thread, cx);
         }
-        // A turn boundary, before the next pending submission starts.
         self.save_thread(thread, cx);
         self.thread_updated(thread_id, cx);
         if matches!(outcome, protocol::RunOutcome::Completed) {
@@ -911,8 +879,6 @@ impl Cowork {
         self.scheduled_generation_ended(thread_id, message_id, &outcome, cx);
     }
 
-    /// Remembers that the run producing message `message_id` waits on a
-    /// decision about `call` of `tool`, and tells everyone.
     pub(crate) fn await_tool_approval(
         &mut self,
         thread_id: Uuid,
@@ -947,11 +913,9 @@ impl Cowork {
         self.scheduled_run_waits(thread_id, message_id, tool, cx);
     }
 
-    /// Adds a finished turn's usage to its thread, with when it was used:
-    /// spread across the `duration` of the response it started at
-    /// `started_at`. The profile's statistics add up the user's own threads;
-    /// a turn ending after its thread was deleted is counted with the
-    /// deleted ones.
+    /// Adds a finished turn's usage to its thread, spread across the
+    /// `duration` of the response that started at `started_at`. A turn ending
+    /// after its thread was deleted is counted with the deleted ones.
     pub(crate) fn record_turn_usage(
         &mut self,
         thread: &Entity<Thread>,
@@ -986,8 +950,6 @@ impl Cowork {
         }
     }
 
-    /// Redraws the timeline after `thread_id` changed, staying pinned to the
-    /// newest output unless the user has scrolled away.
     pub(crate) fn thread_updated(&mut self, thread_id: Uuid, cx: &mut Context<Self>) {
         if self.active_thread_id(cx) != Some(thread_id) {
             return;
@@ -998,8 +960,6 @@ impl Cowork {
         cx.notify();
     }
 
-    /// Stops the active thread's agent run, asking the host to when the
-    /// thread is mirrored.
     pub(crate) fn stop_generation(&mut self, cx: &mut Context<Self>) {
         let Some(thread) = self.active_thread(cx) else {
             return;
@@ -1074,8 +1034,6 @@ mod tests {
     use crate::models::{ModelProvider, Reasoning};
     use agent::model::JsonObject;
 
-    /// A provider answering each request with the next of its replies, and
-    /// keeping the requests.
     #[derive(Default)]
     struct Scripted {
         replies: parking_lot::Mutex<VecDeque<Message>>,
@@ -1270,7 +1228,6 @@ mod tests {
         assert_eq!(outcome, RunOutcome::Completed);
         assert_eq!(asked, [WriteFile::NAME]);
         assert_eq!(discarded, [DiscardReason::Removed]);
-        // Only the delivered steer's comments joined the run's.
         assert_eq!(
             host.comments().current().unanswered_comment_ids(),
             delivered_comments

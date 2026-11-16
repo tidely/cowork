@@ -25,16 +25,12 @@ use crate::{
     timeline::{CommentReference, UserComment, UserCommentBody},
 };
 
-/// A thread's pending request: the shared draft document, the bytes of the
-/// thread's files, and the local editors showing its items.
-///
 /// Editors are created lazily by [`Cowork::prepare_draft`] because they need
 /// a window, and they are kept in sync with the document there too.
 pub(crate) struct ThreadDraft {
     /// Routes asynchronous work, such as reading attachments, to this draft
     /// even after the user switched threads.
     pub(crate) id: Uuid,
-    /// Who the local user is in this draft.
     pub(crate) author: ParticipantId,
     pub(super) doc: Draft,
     /// The bytes of every file this participant has of the thread: the
@@ -105,7 +101,6 @@ impl ItemEditors {
     }
 }
 
-/// Which part of a draft an editor edits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum EditorSlot {
     DraftPosition,
@@ -237,7 +232,6 @@ impl ThreadDraft {
         self.doc.take_local_update()
     }
 
-    /// Maintains projection caches without granting mutable canonical access.
     pub(crate) fn update_draft_editors<R>(
         &mut self,
         f: impl FnOnce(&[DraftItem], &mut DraftEditorState) -> R,
@@ -292,7 +286,6 @@ impl ThreadDraft {
         self.presence.insert(participant, (presence, moved_at));
     }
 
-    /// Whether anyone other than `except` is focused in the item.
     pub(crate) fn is_attended(&self, id: ItemId, except: Option<ParticipantId>) -> bool {
         let focus = protocol::PresenceFocus::Item(id.as_uuid().into_bytes());
         self.presence.iter().any(|(participant, (presence, _))| {
@@ -300,7 +293,6 @@ impl ThreadDraft {
         })
     }
 
-    /// Participants focused in the item, in join order.
     pub(crate) fn editors_of(&self, id: ItemId, order: &[ParticipantId]) -> Vec<ParticipantId> {
         let focus = protocol::PresenceFocus::Item(id.as_uuid().into_bytes());
         self.participants_where(order, |presence| presence.focus == Some(focus))
@@ -394,7 +386,6 @@ impl ThreadDraft {
             .collect()
     }
 
-    /// Whether anyone's presence announces files being read into the block.
     pub(crate) fn has_announced_reads_into(&self, id: ItemId) -> bool {
         let block = id.as_uuid().into_bytes();
         self.presence.values().any(|(presence, _)| {
@@ -518,7 +509,6 @@ impl ThreadDraft {
         self.doc.body(id)
     }
 
-    /// Removes items together with their editors and file bytes.
     pub(crate) fn remove_items(&mut self, ids: &[ItemId]) {
         let attachments = self
             .doc
@@ -560,7 +550,6 @@ impl ThreadDraft {
             .retain(|_, block| !ids.contains(block));
     }
 
-    /// Forgets everything about a file.
     pub(crate) fn drop_file(&mut self, id: AttachmentId) {
         self.files.remove(&id);
         self.incoming.remove(&id);
@@ -569,7 +558,6 @@ impl ThreadDraft {
         self.discarded.insert(id);
     }
 
-    /// The attachment records of the draft's prompt blocks, in draft order.
     pub(crate) fn attachment_records(&self) -> Vec<AttachmentRecord> {
         self.doc
             .items()
@@ -671,7 +659,6 @@ impl ThreadDraft {
         Ok((file.bytes.len() as u64 == file.total).then_some(id))
     }
 
-    /// Turns a completely received file into one this participant has.
     pub(crate) fn complete_file(&mut self, id: AttachmentId) -> anyhow::Result<()> {
         let Some(file) = self.incoming.remove(&id) else {
             return Ok(());
@@ -701,7 +688,6 @@ impl ThreadDraft {
         })
     }
 
-    /// Removes the item if it is empty. Returns whether it was removed.
     pub(crate) fn remove_if_empty(&mut self, id: ItemId) -> bool {
         if !self.doc.item(id).is_some_and(|item| item.is_empty()) {
             return false;
@@ -719,7 +705,6 @@ impl ThreadDraft {
         !self.is_attended(id, Some(self.author)) && self.remove_if_empty(id)
     }
 
-    /// The block to attach a finished file to, creating it when needed.
     pub(crate) fn attachment_block(&mut self, target: AttachmentTarget) -> ItemId {
         let batch = match target {
             AttachmentTarget::Block(id)
@@ -796,13 +781,11 @@ impl ThreadDraft {
     }
 }
 
-/// Who is in a draft item besides its creator, and where their carets are.
 #[derive(Clone, Default)]
 pub(crate) struct ItemPresence {
     /// Participants focused in the item other than its creator, in join
     /// order.
     pub(crate) editors: Vec<ParticipantId>,
-    /// Everyone else's carets in the item.
     pub(crate) carets: Vec<RemoteCaret>,
 }
 
@@ -820,10 +803,8 @@ pub(crate) struct RemoteCaret {
 /// How long a remote caret shows its participant's name after moving.
 pub(crate) const CARET_LABEL_DURATION: Duration = Duration::from_millis(1_500);
 
-/// Where a file being read will be attached.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AttachmentTarget {
     Block(ItemId),
-    /// A block created for the batch of files picked together.
     NewBlock(Uuid),
 }

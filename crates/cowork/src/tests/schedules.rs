@@ -16,7 +16,6 @@ use crate::{
     submission::RunTotals,
 };
 
-/// Folders that exist, named `names`, under a fresh temporary directory.
 fn temp_folders(names: &[&str]) -> Vec<PathBuf> {
     let root = std::env::temp_dir().join(format!("cowork-schedule-{}", Uuid::new_v4()));
     names
@@ -115,14 +114,12 @@ fn tick(cowork: &Entity<Cowork>, now: NaiveDateTime, cx: &mut gpui::VisualTestCo
     draw(cx);
 }
 
-/// The thread the run going on now is in.
 fn running_thread(cowork: &Entity<Cowork>, cx: &mut gpui::VisualTestContext) -> Option<Uuid> {
     cowork.read_with(cx, |cowork, _| {
         cowork.scheduler.run.map(|run| run.thread_id)
     })
 }
 
-/// Ends the agent run of `thread_id` the way a finished run does.
 fn finish(
     cowork: &Entity<Cowork>,
     thread_id: Uuid,
@@ -147,7 +144,6 @@ fn finish(
     draw(cx);
 }
 
-/// The prompts submitted to `thread_id`, in order.
 fn prompts(
     cowork: &Entity<Cowork>,
     thread_id: Uuid,

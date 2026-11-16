@@ -1,22 +1,16 @@
 //! The conversation navigation rail: a marker per turn at the right edge of
 //! the center stage, a card previewing the turn under the pointer, and
-//! jumping to a turn. See `docs/conversation-navigation.md`.
+//! jumping to a turn.
 //!
 //! A **turn** is a user group that started an agent run: the group appended
-//! right before its run's `AgentStarted`, as both `UserMessage` and
-//! `PendingDelivered` do (`docs/collaboration.md`, "Pending delivery"). A
-//! steer is a group too, but its run's output names it with a
-//! [`AgentStep::Steering`] step, the rule live folding and replay share, so
-//! it is never a turn; nor is a pending group whose run hasn't started, nor
-//! the onboarding greeting, which has no group. A turn is identified by its
-//! group's id, which is also its row in the timeline.
+//! right before its run's `AgentStarted`. A steer is a group too, but its
+//! run's output names it with an [`AgentStep::Steering`] step, the rule live
+//! folding and replay share, so it is never a turn; nor is a pending group
+//! whose run hasn't started, nor the onboarding greeting. A turn is
+//! identified by its group's id, which is also its row in the timeline.
 //!
-//! Everything here is local: which marker is hovered, the rail's scroll
-//! offset, and the turn navigated to. The card is built from the shared
-//! records of the hovered turn alone: its group, and its run's response,
-//! model, and start time. The card's second section is that response, the
-//! agent's visible answer (what was called the "agent prompt"), never its
-//! reasoning, tool calls, or the system prompt.
+//! Everything here is local; the card is built from the shared records of
+//! the hovered turn alone.
 
 use std::{
     collections::{HashMap, HashSet},
@@ -51,9 +45,7 @@ use crate::{
 /// hit area. Message rows and the composer keep a gap this wide on their
 /// right (see `Cowork::render_message_row`), so the rail never covers text.
 pub(crate) const RAIL_WIDTH: Pixels = px(40.);
-/// From the stage's right edge to every pill's right end.
 const RAIL_INSET: Pixels = px(10.);
-/// A marker's height, and the distance between markers.
 const MARKER_PITCH: Pixels = px(14.);
 const PILL_HEIGHT: Pixels = px(3.);
 /// The hovered pill's width, then its neighbors' by distance.
@@ -64,7 +56,6 @@ const PILL_MOTION: Duration = Duration::from_millis(140);
 pub(crate) const CARD_WIDTH: Pixels = px(360.);
 /// The least room the card keeps from the stage's edges.
 const CARD_INSET: Pixels = px(8.);
-/// Between the card and the rail.
 pub(crate) const CARD_GAP: Pixels = px(6.);
 /// Below this the stage is too narrow for a card worth reading.
 const MIN_CARD_WIDTH: Pixels = px(160.);
@@ -153,16 +144,13 @@ impl Element for PositionedTurnCard {
     }
 }
 
-/// A turn of the conversation, as it is in this frame's timeline.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Turn {
-    /// The user group that started the run: the turn's identity.
     pub(crate) group: Uuid,
     pub(crate) group_index: usize,
     pub(crate) run_index: usize,
 }
 
-/// The user groups that joined a run as steers.
 pub(crate) fn steered_groups(timeline: &[TimelineMessage]) -> HashSet<Uuid> {
     timeline
         .iter()
@@ -192,7 +180,6 @@ pub(crate) fn initiates_run(
     )
 }
 
-/// The turns of `timeline`, oldest first.
 pub(crate) fn conversation_turns(timeline: &[TimelineMessage]) -> Vec<Turn> {
     let steered = steered_groups(timeline);
     (0..timeline.len())
@@ -216,17 +203,13 @@ fn pill_width(index: usize, hovered: Option<usize>) -> Pixels {
         .unwrap_or(REST_WIDTH)
 }
 
-/// The rail's local state for the active thread.
 #[derive(Default)]
 pub(crate) struct TurnRail {
-    /// The thread the rest is about; any other thread starts afresh.
     thread: Option<Uuid>,
-    /// The turn whose card shows, and whose neighbors widen.
     pub(crate) hovered: Option<Uuid>,
     /// The final action marker widens without opening a turn card.
     hovered_end: bool,
     pub(crate) scroll: ScrollHandle,
-    /// The current turn the rail last scrolled into view.
     shown_current: Option<Uuid>,
 }
 
@@ -241,16 +224,12 @@ impl TurnRail {
     }
 }
 
-/// What the card says of a turn's response.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TurnResponse {
-    /// The run's response, as far as it has come.
     Text(String),
-    /// Why there is none (yet).
     Status(&'static str),
 }
 
-/// What the card shows of a turn, from its shared records.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum TurnPrompt {
     Text(String),
@@ -259,7 +238,6 @@ pub(crate) enum TurnPrompt {
     Comments(Vec<String>),
 }
 
-/// What the card shows of a turn, from its shared records.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TurnPreview {
     /// The comments' and prompt blocks' text, in the order the timeline
@@ -273,11 +251,8 @@ pub(crate) struct TurnPreview {
     /// The run was started by a scheduled task, as its committed input
     /// records.
     pub(crate) scheduled: bool,
-    /// The model the run used, as it was started; `None` when unrecorded.
     pub(crate) model: Option<ModelRef>,
-    /// The model's name in the thread's catalog, when it is still there.
     pub(crate) model_name: Option<String>,
-    /// When the host started the run.
     pub(crate) started_at: SystemTime,
 }
 
@@ -658,7 +633,6 @@ pub(crate) fn render_rail(
         .into_any_element()
 }
 
-/// The card previewing a turn, sized by its caller.
 pub(crate) fn render_turn_card(
     preview: &TurnPreview,
     profiles: &HashMap<ParticipantId, Profile>,
@@ -932,7 +906,6 @@ impl Cowork {
         cx.notify();
     }
 
-    /// Closes the card, if one shows; true when it did.
     pub(crate) fn dismiss_turn_card(&mut self, cx: &mut Context<Self>) -> bool {
         let rail = &mut self.turn_rail;
         let shown = rail.hovered.take().is_some();
@@ -1052,7 +1025,6 @@ mod tests {
             self.thread.apply_for_test(message, cx);
         }
 
-        /// A run starting with `model` at `started_at`.
         fn start(
             &mut self,
             run: Uuid,
@@ -1071,7 +1043,6 @@ mod tests {
             );
         }
 
-        /// Input `id` joining run `run`, from `source`.
         fn input(&mut self, run: Uuid, id: InputId, source: RunSource, cx: &mut App) {
             let index = self.entries;
             self.entries += 1;

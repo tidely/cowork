@@ -1,9 +1,6 @@
 //! The `read_pdf` tool: reading a PDF on the host as its pages' text or as
 //! images of them, with `pdf_oxide`, under the same path checks as the other
 //! file tools ([`crate::paths`]).
-//!
-//! The limits and rendering settings follow grok-build's PDF reading, its
-//! `read_file`'s, with a text budget added like `read_file`'s here.
 
 use std::{
     fmt::Write as _,
@@ -26,13 +23,11 @@ use crate::{
     paths::{FileError, Places},
 };
 
-/// The largest PDF `read_pdf` opens. The whole file is read into memory and
-/// parsed, so this bounds both.
+/// The largest PDF `read_pdf` opens; the whole file is read into memory.
 const PDF_SOURCE_LIMIT: u64 = 50 * 1024 * 1024;
 
-/// How long one call may take. A PDF built to be slow to parse or render
-/// must not hold the run; the blocking thread can't be stopped, but the call
-/// fails and the run goes on.
+/// How long one call may take, so a PDF built to be slow to parse or render
+/// cannot hold the run. The blocking thread can't be stopped, but the call fails.
 const PDF_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// The most pages a call without a range reads; a longer document asks for a
@@ -42,10 +37,9 @@ const AUTO_READ_PAGES: u32 = 10;
 /// The most pages one call reads.
 const MAX_PAGES: u32 = 20;
 
-/// How much text one call returns, in bytes. A read stops at a page boundary
-/// past it and says where to go on, as `read_file` does at a line. Larger
-/// than `read_file`'s limit, since a dense page is a few KB and a call may
-/// read 20 of them.
+/// How much text one call returns, in bytes; a read stops at a page boundary
+/// past it. Larger than `read_file`'s limit, since a call may read 20 pages of
+/// a few KB each.
 const TEXT_LIMIT: usize = 64 * 1024;
 
 /// A US Letter page at 150 DPI is 1275 × 1650 pixels: legible small print,

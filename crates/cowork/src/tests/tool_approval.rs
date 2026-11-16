@@ -2,7 +2,6 @@ use agent::model::ToolCallId;
 
 use super::*;
 
-/// A run of the host's thread waiting for approval of a non-allowlisted call.
 struct WaitingCall {
     message_id: Uuid,
     call: ToolCallId,
@@ -18,7 +17,6 @@ fn wait_for_approval(session: &mut Collaboration<'_>) -> WaitingCall {
     )
 }
 
-/// Like [`wait_for_approval`], for a call of `tool` with `arguments`.
 fn wait_for_approval_of(
     session: &mut Collaboration<'_>,
     tool: &str,
@@ -50,7 +48,6 @@ fn wait_for_approval_of(
     WaitingCall { message_id, call }
 }
 
-/// The call the thread's last agent message waits for approval of.
 fn awaiting(thread: &Entity<Thread>, cx: &mut gpui::VisualTestContext) -> Option<ToolCallId> {
     thread.read_with(cx, |thread, _| {
         thread.timeline.iter().rev().find_map(|entry| match entry {
@@ -60,7 +57,6 @@ fn awaiting(thread: &Entity<Thread>, cx: &mut gpui::VisualTestContext) -> Option
     })
 }
 
-/// The decisions the host handed its run.
 fn decisions(session: &mut Collaboration<'_>) -> Vec<(ToolCallId, bool)> {
     let thread_id = session
         .host_thread

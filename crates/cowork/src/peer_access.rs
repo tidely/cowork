@@ -31,7 +31,6 @@ use crate::{
 
 const MODES: [PeerMode; 3] = [PeerMode::ReadOnly, PeerMode::Write, PeerMode::Admin];
 
-/// The popover's width; its content is this minus its padding.
 pub(crate) const PANEL_WIDTH: gpui::Pixels = px(300.);
 /// Every row's content starts and ends this far inside the panel's
 /// padding, including the text inside full-width buttons, so that text,
@@ -42,7 +41,6 @@ const INSET: gpui::Pixels = px(8.);
 const PERSON_MENU_WIDTH: gpui::Pixels = px(92.);
 const AVATAR: gpui::Pixels = px(24.);
 
-/// Someone shown in the panel, with the profile their avatar and name use.
 #[derive(Clone)]
 pub(crate) struct Person {
     pub(crate) id: ParticipantId,
@@ -59,24 +57,18 @@ impl Person {
     }
 }
 
-/// A collaborator as the host sees them: an override, or the default.
 #[derive(Clone)]
 pub(crate) struct PeerRow {
     pub(crate) person: Person,
     pub(crate) override_mode: Option<PeerMode>,
 }
 
-/// Everything the sharing popover shows.
 pub(crate) struct SharingPanel {
     pub(crate) status: SharingStatus,
-    /// The link was just copied.
     pub(crate) copied: bool,
     pub(crate) default_mode: PeerMode,
-    /// The host's collaborators, without the host.
     pub(crate) peers: Vec<PeerRow>,
-    /// A collaborator's host, while connected.
     pub(crate) host: Option<Person>,
-    /// A collaborator's own mode, while connected.
     pub(crate) local_mode: PeerMode,
 }
 
@@ -85,10 +77,8 @@ type Action = Rc<dyn Fn(&mut Window, &mut App)>;
 type MenuOpen = Rc<dyn Fn(Option<ParticipantId>, bool, &mut Window, &mut App)>;
 type SetMode = Rc<dyn Fn(Option<ParticipantId>, Option<PeerMode>, &mut Window, &mut App)>;
 
-/// What the panel's controls do: the app's sharing paths, or the preview's.
 #[derive(Clone)]
 pub(crate) struct SharingActions {
-    /// Starts or stops sharing as the host, or disconnects a collaborator.
     pub(crate) toggle: Action,
     pub(crate) copy: Action,
     /// Sets the default mode (no participant) or a participant's override

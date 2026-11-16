@@ -136,11 +136,9 @@ impl Draft {
     /// The v1 update of every local change since the previous call, merged into one update, or
     /// `None` when nothing changed locally.
     ///
-    /// Local changes are those made through this `Draft`'s own mutating methods
-    /// ([`Self::create_prompt`], [`Self::create_comment`], [`Self::remove_items`],
-    /// [`Self::set_body`], [`Self::edit_body`], [`Self::add_attachment`],
-    /// [`Self::remove_attachment`]). Changes merged in with [`Self::apply_update`] are never
-    /// reported, though local changes made afterwards may depend on them.
+    /// Local changes are those made through this `Draft`'s own mutating methods. Changes
+    /// merged in with [`Self::apply_update`] are never reported, though local changes made
+    /// afterwards may depend on them.
     pub fn take_local_update(&self) -> Option<Vec<u8>> {
         let updates = std::mem::take(&mut *self.local_updates.lock());
         if updates.is_empty() {

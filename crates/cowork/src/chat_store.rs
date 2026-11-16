@@ -46,7 +46,6 @@ impl Chat {
         }
     }
 
-    /// Starts loading, unless loaded or loading already.
     fn load(
         &mut self,
         loader: &ChatLoader,
@@ -470,7 +469,6 @@ impl ThreadStore {
         })
     }
 
-    /// Every loaded chat, recents then archive.
     pub(crate) fn loaded_all(&self, cx: &App) -> Vec<Entity<Thread>> {
         self.all(cx)
             .filter_map(ListedChat::loaded)

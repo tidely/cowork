@@ -1,25 +1,16 @@
 //! The transcript and the agent's events: on the wire, and folded into a
 //! thread.
 //!
-//! Only the host runs the agent, as an agent session per thread (see
-//! `generation.rs`). The transcript is that session's conversation, kept by
-//! every participant: the host forwards what the session reports as
-//! [`RunEvent`]s, and everyone, the host included, folds them into a replica
-//! of the conversation, which checks each committed entry as the session's
-//! own conversation did. Accepted summaries replace the older part of the
-//! context for later requests; they never remove entries.
+//! Only the host runs the agent (see `generation.rs`), but every participant
+//! keeps a replica of its conversation by folding the host's [`RunEvent`]s,
+//! checking each committed entry as the session did. Accepted summaries
+//! replace the older context for later requests; they never remove entries.
 //!
 //! What an agent message shows ([`AgentOutput`]) is never sent. It is a
-//! function of transcript entries: the ones its run added after its prompt,
-//! followed by the reply being sampled, as far as its previews have come.
-//! Those previews are the run's pending events, which a snapshot carries raw,
-//! so someone joining rebuilds the message exactly, and every copy shows the
-//! same.
-//!
-//! Live, the transcript part never changes, so only the rest is redone per
-//! event: a message rewinds its output to where the committed part ends,
-//! adds an entry that has just joined the transcript, if any, and then the
-//! preview.
+//! function of the transcript entries its run added plus the reply being
+//! sampled, whose previews a snapshot carries raw, so every copy shows the
+//! same. Live, the committed part never changes, so only the rest is redone
+//! per event.
 
 use std::{
     collections::{BTreeMap, HashSet},
@@ -52,9 +43,7 @@ pub(crate) const BYTES_PER_TOKEN: u64 = 4;
 /// checked authority when it accepted the submission.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum RunSource {
-    /// A participant's submission.
     Participant(uuid::Bytes),
-    /// A scheduled task, which nobody may be watching.
     Schedule,
     /// The host app itself, for requests nobody made, such as compacting a
     /// full context.
@@ -76,7 +65,6 @@ pub(crate) struct TranscriptIndex(pub(crate) u64);
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Transcript {
     conversation: Conversation<RunSource>,
-    /// The number of entries when each compaction was accepted, in order.
     compacted_at: Vec<usize>,
 }
 
@@ -93,7 +81,6 @@ impl PartialEq for Transcript {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub(crate) struct TranscriptRecord {
     entries: Vec<StoredEntry>,
-    /// Each compaction, after the number of entries it was accepted at.
     compactions: Vec<(u64, StoredCompaction)>,
 }
 
@@ -131,12 +118,10 @@ impl Transcript {
         Ok(())
     }
 
-    /// Whether every tool call has its result.
     pub(crate) fn is_settled(&self) -> bool {
         self.conversation.is_settled()
     }
 
-    /// Whether `call` waits for its result.
     pub(crate) fn is_pending(&self, call: &ToolCallId) -> bool {
         self.conversation
             .pending_calls()
@@ -201,7 +186,6 @@ pub(crate) struct TranscriptExtent {
 }
 
 impl TranscriptExtent {
-    /// Whether `self` holds no more than `other` of either.
     pub(crate) fn within(self, other: Self) -> bool {
         self.entries <= other.entries && self.compactions <= other.compactions
     }
@@ -265,13 +249,11 @@ impl Transcript {
     }
 }
 
-/// An entry as it is sent.
 pub(crate) fn shared_entry(entry: &Entry<RunSource>) -> Json<StoredEntry> {
     Json::from_value(&StoredEntry::encode(entry).expect("committed entries encode"))
         .expect("a stored entry encodes as JSON")
 }
 
-/// A compaction as it is sent.
 pub(crate) fn shared_compaction(compaction: &Compaction) -> Json<StoredCompaction> {
     Json::from_value(&StoredCompaction::encode(compaction).expect("accepted summaries encode"))
         .expect("a stored compaction encodes as JSON")
@@ -313,7 +295,6 @@ impl ReplyPreview {
         self.parts.is_empty()
     }
 
-    /// The reply as far as it has come, or `None` before its first preview.
     pub(crate) fn partial(&self) -> Option<Message> {
         (!self.is_empty())
             .then(|| Message::new(Role::Assistant, self.parts.values().cloned().collect()))
@@ -559,7 +540,6 @@ impl Thread {
         Ok(())
     }
 
-    /// Stops showing `call` as waiting for approval; its result follows.
     pub(crate) fn resolve_tool_approval(&mut self, message_id: Uuid, call: &ToolCallId) {
         if let Some(message) = agent_message(&mut self.timeline, message_id)
             && message.record.awaiting_approval.as_ref() == Some(call)
@@ -589,9 +569,7 @@ impl Thread {
             return;
         };
         message.record.run = AgentRun::Ended { outcome, duration };
-        // A run that ends no longer waits for anything.
         message.record.awaiting_approval = None;
-        // The work collapses under its summary, leaving the response.
         message.ui.work_expanded = false;
         message.ui.advance(None, partial.as_ref(), false, cx);
     }

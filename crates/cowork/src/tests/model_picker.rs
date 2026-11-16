@@ -527,13 +527,11 @@ fn picked_models_apply_to_the_active_thread_and_new_threads(cx: &mut gpui::TestA
     });
 }
 
-/// The catalog the picker's rows were last built from.
 fn picker_catalog(cowork: &Cowork) -> ModelCatalog {
     let (catalog, _) = cowork.picker_rows.as_ref().expect("picker rows");
     (**catalog).clone()
 }
 
-/// Whether the picker shows its selection as available, if it has one.
 fn picker_selection_available(cowork: &Cowork, cx: &App) -> Option<bool> {
     let picker = cowork.model_picker.read(cx);
     picker.selection().first().map(|(_, row)| row.available)

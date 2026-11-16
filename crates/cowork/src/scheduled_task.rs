@@ -53,7 +53,6 @@ impl IntervalUnit {
     }
 }
 
-/// When a task runs.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum When {
     /// Every `every` units, counted from `start`, not from when the last run
@@ -86,7 +85,6 @@ pub(crate) enum When {
     },
 }
 
-/// The occurrences of a schedule within a span of time.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Occurrences {
     pub(crate) count: u64,
@@ -119,7 +117,6 @@ fn custom_rule(rule: &str, start: NaiveDateTime) -> Result<RRuleSet, String> {
 }
 
 impl When {
-    /// Why the schedule can't run, if it can't.
     pub(crate) fn validate(&self) -> Result<(), String> {
         match self {
             Self::Interval { every: 0, .. } => Err("Enter a whole number above zero.".into()),
@@ -132,7 +129,6 @@ impl When {
         }
     }
 
-    /// The schedule in a few words, as the list shows it.
     pub(crate) fn describe(&self) -> String {
         let time = |time: &NaiveTime| time.format("%H:%M").to_string();
         match self {
@@ -158,7 +154,6 @@ impl When {
         }
     }
 
-    /// The first time after `after` the task is due, if it ever is again.
     pub(crate) fn next_after(&self, after: NaiveDateTime) -> Option<NaiveDateTime> {
         let first_day_after = |time: NaiveTime, runs_on: &dyn Fn(NaiveDate) -> bool| {
             after
@@ -204,7 +199,6 @@ impl When {
         }
     }
 
-    /// The occurrences after `after`, up to and including `until`.
     pub(crate) fn occurrences(&self, after: NaiveDateTime, until: NaiveDateTime) -> Occurrences {
         let mut found = Occurrences::default();
         if until <= after {
@@ -288,7 +282,6 @@ pub(crate) enum MissedRuns {
     Skip,
 }
 
-/// What the user sets in a task's dialog.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TaskSettings {
     pub(crate) title: String,
@@ -321,7 +314,6 @@ pub(crate) enum Trigger {
     /// For the most recent occurrence missed while the app was closed or
     /// the computer asleep.
     CatchUp,
-    /// Run now, outside the schedule.
     Manual,
 }
 
@@ -335,11 +327,8 @@ pub(crate) struct QueuedRun {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SkipReason {
-    /// Due while the app was closed or the computer asleep.
     Missed,
-    /// Due while the task already had a run queued.
     AlreadyQueued,
-    /// Queued when the task was paused.
     Paused,
 }
 
@@ -349,7 +338,6 @@ pub(crate) enum RunResult {
     Completed,
     Stopped,
     Failed(String),
-    /// Cowork quit during the run.
     Interrupted,
     /// `count` occurrences didn't run, the latest being the record's.
     Skipped {
@@ -395,17 +383,14 @@ pub(crate) struct ScheduledTask {
     /// recorded as skipped. Saved, so occurrences due while the app was
     /// closed are found when it starts.
     checked_until: NaiveDateTime,
-    /// The thread **continue the last thread** runs submit to.
     pub(crate) thread_id: Option<Uuid>,
     queued: Option<QueuedRun>,
-    /// Oldest first.
     history: Vec<RunRecord>,
     /// The next occurrence after `checked_until`, kept so that neither each
     /// look at the clock nor each frame evaluates the schedule.
     next_due: Option<NaiveDateTime>,
 }
 
-/// A task as it is saved (`chat_db`), without what is derived from it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SavedTask {
     pub(crate) id: Uuid,
@@ -414,12 +399,10 @@ pub(crate) struct SavedTask {
     pub(crate) checked_until: NaiveDateTime,
     pub(crate) thread_id: Option<Uuid>,
     pub(crate) queued: Option<QueuedRun>,
-    /// Oldest first.
     pub(crate) history: Vec<RunRecord>,
 }
 
 impl ScheduledTask {
-    /// A task that runs from `now` on: earlier occurrences aren't missed.
     pub(crate) fn new(settings: TaskSettings, now: NaiveDateTime) -> Self {
         let mut task = Self {
             id: Uuid::new_v4(),
@@ -466,7 +449,6 @@ impl ScheduledTask {
         task
     }
 
-    /// What is saved of the task: all but what is derived.
     pub(crate) fn to_saved(&self) -> SavedTask {
         SavedTask {
             id: self.id,
@@ -535,7 +517,6 @@ impl ScheduledTask {
         }
     }
 
-    /// Queues a run now, outside the schedule, unless one is queued already.
     pub(crate) fn queue_now(&mut self, now: NaiveDateTime) -> bool {
         if self.queued.is_some() {
             return false;
@@ -612,7 +593,6 @@ impl ScheduledTask {
         true
     }
 
-    /// Takes the queued run to start it.
     pub(crate) fn take_queued(&mut self) -> Option<QueuedRun> {
         self.queued.take()
     }
@@ -647,7 +627,6 @@ impl ScheduledTask {
         id
     }
 
-    /// Records `run` as failed before it could start.
     pub(crate) fn fail(&mut self, run: QueuedRun, now: NaiveDateTime, error: String) {
         self.record(RunRecord {
             id: Uuid::new_v4(),

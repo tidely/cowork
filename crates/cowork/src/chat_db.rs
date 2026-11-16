@@ -1,9 +1,8 @@
-//! Saving the user's own chats in one SQLite database,
-//! `~/.cowork/cowork.db`, and reading them back: every chat's row at
-//! startup, and the rest of a chat when it loads. The schema is in
-//! `migrations/`; the design, and why it is this one, in
-//! `docs/sqlite-storage.md`. The same database keeps the rest of what
-//! Cowork saves, through the same writer; see `app_state`.
+//! Saving the user's own chats in one SQLite database, `~/.cowork/cowork.db`,
+//! and reading them back: every chat's row at startup, and the rest of a chat
+//! when it loads. The schema is in `migrations/` and the design in
+//! `docs/sqlite-storage.md`. The same database and writer keep the rest of
+//! what Cowork saves; see `app_state`.
 //!
 //! Only the host saves a chat; a joined one is its host's. A chat is saved
 //! at turn boundaries, when it is archived or restored, before it is
@@ -18,19 +17,19 @@
 //! the save if that is less than `from` (an earlier save failed: the next
 //! one starts from what is there) or more than `end` (the chat in memory
 //! isn't the whole chat). Otherwise it writes the rows past what is stored.
-//! What this side remembers per chat is a hint of where to start encoding,
-//! and what the writer last confirmed, from which [`ChatDb::is_saved`]
-//! tells whether a chat may be unloaded.
+//! What this side remembers per chat is only a hint of where to start
+//! encoding, plus what the writer last confirmed, from which
+//! [`ChatDb::is_saved`] tells whether a chat may be unloaded.
 //!
 //! One Tokio task writes, taking jobs in the order they were queued, so a
 //! load sees every save before it and quit waits for all of them. Only
 //! plain rows cross into it. Searches read on their own connection.
 //!
-//! One Cowork instance keeps the chats, holding `.lock` next to the
-//! database. An explicitly ephemeral instance has no database and saves
-//! nothing; its commands' scratch folders are in a temporary folder removed
-//! when it quits. Each chat's scratch folder is `threads/<id>/scratch/`
-//! either way, under `~/.cowork` or that folder; see `sandbox::settings`.
+//! One Cowork instance keeps the chats, holding `.lock` next to the database.
+//! An explicitly ephemeral instance has no database and saves nothing; its
+//! scratch folders are in a temporary folder removed when it quits. Each
+//! chat's scratch folder is `threads/<id>/scratch/` either way; see
+//! `sandbox::settings`.
 
 mod app_state;
 mod columns;
@@ -69,7 +68,6 @@ use rows::{Extent, Head, Placement, Tail};
 
 const DB_FILE: &str = "cowork.db";
 const LOCK_FILE: &str = ".lock";
-/// Where the chats' folders are, under Cowork's folder.
 const THREADS_DIR: &str = "threads";
 /// The most texts one search reads; enough for a palette's worth of chats.
 const SEARCH_LIMIT: i64 = 2000;
@@ -84,20 +82,17 @@ pub(crate) fn ephemeral_root() -> PathBuf {
     std::env::temp_dir().join(format!("cowork-threads-{}", Uuid::new_v4().simple()))
 }
 
-/// A saved chat's listing at startup: its row, and whether it is archived.
 pub(crate) struct ListedRow {
     pub(crate) meta: ChatMeta,
     pub(crate) archived: bool,
 }
 
-/// What the database holds at startup.
 pub(crate) struct Saved {
     /// Archived ones last, each list in its saved order.
     pub(crate) chats: Vec<ListedRow>,
     pub(crate) state: AppState,
 }
 
-/// The saved chats, and the writer saving them.
 pub(crate) struct ChatDb {
     root: PathBuf,
     jobs: mpsc::UnboundedSender<Job>,
@@ -107,7 +102,6 @@ pub(crate) struct ChatDb {
     _lock: File,
 }
 
-/// What this side knows of each loaded chat's saves.
 struct Tracking {
     /// Where the next save starts encoding: what the database is believed
     /// to hold. Too low costs re-encoding; too high is refused and
@@ -119,7 +113,6 @@ struct Tracking {
 }
 
 impl Tracking {
-    /// Takes in the writer's reports so far.
     fn pump(&mut self) {
         while let Ok(report) = self.reports.try_recv() {
             match report {
@@ -156,7 +149,6 @@ enum Job {
     FailNextSave,
 }
 
-/// A save, built only by [`ChatDb::save`] from a loaded chat.
 struct SaveJob {
     from: Extent,
     end: Extent,
@@ -242,14 +234,12 @@ impl ChatDb {
         ))
     }
 
-    /// Where the rest of the app's state is saved from.
     pub(crate) fn saver(&self) -> StateSaver {
         StateSaver {
             jobs: self.jobs.clone(),
         }
     }
 
-    /// The chats' folders, each with its commands' scratch folder.
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
@@ -279,8 +269,6 @@ impl ChatDb {
         Ok(())
     }
 
-    /// Whether everything `thread` holds is confirmed written, so it may go
-    /// back to its row.
     pub(crate) fn is_saved(&self, thread: &Thread) -> bool {
         let mut tracking = self.tracking.borrow_mut();
         tracking.pump();
@@ -296,7 +284,6 @@ impl ChatDb {
         _ = self.jobs.send(Job::Meta(id, placement));
     }
 
-    /// Forgets what is known of a chat's saves, as it is unloaded.
     pub(crate) fn forget(&self, id: Uuid) {
         let mut tracking = self.tracking.borrow_mut();
         tracking.hints.remove(&id);
@@ -313,8 +300,6 @@ impl ChatDb {
         }
     }
 
-    /// Loads chats through the writer's queue, behind every save and delete
-    /// queued before.
     pub(crate) fn loader(&self) -> ChatLoader {
         let jobs = self.jobs.clone();
         let tracking = self.tracking.clone();
@@ -354,7 +339,6 @@ impl ChatDb {
         async move { search.await? }
     }
 
-    /// Finishes writing. Nothing can be queued after.
     pub(crate) fn quit(self) -> impl Future<Output = ()> + 'static {
         let (done, finished) = oneshot::channel();
         _ = self.jobs.send(Job::Quit(done));
@@ -368,7 +352,6 @@ impl ChatDb {
         _ = self.jobs.send(Job::FailNextSave);
     }
 
-    /// Waits for every job queued so far, and takes in their reports.
     #[cfg(test)]
     pub(crate) async fn flush(&self) {
         let (done, finished) = oneshot::channel();
@@ -426,7 +409,6 @@ impl StateSaver {
     }
 }
 
-/// Takes `root`'s lock, or `None` when another instance holds it.
 fn lock(dir: &Path) -> anyhow::Result<Option<File>> {
     std::fs::create_dir_all(dir)?;
     let file = File::create(dir.join(LOCK_FILE))?;
@@ -437,7 +419,6 @@ fn lock(dir: &Path) -> anyhow::Result<Option<File>> {
     }
 }
 
-/// The writer: takes jobs one at a time, in order.
 async fn write(
     pool: SqlitePool,
     root: PathBuf,
@@ -510,7 +491,6 @@ async fn write(
             }
             Job::Load(id, reply) => {
                 let result = async {
-                    // One transaction, so the rows are of one save.
                     let mut tx = pool.begin().await?;
                     sql::load(&mut tx, id).await
                 }
@@ -573,9 +553,8 @@ fn remove_dir(path: &Path) {
 
 impl Cowork {
     /// Saves with `db` from now on, starting from what it held: lists its
-    /// chats in the sidebar and archive in their saved order, unloaded, and
-    /// takes up its projects, settings, deleted chats' statistics and
-    /// scheduled tasks. Cowork saves its chats again when it quits.
+    /// chats unloaded in their saved order and takes up its projects,
+    /// settings, deleted chats' statistics and scheduled tasks.
     pub(crate) fn start_chat_db(&mut self, db: ChatDb, saved: Saved, cx: &mut Context<Self>) {
         let Saved { chats, state } = saved;
         self.profile_statistics = None;
@@ -657,8 +636,6 @@ impl Cowork {
         }
     }
 
-    /// Deletes a chat's rows, and its folder with its commands' scratch
-    /// folder, adding `counted` to the deleted chats' statistics with it.
     pub(crate) fn delete_saved_chat(&mut self, thread_id: Uuid, counted: &Statistics) {
         if let Some(db) = &self.chat_db {
             db.delete(thread_id, counted);
@@ -666,8 +643,6 @@ impl Cowork {
     }
 }
 
-/// A database in a fresh folder, with a runtime driving its writer; the
-/// folder is removed when this is dropped.
 #[cfg(test)]
 pub(crate) struct TestDb {
     root: PathBuf,
@@ -687,7 +662,6 @@ impl TestDb {
         (Self { root, runtime }, db)
     }
 
-    /// The database again, as the next launch opens it, once `db` quit.
     pub(crate) fn reopen(&self) -> (ChatDb, Saved) {
         ChatDb::open(self.root.clone(), self.runtime.handle()).expect("a test database")
     }

@@ -63,12 +63,10 @@ pub(crate) enum TimelineMessage {
     Agent(AgentMessage),
 }
 
-/// Shared run identity and replay metadata; no derived output or GPUI views.
 #[derive(Clone)]
 pub(crate) struct AgentRunRecord {
     pub(crate) id: Uuid,
     pub(crate) comment_group_id: Option<Uuid>,
-    /// When the host started generating this message.
     pub(crate) started_at: SystemTime,
     /// See [`protocol::AgentMessage::start`].
     pub(crate) start: crate::transcript::TranscriptIndex,
@@ -106,7 +104,6 @@ pub(crate) struct AgentMessageUi {
     /// The diff view of each `write_file` and `edit_file` call in `output`;
     /// see [`AgentMessage::show_file_changes`].
     pub(crate) file_views: HashMap<ToolCallId, Entity<FileChangeView>>,
-    // Local view state.
     /// Whether the agent's work (everything but its response) is shown. Open
     /// while the run is going, and closed when it ends.
     pub(crate) work_expanded: bool,
@@ -176,7 +173,6 @@ impl TimelineMessage {
 /// from the same messages; see `AgentOutput::from_transcript`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct AgentOutput {
-    /// Everything the agent produced, in order.
     steps: Vec<AgentStep>,
     /// False only while the model is still reasoning: the run is generating
     /// and reasoning is the last part of the reply streaming. The last step
@@ -206,7 +202,6 @@ pub(crate) enum AgentStep {
     Steering(Uuid),
 }
 
-/// How an [`AgentStep`] is shown: local state, never sent.
 #[derive(Clone)]
 pub(crate) enum StepView {
     /// Whether completed thinking is shown; thinking in progress always is.
@@ -246,7 +241,6 @@ pub(crate) struct AgentCommentResponse {
     pub(crate) response_view: Entity<TextViewState>,
 }
 
-/// A tool call the agent made, and what the tool returned.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct AgentToolCall {
     pub(crate) call: ToolCall,
@@ -257,11 +251,8 @@ pub(crate) struct AgentToolCall {
     pub(crate) failed: bool,
 }
 
-/// What a file call acts on, as its row names it.
 enum Target<'a> {
-    /// The path the call names.
     Path(&'a str),
-    /// What it acts on in words, when it names no path to show.
     Named(&'static str),
 }
 
@@ -294,7 +285,6 @@ impl AgentToolCall {
         pretty_json(&arguments_value(&self.call))
     }
 
-    /// A quiet description for the collapsed row; raw arguments stay in the details.
     pub(crate) fn description(&self) -> String {
         match self.call.name.as_str() {
             "calculate" => {
@@ -403,7 +393,6 @@ impl AgentToolCall {
         Some(preview)
     }
 
-    /// The result's content as text, one item per line.
     pub(crate) fn result_text(&self) -> Option<String> {
         let content = self.result.as_ref()?;
         Some(
@@ -571,7 +560,6 @@ impl AgentOutput {
             .map(|(index, _)| index)
     }
 
-    /// The response, from the steps.
     pub(crate) fn response(&self) -> String {
         self.steps[self.response_start()..]
             .iter()
@@ -585,7 +573,6 @@ impl AgentOutput {
             .collect()
     }
 
-    /// Whether step `index` is the thinking the model is still writing.
     pub(crate) fn thinking_in_progress(&self, index: usize) -> bool {
         !self.thinking_complete
             && index + 1 == self.steps.len()
@@ -609,7 +596,6 @@ impl StepView {
         }
     }
 
-    /// Whether the step is opened up. Text has nothing to open.
     pub(crate) fn expanded(&self) -> bool {
         match self {
             Self::Thinking { expanded, .. } | Self::ToolCall { expanded } => *expanded,
@@ -640,7 +626,6 @@ pub(crate) struct UserMessageGroup {
     pub(crate) comments_folded: bool,
 }
 
-/// Shared submission content, without draft editor entities or local folding.
 #[derive(Clone)]
 pub(crate) struct SubmittedGroup {
     pub(crate) id: Uuid,
@@ -781,7 +766,6 @@ impl UserMessageGroup {
         }
     }
 
-    /// The text the thread is titled after.
     pub(crate) fn title_text(&self) -> &str {
         self.blocks
             .iter()
@@ -1029,7 +1013,6 @@ impl AgentOutput {
         }
     }
 
-    /// Continues the text the output ends with, or starts new text.
     fn push_text(&mut self, text: &str) {
         match self.steps.last_mut() {
             Some(AgentStep::Text(existing)) => existing.push_str(text),
@@ -1056,7 +1039,6 @@ impl AgentOutput {
         })
     }
 
-    /// Records what the tool returned for `call`.
     fn record_tool_result(&mut self, result: &ToolResult) {
         if let Some(tool_call) = self
             .tool_calls_mut()
@@ -1067,7 +1049,6 @@ impl AgentOutput {
         };
     }
 
-    /// Where the output ends now, as its committed part.
     fn mark(&self) -> OutputMark {
         let answered = self
             .tool_calls()
@@ -1116,7 +1097,6 @@ impl AgentOutput {
 }
 
 impl AgentMessageUi {
-    /// Summary entries commit at a safe boundary, just like completed messages.
     pub(crate) fn compact(&mut self, cx: &mut impl AppContext) {
         let first = self.output.steps.len();
         self.output.push_compaction();

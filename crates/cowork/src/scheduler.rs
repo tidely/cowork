@@ -34,7 +34,6 @@ const TICK: Duration = Duration::from_secs(15);
 /// Ollama isn't running yet.
 const MODEL_RETRY: Duration = Duration::from_secs(60);
 
-/// The run going on now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ScheduledRun {
     pub(crate) task_id: Uuid,
@@ -43,7 +42,6 @@ pub(crate) struct ScheduledRun {
     message_id: Uuid,
 }
 
-/// What a task is doing, as its row shows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TaskStatus {
     Running,
@@ -59,7 +57,6 @@ pub(crate) enum TaskStatus {
     Paused,
 }
 
-/// Why the next run can't start yet.
 enum Blocked {
     Thread,
     /// The chat it continues is loading, or must be loaded first.
@@ -75,7 +72,6 @@ pub(crate) struct Scheduler {
     /// Saves the tasks; `None` keeps them in memory, as in tests and
     /// ephemeral launches.
     saver: Option<StateSaver>,
-    /// Shows notifications; `None` in tests.
     window: Option<AnyWindowHandle>,
     last_model_request: Option<Instant>,
     _ticking: Option<Task<()>>,
@@ -90,7 +86,6 @@ impl Scheduler {
         self.tasks.iter_mut().find(|task| task.id == task_id)
     }
 
-    /// The task whose queued run is next.
     fn next_queued(&self) -> Option<usize> {
         self.tasks
             .iter()
@@ -112,7 +107,6 @@ impl Scheduler {
             .collect()
     }
 
-    /// Takes up the saved `tasks`, saving them with `saver` from now on.
     pub(crate) fn start_saving(&mut self, tasks: Vec<ScheduledTask>, saver: StateSaver) {
         self.tasks = tasks;
         self.saver = Some(saver);
@@ -132,7 +126,6 @@ pub(crate) fn now() -> NaiveDateTime {
 }
 
 impl Cowork {
-    /// Starts looking at the clock, for the tasks taken up so far.
     pub(crate) fn start_scheduler(
         &mut self,
         window: Option<AnyWindowHandle>,
@@ -167,7 +160,6 @@ impl Cowork {
         self.run_next_scheduled(now, cx);
     }
 
-    /// Asks for models again while queued runs wait for them.
     fn request_models_for_queued_runs(&mut self, cx: &mut Context<Self>) {
         if self.models.providers().next().is_some() || self.scheduler.next_queued().is_none() {
             return;
@@ -183,12 +175,10 @@ impl Cowork {
         self.refresh_models(cx);
     }
 
-    /// Starts queued runs until one is going on or the next must wait.
     pub(crate) fn run_next_scheduled(&mut self, now: NaiveDateTime, cx: &mut Context<Self>) {
         while self.scheduler.run.is_none() && self.start_next_scheduled_run(now, cx) {}
     }
 
-    /// Why the next queued run, `index`'s, can't start yet, if it can't.
     fn blocked(&self, index: usize, cx: &App) -> Option<Blocked> {
         self.ready(index, cx).err()
     }
@@ -394,7 +384,6 @@ impl Cowork {
         });
     }
 
-    /// What `task` is doing.
     pub(crate) fn task_status(&self, task: &ScheduledTask, cx: &App) -> TaskStatus {
         if let Some(run) = self.scheduler.run.filter(|run| run.task_id == task.id) {
             let waiting = self
@@ -430,7 +419,6 @@ impl Cowork {
             .map_or(TaskStatus::NoMoreRuns, TaskStatus::Due)
     }
 
-    /// Adds a task, or with `task_id` changes one.
     pub(crate) fn save_scheduled_task(
         &mut self,
         task_id: Option<Uuid>,
@@ -467,7 +455,6 @@ impl Cowork {
         cx.notify();
     }
 
-    /// Queues a run of `task_id` now, behind the runs already waiting.
     pub(crate) fn run_scheduled_task_now(&mut self, task_id: Uuid, cx: &mut Context<Self>) {
         let now = now();
         if self

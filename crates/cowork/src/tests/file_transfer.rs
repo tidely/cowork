@@ -48,7 +48,6 @@ fn files_the_host_is_reading_hold_back_everyones_submission(cx: &mut gpui::TestA
     });
 }
 
-/// A text file big enough to take several chunks.
 fn big_text_file() -> (PathBuf, String) {
     let text = "0123456789abcdef\n".repeat(9_000);
     assert!(text.len() > 2 * protocol::ATTACHMENT_CHUNK_SIZE);

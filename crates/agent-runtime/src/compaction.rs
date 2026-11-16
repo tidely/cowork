@@ -11,9 +11,8 @@ use crate::ConversationError;
 /// always available; automatic compaction needs a trigger.
 ///
 /// A compaction summarizes the older part of the model context and keeps the
-/// newer part verbatim after the summary: the next request is the summary,
-/// then the entries past the cut. The summary request sends the context up
-/// to the cut, which is how the last request began, so the provider serves
+/// newer part verbatim after the summary. The summary request sends the context
+/// up to the cut, which is how the last request began, so the provider serves
 /// it from its prompt cache.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CompactionPolicy {

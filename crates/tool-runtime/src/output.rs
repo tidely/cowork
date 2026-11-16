@@ -4,11 +4,10 @@ use serde_json::Value;
 
 use crate::{ToolError, ToolErrorKind};
 
-/// The application's built-in result vocabulary. Named variants will let the UI
-/// and other consumers match known results without interpreting arbitrary JSON
-/// or scraping model-facing prose. No tool has a named variant yet, so only
-/// the dynamic case exists; it also remains the escape hatch for custom and
-/// runtime-discovered tools as named built-in variants are added.
+/// The application's built-in result vocabulary. Named variants would let the UI
+/// match known results without interpreting arbitrary JSON; no tool has one yet,
+/// so only the dynamic case exists, which stays the escape hatch for custom and
+/// runtime-discovered tools.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum BuiltinToolOutput {
@@ -16,9 +15,8 @@ pub enum BuiltinToolOutput {
 }
 
 /// A concrete tool result's structured and model-facing representations.
-/// Implementations can customize either projection; the default retains the
-/// serialized value and presents that same JSON to the model. Serialization is
-/// ordinary runtime data and makes no versioned storage or wire-format promise.
+/// The default keeps the serialized value and shows that same JSON to the model.
+/// Serialization is runtime data, with no storage or wire-format promise.
 pub trait ToolOutput: Serialize {
     /// `None` uses the structured result's default JSON projection. `Some`
     /// supplies explicit content and must contain at least one block.

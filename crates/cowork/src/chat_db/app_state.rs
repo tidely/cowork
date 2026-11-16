@@ -34,11 +34,9 @@ pub(crate) struct AppState {
     pub(crate) projects: Vec<ProjectRecord>,
     pub(crate) settings: Settings,
     pub(crate) deleted: Statistics,
-    /// In the order they were created.
     pub(crate) tasks: Vec<ScheduledTask>,
 }
 
-/// A change to what is saved besides chats.
 pub(super) enum StateJob {
     CreateProject(ProjectRow),
     RemoveProject(Uuid),
@@ -48,7 +46,6 @@ pub(super) enum StateJob {
 }
 
 impl StateJob {
-    /// What failed, for the log.
     pub(super) fn what(&self) -> &'static str {
         match self {
             Self::CreateProject(_) => "the new project",
@@ -126,7 +123,6 @@ impl SettingsRow {
     }
 }
 
-/// Deleted chats' counts, or what to add to them.
 pub(super) struct UsageRow {
     chats: i64,
     tokens_used: i64,
@@ -241,7 +237,6 @@ impl TaskRow {
     }
 }
 
-/// Applies `job`. The caller commits.
 pub(super) async fn write(conn: &mut SqliteConnection, job: &StateJob) -> anyhow::Result<()> {
     match job {
         StateJob::CreateProject(project) => insert_project(conn, project).await,
@@ -329,7 +324,6 @@ pub(super) async fn count_deleted(
     Ok(())
 }
 
-/// Replaces every task with `tasks`; their folders and runs cascade.
 async fn replace_tasks(conn: &mut SqliteConnection, tasks: &[TaskRow]) -> anyhow::Result<()> {
     sqlx::query("DELETE FROM scheduled_tasks")
         .execute(&mut *conn)

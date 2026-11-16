@@ -42,7 +42,6 @@ const COWORK_ALPN: &[u8] = b"cowork/0";
 
 const ENDPOINT_ID_TEXT_LENGTH: usize = EndpointId::LENGTH * 2;
 
-/// How long any single step of the collaboration handshake may take.
 const PEER_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub(crate) fn endpoint_id_input_is_complete(input: &str) -> bool {

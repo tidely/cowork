@@ -57,7 +57,9 @@ pub(crate) enum CollaboratorMessage {
     /// Always the first frame a collaborator sends. The host replies with
     /// [`HostMessage::Welcome`], or [`HostMessage::Rejected`] when it cannot
     /// serve this collaborator. Must remain the first variant.
-    Join { protocol_version: u32 },
+    Join {
+        protocol_version: u32,
+    },
     /// The collaborator's profile. Always the second frame, which the host
     /// waits for before admitting the collaborator, and sent again whenever
     /// the collaborator changes it.
@@ -67,20 +69,30 @@ pub(crate) enum CollaboratorMessage {
     SelectModel(ModelRef),
     /// Stops the agent run producing message `message_id`, if it is still
     /// running.
-    Stop { message_id: uuid::Bytes },
+    Stop {
+        message_id: uuid::Bytes,
+    },
     /// A Yrs update from this peer's current draft replica. Generation is
     /// assigned by the host; queued bytes from a rejected replica stay fenced
     /// out even if the peer regains Write before they reach the host.
-    DraftUpdate { generation: u64, update: Vec<u8> },
+    DraftUpdate {
+        generation: u64,
+        update: Vec<u8>,
+    },
     /// Submits the draft. `sequence` is the number of accepted submissions the
     /// collaborator has seen, including pending drafts, so a submission that raced another one is
     /// ignored instead of submitting whatever was typed in between. While a
     /// run is going, the submission steers it at its next safe boundary.
-    Submit { sequence: u64 },
+    Submit {
+        sequence: u64,
+    },
     /// Explicit queueing instead of the default steering delivery.
-    Queue { sequence: u64 },
-    /// Cancels the pending submission `id`, if it has not started a run.
-    CancelPending { id: uuid::Bytes },
+    Queue {
+        sequence: u64,
+    },
+    CancelPending {
+        id: uuid::Bytes,
+    },
     /// Replaces the collaborator's presence.
     Presence(Presence),
     /// The collaborator stopped uploading a file whose record is gone, so
@@ -124,9 +136,7 @@ pub(crate) struct AttachmentChunk {
     pub(crate) id: uuid::Bytes,
     pub(crate) name: String,
     pub(crate) kind: AttachmentKind,
-    /// The size of the whole file.
     pub(crate) total: u64,
-    /// Where in the file `bytes` start.
     pub(crate) offset: u64,
     pub(crate) bytes: Vec<u8>,
 }
@@ -168,7 +178,6 @@ pub(crate) struct PendingRead {
     pub(crate) id: uuid::Bytes,
     pub(crate) name: String,
     pub(crate) is_image: bool,
-    /// Percent read, once known.
     pub(crate) progress: Option<u8>,
     /// The block the file will be attached to, or `None` for a new block.
     pub(crate) block: Option<uuid::Bytes>,
@@ -191,7 +200,6 @@ pub(crate) enum HostMessage {
     /// connection. Carries a message to show to the user. Must remain the
     /// second variant.
     Rejected(String),
-    /// A participant connected. Participants are listed in join order.
     ParticipantJoined {
         participant: uuid::Bytes,
         profile: Profile,
@@ -199,7 +207,6 @@ pub(crate) enum HostMessage {
     /// A participant disconnected. Their profile is kept, since their
     /// messages still name them.
     ParticipantLeft(uuid::Bytes),
-    /// A participant changed their profile.
     ProfileChanged {
         participant: uuid::Bytes,
         profile: Profile,
@@ -214,11 +221,8 @@ pub(crate) enum HostMessage {
     /// order the host added them. Only names travel: the folders are on the
     /// host's machine, and their paths would reveal how it is laid out.
     ProjectFoldersChanged(Vec<String>),
-    /// The host changed what the agent's commands may do with the project.
     ProjectModeChanged(ProjectMode),
-    /// A Yrs update to the draft, made by the host or a collaborator.
     DraftUpdate(Vec<u8>),
-    /// A participant's presence changed.
     Presence {
         participant: uuid::Bytes,
         presence: Presence,
@@ -232,9 +236,7 @@ pub(crate) enum HostMessage {
     /// Part of an attachment's bytes, relayed by the host. Sent on the bulk
     /// queue; see [`Peer::bulk`].
     AttachmentData(AttachmentChunk),
-    /// The thread was named, which happens on its first user message.
     ThreadTitled(String),
-    /// A user message was appended to the timeline.
     UserMessage(UserMessage),
     PendingSubmissions {
         sequence: u64,
@@ -326,14 +328,15 @@ pub(crate) enum RunEvent {
     },
     /// The tokens a request used (the provider's total, or input plus
     /// output), measuring how full the context is.
-    Usage { tokens: u64 },
+    Usage {
+        tokens: u64,
+    },
     /// Summarizing the older part of the context began, at a point where
     /// every call has its result.
     CompactionStarted,
     /// The summary replaces the entries it covers for later requests; the
     /// entries stay in the transcript.
     Compacted(Json<StoredCompaction>),
-    /// Summarizing failed or saved nothing; the context is unchanged.
     CompactionFailed,
 }
 
@@ -410,12 +413,10 @@ pub(crate) struct Welcome {
     /// The id the host assigned to the receiving collaborator.
     pub(crate) participant_id: uuid::Bytes,
     pub(crate) thread: ThreadSnapshot,
-    /// The full state of the draft as a Yrs update.
     pub(crate) draft: Vec<u8>,
     /// This receiving peer's draft epoch, not a thread-wide revision. A changed
     /// epoch requires replacement, while matching epochs preserve unsent edits.
     pub(crate) draft_generation: u64,
-    /// Every connected participant's presence.
     pub(crate) presence: Vec<(uuid::Bytes, Presence)>,
     /// The attachments whose bytes the host holds. They follow the welcome
     /// as `AttachmentData`.
@@ -442,13 +443,10 @@ pub(crate) struct PendingSubmission {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ThreadSnapshot {
     pub(crate) submission_sequence: u64,
-    /// Oldest first.
     pub(crate) pending: Vec<PendingSubmission>,
     pub(crate) id: uuid::Bytes,
     pub(crate) title: String,
-    /// Connected participants in join order, starting with the host.
     pub(crate) participants: Vec<uuid::Bytes>,
-    /// The profile of everyone who has joined, including those who left.
     pub(crate) profiles: Vec<(uuid::Bytes, Profile)>,
     /// The models the thread can run: the host's.
     pub(crate) models: ModelCatalog,
@@ -458,10 +456,8 @@ pub(crate) struct ThreadSnapshot {
     /// Host-owned default and sparse overrides. The host is always Admin and
     /// alone manages policy; Admin peers cannot delegate access.
     pub(crate) peer_permissions: PeerPermissions,
-    /// The context window use the provider last measured, if any.
     pub(crate) context_tokens: Option<u64>,
     pub(crate) compacting: bool,
-    /// Bytes of agent output streamed since `context_tokens` was measured.
     pub(crate) streamed_bytes: u64,
     pub(crate) messages: Vec<TimelineMessage>,
     /// The agent's records need JSON's self-describing format; postcard
@@ -485,14 +481,12 @@ pub(crate) enum TimelineMessage {
 pub(crate) struct UserMessage {
     pub(crate) id: uuid::Bytes,
     pub(crate) comments: Vec<UserComment>,
-    /// The submitted prompt blocks in draft order.
     pub(crate) blocks: Vec<PromptBlock>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct PromptBlock {
     pub(crate) id: uuid::Bytes,
-    /// The participant who created the block.
     pub(crate) author: uuid::Bytes,
     pub(crate) text: String,
     /// The block's files; their bytes travel separately as `AttachmentData`.
@@ -511,7 +505,6 @@ pub(crate) struct AttachmentRef {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct UserComment {
     pub(crate) id: uuid::Bytes,
-    /// The participant who wrote the comment.
     pub(crate) author: uuid::Bytes,
     pub(crate) reference: CommentReference,
     pub(crate) body: String,
@@ -528,7 +521,6 @@ pub(crate) struct CommentReference {
 pub(crate) struct AgentMessage {
     pub(crate) id: uuid::Bytes,
     pub(crate) comment_group_id: Option<uuid::Bytes>,
-    /// See [`HostMessage::AgentStarted`].
     pub(crate) started_at: SystemTime,
     /// Where this run starts in the ordered transcript. Its first input
     /// entry is its prompt, possibly after context notes. Only the active
@@ -554,7 +546,6 @@ pub(crate) struct AgentMessage {
     pub(crate) awaiting_approval: Option<ToolCallId>,
 }
 
-/// Whether an agent message's run is still going.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum AgentRun {
     Generating,
@@ -565,11 +556,9 @@ pub(crate) enum AgentRun {
     },
 }
 
-/// How an agent run ended.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum RunOutcome {
     Completed,
-    /// Someone stopped it.
     Stopped,
     /// It failed, with a message to display when the agent produced no
     /// output of its own.
@@ -581,7 +570,6 @@ impl AgentRun {
         matches!(self, Self::Generating)
     }
 
-    /// How the run ended. `None` while it is still going.
     pub(crate) fn outcome(&self) -> Option<&RunOutcome> {
         match self {
             Self::Generating => None,
@@ -589,7 +577,6 @@ impl AgentRun {
         }
     }
 
-    /// Why the run failed, if it did.
     pub(crate) fn failure(&self) -> Option<&str> {
         match self.outcome() {
             Some(RunOutcome::Failed(failure)) => Some(failure),
@@ -597,7 +584,6 @@ impl AgentRun {
         }
     }
 
-    /// How long the host spent generating. `None` while it still is.
     pub(crate) fn duration(&self) -> Option<Duration> {
         match self {
             Self::Generating => None,
@@ -639,7 +625,6 @@ impl<Outgoing, Incoming> Peer<Outgoing, Incoming> {
         self.incoming.recv().await.ok()
     }
 
-    /// The control and bulk senders, and the receiver.
     pub(crate) fn split(
         self,
     ) -> (

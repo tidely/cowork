@@ -43,21 +43,17 @@ impl TimelineSelection {
         *self = Self::default();
     }
 
-    /// Whether `message_id`'s row must stay built: it holds an end of the
-    /// selection.
     pub(crate) fn pins(&self, message_id: Uuid) -> bool {
         self.anchor == Some(message_id) || self.cursor == Some(message_id)
     }
 }
 
-/// What one view or prompt of a row contributes to Copy.
 pub(crate) enum CopyPiece {
     Text(gpui::Entity<TextViewState>),
     Prompt { block_id: Uuid, text: SharedString },
 }
 
 impl CopyPiece {
-    /// All of it, as Copy of a selection covering it gives it.
     fn whole(&self, cx: &App) -> String {
         match self {
             Self::Text(view) => view.read(cx).rendered_text().as_str().to_owned(),
@@ -65,7 +61,6 @@ impl CopyPiece {
         }
     }
 
-    /// What of it is selected, as last painted.
     fn selected(&self, selection: &TimelineSelection, cx: &App) -> String {
         match self {
             Self::Text(view) => view.read(cx).selected_text(),

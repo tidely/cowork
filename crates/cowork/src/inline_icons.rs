@@ -14,7 +14,6 @@ use gpui_kit_assets::IconName;
 
 const NODE: &str = "cowork-icon";
 
-/// The icons a message may name, matching where each feature appears.
 fn icon_named(name: &str) -> Option<IconName> {
     Some(match name {
         // The titlebar's collaborators popover.

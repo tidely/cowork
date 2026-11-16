@@ -31,7 +31,6 @@ impl Cowork {
         participant_name(self.local_participant_id, Some(&self.profile))
     }
 
-    /// The local user's picture if they chose one, their initials otherwise.
     pub(crate) fn render_profile_avatar(&self, size: gpui::Pixels) -> gpui::Div {
         Self::render_avatar_for(self.local_participant_id, Some(&self.profile), size)
     }
@@ -154,7 +153,6 @@ impl Cowork {
             .fold(self.deleted.longest_chat, Duration::max)
     }
 
-    /// A row of the user's usage statistics, each a value over its label.
     fn render_usage_stats(&self, cx: &App) -> impl IntoElement {
         let totals = &self.profile_statistics.as_ref().unwrap().totals;
         let stats = [
@@ -211,12 +209,9 @@ impl Cowork {
     /// the two never collide.
     fn render_token_activity(&self, cx: &mut Context<Self>) -> impl IntoElement {
         const PLOT_HEIGHT: f32 = 120.;
-        /// How far below the plot's top `LineChart` draws its highest value.
         const PLOT_TOP_INSET: f32 = 10.;
         const LABEL_LINE_HEIGHT: f32 = 16.;
-        /// The peak's line, just under its label, which tops the chart.
         const PEAK_LINE_TOP: f32 = LABEL_LINE_HEIGHT + 2.;
-        /// Room above the plot, so that its highest value meets the line.
         const PEAK_LABEL_ROOM: f32 = PEAK_LINE_TOP - PLOT_TOP_INSET;
 
         let chart = &self.profile_statistics.as_ref().unwrap().chart.chart;

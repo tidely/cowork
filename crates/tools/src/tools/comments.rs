@@ -4,11 +4,8 @@ use agent::tool::{Tool, ToolCall, ToolError, ToolErrorKind, ToolOutput};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-/// A stable, model-facing identifier for a comment in one agent turn.
-///
-/// These identifiers are deliberately scoped to a turn. The application should
-/// pair them with its canonical comments when constructing the prompt instead of
-/// copying comment bodies into this crate.
+/// A stable, model-facing identifier for a comment, scoped to one agent turn.
+/// The application pairs it with its canonical comment when building the prompt.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 pub struct CommentId(String);
@@ -45,10 +42,9 @@ struct TurnCommentsState {
 
 /// Shared state for the comments attached to one agent turn.
 ///
-/// Keep this in the application and pass an [`Arc`] clone to
-/// [`RespondToComment`]. The tool then mutates the same response store rather
-/// than owning a copy. Only generated aliases are stored here; comment bodies
-/// remain in the application's canonical message model.
+/// The application keeps it and passes an [`Arc`] clone to [`RespondToComment`].
+/// Only generated aliases are stored here; comment bodies stay in the
+/// application's own message model.
 pub struct TurnComments {
     comment_ids: Vec<CommentId>,
     state: Mutex<TurnCommentsState>,
@@ -63,7 +59,7 @@ impl TurnComments {
         }
     }
 
-    /// Returns aliases in the same order as the comments supplied by the app.
+    /// The aliases, in the order of the comments the app supplied.
     pub fn comment_ids(&self) -> &[CommentId] {
         &self.comment_ids
     }
@@ -87,12 +83,12 @@ impl TurnComments {
         }
     }
 
-    /// Returns a snapshot of responses in tool-call order.
+    /// A snapshot of responses in tool-call order.
     pub fn responses(&self) -> Vec<CommentResponse> {
         self.state.lock().responses.clone()
     }
 
-    /// Returns aliases that have not received a response, in comment order.
+    /// The aliases that have not received a response, in comment order.
     pub fn unanswered_comment_ids(&self) -> Vec<CommentId> {
         let state = self.state.lock();
         self.comment_ids
