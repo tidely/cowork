@@ -22,7 +22,7 @@ use agent::{
     AgentDefinition, AgentEvent, AgentSession, ApprovalDecision, Configuration, ContextSection,
     Delivery, DiscardReason, EventKind, Fallback, InputId, Lifetime, Policy, QueueAccess, Request,
     RequestKind, RunId, SessionHandle, SessionView,
-    model::{ContentDelta, LanguageModel, LanguageModelProvider, ToolCallId, Usage},
+    model::{ContentDelta, LanguageModel, LanguageModelProvider, ToolCallId},
     tool::ToolRegistry,
 };
 use futures::{StreamExt as _, channel::mpsc};
@@ -41,8 +41,8 @@ use crate::{
     models::{ModelInfo, ModelRef},
     participant::ParticipantId,
     protocol::{self, Preview, PreviewDelta, RunEvent},
-    statistics::Statistics,
     thread::{ControlGeneration, Thread, ThreadOwnership, ThreadSharing},
+    timeline::TimelineMessage,
     tool_approval::{self, CoworkHost, CoworkInput},
     transcript::{RunSource, shared_compaction, shared_entry, steering_comment_ids},
     usage::{TokenActivity, usage_tokens},
@@ -258,7 +258,6 @@ fn start_session(
 pub(crate) struct RunTotals {
     pub(crate) started_at: SystemTime,
     pub(crate) duration: Duration,
-    pub(crate) usage: Usage,
 }
 
 pub(crate) struct ActiveGeneration {
@@ -277,7 +276,6 @@ pub(crate) struct ActiveGeneration {
     started_at: SystemTime,
     /// Monotonic, so the duration survives clock changes.
     started: Instant,
-    usage: Usage,
     #[cfg(test)]
     decisions: Vec<(ToolCallId, bool)>,
 }
@@ -293,7 +291,6 @@ impl ActiveGeneration {
             offered: HashSet::new(),
             started_at: SystemTime::now(),
             started: Instant::now(),
-            usage: Usage::default(),
             #[cfg(test)]
             decisions: Vec::new(),
         }
@@ -355,7 +352,6 @@ impl ActiveGeneration {
         RunTotals {
             started_at: self.started_at,
             duration: self.started.elapsed(),
-            usage: self.usage.clone(),
         }
     }
 }
@@ -372,19 +368,6 @@ impl ActiveGeneration {
     pub(crate) fn decisions_for_test(&self) -> &[(ToolCallId, bool)] {
         &self.decisions
     }
-}
-
-fn add_usage(usage: &mut Usage, more: &Usage) {
-    let add = |total: &mut Option<u64>, more: Option<u64>| {
-        if let Some(more) = more {
-            *total = Some(total.unwrap_or(0) + more);
-        }
-    };
-    add(&mut usage.input_tokens, more.input_tokens);
-    add(&mut usage.output_tokens, more.output_tokens);
-    add(&mut usage.total_tokens, more.total_tokens);
-    add(&mut usage.cached_input_tokens, more.cached_input_tokens);
-    add(&mut usage.reasoning_tokens, more.reasoning_tokens);
 }
 
 fn run_outcome(outcome: agent::RunOutcome, error: Option<agent::RunError>) -> protocol::RunOutcome {
@@ -769,7 +752,7 @@ impl Cowork {
                 }
             }
             EventKind::UsageReported(usage) => {
-                add_usage(&mut generation.usage, &usage);
+                // Every replica adds these up into the run's tokens.
                 if usage.total_tokens.is_none()
                     && usage.input_tokens.is_none()
                     && usage.output_tokens.is_none()
@@ -835,7 +818,6 @@ impl Cowork {
         let RunTotals {
             started_at,
             duration,
-            usage,
         } = totals;
         let thread_id = thread.read(cx).instance_id;
         if self
@@ -867,7 +849,18 @@ impl Cowork {
                 cx,
             );
         });
-        self.record_turn_usage(thread, usage, started_at, duration, cx);
+        let tokens = thread
+            .read(cx)
+            .timeline
+            .iter()
+            .find_map(|message| match message {
+                TimelineMessage::Agent(message) if message.record.id == message_id => {
+                    Some(message.record.tokens)
+                }
+                _ => None,
+            })
+            .unwrap_or(0);
+        self.record_turn_usage(thread, tokens, started_at, duration, cx);
         cx.notify();
         if let Entry::Occupied(entry) = self.active_generations.entry(thread_id)
             && entry.get().message_id == message_id
@@ -922,41 +915,40 @@ impl Cowork {
         self.scheduled_run_waits(thread_id, message_id, tool, cx);
     }
 
-    /// Adds a finished turn's usage to its thread, spread across the
-    /// `duration` of the response that started at `started_at`. A turn ending
-    /// after its thread was deleted is counted with the deleted ones.
+    /// Counts a finished turn's `tokens` in the profile's statistics, spread
+    /// across the `duration` of the response that started at `started_at`,
+    /// if the thread is one of the user's own. A turn ending after its
+    /// thread was deleted is counted with the deleted ones.
     pub(crate) fn record_turn_usage(
         &mut self,
         thread: &Entity<Thread>,
-        usage: Usage,
+        tokens: u64,
         started_at: SystemTime,
         duration: Duration,
         cx: &mut App,
     ) {
-        let tokens = usage_tokens(&usage);
-        let activity = (tokens > 0).then_some(TokenActivity {
-            at: started_at,
-            duration,
-            tokens,
-        });
-        let (thread_id, ownership) = thread.update(cx, |thread, _| {
-            thread.tokens_used += tokens;
-            thread.token_activity.extend(activity);
-            (thread.instance_id, thread.ownership())
-        });
+        let thread = thread.read(cx);
+        if thread.ownership() != ThreadOwnership::Local {
+            return;
+        }
         // Duration can change even when the provider reports zero tokens.
-        if ownership == ThreadOwnership::Local {
-            self.profile_statistics = None;
+        self.profile_statistics = None;
+        if tokens == 0 {
+            return;
         }
-        let store = self.thread_store.read(cx);
-        let deleted = store.listed(thread_id, cx).is_none();
-        if ownership == ThreadOwnership::Local && deleted {
-            self.count_deleted(Statistics {
-                tokens_used: tokens,
-                token_activity: activity.into_iter().collect(),
-                ..Statistics::default()
-            });
-        }
+        let deleted = self
+            .thread_store
+            .read(cx)
+            .listed(thread.instance_id, cx)
+            .is_none();
+        self.count_run(
+            TokenActivity {
+                at: started_at,
+                duration,
+                tokens,
+            },
+            deleted,
+        );
     }
 
     pub(crate) fn thread_updated(&mut self, thread_id: Uuid, cx: &mut Context<Self>) {
@@ -1041,7 +1033,7 @@ mod tests {
 
     use super::*;
     use crate::models::{ModelProvider, Reasoning};
-    use agent::model::JsonObject;
+    use agent::model::{JsonObject, Usage};
 
     #[derive(Default)]
     struct Scripted {
@@ -1288,29 +1280,6 @@ mod tests {
         );
         assert_eq!(first.instructions.as_deref(), Some(system_prompt()));
         _ = handle.post(Request::new(RunSource::Host, RequestKind::Shutdown));
-    }
-
-    #[test]
-    fn usage_adds_what_either_reported() {
-        let mut total = Usage::default();
-        add_usage(
-            &mut total,
-            &Usage {
-                input_tokens: Some(3),
-                total_tokens: Some(5),
-                ..Usage::default()
-            },
-        );
-        add_usage(
-            &mut total,
-            &Usage {
-                total_tokens: Some(7),
-                ..Usage::default()
-            },
-        );
-        assert_eq!(total.total_tokens, Some(12));
-        assert_eq!(total.input_tokens, Some(3));
-        assert_eq!(total.output_tokens, None);
     }
 
     /// The app's session against a local Ollama: a prompt, a tool call, and

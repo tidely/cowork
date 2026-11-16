@@ -979,6 +979,7 @@ pub(crate) mod tests {
                         onboarding_intro: None,
                         agents: HashMap::new(),
                         deleted: Default::default(),
+                        token_activity: Vec::new(),
                         profile_statistics: None,
                         saved_chat_search: Default::default(),
                         chat_db: None,

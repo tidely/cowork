@@ -10,16 +10,23 @@
 //! in its transcript has its result. Its draft, pending submissions and
 //! sharing are not saved.
 //!
+//! Messages are stored as a tree, so chats could share a history up to a
+//! fork point: a chat is a pointer to its last message (its head), and its
+//! history is the path from the root to the head. A loaded chat is that
+//! path, so a message's timeline index is its depth. Everything a message
+//! holds, its run's transcript entries and compactions included, hangs off
+//! it.
+//!
 //! **The database is the truth about what is saved.** A save carries the
-//! extent it was built from (`from`: messages, transcript entries,
-//! compactions, all of which only grow) and the chat's whole extent (`end`).
-//! In its transaction the writer reads what the database holds and refuses
-//! the save if that is less than `from` (an earlier save failed: the next
-//! one starts from what is there) or more than `end` (the chat in memory
-//! isn't the whole chat). Otherwise it writes the rows past what is stored.
-//! What this side remembers per chat is only a hint of where to start
-//! encoding, plus what the writer last confirmed, from which
-//! [`ChatDb::is_saved`] tells whether a chat may be unloaded.
+//! head it was built on (`base`, the head this side believes is stored)
+//! and every message after it. In its transaction the writer reads the
+//! stored head: if it is the base or one of the sent messages, it writes the
+//! messages after it and moves the head; if it is shallower than the base,
+//! an earlier save failed (`Behind`: the next one starts from it);
+//! otherwise the chat in memory isn't the whole chat (`Ahead`). What this
+//! side remembers per chat is only that hint, plus what the writer last
+//! confirmed, from which [`ChatDb::is_saved`] tells whether a chat may be
+//! unloaded.
 //!
 //! One Tokio task writes, taking jobs in the order they were queued, so a
 //! load sees every save before it and quit waits for all of them. Only
@@ -60,11 +67,13 @@ use crate::{
     projects::{ProjectId, ProjectRecord},
     saved_settings::Settings,
     scheduled_task::ScheduledTask,
-    statistics::Statistics,
+    statistics::DeletedChats,
     thread::{Thread, ThreadOwnership},
+    transcript::TranscriptExtent,
+    usage::TokenActivity,
 };
-use app_state::{ProjectRow, SettingsRow, StateJob, TaskRow, UsageRow};
-use rows::{Extent, Head, Placement, Tail};
+use app_state::{DeletedRow, ProjectRow, SettingsRow, StateJob, TaskRow};
+use rows::{ActivityRow, NewMessage, PathPoint, Placement, ThreadRow};
 
 const DB_FILE: &str = "cowork.db";
 const LOCK_FILE: &str = ".lock";
@@ -90,6 +99,8 @@ pub(crate) struct ListedRow {
 pub(crate) struct Saved {
     /// Archived ones last, each list in its saved order.
     pub(crate) chats: Vec<ListedRow>,
+    /// Every own run's usage, deleted chats' included, for statistics.
+    pub(crate) token_activity: Vec<TokenActivity>,
     pub(crate) state: AppState,
 }
 
@@ -103,29 +114,48 @@ pub(crate) struct ChatDb {
 }
 
 struct Tracking {
-    /// Where the next save starts encoding: what the database is believed
-    /// to hold. Too low costs re-encoding; too high is refused and
-    /// corrected by the writer's report.
-    hints: HashMap<Uuid, Extent>,
-    /// The extent and head the writer last confirmed writing.
-    confirmed: HashMap<Uuid, (Extent, Head)>,
+    /// Where the next save starts encoding: the head the database is
+    /// believed to hold. Too early costs re-encoding; anything else is
+    /// refused and corrected by the writer's report.
+    hints: HashMap<Uuid, Option<Uuid>>,
+    /// What the writer last confirmed writing.
+    confirmed: HashMap<Uuid, Confirmed>,
     reports: mpsc::UnboundedReceiver<Report>,
+}
+
+/// A chat as a save wrote it: its head, its transcript's extent and its
+/// `threads` row.
+#[derive(PartialEq)]
+struct Confirmed {
+    head: Option<Uuid>,
+    transcript: TranscriptExtent,
+    row: ThreadRow,
+}
+
+impl Confirmed {
+    fn of(thread: &Thread) -> anyhow::Result<Self> {
+        Ok(Self {
+            head: rows::head_of(thread),
+            transcript: thread.transcript.extent(),
+            row: ThreadRow::of(thread)?,
+        })
+    }
 }
 
 impl Tracking {
     fn pump(&mut self) {
         while let Ok(report) = self.reports.try_recv() {
             match report {
-                Report::Saved { id, end, head } => {
+                Report::Saved { id, confirmed } => {
                     // A chat forgotten meanwhile (unloaded or deleted) is
                     // no longer tracked.
                     if self.hints.contains_key(&id) {
-                        self.confirmed.insert(id, (end, *head));
+                        self.confirmed.insert(id, *confirmed);
                     }
                 }
                 Report::Failed { id, actual } => {
                     if let Some(hint) = self.hints.get_mut(&id) {
-                        *hint = actual.unwrap_or_default();
+                        *hint = actual.flatten();
                     }
                 }
             }
@@ -136,9 +166,9 @@ impl Tracking {
 enum Job {
     Save(Box<SaveJob>),
     Meta(Uuid, Placement),
-    /// Deletes a chat, adding what its statistics count to the deleted
-    /// chats' in the same transaction.
-    Delete(Uuid, UsageRow),
+    /// Deletes a chat, adding it and the usage of the runs removed with it
+    /// to the deleted chats' statistics in the same transaction.
+    Delete(Uuid, DeletedRow),
     State(StateJob),
     Load(Uuid, oneshot::Sender<anyhow::Result<Option<ChatRows>>>),
     Quit(oneshot::Sender<()>),
@@ -150,30 +180,33 @@ enum Job {
 }
 
 struct SaveJob {
-    from: Extent,
-    end: Extent,
-    head: Head,
+    /// The head the save was built on, if any; see the module documentation.
+    base: Option<PathPoint>,
+    /// Every message after `base`.
+    messages: Vec<NewMessage>,
     placement: Placement,
-    tail: Tail,
+    confirmed: Confirmed,
 }
 
 enum Report {
     Saved {
         id: Uuid,
-        end: Extent,
-        head: Box<Head>,
+        confirmed: Box<Confirmed>,
     },
-    /// With what the database holds, when it could tell.
-    Failed { id: Uuid, actual: Option<Extent> },
+    /// With the head the database holds, when it could tell.
+    Failed {
+        id: Uuid,
+        actual: Option<Option<Uuid>>,
+    },
 }
 
-/// Why the writer refused a save: what the database holds doesn't fit it.
+/// Why the writer refused a save: the stored head doesn't fit it.
 #[derive(Debug, thiserror::Error)]
 enum Mismatch {
     #[error("an earlier save of the chat failed")]
-    Behind(Extent),
-    #[error("the chat in memory is shorter than the saved one")]
-    Ahead(Extent),
+    Behind(Option<Uuid>),
+    #[error("the chat in memory isn't the saved one")]
+    Ahead(Option<Uuid>),
 }
 
 impl ChatDb {
@@ -195,19 +228,27 @@ impl ChatDb {
             })?;
         let path = dir.join(DB_FILE);
         let root = dir.join(THREADS_DIR);
-        let (pool, rows, state) = runtime.block_on(async {
+        let (pool, rows, runs, state) = runtime.block_on(async {
             let pool = sql::open(&path).await?;
             let rows = sql::read_metas(&pool).await?;
+            let runs = sql::read_run_activity(&pool).await?;
             let state = app_state::read(&pool).await?;
-            anyhow::Ok((pool, rows, state))
+            anyhow::Ok((pool, rows, runs, state))
         })?;
         let mut listed = Vec::new();
-        for (row, activity) in rows {
+        for row in rows {
             let id = row.id;
             let archived = row.archived;
-            match row.into_meta(activity) {
+            match row.into_meta() {
                 Ok(meta) => listed.push(ListedRow { meta, archived }),
                 Err(error) => eprintln!("could not read chat {id}: {error:#}; left as it is"),
+            }
+        }
+        let mut token_activity = state.deleted_activity.clone();
+        for run in runs {
+            match run.into_activity() {
+                Ok(activity) => token_activity.push(activity),
+                Err(error) => eprintln!("could not read a run's usage: {error:#}; left out"),
             }
         }
         let (jobs, received) = mpsc::unbounded_channel();
@@ -229,6 +270,7 @@ impl ChatDb {
             db,
             Saved {
                 chats: listed,
+                token_activity,
                 state,
             },
         ))
@@ -250,21 +292,23 @@ impl ChatDb {
         let id = thread.instance_id;
         let mut tracking = self.tracking.borrow_mut();
         tracking.pump();
-        let end = Extent::of(thread);
-        let mut from = tracking.hints.get(&id).copied().unwrap_or_default();
-        if !from.within(end) {
-            // Can't be: a chat in memory only grows. Encode it whole; the
-            // writer refuses it if the database holds more.
-            from = Extent::default();
-        }
+        // A hint not in the timeline can't be: a chat in memory only
+        // grows. Encode it whole; the writer refuses it if the database
+        // holds more.
+        let base = tracking
+            .hints
+            .get(&id)
+            .copied()
+            .flatten()
+            .and_then(|hint| PathPoint::find(thread, hint));
+        let start = base.map_or(Ok(0), |base| usize::try_from(base.depth + 1))?;
         let job = SaveJob {
-            from,
-            end,
-            head: Head::of(thread)?,
+            base,
+            messages: NewMessage::after(thread, start)?,
             placement,
-            tail: Tail::after(thread, from)?,
+            confirmed: Confirmed::of(thread)?,
         };
-        tracking.hints.insert(id, end);
+        tracking.hints.insert(id, job.confirmed.head);
         _ = self.jobs.send(Job::Save(Box::new(job)));
         Ok(())
     }
@@ -272,10 +316,10 @@ impl ChatDb {
     pub(crate) fn is_saved(&self, thread: &Thread) -> bool {
         let mut tracking = self.tracking.borrow_mut();
         tracking.pump();
-        let Some((extent, head)) = tracking.confirmed.get(&thread.instance_id) else {
+        let Some(confirmed) = tracking.confirmed.get(&thread.instance_id) else {
             return false;
         };
-        *extent == Extent::of(thread) && Head::of(thread).is_ok_and(|now| now == *head)
+        Confirmed::of(thread).is_ok_and(|now| now == *confirmed)
     }
 
     /// Queues saving where a chat is listed, loaded or not. A chat with no
@@ -290,11 +334,11 @@ impl ChatDb {
         tracking.confirmed.remove(&id);
     }
 
-    /// Queues deleting a chat's rows and folder, adding `counted` to what
-    /// statistics count of deleted chats.
-    fn delete(&self, id: Uuid, counted: &Statistics) {
+    /// Queues deleting a chat's rows and folder, adding `counted` and the
+    /// usage of the runs removed to what statistics count of deleted chats.
+    fn delete(&self, id: Uuid, counted: &DeletedChats) {
         self.forget(id);
-        match UsageRow::of(counted) {
+        match DeletedRow::of(counted) {
             Ok(counted) => _ = self.jobs.send(Job::Delete(id, counted)),
             Err(error) => eprintln!("could not delete chat {id}: {error:#}"),
         }
@@ -310,7 +354,7 @@ impl ChatDb {
             Box::pin(async move {
                 match rows.await {
                     Ok(Ok(Some(rows))) => {
-                        tracking.borrow_mut().hints.insert(meta.id, rows.extent());
+                        tracking.borrow_mut().hints.insert(meta.id, rows.head());
                         Some(rows)
                     }
                     Ok(Ok(None)) => None,
@@ -350,6 +394,23 @@ impl ChatDb {
     #[cfg(test)]
     pub(crate) fn fail_next_save(&self) {
         _ = self.jobs.send(Job::FailNextSave);
+    }
+
+    /// Makes chat `fork` branch off `source`'s path at message `at`, as
+    /// forking will, once every queued job is done.
+    #[cfg(test)]
+    pub(crate) async fn fork_for_test(&self, source: Uuid, at: Uuid, fork: Uuid) {
+        self.flush().await;
+        let pool = self.pool.clone();
+        self.runtime
+            .spawn(async move {
+                let mut conn = pool.acquire().await.expect("a connection");
+                sql::fork(&mut conn, source, at, fork)
+                    .await
+                    .expect("a fork");
+            })
+            .await
+            .expect("the fork ran");
     }
 
     #[cfg(test)]
@@ -400,11 +461,11 @@ impl StateSaver {
         self.send(rows.map(StateJob::Tasks), "scheduled tasks");
     }
 
-    /// Adds `counted` to what statistics count of deleted chats.
-    pub(crate) fn count_deleted(&self, counted: &Statistics) {
+    /// Adds the usage of a run that ended after its chat was deleted.
+    pub(crate) fn count_deleted_run(&self, activity: &TokenActivity) {
         self.send(
-            UsageRow::of(counted).map(StateJob::CountDeleted),
-            "deleted chats' statistics",
+            ActivityRow::of(activity).map(StateJob::CountDeletedRun),
+            "a deleted chat's run",
         );
     }
 }
@@ -430,12 +491,11 @@ async fn write(
     while let Some(job) = jobs.recv().await {
         match job {
             Job::Save(job) => {
-                let id = job.head.id;
+                let id = job.confirmed.row.id;
                 let report = match save(&pool, &job, fail_next_save.take()).await {
                     Ok(()) => Report::Saved {
                         id,
-                        end: job.end,
-                        head: Box::new(job.head),
+                        confirmed: Box::new(job.confirmed),
                     },
                     Err(error) => {
                         eprintln!("could not save chat {id}: {error:#}");
@@ -444,7 +504,10 @@ async fn write(
                                 Some(*actual)
                             }
                             None => match pool.acquire().await {
-                                Ok(mut conn) => sql::extent(&mut conn, id).await.ok(),
+                                Ok(mut conn) => sql::stored_head(&mut conn, id)
+                                    .await
+                                    .ok()
+                                    .map(|head| head.map(|(head, _)| head.id)),
                                 Err(_) => None,
                             },
                         };
@@ -466,8 +529,9 @@ async fn write(
             Job::Delete(id, counted) => {
                 let result = async {
                     let mut tx = pool.begin().await?;
-                    sql::delete(&mut tx, id).await?;
+                    let removed = sql::delete(&mut tx, id).await?;
                     app_state::count_deleted(&mut tx, &counted).await?;
+                    app_state::count_deleted_runs(&mut tx, &removed).await?;
                     tx.commit().await?;
                     anyhow::Ok(())
                 }
@@ -509,36 +573,41 @@ async fn write(
     }
 }
 
-/// Writes `job`'s rows past what the database holds, or refuses it; see the
-/// module documentation. `fail` fails it midway, for tests.
+/// Writes `job`'s messages after the stored head and moves the head, or
+/// refuses it; see the module documentation. `fail` fails it midway, for
+/// tests.
 async fn save(pool: &SqlitePool, job: &SaveJob, fail: bool) -> anyhow::Result<()> {
-    let id = job.head.id;
     let mut tx = pool.begin().await?;
-    let actual = sql::extent(&mut tx, id).await?;
-    if !job.from.within(actual) {
-        return Err(Mismatch::Behind(actual).into());
-    }
-    if !actual.within(job.end) {
-        return Err(Mismatch::Ahead(actual).into());
-    }
-    sql::write_head(&mut tx, &job.head, &job.placement).await?;
-    let skip = actual.messages - job.from.messages;
-    for (index, message) in job.tail.messages.iter().enumerate().skip(skip) {
-        sql::insert_message(&mut tx, id, job.from.messages + index, message).await?;
+    let stored = sql::stored_head(&mut tx, job.confirmed.row.id).await?;
+    let stored_id = stored.map(|(head, _)| head.id);
+    let skip = if stored_id == job.base.map(|base| base.id) {
+        0
+    } else if let Some(index) = stored_id.and_then(|stored| {
+        job.messages
+            .iter()
+            .position(|message| message.row.id() == stored)
+    }) {
+        index + 1
+    } else {
+        // Nothing stored counts as shallower than any message.
+        let depth = |point: Option<PathPoint>| point.map_or(-1, |point| point.depth);
+        return Err(if depth(stored.map(|(head, _)| head)) < depth(job.base) {
+            Mismatch::Behind(stored_id)
+        } else {
+            Mismatch::Ahead(stored_id)
+        }
+        .into());
+    };
+    let mut tip = stored.map(|(head, root)| (head.id, root));
+    for (index, message) in job.messages.iter().enumerate().skip(skip) {
+        anyhow::ensure!(!(fail && index > skip), "failed for a test");
+        let id = message.row.id();
+        let root = tip.map_or(id, |(_, root)| root);
+        sql::insert_message(&mut tx, tip.map(|(parent, _)| parent), root, message).await?;
+        tip = Some((id, root));
     }
     anyhow::ensure!(!fail, "failed for a test");
-    let from = job.from.transcript;
-    let skip = actual.transcript.entries - from.entries;
-    for (index, entry) in job.tail.entries.iter().enumerate().skip(skip) {
-        sql::insert_entry(&mut tx, id, from.entries + index, entry).await?;
-    }
-    let skip = actual.transcript.compactions - from.compactions;
-    for (index, (at, compaction)) in job.tail.compactions.iter().enumerate().skip(skip) {
-        sql::insert_compaction(&mut tx, id, from.compactions + index, *at, compaction).await?;
-    }
-    for (file, bytes) in &job.tail.files {
-        sql::insert_file(&mut tx, id, *file, bytes).await?;
-    }
+    sql::write_thread(&mut tx, &job.confirmed.row, &job.placement, tip).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -556,8 +625,13 @@ impl Cowork {
     /// chats unloaded in their saved order and takes up its projects,
     /// settings, deleted chats' statistics and scheduled tasks.
     pub(crate) fn start_chat_db(&mut self, db: ChatDb, saved: Saved, cx: &mut Context<Self>) {
-        let Saved { chats, state } = saved;
+        let Saved {
+            chats,
+            token_activity,
+            state,
+        } = saved;
         self.profile_statistics = None;
+        self.token_activity = token_activity;
         let loader = db.loader();
         self.thread_store.update(cx, |store, cx| {
             store.set_loader(loader);
@@ -636,7 +710,7 @@ impl Cowork {
         }
     }
 
-    pub(crate) fn delete_saved_chat(&mut self, thread_id: Uuid, counted: &Statistics) {
+    pub(crate) fn delete_saved_chat(&mut self, thread_id: Uuid, counted: &DeletedChats) {
         if let Some(db) = &self.chat_db {
             db.delete(thread_id, counted);
         }

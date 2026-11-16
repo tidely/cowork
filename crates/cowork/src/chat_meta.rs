@@ -9,7 +9,7 @@ use std::{rc::Rc, time::Duration, time::SystemTime};
 use futures::future::LocalBoxFuture;
 use uuid::Uuid;
 
-use crate::{chat_db::ChatRows, projects::ProjectId, thread::Thread, usage::TokenActivity};
+use crate::{chat_db::ChatRows, projects::ProjectId, thread::Thread};
 
 /// A saved chat's `threads` row: everything the sidebar, archive, schedules
 /// and statistics read. Where it is listed (recents or archive, and its
@@ -19,10 +19,8 @@ pub(crate) struct ChatMeta {
     pub(crate) id: Uuid,
     pub(crate) title: String,
     pub(crate) project: Option<ProjectId>,
-    pub(crate) tokens_used: u64,
     pub(crate) generation_time: Duration,
     pub(crate) last_run_at: Option<SystemTime>,
-    pub(crate) token_activity: Vec<TokenActivity>,
 }
 
 impl ChatMeta {
@@ -31,10 +29,8 @@ impl ChatMeta {
             id: thread.instance_id,
             title: thread.summary.title.clone(),
             project: thread.project(),
-            tokens_used: thread.tokens_used,
             generation_time: thread.generation_time(),
             last_run_at: thread.last_activity(),
-            token_activity: thread.token_activity.clone(),
         }
     }
 }

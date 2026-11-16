@@ -1,8 +1,11 @@
-//! The chats' SQL: opening the database, the extent check, writing and
-//! reading a chat's rows, placement updates, deletion and search. The rest
-//! of the app's state is `app_state`'s. Functions take a
+//! The chats' SQL: opening the database, reading a chat's stored head,
+//! writing and reading a chat's rows, placement updates, deletion and
+//! search. The rest of the app's state is `app_state`'s. Functions take a
 //! connection (a transaction, for writes) and plain rows; none decide what
 //! to save. Enum columns go through `columns`.
+//!
+//! Messages form a tree (see `migrations/0002_chat_tree.sql`); a chat's
+//! rows are those of the messages on the path from its head to the root.
 
 use std::{collections::HashMap, path::Path};
 
@@ -16,11 +19,28 @@ use uuid::Uuid;
 use super::{
     columns,
     rows::{
-        ActivityRow, AttachmentRow, BlockRow, ChatRows, CommentRow, Extent, Head, MessageRow,
-        MetaRow, NewMessage, Placement, ProfileRow, RunRow,
+        ActivityRow, AttachmentRow, BlockRow, ChatRows, CommentRow, MessageRow, MetaRow,
+        NewMessage, PathPoint, Placement, ProfileRow, RunRow, ThreadRow,
     },
 };
-use crate::{models::ModelRef, transcript::TranscriptExtent};
+use crate::models::ModelRef;
+
+/// `$query` with `path (id, parent_id, depth)` bound to the messages on the
+/// path of chat `?1`, from its head up to the root.
+macro_rules! on_path {
+    ($query:literal) => {
+        concat!(
+            "WITH RECURSIVE path (id, parent_id, depth) AS (
+                 SELECT m.id, m.parent_id, m.depth FROM threads t
+                 JOIN messages m ON m.id = t.head_id WHERE t.id = ?1
+                 UNION ALL
+                 SELECT m.id, m.parent_id, m.depth FROM path p
+                 JOIN messages m ON m.id = p.parent_id
+             ) ",
+            $query
+        )
+    };
+}
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
@@ -41,67 +61,65 @@ pub(super) async fn open(path: &Path) -> anyhow::Result<SqlitePool> {
     Ok(pool)
 }
 
-/// Every chat's row, archived ones last, each list in its saved order, with
-/// its token activity.
-pub(super) async fn read_metas(
-    pool: &SqlitePool,
-) -> anyhow::Result<Vec<(MetaRow, Vec<ActivityRow>)>> {
-    let mut activity = HashMap::<Uuid, Vec<ActivityRow>>::new();
-    for row in sqlx::query(
-        "SELECT thread_id, at, duration_ns, tokens FROM token_activity ORDER BY thread_id, seq",
-    )
-    .fetch_all(pool)
-    .await?
-    {
-        activity.entry(row.get(0)).or_default().push(ActivityRow {
-            at: row.get(1),
-            duration_ns: row.get(2),
-            tokens: row.get(3),
-        });
-    }
-    let rows = sqlx::query(
-        "SELECT id, title, archived, project_id, tokens_used, generation_ns, last_run_at
+/// Every chat's row, archived ones last, each list in its saved order.
+pub(super) async fn read_metas(pool: &SqlitePool) -> anyhow::Result<Vec<MetaRow>> {
+    Ok(sqlx::query(
+        "SELECT id, title, archived, project_id, generation_ns, last_run_at
          FROM threads ORDER BY archived, position, unixepoch(last_run_at, 'subsec') DESC",
     )
     .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .map(|row| {
-            let id: Uuid = row.get(0);
-            let meta = MetaRow {
-                id,
-                title: row.get(1),
-                archived: row.get(2),
-                project: row.get(3),
-                tokens_used: row.get(4),
-                generation_ns: row.get(5),
-                last_run_at: row.get(6),
-            };
-            (meta, activity.remove(&id).unwrap_or_default())
-        })
-        .collect())
+    .await?
+    .into_iter()
+    .map(|row| MetaRow {
+        id: row.get(0),
+        title: row.get(1),
+        archived: row.get(2),
+        project: row.get(3),
+        generation_ns: row.get(4),
+        last_run_at: row.get(5),
+    })
+    .collect())
 }
 
-/// What the database holds of a chat, as counts: three `max` lookups on
-/// primary keys.
-pub(super) async fn extent(conn: &mut SqliteConnection, id: Uuid) -> anyhow::Result<Extent> {
-    let row = sqlx::query(
-        "SELECT
-             (SELECT coalesce(max(seq) + 1, 0) FROM messages WHERE thread_id = ?1),
-             (SELECT coalesce(max(idx) + 1, 0) FROM transcript_entries WHERE thread_id = ?1),
-             (SELECT coalesce(max(seq) + 1, 0) FROM transcript_compactions WHERE thread_id = ?1)",
+/// Every saved run's usage that used any tokens, for statistics. Each run is
+/// stored once, however many chats share it.
+pub(super) async fn read_run_activity(pool: &SqlitePool) -> anyhow::Result<Vec<ActivityRow>> {
+    Ok(sqlx::query(
+        "SELECT started_at, duration_ns, tokens FROM agent_runs
+         WHERE tokens > 0 ORDER BY unixepoch(started_at, 'subsec')",
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|row| ActivityRow {
+        at: row.get(0),
+        duration_ns: row.get(1),
+        tokens: row.get(2),
+    })
+    .collect())
+}
+
+/// A chat's stored head and its root, if it has a row with messages.
+pub(super) async fn stored_head(
+    conn: &mut SqliteConnection,
+    id: Uuid,
+) -> anyhow::Result<Option<(PathPoint, Uuid)>> {
+    Ok(sqlx::query(
+        "SELECT t.head_id, m.depth, t.root_id FROM threads t
+         JOIN messages m ON m.id = t.head_id WHERE t.id = ?",
     )
     .bind(id)
-    .fetch_one(&mut *conn)
-    .await?;
-    Ok(Extent {
-        messages: columns::count(row.get(0), "messages")?,
-        transcript: TranscriptExtent {
-            entries: columns::count(row.get(1), "entries")?,
-            compactions: columns::count(row.get(2), "compactions")?,
-        },
-    })
+    .fetch_optional(&mut *conn)
+    .await?
+    .map(|row| {
+        (
+            PathPoint {
+                id: row.get(0),
+                depth: row.get(1),
+            },
+            row.get(2),
+        )
+    }))
 }
 
 fn model_columns(model: &Option<ModelRef>) -> (Option<&'static str>, Option<&str>) {
@@ -121,29 +139,33 @@ fn to_model(provider: Option<String>, id: Option<String>) -> anyhow::Result<Opti
     })
 }
 
-/// Upserts the `threads` row and replaces its small tables. Never
-/// `INSERT OR REPLACE`: its delete would cascade to the whole chat. A
-/// project removed since is saved as none, here and in
-/// [`update_placement`]; removing it unfiled the chat's row already.
-pub(super) async fn write_head(
+/// Upserts the `threads` row, pointing it at `head` (with the root of its
+/// tree), and replaces its small tables. Never `INSERT OR REPLACE`: its
+/// delete would cascade to the chat's small tables. A project removed since
+/// is saved as none, here and in [`update_placement`]; removing it unfiled
+/// the chat's row already.
+pub(super) async fn write_thread(
     conn: &mut SqliteConnection,
-    head: &Head,
+    head: &ThreadRow,
     placement: &Placement,
+    tip: Option<(Uuid, Uuid)>,
 ) -> anyhow::Result<()> {
     let (provider, model) = model_columns(&head.model);
+    let (head_id, root_id) = tip.unzip();
     sqlx::query(
         "INSERT INTO threads (id, title, participant_id, archived, position, model_provider,
-             model_id, project_mode, project_id, tokens_used, context_tokens, streamed_bytes,
-             generation_ns, last_run_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, (SELECT id FROM projects WHERE id = ?), ?, ?, ?, ?, ?)
+             model_id, project_mode, project_id, context_tokens, streamed_bytes,
+             generation_ns, last_run_at, head_id, root_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, (SELECT id FROM projects WHERE id = ?), ?, ?, ?, ?, ?, ?)
          ON CONFLICT (id) DO UPDATE SET
              title = excluded.title, participant_id = excluded.participant_id,
              archived = excluded.archived, position = excluded.position,
              model_provider = excluded.model_provider, model_id = excluded.model_id,
              project_mode = excluded.project_mode, project_id = excluded.project_id,
-             tokens_used = excluded.tokens_used, context_tokens = excluded.context_tokens,
+             context_tokens = excluded.context_tokens,
              streamed_bytes = excluded.streamed_bytes, generation_ns = excluded.generation_ns,
-             last_run_at = excluded.last_run_at",
+             last_run_at = excluded.last_run_at, head_id = excluded.head_id,
+             root_id = excluded.root_id",
     )
     .bind(head.id)
     .bind(&head.title)
@@ -154,18 +176,18 @@ pub(super) async fn write_head(
     .bind(model)
     .bind(columns::mode(head.project_mode))
     .bind(placement.project)
-    .bind(head.tokens_used)
     .bind(head.context_tokens)
     .bind(head.streamed_bytes)
     .bind(head.generation_ns)
     .bind(head.last_run_at)
+    .bind(head_id)
+    .bind(root_id)
     .execute(&mut *conn)
     .await?;
     for delete in [
         "DELETE FROM thread_folders WHERE thread_id = ?",
         "DELETE FROM thread_profiles WHERE thread_id = ?",
         "DELETE FROM prompt_names WHERE thread_id = ?",
-        "DELETE FROM token_activity WHERE thread_id = ?",
     ] {
         sqlx::query(delete)
             .bind(head.id)
@@ -199,39 +221,32 @@ pub(super) async fn write_head(
             .execute(&mut *conn)
             .await?;
     }
-    for (seq, activity) in head.token_activity.iter().enumerate() {
-        sqlx::query("INSERT INTO token_activity VALUES (?, ?, ?, ?, ?)")
-            .bind(head.id)
-            .bind(columns::index(seq, "turn")?)
-            .bind(activity.at)
-            .bind(activity.duration_ns)
-            .bind(activity.tokens)
-            .execute(&mut *conn)
-            .await?;
-    }
     Ok(())
 }
 
-/// Inserts `message` at `seq` with everything under it and its search
-/// texts.
+/// Inserts `message` below `parent` in the tree rooted at `root`, with
+/// everything it holds: its blocks or run, its run's entries and
+/// compactions, its files' bytes and its search texts.
 pub(super) async fn insert_message(
     conn: &mut SqliteConnection,
-    thread: Uuid,
-    seq: usize,
+    parent: Option<Uuid>,
+    root: Uuid,
     message: &NewMessage,
 ) -> anyhow::Result<()> {
-    let seq = columns::index(seq, "message")?;
     let kind = match &message.row {
         MessageRow::User { .. } => "user",
         MessageRow::Agent { .. } => "agent",
     };
-    sqlx::query("INSERT INTO messages (thread_id, id, seq, kind) VALUES (?, ?, ?, ?)")
-        .bind(thread)
-        .bind(message.row.id())
-        .bind(seq)
-        .bind(kind)
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query(
+        "INSERT INTO messages (id, parent_id, depth, root_id, kind) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(message.row.id())
+    .bind(parent)
+    .bind(message.depth)
+    .bind(root)
+    .bind(kind)
+    .execute(&mut *conn)
+    .await?;
     match &message.row {
         MessageRow::User {
             id,
@@ -239,18 +254,19 @@ pub(super) async fn insert_message(
             comments,
         } => {
             for (block_seq, block) in blocks.iter().enumerate() {
-                sqlx::query("INSERT INTO prompt_blocks VALUES (?, ?, ?, ?, ?, ?)")
-                    .bind(thread)
-                    .bind(id)
-                    .bind(columns::index(block_seq, "block")?)
-                    .bind(block.id)
-                    .bind(block.author)
-                    .bind(&block.text)
-                    .execute(&mut *conn)
-                    .await?;
+                sqlx::query(
+                    "INSERT INTO prompt_blocks (id, message_id, seq, author, text)
+                     VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(block.id)
+                .bind(id)
+                .bind(columns::index(block_seq, "block")?)
+                .bind(block.author)
+                .bind(&block.text)
+                .execute(&mut *conn)
+                .await?;
                 for (attachment_seq, attachment) in block.attachments.iter().enumerate() {
-                    sqlx::query("INSERT INTO block_attachments VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-                        .bind(thread)
+                    sqlx::query("INSERT INTO block_attachments VALUES (?, ?, ?, ?, ?, ?, ?)")
                         .bind(block.id)
                         .bind(columns::index(attachment_seq, "attachment")?)
                         .bind(attachment.id)
@@ -263,8 +279,7 @@ pub(super) async fn insert_message(
                 }
             }
             for (comment_seq, comment) in comments.iter().enumerate() {
-                sqlx::query("INSERT INTO comments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-                    .bind(thread)
+                sqlx::query("INSERT INTO comments VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
                     .bind(comment.id)
                     .bind(id)
                     .bind(columns::index(comment_seq, "comment")?)
@@ -281,82 +296,68 @@ pub(super) async fn insert_message(
         MessageRow::Agent { id, run } => {
             let (outcome, error) = columns::outcome(&run.outcome);
             let (provider, model) = model_columns(&run.model);
-            sqlx::query("INSERT INTO agent_runs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-                .bind(thread)
+            sqlx::query(
+                "INSERT INTO agent_runs (message_id, comment_group_id, started_at, duration_ns,
+                     tokens, transcript_start, outcome, error, unfinished, model_provider,
+                     model_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(id)
+            .bind(run.comment_group_id)
+            .bind(run.started_at)
+            .bind(run.duration_ns)
+            .bind(run.tokens)
+            .bind(run.transcript_start)
+            .bind(outcome)
+            .bind(error)
+            .bind(&run.unfinished)
+            .bind(provider)
+            .bind(model)
+            .execute(&mut *conn)
+            .await?;
+            // Entries before compactions: the trigger checks a compaction
+            // against the run's entries.
+            for (idx, record) in &message.entries {
+                sqlx::query(
+                    "INSERT INTO transcript_entries (run_id, idx, record) VALUES (?, ?, ?)",
+                )
                 .bind(id)
-                .bind(run.comment_group_id)
-                .bind(run.started_at)
-                .bind(run.duration_ns)
-                .bind(run.transcript_start)
-                .bind(outcome)
-                .bind(error)
-                .bind(&run.unfinished)
-                .bind(provider)
-                .bind(model)
+                .bind(idx)
+                .bind(record)
                 .execute(&mut *conn)
                 .await?;
+            }
+            for (seq, (at_entries, record)) in message.compactions.iter().enumerate() {
+                sqlx::query(
+                    "INSERT INTO transcript_compactions (run_id, seq, at_entries, record)
+                     VALUES (?, ?, ?, ?)",
+                )
+                .bind(id)
+                .bind(columns::index(seq, "compaction")?)
+                .bind(at_entries)
+                .bind(record)
+                .execute(&mut *conn)
+                .await?;
+            }
         }
     }
-    for (part, text) in message.search.iter().enumerate() {
-        sqlx::query(
-            "INSERT INTO search_texts (thread_id, message_seq, part, text) VALUES (?, ?, ?, ?)",
-        )
-        .bind(thread)
-        .bind(seq)
-        .bind(columns::index(part, "search text")?)
-        .bind(text)
-        .execute(&mut *conn)
-        .await?;
+    // Each file is written once, with the message attaching it.
+    for (file, bytes) in &message.files {
+        sqlx::query("INSERT INTO attachment_data (id, message_id, bytes) VALUES (?, ?, ?)")
+            .bind(file)
+            .bind(message.row.id())
+            .bind(bytes)
+            .execute(&mut *conn)
+            .await?;
     }
-    Ok(())
-}
-
-pub(super) async fn insert_entry(
-    conn: &mut SqliteConnection,
-    thread: Uuid,
-    idx: usize,
-    record: &str,
-) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO transcript_entries VALUES (?, ?, ?)")
-        .bind(thread)
-        .bind(columns::index(idx, "entry")?)
-        .bind(record)
-        .execute(&mut *conn)
-        .await?;
-    Ok(())
-}
-
-pub(super) async fn insert_compaction(
-    conn: &mut SqliteConnection,
-    thread: Uuid,
-    seq: usize,
-    at_entries: i64,
-    record: &str,
-) -> anyhow::Result<()> {
-    sqlx::query("INSERT INTO transcript_compactions VALUES (?, ?, ?, ?)")
-        .bind(thread)
-        .bind(columns::index(seq, "compaction")?)
-        .bind(at_entries)
-        .bind(record)
-        .execute(&mut *conn)
-        .await?;
-    Ok(())
-}
-
-/// Writes a file's bytes unless they are already stored: each is written
-/// once.
-pub(super) async fn insert_file(
-    conn: &mut SqliteConnection,
-    thread: Uuid,
-    id: Uuid,
-    bytes: &[u8],
-) -> anyhow::Result<()> {
-    sqlx::query("INSERT OR IGNORE INTO attachment_data VALUES (?, ?, ?)")
-        .bind(thread)
-        .bind(id)
-        .bind(bytes)
-        .execute(&mut *conn)
-        .await?;
+    for (part, text) in message.search.iter().enumerate() {
+        sqlx::query("INSERT INTO search_texts (message_id, part, text) VALUES (?, ?, ?)")
+            .bind(message.row.id())
+            .bind(columns::index(part, "search text")?)
+            .bind(text)
+            .execute(&mut *conn)
+            .await?;
+    }
     Ok(())
 }
 
@@ -381,23 +382,70 @@ pub(super) async fn update_placement(
     Ok(())
 }
 
-/// Deletes a chat: everything cascades from its `threads` row, its search
-/// index included, through `search_texts`' trigger.
-pub(super) async fn delete(conn: &mut SqliteConnection, id: Uuid) -> anyhow::Result<()> {
+/// Deletes a chat's row, then its messages from its head up, stopping at a
+/// message another chat still needs: one with another child, or another
+/// chat's head (a chat can end where another branches off). Each message
+/// takes what it holds with it by cascade, its search index included
+/// through `search_texts`' trigger. Returns the usage of the runs removed,
+/// so shared runs stay counted with the chats keeping them.
+pub(super) async fn delete(
+    conn: &mut SqliteConnection,
+    id: Uuid,
+) -> anyhow::Result<Vec<ActivityRow>> {
+    let head: Option<Uuid> = sqlx::query_scalar("SELECT head_id FROM threads WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?
+        .flatten();
     sqlx::query("DELETE FROM threads WHERE id = ?")
         .bind(id)
         .execute(&mut *conn)
         .await?;
-    Ok(())
+    let mut removed = Vec::new();
+    let mut next = head;
+    while let Some(message) = next {
+        let needed: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM messages WHERE parent_id = ?1)
+                 OR EXISTS (SELECT 1 FROM threads WHERE head_id = ?1)",
+        )
+        .bind(message)
+        .fetch_one(&mut *conn)
+        .await?;
+        if needed {
+            break;
+        }
+        if let Some(row) = sqlx::query(
+            "SELECT started_at, duration_ns, tokens FROM agent_runs
+             WHERE message_id = ? AND tokens > 0",
+        )
+        .bind(message)
+        .fetch_optional(&mut *conn)
+        .await?
+        {
+            removed.push(ActivityRow {
+                at: row.get(0),
+                duration_ns: row.get(1),
+                tokens: row.get(2),
+            });
+        }
+        next = sqlx::query_scalar("DELETE FROM messages WHERE id = ? RETURNING parent_id")
+            .bind(message)
+            .fetch_one(&mut *conn)
+            .await?;
+    }
+    Ok(removed)
 }
 
+/// A chat's row and everything on its path, or `None` if it has no row.
+/// Fails unless the path runs from the head down to the chat's root, with
+/// every depth once, and its entries are the whole transcript in order.
 pub(super) async fn load(
     conn: &mut SqliteConnection,
     id: Uuid,
 ) -> anyhow::Result<Option<ChatRows>> {
     let Some(row) = sqlx::query(
         "SELECT title, participant_id, model_provider, model_id, project_mode, project_id,
-                tokens_used, context_tokens, streamed_bytes, generation_ns, last_run_at
+                context_tokens, streamed_bytes, generation_ns, last_run_at, root_id
          FROM threads WHERE id = ?",
     )
     .bind(id)
@@ -407,28 +455,27 @@ pub(super) async fn load(
         return Ok(None);
     };
     let project: Option<Uuid> = row.get(5);
-    let mut head = Head {
+    let root: Option<Uuid> = row.get(10);
+    let mut thread = ThreadRow {
         id,
         title: row.get(0),
         participant_id: row.get(1),
         model: to_model(row.get(2), row.get(3))?,
         project_mode: columns::to_mode(row.get::<&str, _>(4))?,
-        tokens_used: row.get(6),
-        context_tokens: row.get(7),
-        streamed_bytes: row.get(8),
-        generation_ns: row.get(9),
-        last_run_at: row.get::<Option<DateTime<Utc>>, _>(10),
+        context_tokens: row.get(6),
+        streamed_bytes: row.get(7),
+        generation_ns: row.get(8),
+        last_run_at: row.get::<Option<DateTime<Utc>>, _>(9),
         folders: Vec::new(),
         profiles: Vec::new(),
         prompt_names: Vec::new(),
-        token_activity: Vec::new(),
     };
-    head.folders =
+    thread.folders =
         sqlx::query_as("SELECT name, path FROM thread_folders WHERE thread_id = ? ORDER BY seq")
             .bind(id)
             .fetch_all(&mut *conn)
             .await?;
-    head.profiles = sqlx::query(
+    thread.profiles = sqlx::query(
         "SELECT participant, name, picture, appearance FROM thread_profiles
          WHERE thread_id = ? ORDER BY participant",
     )
@@ -443,31 +490,20 @@ pub(super) async fn load(
         appearance: row.get(3),
     })
     .collect();
-    head.prompt_names = sqlx::query_as(
+    thread.prompt_names = sqlx::query_as(
         "SELECT participant, name FROM prompt_names WHERE thread_id = ? ORDER BY participant",
     )
     .bind(id)
     .fetch_all(&mut *conn)
     .await?;
-    head.token_activity = sqlx::query(
-        "SELECT at, duration_ns, tokens FROM token_activity WHERE thread_id = ? ORDER BY seq",
-    )
-    .bind(id)
-    .fetch_all(&mut *conn)
-    .await?
-    .into_iter()
-    .map(|row| ActivityRow {
-        at: row.get(0),
-        duration_ns: row.get(1),
-        tokens: row.get(2),
-    })
-    .collect();
 
     let mut attachments = HashMap::<Uuid, Vec<AttachmentRow>>::new();
-    for row in sqlx::query(
-        "SELECT block_id, attachment_id, name, kind, size, creator FROM block_attachments
-         WHERE thread_id = ? ORDER BY block_id, seq",
-    )
+    for row in sqlx::query(on_path!(
+        "SELECT a.block_id, a.attachment_id, a.name, a.kind, a.size, a.creator FROM path p
+         JOIN prompt_blocks b ON b.message_id = p.id
+         JOIN block_attachments a ON a.block_id = b.id
+         ORDER BY a.block_id, a.seq"
+    ))
     .bind(id)
     .fetch_all(&mut *conn)
     .await?
@@ -484,10 +520,11 @@ pub(super) async fn load(
             });
     }
     let mut blocks = HashMap::<Uuid, Vec<BlockRow>>::new();
-    for row in sqlx::query(
-        "SELECT message_id, id, author, text FROM prompt_blocks
-         WHERE thread_id = ? ORDER BY message_id, seq",
-    )
+    for row in sqlx::query(on_path!(
+        "SELECT b.message_id, b.id, b.author, b.text FROM path p
+         JOIN prompt_blocks b ON b.message_id = p.id
+         ORDER BY b.message_id, b.seq"
+    ))
     .bind(id)
     .fetch_all(&mut *conn)
     .await?
@@ -501,10 +538,12 @@ pub(super) async fn load(
         });
     }
     let mut comments = HashMap::<Uuid, Vec<CommentRow>>::new();
-    for row in sqlx::query(
-        "SELECT message_id, id, author, target_message_id, range_start, range_end, quote, body
-         FROM comments WHERE thread_id = ? ORDER BY message_id, seq",
-    )
+    for row in sqlx::query(on_path!(
+        "SELECT c.message_id, c.id, c.author, c.target_message_id, c.range_start, c.range_end,
+                c.quote, c.body
+         FROM path p JOIN comments c ON c.message_id = p.id
+         ORDER BY c.message_id, c.seq"
+    ))
     .bind(id)
     .fetch_all(&mut *conn)
     .await?
@@ -520,11 +559,12 @@ pub(super) async fn load(
         });
     }
     let mut runs = HashMap::<Uuid, RunRow>::new();
-    for row in sqlx::query(
-        "SELECT message_id, comment_group_id, started_at, duration_ns, transcript_start, outcome,
-                error, unfinished, model_provider, model_id
-         FROM agent_runs WHERE thread_id = ?",
-    )
+    for row in sqlx::query(on_path!(
+        "SELECT r.message_id, r.comment_group_id, r.started_at, r.duration_ns, r.tokens,
+                r.transcript_start, r.outcome, r.error, r.unfinished, r.model_provider,
+                r.model_id
+         FROM path p JOIN agent_runs r ON r.message_id = p.id"
+    ))
     .bind(id)
     .fetch_all(&mut *conn)
     .await?
@@ -535,20 +575,33 @@ pub(super) async fn load(
                 comment_group_id: row.get(1),
                 started_at: row.get(2),
                 duration_ns: row.get(3),
-                transcript_start: row.get(4),
-                outcome: columns::to_outcome(row.get::<&str, _>(5), row.get(6))?,
-                unfinished: row.get(7),
-                model: to_model(row.get(8), row.get(9))?,
+                tokens: row.get(4),
+                transcript_start: row.get(5),
+                outcome: columns::to_outcome(row.get::<&str, _>(6), row.get(7))?,
+                unfinished: row.get(8),
+                model: to_model(row.get(9), row.get(10))?,
             },
         );
     }
     let mut messages = Vec::new();
-    for row in sqlx::query("SELECT id, kind FROM messages WHERE thread_id = ? ORDER BY seq")
-        .bind(id)
-        .fetch_all(&mut *conn)
-        .await?
+    let mut path_root = None;
+    for row in sqlx::query(on_path!(
+        "SELECT m.id, m.kind, m.depth, m.parent_id FROM path p
+         JOIN messages m ON m.id = p.id ORDER BY p.depth"
+    ))
+    .bind(id)
+    .fetch_all(&mut *conn)
+    .await?
     {
         let message: Uuid = row.get(0);
+        let depth: i64 = row.get(2);
+        let parent: Option<Uuid> = row.get(3);
+        anyhow::ensure!(
+            depth == columns::index(messages.len(), "depth")?
+                && parent.is_none() == messages.is_empty(),
+            "message {message} is out of place on the chat's path"
+        );
+        path_root.get_or_insert(message);
         messages.push(match row.get::<&str, _>(1) {
             "user" => MessageRow::User {
                 id: message,
@@ -564,28 +617,40 @@ pub(super) async fn load(
             kind => anyhow::bail!("unknown message kind {kind:?}"),
         });
     }
-    let entries = sqlx::query_scalar(
-        "SELECT record FROM transcript_entries WHERE thread_id = ? ORDER BY idx",
-    )
+    anyhow::ensure!(path_root == root, "the chat's path doesn't reach its root");
+    let mut entries = Vec::new();
+    for (idx, record) in sqlx::query_as::<_, (i64, String)>(on_path!(
+        "SELECT e.idx, e.record FROM path p
+         JOIN transcript_entries e ON e.run_id = p.id ORDER BY e.idx"
+    ))
+    .bind(id)
+    .fetch_all(&mut *conn)
+    .await?
+    {
+        anyhow::ensure!(
+            idx == columns::index(entries.len(), "entry")?,
+            "the chat's transcript misses entry {}",
+            entries.len()
+        );
+        entries.push(record);
+    }
+    let compactions = sqlx::query_as(on_path!(
+        "SELECT c.at_entries, c.record FROM path p
+         JOIN transcript_compactions c ON c.run_id = p.id ORDER BY p.depth, c.seq"
+    ))
     .bind(id)
     .fetch_all(&mut *conn)
     .await?;
-    let compactions = sqlx::query_as(
-        "SELECT at_entries, record FROM transcript_compactions WHERE thread_id = ? ORDER BY seq",
-    )
-    .bind(id)
-    .fetch_all(&mut *conn)
-    .await?;
-    let files = sqlx::query_as::<_, (Uuid, Vec<u8>)>(
-        "SELECT id, bytes FROM attachment_data WHERE thread_id = ?",
-    )
+    let files = sqlx::query_as::<_, (Uuid, Vec<u8>)>(on_path!(
+        "SELECT f.id, f.bytes FROM path p JOIN attachment_data f ON f.message_id = p.id"
+    ))
     .bind(id)
     .fetch_all(&mut *conn)
     .await?
     .into_iter()
     .collect();
     Ok(Some(ChatRows {
-        head,
+        thread,
         project,
         messages,
         entries,
@@ -601,8 +666,9 @@ pub(crate) struct SearchHit {
 }
 
 /// The texts containing `phrase`, ignoring case and diacritics, in each
-/// chat's order. The trigram index needs three characters; a shorter phrase
-/// finds nothing. `limit` caps the rows read.
+/// chat's order. A match is a message, so it is a hit for every chat in the
+/// message's tree. The trigram index needs three characters; a shorter
+/// phrase finds nothing. `limit` caps the rows read.
 pub(super) async fn search(
     pool: &SqlitePool,
     phrase: &str,
@@ -613,10 +679,12 @@ pub(super) async fn search(
     }
     let quoted = format!("\"{}\"", phrase.replace('"', "\"\""));
     Ok(sqlx::query(
-        "SELECT s.thread_id, s.text FROM chat_search f
+        "SELECT t.id, s.text FROM chat_search f
          JOIN search_texts s ON s.rowid = f.rowid
+         JOIN messages m ON m.id = s.message_id
+         JOIN threads t ON t.root_id = m.root_id
          WHERE f.chat_search MATCH ?
-         ORDER BY s.thread_id, s.message_seq, s.part
+         ORDER BY t.id, m.depth, s.part
          LIMIT ?",
     )
     .bind(quoted)
@@ -629,4 +697,39 @@ pub(super) async fn search(
         text: row.get(1),
     })
     .collect())
+}
+
+/// Makes chat `fork` end at `at`, a message of `source`'s path, with
+/// `source`'s per-chat rows: what forking will do, for the storage tests
+/// until it exists.
+#[cfg(test)]
+pub(super) async fn fork(
+    conn: &mut SqliteConnection,
+    source: Uuid,
+    at: Uuid,
+    fork: Uuid,
+) -> anyhow::Result<()> {
+    for statement in [
+        "INSERT INTO threads (id, title, participant_id, archived, position, model_provider,
+             model_id, project_mode, project_id, context_tokens, streamed_bytes, generation_ns,
+             last_run_at, head_id, root_id)
+         SELECT ?3, title, participant_id, archived, position, model_provider, model_id,
+             project_mode, project_id, context_tokens, streamed_bytes, generation_ns,
+             last_run_at, ?2, root_id
+         FROM threads WHERE id = ?1",
+        "INSERT INTO thread_folders SELECT ?3, seq, name, path FROM thread_folders
+         WHERE thread_id = ?1",
+        "INSERT INTO thread_profiles SELECT ?3, participant, name, picture, appearance
+         FROM thread_profiles WHERE thread_id = ?1",
+        "INSERT INTO prompt_names SELECT ?3, participant, name FROM prompt_names
+         WHERE thread_id = ?1",
+    ] {
+        sqlx::query(statement)
+            .bind(source)
+            .bind(at)
+            .bind(fork)
+            .execute(&mut *conn)
+            .await?;
+    }
+    Ok(())
 }

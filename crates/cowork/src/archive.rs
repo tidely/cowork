@@ -22,7 +22,7 @@ use uuid::Uuid;
 use crate::{
     Cowork, MainStage,
     chat_store::{ListedChat, Place},
-    statistics::Statistics,
+    statistics::DeletedChats,
     thread::Thread,
 };
 
@@ -223,7 +223,7 @@ impl Cowork {
             return;
         };
         self.forget_scheduled_thread(thread_id);
-        self.retire_chat(thread_id, Statistics::of_chat(&meta));
+        self.retire_chat(thread_id, DeletedChats::of_chat(&meta));
         cx.notify();
     }
 
@@ -400,16 +400,16 @@ impl Cowork {
             return;
         }
         // Deleted already; its run's time may make it the longest.
-        let counted = Statistics {
+        let counted = DeletedChats {
             longest_chat: thread.generation_time(),
-            ..Statistics::default()
+            ..DeletedChats::default()
         };
         self.retire_chat(thread_id, counted);
     }
 
     /// Forgets a deleted chat but for its statistics, adding `counted` to
     /// them as its rows are deleted.
-    fn retire_chat(&mut self, thread_id: Uuid, counted: Statistics) {
+    fn retire_chat(&mut self, thread_id: Uuid, counted: DeletedChats) {
         self.retire_agent(thread_id);
         self.profile_statistics = None;
         self.sandboxes.forget(&thread_id.to_string());

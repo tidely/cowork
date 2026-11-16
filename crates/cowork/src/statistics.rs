@@ -1,10 +1,13 @@
-//! The profile page's statistics: what they count of deleted chats, so it
-//! outlasts them, and the totals across those and the user's own chats. A
-//! chat's counts are added to the deleted ones' in the transaction that
-//! deletes it (`chat_db.rs`); usage of a run ending after that is added on
-//! its own. The profile lazily caches the totals and activity, rebuilding
-//! after counted data changes; chart range and calendar-bucket changes
-//! rebuild only the chart.
+//! The profile page's statistics: the usage of every run in the user's own
+//! chats, deleted ones included, and the chat counts, of deleted chats too
+//! so they outlast them. Usage is counted per run, so a run shared by
+//! several chats counts once: in memory it stays in one list however chats
+//! are deleted, and in the database a deleted chat's removed runs move to
+//! the deleted chats' usage in the transaction that deletes it
+//! (`chat_db.rs`); usage of a run ending after that is added on its own. The
+//! profile lazily caches the totals and activity, rebuilding after counted
+//! data changes; chart range and calendar-bucket changes rebuild only the
+//! chart.
 
 use std::time::Duration;
 
@@ -24,6 +27,7 @@ pub(crate) struct ProfileStatistics {
     pub(crate) chart: CachedActivityChart,
 }
 
+/// The totals the profile shows.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Statistics {
     pub(crate) tokens_used: u64,
@@ -32,47 +36,49 @@ pub(crate) struct Statistics {
     pub(crate) token_activity: Vec<TokenActivity>,
 }
 
-impl Statistics {
+/// What statistics count of deleted chats beyond their runs' usage.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct DeletedChats {
+    pub(crate) chats: usize,
+    pub(crate) longest_chat: Duration,
+}
+
+impl DeletedChats {
     /// What a chat being deleted counts, as it is now. A run of it still
-    /// ending adds its usage with [`Cowork::record_turn_usage`].
+    /// ending adds its time with `Cowork::settle_retired_thread`.
     pub(crate) fn of_chat(chat: &ChatMeta) -> Self {
         Self {
             chats: 1,
-            tokens_used: chat.tokens_used,
             longest_chat: chat.generation_time,
-            token_activity: chat.token_activity.clone(),
         }
     }
 
     /// Counts `more` too: sums, but the longest chat is the longer one, as
     /// the database adds them (`chat_db/app_state.rs`).
-    pub(crate) fn add(&mut self, more: &Statistics) {
+    pub(crate) fn add(&mut self, more: &DeletedChats) {
         self.chats += more.chats;
-        self.tokens_used = self.tokens_used.saturating_add(more.tokens_used);
         self.longest_chat = self.longest_chat.max(more.longest_chat);
-        self.token_activity
-            .extend(more.token_activity.iter().copied());
     }
 }
 
 impl Cowork {
-    /// Adds usage of a deleted chat to what statistics count of deleted
-    /// ones, saving it.
-    pub(crate) fn count_deleted(&mut self, counted: Statistics) {
-        self.profile_statistics = None;
-        if let Some(db) = &self.chat_db {
-            db.saver().count_deleted(&counted);
+    /// Counts a run of one of the user's own chats; `deleted` if the chat
+    /// was deleted before the run ended, which the database then counts
+    /// with the deleted chats.
+    pub(crate) fn count_run(&mut self, activity: TokenActivity, deleted: bool) {
+        if deleted && let Some(db) = &self.chat_db {
+            db.saver().count_deleted_run(&activity);
         }
-        self.deleted.add(&counted);
+        self.token_activity.push(activity);
     }
 
     pub(crate) fn prepare_profile_statistics(&mut self, now: DateTime<Local>, cx: &App) {
         if self.profile_statistics.is_none() {
             let totals = Statistics {
-                tokens_used: self.tokens_used(cx),
+                tokens_used: self.tokens_used(),
                 chats: self.total_chats(cx),
                 longest_chat: self.longest_chat(cx),
-                token_activity: self.token_activity(cx),
+                token_activity: self.token_activity(),
             };
             self.profile_statistics = Some(ProfileStatistics {
                 chart: CachedActivityChart::new(&totals.token_activity, self.activity_range, now),
@@ -88,23 +94,14 @@ impl Cowork {
 
     /// Tokens used across the user's own threads, deleted ones included,
     /// and none joined from someone else.
-    pub(crate) fn tokens_used(&self, cx: &App) -> u64 {
-        self.own_threads(cx)
-            .map(|chat| chat.tokens_used)
-            .fold(self.deleted.tokens_used, u64::saturating_add)
+    pub(crate) fn tokens_used(&self) -> u64 {
+        self.token_activity
+            .iter()
+            .map(|activity| activity.tokens)
+            .fold(0, u64::saturating_add)
     }
 
-    pub(crate) fn token_activity(&self, cx: &App) -> Vec<TokenActivity> {
-        self.deleted
-            .token_activity
-            .iter()
-            .chain(
-                self.own_threads(cx)
-                    .flat_map(|chat| chat.token_activity)
-                    .collect::<Vec<_>>()
-                    .iter(),
-            )
-            .copied()
-            .collect()
+    pub(crate) fn token_activity(&self) -> Vec<TokenActivity> {
+        self.token_activity.clone()
     }
 }

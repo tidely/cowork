@@ -163,6 +163,15 @@ pub(crate) struct ScriptedHost {
 }
 
 impl ScriptedHost {
+    /// The host of `thread` as it is, such as one loaded from the database.
+    pub(crate) fn resuming(thread: &crate::thread::Thread) -> Self {
+        Self {
+            entries: thread.transcript.len() as u64,
+            compactions: thread.transcript.conversation().compactions().len(),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn started(
         &self,
         id: Uuid,

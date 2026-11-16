@@ -247,7 +247,7 @@ fn provider_setup_starts_onboarding_with_the_selected_model(cx: &mut gpui::TestA
         assert!(cowork.active_generations.is_empty());
         assert!(thread.project_folders().is_empty());
         assert_eq!(thread.submission_sequence, 0);
-        assert_eq!(thread.tokens_used, 0);
+        assert_eq!(cowork.tokens_used(), 0);
         assert_eq!(thread.timeline.len(), 1);
         assert_eq!(thread.transcript.len(), 2);
         assert!(matches!(

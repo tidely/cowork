@@ -150,13 +150,6 @@ pub(crate) struct Thread {
     /// item is submitted so that renaming never changes the transcript and
     /// the agent knows everyone by one name. Mirrored like the transcript.
     pub(crate) prompt_names: HashMap<ParticipantId, SharedString>,
-    /// Tokens the agent has used in this thread, counted at the end of each
-    /// turn; see [`Cowork::record_turn_usage`]. Only the host, which runs
-    /// the agent, fills it.
-    pub(crate) tokens_used: u64,
-    /// When those tokens were used, turn by turn, which the profile's
-    /// activity chart adds up over the user's own threads.
-    pub(crate) token_activity: Vec<crate::usage::TokenActivity>,
     /// The selected model. It may be missing from `models`, in which case it
     /// cannot run until another is picked; see [`Thread::runnable_model`].
     model: Option<ModelRef>,
@@ -320,8 +313,6 @@ impl Thread {
             transcript: Transcript::default(),
             active_run: None,
             prompt_names: HashMap::new(),
-            tokens_used: 0,
-            token_activity: Vec::new(),
             model,
             models,
             context_tokens: None,
@@ -626,8 +617,6 @@ impl Thread {
             transcript: Transcript::default(),
             active_run: None,
             prompt_names: HashMap::new(),
-            tokens_used: 0,
-            token_activity: Vec::new(),
             model: None,
             models: Arc::default(),
             context_tokens: None,

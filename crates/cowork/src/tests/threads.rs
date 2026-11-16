@@ -664,10 +664,6 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
         .build()
         .expect("test runtime");
     let (cowork, _, cx) = attachment_test_cowork(cx, runtime.handle().clone());
-    let turn = |total: u64| Usage {
-        total_tokens: Some(total),
-        ..Usage::default()
-    };
 
     cowork.update(cx, |cowork, cx| {
         let local = cowork.active_thread(cx).expect("active thread");
@@ -675,7 +671,7 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
 
         let at = |seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
         let took = Duration::from_secs;
-        cowork.record_turn_usage(&local, turn(100), at(10), took(3), cx);
+        cowork.record_turn_usage(&local, 100, at(10), took(3), cx);
         let now = chrono::Local::now();
         cowork.prepare_profile_statistics(now, cx);
         assert_eq!(
@@ -697,23 +693,23 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
         assert_eq!(snapshot.totals.token_activity.as_ptr(), activity);
         assert_eq!(snapshot.chart.chart.buckets.as_ptr(), buckets);
 
-        cowork.record_turn_usage(&local, turn(0), at(15), took(1), cx);
+        cowork.record_turn_usage(&local, 0, at(15), took(1), cx);
         assert!(
             cowork.profile_statistics.is_none(),
             "zero-token runs can change duration"
         );
-        cowork.record_turn_usage(&local, turn(50), at(20), took(2), cx);
+        cowork.record_turn_usage(&local, 50, at(20), took(2), cx);
         cowork.prepare_profile_statistics(now, cx);
-        cowork.record_turn_usage(&joined, turn(30), at(30), took(4), cx);
+        cowork.record_turn_usage(&joined, 30, at(30), took(4), cx);
         assert!(
             cowork.profile_statistics.is_some(),
             "joined usage does not affect the profile"
         );
         let totals = &cowork.profile_statistics.as_ref().unwrap().totals;
-        assert_eq!(totals.tokens_used, cowork.tokens_used(cx));
+        assert_eq!(totals.tokens_used, cowork.tokens_used());
         assert_eq!(totals.chats, cowork.total_chats(cx));
         assert_eq!(totals.longest_chat, cowork.longest_chat(cx));
-        assert_eq!(totals.token_activity, cowork.token_activity(cx));
+        assert_eq!(totals.token_activity, cowork.token_activity());
 
         let activity = totals.token_activity.as_ptr();
         cowork.activity_range = ActivityRange::Day;
@@ -730,12 +726,10 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
             )
         );
 
-        assert_eq!(local.read(cx).tokens_used, 150);
-        assert_eq!(joined.read(cx).tokens_used, 30);
-        assert_eq!(cowork.tokens_used(cx), 150);
+        assert_eq!(cowork.tokens_used(), 150);
         // Only the user's own turns that used tokens are charted.
         assert_eq!(
-            cowork.token_activity(cx),
+            cowork.token_activity(),
             [
                 TokenActivity {
                     at: at(10),
@@ -800,6 +794,40 @@ fn context_tokens_are_estimated_while_streaming(cx: &mut gpui::TestAppContext) {
             thread.apply_for_test(agent_ended(id, protocol::RunOutcome::Completed), cx);
             assert_eq!(thread.live_context_tokens(), Some(100));
         });
+    });
+}
+
+/// A run's tokens are the sum of its requests' usage on every replica,
+/// including one that joined during the run.
+#[gpui::test]
+fn every_replica_adds_up_a_runs_tokens(cx: &mut gpui::TestAppContext) {
+    let (thread, cx) = empty_thread(cx, Arc::default());
+    let id = Uuid::new_v4();
+    let mut host = ScriptedHost::default();
+    let mut first = host.start(id, "prompt");
+    first.extend(host.turn(id, [streamed_text("answer", "one", false)], 100));
+    let mut rest = host.turn(id, [streamed_text("answer", "two", false)], 200);
+    rest.push(agent_ended(id, protocol::RunOutcome::Completed));
+    let run_tokens = |thread: &Thread| match &thread.timeline[0] {
+        TimelineMessage::Agent(message) => message.record.tokens,
+        TimelineMessage::User(_) => panic!("the run's message"),
+    };
+    cx.update(|_, cx| {
+        thread.update(cx, |thread, cx| {
+            for event in first {
+                thread.apply_for_test(event, cx);
+            }
+        });
+        let mirror = cx.new(|cx| Thread::join_for_test(thread.read(cx).welcome_for_test(), cx));
+        assert_eq!(run_tokens(mirror.read(cx)), 100);
+        for replica in [&thread, &mirror] {
+            replica.update(cx, |replica, cx| {
+                for event in &rest {
+                    replica.apply_for_test(event.clone(), cx);
+                }
+            });
+            assert_eq!(run_tokens(replica.read(cx)), 300);
+        }
     });
 }
 

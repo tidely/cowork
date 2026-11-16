@@ -45,7 +45,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 37;
+pub(crate) const PROTOCOL_VERSION: u32 = 38;
 
 /// A request from a collaborator to the host.
 ///
@@ -536,6 +536,9 @@ pub(crate) struct AgentMessage {
     /// these, never sent separately; see `transcript.rs`.
     pub(crate) pending_events: Vec<Preview>,
     pub(crate) run: AgentRun,
+    /// What the run's requests have used so far, summaries included: the
+    /// sum of its [`RunEvent::Usage`], which every replica adds up.
+    pub(crate) tokens: u64,
     /// The model that wrote the message, so a thread that switched models
     /// shows each message's own provider. A run keeps its model to the end,
     /// as a model change applies from the next run. `None` for a reply no
@@ -953,6 +956,7 @@ mod tests {
                         outcome: RunOutcome::Failed("Failed".into()),
                         duration: Duration::from_millis(12_345),
                     },
+                    tokens: 1_234,
                     model: Some(sample_model()),
                     awaiting_approval: Some(ToolCallId("call_1".into())),
                 }),

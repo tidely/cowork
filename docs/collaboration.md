@@ -523,8 +523,8 @@ under is local organization and never sent to collaborators (`docs/projects.md`)
   restored, before it is unloaded, and when the app quits; never during a run, so
   every tool call in a saved transcript has its result. A crash during a run
   loses what that run did since the last save. A save appends what is new in one
-  transaction and carries the extent it was built from, which the database
-  checks; a save holding less than is stored is refused.
+  transaction and carries the head it was built on, which the database checks; a
+  save holding less than is stored is refused.
 - The draft, pending submissions, sharing, and per-peer permissions are not
   saved. A thread comes back unshared, where it was in the sidebar or archive,
   with an empty draft and the profiles kept so earlier messages still name their
