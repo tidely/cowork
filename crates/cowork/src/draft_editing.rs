@@ -412,8 +412,7 @@ impl Cowork {
         }
         self.thread_store
             .read(cx)
-            .threads
-            .iter()
+            .loaded_recents(cx)
             .map(|thread| thread.read(cx))
             .find(|thread| thread.draft().id == draft_id)
             .map(|thread| read(thread.draft()))
@@ -508,7 +507,7 @@ impl Cowork {
             .typing_in
             .as_ref()
             .filter(|(typing_draft, _, _)| {
-                *typing_draft == draft.id && self.active_thread_id == Some(thread.instance_id)
+                *typing_draft == draft.id && self.active_thread_id(cx) == Some(thread.instance_id)
             })
             .and_then(|(_, editor, _)| draft.slot_of(*editor));
         let focus = slot.map(|slot| match slot.item() {
@@ -557,7 +556,12 @@ impl Cowork {
     /// Sends the local user's presence in every shared thread whose has
     /// changed since it was last sent.
     pub(crate) fn publish_presence(&mut self, cx: &mut Context<Self>) {
-        let threads = self.thread_store.read(cx).threads.clone();
+        let threads = self
+            .thread_store
+            .read(cx)
+            .loaded_recents(cx)
+            .cloned()
+            .collect::<Vec<_>>();
         let mut collaborating = HashSet::new();
         for thread in threads {
             let (thread_id, presence) = {
@@ -734,11 +738,11 @@ impl Cowork {
 
     /// The composer can display a draft regardless of the local access mode.
     pub(crate) fn readable_draft_id(&self, cx: &App) -> Option<Uuid> {
-        match self.active_thread_id {
+        match self.active_thread_id(cx) {
             Some(id) => self
                 .thread_store
                 .read(cx)
-                .thread(id, cx)
+                .loaded(id, cx)
                 .map(|thread| thread.read(cx).draft().id),
             None => Some(self.new_thread_draft.id),
         }
@@ -749,7 +753,7 @@ impl Cowork {
         if self.new_thread_draft.id == draft_id {
             return true;
         }
-        self.thread_store.read(cx).threads.iter().any(|thread| {
+        self.thread_store.read(cx).loaded_recents(cx).any(|thread| {
             let thread = thread.read(cx);
             thread.draft().id == draft_id && thread.can_edit_draft()
         })
@@ -762,8 +766,7 @@ impl Cowork {
     pub(crate) fn enter_sends_draft(&self, draft_id: Uuid, cx: &App) -> bool {
         self.thread_store
             .read(cx)
-            .threads
-            .iter()
+            .loaded_recents(cx)
             .map(|thread| thread.read(cx))
             .find(|thread| thread.draft().id == draft_id)
             .is_none_or(|thread| {
@@ -784,7 +787,7 @@ impl Cowork {
     /// Canonical text and IME are reconciled by `prepare_draft` during render,
     /// which has the window required by the text input APIs.
     pub(crate) fn reconcile_peer_access(&mut self, thread_id: Uuid, cx: &mut Context<Self>) {
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+        let Some(thread) = self.thread_store.read(cx).loaded(thread_id, cx) else {
             return;
         };
         let (draft_id, can_edit, editors) = {
@@ -834,8 +837,7 @@ impl Cowork {
         let thread = self
             .thread_store
             .read(cx)
-            .threads
-            .iter()
+            .loaded_recents(cx)
             .find(|thread| thread.read(cx).draft().id == draft_id)
             .cloned()?;
         Some(thread.update(cx, |thread, _| thread.update_draft_editors(update)))
@@ -859,8 +861,7 @@ impl Cowork {
         let thread = self
             .thread_store
             .read(cx)
-            .threads
-            .iter()
+            .loaded_recents(cx)
             .find(|thread| {
                 let thread = thread.read(cx);
                 thread.draft().id == draft_id
@@ -955,9 +956,9 @@ pub(crate) mod tests {
                         cx,
                     )
                 });
-                let thread_store = cx.new(|_| {
+                let thread_store = cx.new(|cx| {
                     let mut store = ThreadStore::default();
-                    store.threads.push_front(thread.clone());
+                    store.push_front(thread.clone(), cx);
                     store
                 });
                 let thread_id = thread.read(cx).instance_id;
@@ -967,6 +968,7 @@ pub(crate) mod tests {
                     Cowork {
                         sidebar_open: true,
                         recents_open: true,
+                        recents_shown: crate::sidebar::RECENTS_PAGE,
                         new_thread_draft: ThreadDraft::new(actor),
                         attachment_errors: Vec::new(),
                         pending_attachments: Vec::new(),
@@ -977,8 +979,11 @@ pub(crate) mod tests {
                         timeline_selection: Default::default(),
                         timeline_focus_handle: cx.focus_handle(),
                         follow_generation: true,
-                        thread_store,
-                        active_thread_id: Some(thread_id),
+                        thread_store: {
+                            thread_store
+                                .update(cx, |store, cx| assert!(store.activate(thread_id, cx)));
+                            thread_store.clone()
+                        },
                         selection_message_id: None,
                         segment_text_views: HashMap::new(),
                         shown_segments: HashMap::new(),
@@ -1005,8 +1010,8 @@ pub(crate) mod tests {
                         agents: HashMap::new(),
                         deleted: Default::default(),
                         profile_statistics: None,
-                        statistics_file: None,
-                        thread_files: None,
+                        saved_chat_search: Default::default(),
+                        chat_db: None,
                         scheduler: Default::default(),
                         activity_range: ActivityRange::default(),
                         local_participant_id: actor,
@@ -1015,7 +1020,6 @@ pub(crate) mod tests {
                         caret_label_refresh: None,
                         working_refresh: None,
                         new_thread_model: None,
-                        settings_file: None,
                         new_thread_project_folders: Vec::new(),
                         new_thread_project_mode: Default::default(),
                         new_thread_project: None,
@@ -1023,9 +1027,15 @@ pub(crate) mod tests {
                         model_picker,
                         models: Arc::default(),
                         picker_rows: None,
+                        idle_clock: Default::default(),
                         _model_picker_subscription: model_picker_subscription,
                         _window_activation_subscription: cx
                             .observe_window_activation(window, |_, _, _| {}),
+                        _thread_store_subscription: Cowork::subscribe_thread_store(
+                            &thread_store,
+                            window,
+                            cx,
+                        ),
                     }
                 });
                 EditorTestRoot { cowork, thread }

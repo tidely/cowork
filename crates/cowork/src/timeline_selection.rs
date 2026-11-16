@@ -94,8 +94,8 @@ impl Cowork {
         if anchor == cursor || !TextSelection::has_selection(window, cx) {
             return None;
         }
-        let thread_id = self.active_thread_id?;
-        let thread = self.thread_store.read(cx).thread(thread_id, cx)?;
+        let thread_id = self.active_thread_id(cx)?;
+        let thread = self.thread_store.read(cx).loaded(thread_id, cx)?;
         let timeline = &thread.read(cx).timeline;
         let (rows, steering_groups) = self.plan_timeline_rows(timeline);
         let position = |id| rows.iter().position(|row| row.message_id == id);

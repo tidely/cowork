@@ -47,19 +47,20 @@ nothing about projects is sent to collaborators.
 - The row's menu has "Remove project", which asks first ("Remove <name>?").
   Removing deletes only the project's record: its chats, archived and shared
   ones too, are kept and filed in no project, so they show in Recents (or
-  where they otherwise would). A running chat's change is saved when its run
-  ends. A new chat being composed in the project is no longer in it, but
+  where they otherwise would). Their saved rows are unfiled in the
+  transaction that removes the project. A new chat being composed in the project is no longer in it, but
   keeps the folders it copied. No files on disk are touched.
 
 ## Saving
 
-- Project records are saved in `~/.cowork/projects.json` when one is
-  created or removed (`crates/cowork/src/projects.rs`), with a format version of their
-  own; a file of another version or unreadable is moved aside.
-- Which project a chat belongs to is saved with the chat, as `project` in its
-  `thread.json` (`thread_files.rs`). It is always explicit, never inferred
-  from folders. Files saved before projects read as in no project, so the
-  thread format needed no new version.
+- Project records are saved in the chats' database (`projects`,
+  `project_folders`) when one is created or removed
+  (`crates/cowork/src/projects.rs`, `chat_db/app_state.rs`).
+- Which project a chat belongs to is saved with the chat, as `project_id` in
+  its row (`chat_db.rs`), so the sidebar files it without loading it. It is
+  always explicit, never inferred from folders. It always names a saved
+  project: a chat saved after its project was removed is saved unfiled, and
+  one still loading when it was removed takes its project from its listing.
 - Which projects are open, and how many chats they show, isn't saved.
 - `--ephemeral` launches save no projects.
 

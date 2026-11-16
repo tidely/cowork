@@ -50,9 +50,9 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let active_thread = self
-            .active_thread_id
+            .active_thread_id(cx)
             .filter(|_| self.main_stage == MainStage::Thread)
-            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx));
+            .and_then(|thread_id| self.thread_store.read(cx).loaded(thread_id, cx));
 
         TitleBar::new()
             .h(TOP_BAR_HEIGHT)

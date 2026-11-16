@@ -19,10 +19,10 @@ use gpui_component::{
 use gpui_kit_assets::IconName as AssetIconName;
 use itertools::Itertools;
 
+use crate::chat_meta::ChatMeta;
 use crate::{
     Cowork,
     profile::{Profile, display_name_error, load_profile_picture, participant_name},
-    thread::{Thread, ThreadOwnership},
     usage::{ActivityBucket, ActivityRange, format_stat_count, format_stat_duration},
 };
 
@@ -131,16 +131,14 @@ impl Cowork {
             )
     }
 
-    /// The chats the user started here, archived ones included, excluding
-    /// joined ones.
-    pub(crate) fn own_threads<'a>(&self, cx: &'a App) -> impl Iterator<Item = &'a Thread> {
-        let store = self.thread_store.read(cx);
-        store
-            .threads
-            .iter()
-            .chain(&store.archived)
-            .map(|thread| thread.read(cx))
-            .filter(|thread| thread.ownership() == ThreadOwnership::Local)
+    /// The rows of the chats the user started here, archived ones included,
+    /// excluding joined ones; derived from loaded chats.
+    pub(crate) fn own_threads<'a>(&self, cx: &'a App) -> impl Iterator<Item = ChatMeta> + 'a {
+        self.thread_store
+            .read(cx)
+            .all(cx)
+            .filter(|chat| chat.is_own(cx))
+            .map(|chat| chat.meta(cx))
     }
 
     /// How many chats the user has started, including deleted ones.
@@ -152,7 +150,7 @@ impl Cowork {
     /// own chats, including archived and deleted ones.
     pub(crate) fn longest_chat(&self, cx: &App) -> Duration {
         self.own_threads(cx)
-            .map(Thread::generation_time)
+            .map(|chat| chat.generation_time)
             .fold(self.deleted.longest_chat, Duration::max)
     }
 
@@ -517,7 +515,7 @@ impl Cowork {
         }
         self.set_profile(
             Profile {
-                name: Some(value.trim().to_owned().into()),
+                name: Some(SharedString::from(value.trim())),
                 ..self.profile.clone()
             },
             cx,
@@ -530,7 +528,12 @@ impl Cowork {
     /// thread with.
     pub(crate) fn set_profile(&mut self, profile: Profile, cx: &mut Context<Self>) {
         self.profile = profile;
-        let threads = self.thread_store.read(cx).threads.clone();
+        let threads = self
+            .thread_store
+            .read(cx)
+            .loaded_recents(cx)
+            .cloned()
+            .collect::<Vec<_>>();
         for thread in threads {
             thread.update(cx, |thread, cx| {
                 thread.update_local_profile(&self.profile, cx);

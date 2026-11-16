@@ -299,7 +299,7 @@ impl Cowork {
         allow: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+        let Some(thread) = self.thread_store.read(cx).loaded(thread_id, cx) else {
             return;
         };
         if !thread.read(cx).is_host() {

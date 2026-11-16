@@ -283,7 +283,7 @@ fn access_popover_dismisses_outside_without_moving_layout_and_closes_on_thread_s
             });
             cowork
                 .thread_store
-                .update(cx, |store, _| store.threads.push_front(other));
+                .update(cx, |store, cx| store.push_front(other, cx));
             cowork.open_thread(other_id, window, cx);
         });
     });
@@ -340,7 +340,7 @@ fn stopping_sharing_from_the_menu_preserves_the_canonical_local_thread(
     assert_eq!(
         session
             .host
-            .read_with(session.cx, |cowork, _| cowork.active_thread_id),
+            .read_with(session.cx, |cowork, cx| cowork.active_thread_id(cx)),
         Some(thread_id)
     );
 }
@@ -374,8 +374,10 @@ fn denial_feedback_targets_its_origin_when_another_thread_is_active(cx: &mut gpu
         let new_draft_id = cowork.new_thread_draft.id;
         cowork
             .thread_store
-            .update(cx, |store, _| store.threads.push_front(other));
-        cowork.active_thread_id = Some(other_id);
+            .update(cx, |store, cx| store.push_front(other, cx));
+        cowork
+            .thread_store
+            .update(cx, |store, cx| assert!(store.activate(other_id, cx)));
         for (draft_id, message) in [
             (origin_draft_id, "previous origin feedback"),
             (other_draft_id, "unrelated active-thread error"),
@@ -394,7 +396,7 @@ fn denial_feedback_targets_its_origin_when_another_thread_is_active(cx: &mut gpu
             reason: DenialReason::InsufficientMode,
         };
         cowork.show_permission_denied(origin_id, &denied, cx);
-        assert_eq!(cowork.active_thread_id, Some(other_id));
+        assert_eq!(cowork.active_thread_id(cx), Some(other_id));
         assert_eq!(
             cowork.attachment_errors.len(),
             3,

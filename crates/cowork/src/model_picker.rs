@@ -15,6 +15,7 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 
+use crate::chat_store::ListedChat;
 use crate::{
     Cowork, assets,
     context_settings::{context_details, context_ring},
@@ -156,7 +157,7 @@ pub(crate) fn language_model_groups(
         let group = groups.entry(provider).or_default();
         let start = group.len();
         group.extend(models.iter().map(|(id, info)| LanguageModel {
-            name: info.name.clone().into(),
+            name: SharedString::from(&info.name),
             model: ModelRef {
                 provider,
                 id: id.clone(),
@@ -222,9 +223,8 @@ impl Cowork {
         let store = self.thread_store.read(cx);
         // Archived threads too, as a scheduled run may bring one back.
         let threads = store
-            .threads
-            .iter()
-            .chain(&store.archived)
+            .all(cx)
+            .filter_map(ListedChat::loaded)
             .cloned()
             .collect::<Vec<_>>();
         for thread in threads {

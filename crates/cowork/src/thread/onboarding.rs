@@ -59,7 +59,7 @@ impl Cowork {
     /// archived. Deleting them all makes them new again.
     pub(crate) fn needs_onboarding(&self, cx: &gpui::App) -> bool {
         let store = self.thread_store.read(cx);
-        store.threads.is_empty() && store.archived.is_empty()
+        store.is_empty()
     }
 
     /// Shows the welcome screen, which leads to the onboarding chat. With a
@@ -114,8 +114,8 @@ impl Cowork {
         );
         let message_id = thread.update(cx, |thread, cx| thread.start_onboarding_run(cx));
         let thread_id = thread.read(cx).instance_id;
-        self.thread_store.update(cx, |store, _| {
-            store.threads.push_front(thread.clone());
+        self.thread_store.update(cx, |store, cx| {
+            store.push_front(thread.clone(), cx);
         });
         self.profile_statistics = None;
         self.open_thread(thread_id, window, cx);
@@ -169,7 +169,7 @@ impl Cowork {
             return false;
         };
         let thread_id = intro.thread_id;
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+        let Some(thread) = self.thread_store.read(cx).loaded(thread_id, cx) else {
             return false;
         };
         thread.update(cx, |thread, cx| {
@@ -191,8 +191,8 @@ impl Cowork {
         };
         let store = self.thread_store.read(cx);
         let Some(thread) = store
-            .thread(thread_id, cx)
-            .or_else(|| store.archived_thread(thread_id, cx))
+            .loaded(thread_id, cx)
+            .or_else(|| store.loaded_archived(thread_id, cx))
         else {
             return;
         };

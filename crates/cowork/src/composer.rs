@@ -570,8 +570,7 @@ impl Cowork {
     fn draft_participants(&self, draft_id: Uuid, cx: &App) -> Vec<ParticipantId> {
         self.thread_store
             .read(cx)
-            .threads
-            .iter()
+            .loaded_recents(cx)
             .map(|thread| thread.read(cx))
             .find(|thread| thread.draft().id == draft_id)
             .map(|thread| thread.participants().to_vec())

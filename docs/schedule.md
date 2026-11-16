@@ -8,8 +8,9 @@ the options a task has and how runs behave.
 Implemented: the Scheduled page (`schedules.rs`, opened from the sidebar),
 the task model and its occurrence policy (`scheduled_task.rs`), and the
 scheduler running the queue and saving tasks (`scheduler.rs`), with every
-option and behavior below. Tasks and their run history are saved to
-`~/.cowork/schedules.json`. A **continue the last thread** task finds its
+option and behavior below. Tasks and their run history are saved in the
+chats' database (`scheduled_tasks`, `scheduled_runs`; see
+`docs/sqlite-storage.md`), whole whenever one changes. A **continue the last thread** task finds its
 thread by id after a restart too, as threads are saved (see
 [Saved threads](collaboration.md#saved-threads)).
 

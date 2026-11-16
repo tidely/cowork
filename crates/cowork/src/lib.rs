@@ -48,6 +48,9 @@ mod assets;
 mod attachments;
 mod avatars;
 mod caret;
+mod chat_db;
+mod chat_meta;
+mod chat_store;
 #[doc(hidden)]
 pub mod component_preview;
 mod composer;
@@ -76,13 +79,12 @@ mod prompt;
 mod protocol;
 mod provider_setup;
 mod providers;
+mod saved_settings;
 mod scheduled_task;
 mod scheduler;
 mod schedules;
 mod search_palette;
 mod settings;
-
-mod settings_file;
 
 mod sidebar;
 mod statistics;
@@ -91,7 +93,6 @@ mod statistics;
 mod test_support;
 mod theme;
 mod thread;
-mod thread_files;
 use thread::{draft as thread_draft, sharing, submission};
 mod timeline;
 mod timeline_projection;
@@ -103,6 +104,7 @@ mod tool_call_card;
 mod top_bar;
 mod transcript;
 mod turn_navigation;
+mod unload;
 mod usage;
 mod welcome;
 
@@ -140,6 +142,8 @@ enum MainStage {
 struct Cowork {
     sidebar_open: bool,
     recents_open: bool,
+    /// How many Recents rows the sidebar draws; see `sidebar.rs`.
+    recents_shown: usize,
     new_thread_draft: ThreadDraft,
     attachment_errors: Vec<AttachmentError>,
     pending_attachments: Vec<PendingAttachment>,
@@ -160,7 +164,6 @@ struct Cowork {
     timeline_focus_handle: gpui::FocusHandle,
     follow_generation: bool,
     thread_store: Entity<ThreadStore>,
-    active_thread_id: Option<Uuid>,
     selection_message_id: Option<Uuid>,
     segment_text_views: HashMap<(ThreadMessageId, usize), SegmentTextView>,
     shown_segments: HashMap<ThreadMessageId, ShownSegments>,
@@ -211,12 +214,12 @@ struct Cowork {
     deleted: statistics::Statistics,
     /// Lazily rebuilt on Profile, not on unrelated streaming redraws.
     profile_statistics: Option<statistics::ProfileStatistics>,
-    /// Where the profile's statistics are saved; `None` keeps them in
-    /// memory, as in tests.
-    statistics_file: Option<std::path::PathBuf>,
-    /// Where the user's own threads are saved; `None` keeps them in memory,
-    /// as in tests. See `thread_files.rs`.
-    thread_files: Option<thread_files::ThreadFiles>,
+    /// What the search palette found in unloaded chats; see `search_palette.rs`.
+    saved_chat_search: search_palette::SavedChatSearch,
+    /// Where the user's own threads, and the rest of what outlasts a
+    /// launch, are saved; `None` keeps them in memory, as in tests and
+    /// ephemeral launches. See `chat_db.rs`.
+    chat_db: Option<chat_db::ChatDb>,
     /// The scheduled tasks, and the queue running them; see `scheduler.rs`.
     scheduler: scheduler::Scheduler,
     /// The period the profile page's token activity chart shows.
@@ -235,9 +238,6 @@ struct Cowork {
     /// The model new threads start with: the last one selected locally,
     /// saved for the next launch; see [`Cowork::set_new_thread_model`].
     new_thread_model: Option<ModelRef>,
-    /// Where the user's settings are saved; `None` keeps them in memory, as
-    /// in tests. See `settings_file.rs`.
-    settings_file: Option<std::path::PathBuf>,
     /// The folders added before the thread exists, which move into it with
     /// the draft; see [`Thread::project_folders`].
     new_thread_project_folders: Vec<ProjectFolder>,
@@ -258,12 +258,18 @@ struct Cowork {
     picker_rows: Option<(Arc<ModelCatalog>, Option<ModelRef>)>,
     _model_picker_subscription: Subscription,
     _window_activation_subscription: Subscription,
+    /// How long each loaded chat has been idle; see `unload.rs`.
+    idle_clock: unload::IdleClock,
+    _thread_store_subscription: Subscription,
 }
 
 impl Cowork {
     fn active_thread(&self, cx: &App) -> Option<Entity<Thread>> {
-        self.active_thread_id
-            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
+        self.thread_store.read(cx).active(cx)
+    }
+
+    fn active_thread_id(&self, cx: &App) -> Option<Uuid> {
+        self.thread_store.read(cx).active_id()
     }
 
     fn new_local_thread(
@@ -333,11 +339,11 @@ impl Cowork {
     ) -> impl IntoElement {
         let pointer_owner = cx.entity().downgrade();
         self.render_generation = self.render_generation.wrapping_add(1);
-        let active_thread_id = self.active_thread_id;
+        let active_thread_id = self.active_thread_id(cx);
         // The thread is read in place, never copied whole: a row clones only
         // its own message, and only when it is built.
         let active_thread = active_thread_id
-            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
+            .and_then(|thread_id| self.thread_store.read(cx).loaded(thread_id, cx))
             .zip(active_thread_id);
         let composer = self
             .readable_draft_id(cx)
@@ -625,7 +631,7 @@ impl Render for Cowork {
                 this.open_schedules(window, cx);
             }))
             .on_action(cx.listener(|this, _: &ArchiveChat, window, cx| {
-                if let Some(thread_id) = this.active_thread_id {
+                if let Some(thread_id) = this.active_thread_id(cx) {
                     this.request_archive_thread(thread_id, window, cx);
                 }
             }))
@@ -815,23 +821,15 @@ pub fn run() -> anyhow::Result<()> {
     let ephemeral = std::env::args_os().skip(1).any(|arg| arg == "--ephemeral");
     // Own the persistent store before starting any services or reading other
     // saved state. Only an explicit --ephemeral launch may skip the lock.
-    let (root, mut statistics_file, mut schedule_file, mut settings_file, mut projects_file) =
-        if ephemeral {
-            (None, None, None, None, None)
-        } else {
-            (
-                Some(thread_files::threads_dir().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "Cannot find the home directory. Use --ephemeral to run without saving."
-                    )
-                })?),
-                statistics::statistics_file(),
-                scheduler::schedule_file(),
-                settings_file::settings_file(),
-                projects::projects_file(),
+    let cowork_dir = if ephemeral {
+        None
+    } else {
+        Some(chat_db::cowork_dir().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot find the home directory. Use --ephemeral to run without saving."
             )
-        };
-    let (thread_files, saved_threads) = thread_files::ThreadFiles::open(root)?;
+        })?)
+    };
     let worker_threads = std::thread::available_parallelism()
         .map(usize::from)
         .unwrap_or(4)
@@ -846,11 +844,19 @@ pub fn run() -> anyhow::Result<()> {
         TOKIO_RUNTIME.set(runtime).is_ok(),
         "the agent runtime was already initialized",
     );
-    let sandboxes = Arc::new(sandbox::Sandboxes::new(
-        thread_files.root().to_owned(),
-        command_environment(),
-    ));
-    let mut thread_files = Some((thread_files, saved_threads));
+    // What is saved is read before the window opens, so a first launch is told
+    // apart from one with chats before anything is shown.
+    let (chat_db, scratch_root) = match cowork_dir {
+        Some(dir) => {
+            let (db, saved) = chat_db::ChatDb::open(dir, &tokio_handle)?;
+            let root = db.root().to_owned();
+            (Some((db, saved)), root)
+        }
+        None => (None, chat_db::ephemeral_root()),
+    };
+    let ephemeral_root = chat_db.is_none().then(|| scratch_root.clone());
+    let sandboxes = Arc::new(sandbox::Sandboxes::new(scratch_root, command_environment()));
+    let mut chat_db = chat_db;
 
     gpui_platform::application()
         .with_assets(Assets)
@@ -890,6 +896,7 @@ pub fn run() -> anyhow::Result<()> {
                     Cowork {
                         sidebar_open: true,
                         recents_open: true,
+                        recents_shown: sidebar::RECENTS_PAGE,
                         new_thread_draft,
                         attachment_errors: Vec::new(),
                         pending_attachments: Vec::new(),
@@ -900,8 +907,7 @@ pub fn run() -> anyhow::Result<()> {
                         timeline_selection: Default::default(),
                         timeline_focus_handle: cx.focus_handle(),
                         follow_generation: true,
-                        thread_store,
-                        active_thread_id: None,
+                        thread_store: thread_store.clone(),
                         selection_message_id: None,
                         segment_text_views: HashMap::new(),
                         shown_segments: HashMap::new(),
@@ -928,8 +934,8 @@ pub fn run() -> anyhow::Result<()> {
                         agents: HashMap::new(),
                         deleted: Default::default(),
                         profile_statistics: None,
-                        statistics_file: None,
-                        thread_files: None,
+                        saved_chat_search: Default::default(),
+                        chat_db: None,
                         scheduler: Default::default(),
                         activity_range: ActivityRange::default(),
                         local_participant_id,
@@ -938,26 +944,30 @@ pub fn run() -> anyhow::Result<()> {
                         caret_label_refresh: None,
                         working_refresh: None,
                         new_thread_model: None,
-                        settings_file: None,
                         new_thread_project_folders: Vec::new(),
                         new_thread_project_mode: ProjectMode::default(),
                         new_thread_project: None,
-                        projects: projects::Projects::load(projects_file.take()),
+                        projects: Default::default(),
                         model_picker,
                         models: Arc::default(),
                         picker_rows: None,
+                        idle_clock: Default::default(),
                         _model_picker_subscription: model_picker_subscription,
                         _window_activation_subscription: window_activation_subscription,
+                        _thread_store_subscription: Cowork::subscribe_thread_store(
+                            &thread_store,
+                            window,
+                            cx,
+                        ),
                     }
                 });
                 let window_handle = window.window_handle();
                 cowork.update(cx, |cowork, cx| {
-                    if let Some((files, saved)) = thread_files.take() {
-                        cowork.start_thread_files(files, saved, cx);
+                    if let Some((db, saved)) = chat_db.take() {
+                        cowork.start_chat_db(db, saved, cx);
                     }
-                    cowork.start_statistics(statistics_file.take());
-                    cowork.start_settings(settings_file.take(), cx);
-                    cowork.start_scheduler(schedule_file.take(), Some(window_handle), cx);
+                    cowork.start_scheduler(Some(window_handle), cx);
+                    cowork.start_unload_sweep(cx);
                     cowork.open_start_stage(window, cx);
                 });
                 cx.new(|cx| Root::new(cowork, window, cx))
@@ -967,6 +977,18 @@ pub fn run() -> anyhow::Result<()> {
                 return;
             }
 
+            if let Some(root) = ephemeral_root.clone() {
+                // An ephemeral instance's scratch folders are for this run only.
+                cx.on_app_quit(move |_| {
+                    if let Err(error) = std::fs::remove_dir_all(&root)
+                        && error.kind() != std::io::ErrorKind::NotFound
+                    {
+                        eprintln!("could not remove {}: {error}", root.display());
+                    }
+                    async {}
+                })
+                .detach();
+            }
             cx.set_quit_mode(QuitMode::LastWindowClosed);
             cx.activate(true);
         });

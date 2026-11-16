@@ -195,10 +195,7 @@ impl Fixture {
             let messages = timeline(history, response, cx);
             let thread = cx
                 .new(|_| test_thread(thread_id, messages, ThreadDraft::new(ParticipantId::new())));
-            let store = cx.new(|_| ThreadStore {
-                threads: std::collections::VecDeque::from([thread.clone()]),
-                ..Default::default()
-            });
+            let store = cx.new(|_| ThreadStore::with_recents([thread.clone()]));
             let cowork = cx.new(|cx| test_cowork(store, Some(thread_id), runtime, window, cx));
             cowork.update(cx, |cowork, _| {
                 cowork.sidebar_open = false;

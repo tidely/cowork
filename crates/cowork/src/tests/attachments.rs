@@ -13,7 +13,7 @@ fn thread_draft_attachments(
         let thread = cowork
             .thread_store
             .read(cx)
-            .thread(thread_id, cx)
+            .loaded(thread_id, cx)
             .expect("thread")
             .read(cx);
         draft_attachments(thread.draft())
@@ -39,7 +39,9 @@ fn attachments_land_on_their_thread_after_switching_away(cx: &mut gpui::TestAppC
             cx,
         );
         assert!(cowork.draft_is_loading_attachments(draft_id, cx));
-        cowork.active_thread_id = None;
+        cowork
+            .thread_store
+            .update(cx, |store, _| store.clear_active());
     });
     cx.run_until_parked();
     std::fs::remove_file(&path).expect("remove test attachment");

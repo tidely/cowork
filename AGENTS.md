@@ -14,6 +14,7 @@ Every module starts with a `//!` doc saying what it owns; read it before changin
 | Sidebar projects | `docs/projects.md` |
 | Scheduled tasks | `docs/schedule.md` |
 | Timeline virtualization and performance | `docs/timeline-performance.md` |
+| Saved chats in SQLite, lazy loading, unloading, palette search | `docs/sqlite-storage.md` |
 
 ## Project structure
 
@@ -22,7 +23,8 @@ Every module starts with a `//!` doc saying what it owns; read it before changin
   - Sharing: `protocol.rs`, `sharing.rs`, `participant.rs`, `profile.rs`, `peer_access.rs`.
   - Agent runs: `submission.rs`, `generation.rs`, `tool_approval.rs`, `prompt.rs`; prompts in `prompts/`.
   - UI: `composer*.rs`, `draft_editing.rs`, `timeline_*.rs`, `turn_navigation.rs`, `sidebar.rs`, `settings.rs`, `provider_setup.rs`, `welcome.rs`, …
-  - Persistence: `thread_files.rs`, `settings_file.rs`, `statistics.rs`, `projects.rs`, `scheduler.rs` (all under `~/.cowork/`).
+  - Persistence: everything is in one SQLite database, `~/.cowork/cowork.db`, through `chat_db.rs` (chats; schema in `migrations/`) and `chat_db/app_state.rs` (projects, settings, deleted chats' statistics, scheduled tasks). What uses that state: `projects.rs`, `saved_settings.rs`, `statistics.rs`, `scheduler.rs`.
+  - Lazy chats: `chat_store.rs` (each chat unloaded, loading, or loaded), `chat_meta.rs`, `unload.rs`.
   - Dev previews: `component_preview.rs`, `share_preview.rs`, and `examples/`.
 - `crates/draft` — the collaborative draft as a Yrs CRDT plus `verify_change`. No GPUI or networking dependencies; keep it that way.
 - `crates/agent` — the agent stack, re-exporting `agent-runtime`, `language-model` (`agent::model`), `tool-runtime` (`agent::tool`), and the provider clients in `crates/providers/*`. Cowork depends only on `agent`.
@@ -59,7 +61,7 @@ There is no CI: run fmt, clippy, and the tests before finishing. Use `uv` for Py
 ## Making changes
 
 - **Protocol**: bump `PROTOCOL_VERSION` (`protocol.rs`) on any change to wire messages, model identifier semantics, or the agent records that travel. Never change the encoding of `CollaboratorMessage::Join` or `HostMessage::Rejected` (`version_handshake_encoding_is_stable` checks it). No other backward compatibility is needed.
-- **Saved files** (threads, statistics, schedules) have their own `FILE_VERSION`s, independent of the protocol; bump one on an incompatible format change. Files of another version are left untouched, so convert old ones or accept losing them.
+- **Saved state** (chats, projects, settings, statistics, schedules) is in SQLite, independent of the protocol: change its schema with a new migration in `crates/cowork/migrations/`, never by editing an applied one.
 - **GPUI pins**: `gpui`/`gpui_platform` match the snapshot gpui-kit (`gpui-component`) pins; upgrade them together.
 - Update the relevant `docs/` file when behavior it describes changes.
 

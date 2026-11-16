@@ -64,8 +64,8 @@ pub(crate) struct JoinDialog {
 impl Cowork {
     pub(crate) fn prepare_thread_for_sharing(&mut self, cx: &mut Context<Self>) -> Entity<Thread> {
         if let Some(thread) = self
-            .active_thread_id
-            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
+            .active_thread_id(cx)
+            .and_then(|thread_id| self.thread_store.read(cx).loaded(thread_id, cx))
         {
             return thread;
         }
@@ -82,9 +82,8 @@ impl Cowork {
             cx,
         );
         self.move_project_into(&thread, cx);
-        self.active_thread_id = Some(thread.read(cx).instance_id);
-        self.thread_store.update(cx, |store, _| {
-            store.threads.push_front(thread.clone());
+        self.thread_store.update(cx, |store, cx| {
+            store.push_front_active(thread.clone(), cx);
         });
         self.profile_statistics = None;
         thread
@@ -119,7 +118,7 @@ impl Cowork {
             };
             let deleted = this
                 .read_with(cx, |this, cx| {
-                    this.thread_store.read(cx).thread(thread_id, cx).is_none()
+                    this.thread_store.read(cx).loaded(thread_id, cx).is_none()
                 })
                 .unwrap_or(true);
             if deleted {
@@ -577,10 +576,10 @@ impl Cowork {
     }
 
     pub(crate) fn copy_endpoint_id(&mut self, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.active_thread_id else {
+        let Some(thread_id) = self.active_thread_id(cx) else {
             return;
         };
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+        let Some(thread) = self.thread_store.read(cx).loaded(thread_id, cx) else {
             return;
         };
         let endpoint_id = {
@@ -885,10 +884,9 @@ impl Cowork {
             )
         });
         let thread_id = thread.read(cx).instance_id;
-        self.thread_store.update(cx, |store, _| {
-            store.threads.push_front(thread.clone());
+        self.thread_store.update(cx, |store, cx| {
+            store.push_front_active(thread.clone(), cx);
         });
-        self.active_thread_id = Some(thread_id);
         self.selection_message_id = None;
         self.main_stage = MainStage::Thread;
         self.follow_generation = true;
@@ -939,19 +937,18 @@ impl Cowork {
     /// Closes a joined thread, which has nothing left to show once it is no
     /// longer connected to its host.
     fn remove_mirrored_thread(&mut self, thread_id: Uuid, cx: &mut Context<Self>) {
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+        let Some(thread) = self.thread_store.read(cx).loaded(thread_id, cx) else {
             return;
         };
         if !thread.read(cx).ownership.remove_on_disconnect() {
             return;
         }
         self.thread_store.update(cx, |store, cx| {
-            store
-                .threads
-                .retain(|thread| thread.read(cx).instance_id != thread_id);
+            store.remove(thread_id, cx);
         });
-        if self.active_thread_id == Some(thread_id) {
-            self.active_thread_id = None;
+        if self.active_thread_id(cx) == Some(thread_id) {
+            self.thread_store
+                .update(cx, |store, _| store.clear_active());
             self.selection_message_id = None;
         }
         cx.notify();

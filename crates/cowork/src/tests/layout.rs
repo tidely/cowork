@@ -41,8 +41,10 @@ fn inline_compaction_status_becomes_persistent_dividers(cx: &mut gpui::TestAppCo
             });
             cowork
                 .thread_store
-                .update(cx, |store, _| store.threads.push_back(thread));
-            cowork.active_thread_id = Some(thread_id);
+                .update(cx, |store, cx| store.push_back_loaded(thread, cx));
+            cowork
+                .thread_store
+                .update(cx, |store, cx| assert!(store.activate(thread_id, cx)));
             cx.notify();
         });
     });
@@ -315,10 +317,7 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
                 ThreadDraft::new(ParticipantId::new()),
             )
         });
-        let thread_store = cx.new(|_| ThreadStore {
-            threads: VecDeque::from([thread]),
-            ..Default::default()
-        });
+        let thread_store = cx.new(|cx| ThreadStore::with_recents([thread], cx));
         Root::new(
             cx.new(|cx| {
                 test_cowork(
@@ -389,7 +388,7 @@ fn agent_work_opens_under_its_summary_with_each_step_on_its_own(cx: &mut gpui::T
     assert!(cx.debug_bounds(second_details).is_some());
     let expanded = |cx: &mut gpui::VisualTestContext| {
         cowork.read_with(cx, |cowork, cx| {
-            let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
+            let thread = cowork.thread_store.read(cx).loaded(thread_id, cx).unwrap();
             let TimelineMessage::Agent(message) = &thread.read(cx).timeline[0] else {
                 panic!("expected the agent message");
             };
@@ -438,10 +437,7 @@ fn selected_user_message_text_copies(cx: &mut gpui::TestAppContext) {
         )];
         let thread =
             cx.new(|_| test_thread(thread_id, timeline, ThreadDraft::new(ParticipantId::new())));
-        let thread_store = cx.new(|_| ThreadStore {
-            threads: VecDeque::from([thread]),
-            ..Default::default()
-        });
+        let thread_store = cx.new(|cx| ThreadStore::with_recents([thread], cx));
         Root::new(
             cx.new(|cx| {
                 test_cowork(
@@ -620,10 +616,7 @@ fn participants_sit_beside_the_right_aligned_thread_menu_without_an_extra_access
         thread.apply_for_test(joined(ParticipantId::new()), cx);
         thread.apply_for_test(joined(ParticipantId::new()), cx);
         let thread = cx.new(|_| thread);
-        let thread_store = cx.new(|_| ThreadStore {
-            threads: VecDeque::from([thread]),
-            ..Default::default()
-        });
+        let thread_store = cx.new(|cx| ThreadStore::with_recents([thread], cx));
         let cowork =
             cx.new(|cx| test_cowork(thread_store, Some(thread_id), tokio_handle, window, cx));
         Root::new(cowork, window, cx)

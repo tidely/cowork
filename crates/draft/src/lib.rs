@@ -156,7 +156,14 @@ impl Draft {
 
     /// Appends a prompt block. `body` may be empty.
     pub fn create_prompt(&self, creator: Uuid, body: &str) -> ItemId {
-        let id = ItemId::new();
+        self.create_prompt_with_id(ItemId::new(), creator, body)
+    }
+
+    /// [`Draft::create_prompt`] with an id of the caller's choosing, as a
+    /// peer editing the document directly could. Only for tests of what a
+    /// host must refuse.
+    #[doc(hidden)]
+    pub fn create_prompt_with_id(&self, id: ItemId, creator: Uuid, body: &str) -> ItemId {
         let mut txn = self.doc.transact_mut();
         let item = self.insert_item(&mut txn, id, KIND_PROMPT, creator, body);
         item.insert(&mut txn, ATTACHMENTS, ArrayPrelim::default());

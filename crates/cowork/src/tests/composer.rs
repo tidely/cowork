@@ -496,8 +496,10 @@ fn generation_button_prioritizes_steering_and_shift_shortcut_queues(cx: &mut gpu
         thread.update(cx, |thread, cx| thread.set_generating_for_test(true, cx));
         cowork
             .thread_store
-            .update(cx, |store, _| store.threads.push_front(thread));
-        cowork.active_thread_id = Some(id);
+            .update(cx, |store, cx| store.push_front(thread, cx));
+        cowork
+            .thread_store
+            .update(cx, |store, cx| assert!(store.activate(id, cx)));
         cowork.focus_composer(window, cx);
         cx.notify();
     });
@@ -563,8 +565,10 @@ fn cancel_tooltip_disappears_with_its_sent_message(cx: &mut gpui::TestAppContext
         thread.update(cx, |thread, cx| thread.set_generating_for_test(true, cx));
         cowork
             .thread_store
-            .update(cx, |store, _| store.threads.push_front(thread.clone()));
-        cowork.active_thread_id = Some(thread.read(cx).instance_id);
+            .update(cx, |store, cx| store.push_front(thread.clone(), cx));
+        cowork.thread_store.update(cx, |store, cx| {
+            assert!(store.activate(thread.read(cx).instance_id, cx))
+        });
         assert!(cowork.accept_submission(
             thread.read(cx).draft().id,
             Some(thread.clone()),
@@ -616,8 +620,10 @@ fn idle_pending_messages_show_resume_until_a_new_draft_is_written(cx: &mut gpui:
         thread.update(cx, |thread, cx| thread.set_generating_for_test(true, cx));
         cowork
             .thread_store
-            .update(cx, |store, _| store.threads.push_front(thread.clone()));
-        cowork.active_thread_id = Some(id);
+            .update(cx, |store, cx| store.push_front(thread.clone(), cx));
+        cowork
+            .thread_store
+            .update(cx, |store, cx| assert!(store.activate(id, cx)));
         assert!(cowork.accept_submission(
             thread.read(cx).draft().id,
             Some(thread.clone()),

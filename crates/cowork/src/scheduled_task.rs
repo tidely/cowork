@@ -264,7 +264,7 @@ pub(crate) fn ordinal(day: u32) -> String {
     format!("{day}{suffix}")
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ThreadMode {
     /// Every run starts a fresh thread containing only the prompt.
     NewEachRun,
@@ -281,7 +281,7 @@ impl ThreadMode {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MissedRuns {
     /// One catch-up run for the most recent missed occurrence.
     RunOnce,
@@ -289,7 +289,7 @@ pub(crate) enum MissedRuns {
 }
 
 /// What the user sets in a task's dialog.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TaskSettings {
     pub(crate) title: String,
     pub(crate) prompt: String,
@@ -300,9 +300,7 @@ pub(crate) struct TaskSettings {
     /// The folders on this machine each run's thread has as its project, in
     /// order. Every run gives its thread exactly these, so an edit applies
     /// from the next run, like the model.
-    #[serde(default)]
     pub(crate) folders: Vec<PathBuf>,
-    #[serde(default)]
     pub(crate) project_mode: ProjectMode,
 }
 
@@ -317,7 +315,7 @@ impl TaskSettings {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Trigger {
     Scheduled,
     /// For the most recent occurrence missed while the app was closed or
@@ -329,13 +327,13 @@ pub(crate) enum Trigger {
 
 /// A run waiting its turn in the queue. Waiting isn't missing, however
 /// long it takes.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct QueuedRun {
     pub(crate) scheduled_for: NaiveDateTime,
     pub(crate) trigger: Trigger,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SkipReason {
     /// Due while the app was closed or the computer asleep.
     Missed,
@@ -345,7 +343,7 @@ pub(crate) enum SkipReason {
     Paused,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RunResult {
     Running,
     Completed,
@@ -360,7 +358,7 @@ pub(crate) enum RunResult {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RunRecord {
     pub(crate) id: Uuid,
     pub(crate) scheduled_for: NaiveDateTime,
@@ -388,7 +386,7 @@ impl RunRecord {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ScheduledTask {
     pub(crate) id: Uuid,
     settings: TaskSettings,
@@ -404,8 +402,20 @@ pub(crate) struct ScheduledTask {
     history: Vec<RunRecord>,
     /// The next occurrence after `checked_until`, kept so that neither each
     /// look at the clock nor each frame evaluates the schedule.
-    #[serde(skip)]
     next_due: Option<NaiveDateTime>,
+}
+
+/// A task as it is saved (`chat_db`), without what is derived from it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SavedTask {
+    pub(crate) id: Uuid,
+    pub(crate) settings: TaskSettings,
+    pub(crate) active: bool,
+    pub(crate) checked_until: NaiveDateTime,
+    pub(crate) thread_id: Option<Uuid>,
+    pub(crate) queued: Option<QueuedRun>,
+    /// Oldest first.
+    pub(crate) history: Vec<RunRecord>,
 }
 
 impl ScheduledTask {
@@ -425,16 +435,48 @@ impl ScheduledTask {
         task
     }
 
-    /// Finishes a task read from disk: a run that was going on when Cowork
-    /// quit didn't finish.
-    pub(crate) fn loaded(mut self) -> Self {
-        for record in &mut self.history {
+    /// A task as it was saved: a run that was going on when Cowork quit
+    /// didn't finish.
+    pub(crate) fn loaded(saved: SavedTask) -> Self {
+        let SavedTask {
+            id,
+            settings,
+            active,
+            checked_until,
+            thread_id,
+            queued,
+            mut history,
+        } = saved;
+        for record in &mut history {
             if record.result == RunResult::Running {
                 record.result = RunResult::Interrupted;
             }
         }
-        self.refresh();
-        self
+        let mut task = Self {
+            id,
+            settings,
+            active,
+            checked_until,
+            thread_id,
+            queued,
+            history,
+            next_due: None,
+        };
+        task.refresh();
+        task
+    }
+
+    /// What is saved of the task: all but what is derived.
+    pub(crate) fn to_saved(&self) -> SavedTask {
+        SavedTask {
+            id: self.id,
+            settings: self.settings.clone(),
+            active: self.active,
+            checked_until: self.checked_until,
+            thread_id: self.thread_id,
+            queued: self.queued,
+            history: self.history.clone(),
+        }
     }
 
     fn refresh(&mut self) {
@@ -654,15 +696,8 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn tasks_saved_before_projects_load_without_one() {
-        let mut saved =
-            serde_json::to_value(settings(When::Daily(time(9, 0)), MissedRuns::RunOnce)).unwrap();
-        let fields = saved.as_object_mut().unwrap();
-        fields.remove("folders");
-        fields.remove("project_mode");
-        let loaded: TaskSettings = serde_json::from_value(saved).unwrap();
-        assert!(loaded.folders.is_empty());
-        assert_eq!(loaded.project_mode, ProjectMode::Read);
+    fn a_task_without_folders_misses_none() {
+        let loaded = settings(When::Daily(time(9, 0)), MissedRuns::RunOnce);
         assert_eq!(loaded.missing_folder(), None);
 
         let gone = TaskSettings {
@@ -1028,10 +1063,7 @@ pub(crate) mod tests {
         }
         assert_eq!(task.history().len(), MAX_HISTORY);
 
-        let saved = serde_json::to_string(&task).unwrap();
-        let loaded = serde_json::from_str::<ScheduledTask>(&saved)
-            .unwrap()
-            .loaded();
+        let loaded = ScheduledTask::loaded(task.to_saved());
         assert!(
             loaded
                 .history()

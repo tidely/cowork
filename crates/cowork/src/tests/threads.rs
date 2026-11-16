@@ -631,7 +631,9 @@ fn membership_events_are_idempotent_and_uncatalogued_models_cannot_run(
 /// Only the host saves a thread: one joined from someone else is theirs.
 #[gpui::test]
 fn only_the_users_own_threads_are_saved(cx: &mut gpui::TestAppContext) {
-    let runtime = tokio::runtime::Builder::new_current_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
         .build()
         .expect("test runtime");
     let (cowork, local_id, cx) = attachment_test_cowork(cx, runtime.handle().clone());
@@ -641,21 +643,21 @@ fn only_the_users_own_threads_are_saved(cx: &mut gpui::TestAppContext) {
         let joined = cx.new(|cx| Thread::join_for_test(local.read(cx).welcome_for_test(), cx));
         cowork
             .thread_store
-            .update(cx, |store, _| store.threads.push_back(joined));
-        let (files, saved) = crate::thread_files::ThreadFiles::open(Some(root.clone())).unwrap();
-        assert!(saved.is_empty());
-        cowork.thread_files = Some(files);
+            .update(cx, |store, cx| store.push_back_loaded(joined, cx));
+        let (db, saved) = crate::chat_db::ChatDb::open(root.clone(), runtime.handle()).unwrap();
+        assert!(saved.chats.is_empty());
+        cowork.chat_db = Some(db);
         cowork.save_all_threads(cx);
-        cowork.thread_files.as_ref().unwrap().quit()
+        cowork.chat_db.take().unwrap().quit()
     });
-    futures::executor::block_on(finished).unwrap();
-    let saved = std::fs::read_dir(&root)
-        .unwrap()
-        .flatten()
-        .filter(|entry| entry.path().is_dir())
-        .map(|entry| entry.file_name().into_string().unwrap())
+    futures::executor::block_on(finished);
+    let (_db, saved) = crate::chat_db::ChatDb::open(root.clone(), runtime.handle()).unwrap();
+    let saved = saved
+        .chats
+        .iter()
+        .map(|row| row.meta.id)
         .collect::<Vec<_>>();
-    assert_eq!(saved, [local_id.to_string()]);
+    assert_eq!(saved, [local_id]);
     _ = std::fs::remove_dir_all(root);
 }
 
@@ -754,7 +756,7 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
         // Joined chats are not the user's own.
         cowork
             .thread_store
-            .update(cx, |store, _| store.threads.push_back(joined.clone()));
+            .update(cx, |store, cx| store.push_back_loaded(joined.clone(), cx));
         assert_eq!(cowork.total_chats(cx), 1);
     });
 }

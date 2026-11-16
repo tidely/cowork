@@ -124,10 +124,12 @@ impl Fixture {
                 .new(|_| test_thread(thread_id, messages, ThreadDraft::new(ParticipantId::new())));
             cowork.update(cx, |cowork, cx| {
                 cowork.thread_store.update(cx, |store, cx| {
-                    store.threads.push_front(thread.clone());
+                    store.push_front(thread.clone(), cx);
                     cx.notify();
                 });
-                cowork.active_thread_id = Some(thread_id);
+                cowork
+                    .thread_store
+                    .update(cx, |store, cx| assert!(store.activate(thread_id, cx)));
                 cowork.sidebar_open = false;
                 cowork.follow_generation = false;
                 cowork
@@ -861,8 +863,10 @@ fn hover_cards_close_on_escape_and_stay_with_their_thread(cx: &mut gpui::TestApp
         });
         cowork
             .thread_store
-            .update(cx, |store, _| store.threads.push_front(thread));
-        cowork.active_thread_id = Some(other);
+            .update(cx, |store, cx| store.push_front(thread, cx));
+        cowork
+            .thread_store
+            .update(cx, |store, cx| assert!(store.activate(other, cx)));
         cx.notify();
     });
     settle(cx);

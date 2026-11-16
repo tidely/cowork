@@ -23,6 +23,11 @@ use gpui_component::{
 use gpui_kit_assets::IconName as AssetIconName;
 use uuid::Uuid;
 
+/// How many Recents rows are added at a time, as the list is scrolled.
+pub(crate) const RECENTS_PAGE: usize = 20;
+
+use crate::chat_store::{ChatStoreEvent, ListedChat, Opened};
+use crate::thread::ThreadStore;
 use crate::{
     Cowork, MainStage,
     project_folders::add_folders,
@@ -32,6 +37,7 @@ use crate::{
     thread_draft::ThreadDraft,
     top_bar::TOP_BAR_HEIGHT,
 };
+use gpui::{Entity, Subscription};
 
 pub(crate) const SIDEBAR_WIDTH: gpui::Pixels = px(300.);
 
@@ -455,7 +461,12 @@ pub(crate) struct CoworkSidebarSection {
     pub(crate) open: bool,
     on_label_click: Option<ClickHandler>,
     label_action: Option<SidebarEntry>,
+    /// While some of its rows are not drawn yet: shows more once the end
+    /// of the drawn ones scrolls into view.
+    on_reveal_end: Option<RevealHandler>,
 }
+
+type RevealHandler = Rc<dyn Fn(&mut Window, &mut App)>;
 
 impl CoworkSidebarSection {
     pub(crate) fn new(label: Option<impl Into<SharedString>>, menu: Vec<SidebarEntry>) -> Self {
@@ -474,7 +485,13 @@ impl CoworkSidebarSection {
             open: true,
             on_label_click: None,
             label_action: None,
+            on_reveal_end: None,
         }
+    }
+
+    fn on_reveal_end(mut self, on_reveal: Option<RevealHandler>) -> Self {
+        self.on_reveal_end = on_reveal;
+        self
     }
 
     fn label_toggle(
@@ -592,7 +609,23 @@ impl SidebarItem for CoworkSidebarSection {
                         .children(menu.into_iter().map(|entry| entry.render(cx))),
                 ),
                 SectionItems::Threads(threads) => this
-                    .child(v_flex().children(threads.into_iter().map(|thread| thread.render(cx)))),
+                    .child(v_flex().children(threads.into_iter().map(|thread| thread.render(cx))))
+                    .when_some(self.on_reveal_end, |this, on_reveal| {
+                        // Drawn after the last row: once it is inside the
+                        // sidebar's visible area, more rows are shown.
+                        this.child(
+                            gpui::canvas(
+                                move |bounds, window, cx| {
+                                    if window.content_mask().bounds.intersects(&bounds) {
+                                        window.defer(cx, move |window, cx| on_reveal(window, cx));
+                                    }
+                                },
+                                |_, _, _, _| {},
+                            )
+                            .w_full()
+                            .h(px(1.)),
+                        )
+                    }),
                 SectionItems::Projects(projects) => this.child(
                     v_flex().children(projects.into_iter().map(|project| project.render(cx))),
                 ),
@@ -607,15 +640,37 @@ impl Cowork {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.thread_store.read(cx).thread(thread_id, cx).is_none() {
-            return;
+        let models = self.models.clone();
+        let opened = self
+            .thread_store
+            .update(cx, |store, cx| store.open(thread_id, models, cx));
+        match opened {
+            Opened::Active => self.show_active_thread(window, cx),
+            // Shown once loaded; see `ChatStoreEvent::Activated`.
+            Opened::Loading => cx.notify(),
+            Opened::Missing => {}
         }
+    }
 
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+    /// Shows a chat opened while unloaded once it has loaded, and starts a
+    /// scheduled run that waited for its chat to load.
+    pub(crate) fn subscribe_thread_store(
+        store: &Entity<ThreadStore>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Subscription {
+        cx.subscribe_in(store, window, |this, _, event, window, cx| match event {
+            ChatStoreEvent::Activated => this.show_active_thread(window, cx),
+            ChatStoreEvent::Loaded => this.run_next_scheduled(crate::scheduler::now(), cx),
+        })
+    }
+
+    /// Shows the active chat, as opening it does.
+    pub(crate) fn show_active_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(thread) = self.active_thread(cx) else {
             return;
         };
         let can_write = thread.read(cx).can_edit_draft();
-        self.active_thread_id = Some(thread_id);
         self.selection_message_id = None;
         self.main_stage = MainStage::Thread;
         self.follow_generation = true;
@@ -700,23 +755,22 @@ impl Cowork {
 
         let store = self.thread_store.read(cx);
         let members = store
-            .threads
-            .iter()
-            .chain(&store.archived)
-            .filter(|thread| thread.read(cx).project() == Some(project))
-            .cloned()
+            .all(cx)
+            .filter(|chat| chat.project(cx) == Some(project))
+            .map(|chat| chat.id(cx))
             .collect::<Vec<_>>();
-        for thread in &members {
-            thread.update(cx, |thread, _| thread.set_project(None));
-            // A running chat is saved when its run ends.
-            self.save_thread(thread, cx);
+        // Their saved rows were unfiled with the project's.
+        for id in members {
+            self.thread_store
+                .update(cx, |store, cx| store.set_project(id, None, cx));
         }
         cx.notify();
     }
 
     fn show_new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.new_thread_draft = ThreadDraft::new(self.local_participant_id);
-        self.active_thread_id = None;
+        self.thread_store
+            .update(cx, |store, _| store.clear_active());
         self.selection_message_id = None;
         self.main_stage = MainStage::Thread;
         self.focus_composer(window, cx);
@@ -738,8 +792,26 @@ impl Cowork {
             .iter()
             .map(|record| (record.id, Vec::new()))
             .collect::<Vec<_>>();
-        for thread in &self.thread_store.read(cx).threads {
-            let thread = thread.read(cx);
+        for chat in self.thread_store.read(cx).recents(cx) {
+            let thread = match chat {
+                ListedChat::Loaded(thread) => thread.read(cx),
+                // Saved chats are the user's own and not shared.
+                ListedChat::Unloaded(meta) => {
+                    let summary = ThreadSummary {
+                        id: meta.id,
+                        title: meta.title.clone(),
+                    };
+                    let entry = (meta.id, summary, true);
+                    match meta
+                        .project
+                        .and_then(|project| projects.iter_mut().find(|(id, _)| *id == project))
+                    {
+                        Some((_, chats)) => chats.push((meta.last_run_at, entry)),
+                        None => groups.recents.push(entry),
+                    }
+                    continue;
+                }
+            };
             let entry = (thread.instance_id, thread.summary.clone(), thread.is_host());
             match thread.sharing {
                 ThreadSharing::Sharing | ThreadSharing::Shared { .. } => groups.hosting.push(entry),
@@ -794,7 +866,7 @@ impl Cowork {
             thread_id,
             title: thread.title.clone().into(),
             active: self.main_stage == MainStage::Thread
-                && self.active_thread_id == Some(thread_id),
+                && self.active_thread_id(cx) == Some(thread_id),
             indented,
             on_open: Rc::new(move |window, cx| {
                 _ = open.update(cx, |this, cx| this.open_thread(thread_id, window, cx));
@@ -932,10 +1004,29 @@ impl Cowork {
                 this.open_create_project_dialog(window, cx);
             }),
         ));
+        // A page of Recents at a time, and the active chat wherever it is.
+        let active = self.active_thread_id(cx);
+        let shown = groups
+            .recents
+            .iter()
+            .position(|(id, ..)| Some(*id) == active)
+            .map_or(self.recents_shown, |index| {
+                self.recents_shown.max(index + 1)
+            })
+            .min(groups.recents.len());
         let recents = CoworkSidebarSection::threads(
             "Recents",
-            self.sidebar_thread_rows(&groups.recents, false, cx),
+            self.sidebar_thread_rows(&groups.recents[..shown], false, cx),
         )
+        .on_reveal_end((shown < groups.recents.len()).then(|| -> RevealHandler {
+            let cowork = cx.weak_entity();
+            Rc::new(move |_, cx| {
+                _ = cowork.update(cx, |this, cx| {
+                    this.recents_shown = shown + RECENTS_PAGE;
+                    cx.notify();
+                });
+            })
+        }))
         .label_toggle(
             self.recents_open,
             cx.listener(|this, _, _, cx| {

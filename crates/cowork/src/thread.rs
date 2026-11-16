@@ -2,7 +2,7 @@
 //! step with the host by applying the same events on every participant.
 
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -19,6 +19,7 @@ mod permissions;
 pub(crate) mod sharing;
 #[path = "submission.rs"]
 pub(crate) mod submission;
+mod unload;
 pub(crate) use onboarding::OnboardingIntro;
 pub(crate) use permissions::{
     ApproveTools, ChangeModel, ControlGeneration, DenialReason, EditDraft, ManageAccess, PeerMode,
@@ -26,7 +27,7 @@ pub(crate) use permissions::{
 };
 
 use self::draft::{DraftEditorState, ThreadDraft};
-use gpui::{App, AppContext, Entity, SharedString};
+use gpui::{AppContext, SharedString};
 use iroh::{Endpoint, endpoint::Connection};
 use itertools::Itertools;
 use tokio::sync::broadcast;
@@ -1011,7 +1012,18 @@ impl Thread {
         self.draft.doc.apply_update(&update)?;
         self.publish(protocol::HostMessage::DraftUpdate(update));
         self.draft.doc.validate()?;
-        ::draft::verify_change(&before, &self.draft.doc.items(), author.as_uuid())?;
+        let after = self.draft.doc.items();
+        ::draft::verify_change(&before, &after, author.as_uuid())?;
+        // A submitted block or comment keeps its draft item's id, and a
+        // saved chat is keyed by it, so no new item may bring one back.
+        let submitted = self.submitted_item_ids();
+        anyhow::ensure!(
+            after
+                .iter()
+                .filter(|item| !before.iter().any(|old| old.id == item.id))
+                .all(|item| !submitted.contains(&item.id.as_uuid())),
+            "a new draft item reuses a submitted one's id"
+        );
 
         // The host keeps only the bytes of files still attached; submitted
         // ones leave the draft through the host's own submission instead.
@@ -1036,6 +1048,23 @@ impl Thread {
             self.store_upload(author, id)?;
         }
         Ok(())
+    }
+
+    /// The ids of every block and comment submitted so far, pending ones
+    /// included: each was a draft item's.
+    fn submitted_item_ids(&self) -> std::collections::HashSet<Uuid> {
+        let mut ids = std::collections::HashSet::new();
+        for message in &self.timeline {
+            if let TimelineMessage::User(message) = message {
+                ids.extend(message.record.blocks.iter().map(|block| block.id));
+                ids.extend(message.record.comments.iter().map(|comment| comment.id));
+            }
+        }
+        for pending in &self.pending {
+            ids.extend(pending.group.blocks.iter().map(|block| block.id));
+            ids.extend(pending.group.comments.iter().map(|comment| comment.id));
+        }
+        ids
     }
 
     /// Takes a piece of a file a collaborator is uploading.
@@ -1915,32 +1944,9 @@ impl protocol::ThreadSnapshot {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct ThreadStore {
-    pub(crate) threads: VecDeque<Entity<Thread>>,
-    /// The user's own threads put away in the archive, most recently
-    /// archived first. They do nothing there: no run, no sharing, no
-    /// sandbox. Lookups by id don't find them until they are restored.
-    pub(crate) archived: VecDeque<Entity<Thread>>,
-}
+pub(crate) use crate::chat_store::ThreadStore;
 
 #[cfg(test)]
 mod review_tests;
 #[cfg(test)]
 mod tests;
-
-impl ThreadStore {
-    pub(crate) fn thread(&self, thread_id: Uuid, cx: &App) -> Option<Entity<Thread>> {
-        self.threads
-            .iter()
-            .find(|thread| thread.read(cx).instance_id == thread_id)
-            .cloned()
-    }
-
-    pub(crate) fn archived_thread(&self, thread_id: Uuid, cx: &App) -> Option<Entity<Thread>> {
-        self.archived
-            .iter()
-            .find(|thread| thread.read(cx).instance_id == thread_id)
-            .cloned()
-    }
-}
