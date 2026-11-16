@@ -33,7 +33,7 @@ fn add_thread(cowork: &Entity<Cowork>, seconds: u64, cx: &mut gpui::VisualTestCo
         });
         cowork
             .thread_store
-            .update(cx, |store, _| store.threads.push_front(thread));
+            .update(cx, |store, cx| store.push_front(thread, cx));
         cx.notify();
         thread_id
     })
@@ -89,7 +89,7 @@ fn add_project_thread(
 ) -> Uuid {
     let thread_id = add_thread(cowork, 1, cx);
     cowork.update(cx, |cowork, cx| {
-        let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
+        let thread = cowork.thread_store.read(cx).loaded(thread_id, cx).unwrap();
         thread.update(cx, |thread, _| {
             thread.set_project(project);
             for message in &mut thread.timeline {
@@ -142,13 +142,7 @@ fn open_archive_settings(cowork: &Entity<Cowork>, cx: &mut gpui::VisualTestConte
 fn thread_ids(cowork: &Entity<Cowork>, cx: &mut gpui::VisualTestContext) -> (Vec<Uuid>, Vec<Uuid>) {
     cowork.read_with(cx, |cowork, cx| {
         let store = cowork.thread_store.read(cx);
-        let ids = |threads: &VecDeque<Entity<Thread>>| {
-            threads
-                .iter()
-                .map(|thread| thread.read(cx).instance_id)
-                .collect()
-        };
-        (ids(&store.threads), ids(&store.archived))
+        (store.recent_ids(cx), store.archived_ids(cx))
     })
 }
 
@@ -169,33 +163,36 @@ fn archive_from_sidebar(thread_id: Uuid, cx: &mut gpui::VisualTestContext) {
 #[gpui::test]
 fn deleted_threads_still_count_after_a_restart(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
-    let dir = std::env::temp_dir().join(format!("cowork-statistics-{}", Uuid::new_v4()));
-    let path = dir.join("statistics.json");
-    cowork.update(cx, |cowork, _| cowork.start_statistics(Some(path.clone())));
+    // The database answers from a Tokio thread.
+    cx.executor().allow_parking();
+    let (test_db, db) = crate::chat_db::TestDb::open();
+    cowork.update(cx, |cowork, _| cowork.chat_db = Some(db));
     let kept = add_thread(&cowork, 20, cx);
     let deleted = add_thread(&cowork, 90, cx);
     cowork.update(cx, |cowork, cx| {
         for (thread_id, tokens) in [(kept, 10), (deleted, 100)] {
-            let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
+            let thread = cowork.thread_store.read(cx).loaded(thread_id, cx).unwrap();
             let usage = Usage {
                 total_tokens: Some(tokens),
                 ..Usage::default()
             };
             cowork.record_turn_usage(&thread, usage, SystemTime::now(), Duration::ZERO, cx);
         }
-        let thread = cowork.thread_store.read(cx).thread(deleted, cx).unwrap();
-        cowork.thread_store.update(cx, |store, _| {
-            store.threads.retain(|other| *other != thread);
-            store.archived.push_front(thread);
+        let thread = cowork.thread_store.read(cx).loaded(deleted, cx).unwrap();
+        cowork.thread_store.update(cx, |store, cx| {
+            store.remove(deleted, cx);
+            store.push_front_archived(thread, cx);
         });
         cowork.delete_archived_thread(deleted, cx);
     });
 
-    // The kept thread is read back with its folder; the deleted one's
-    // statistics come from the file.
+    // The kept thread is still in memory; the deleted one's statistics
+    // come from the database.
     cowork.update(cx, |cowork, _| {
-        cowork.deleted = Default::default();
-        cowork.start_statistics(Some(path.clone()));
+        futures::executor::block_on(cowork.chat_db.take().unwrap().quit());
+        let (db, saved) = test_db.reopen();
+        cowork.deleted = saved.state.deleted;
+        futures::executor::block_on(db.quit());
     });
     cowork.read_with(cx, |cowork, cx| {
         assert_eq!(cowork.tokens_used(cx), 110);
@@ -203,8 +200,6 @@ fn deleted_threads_still_count_after_a_restart(cx: &mut gpui::TestAppContext) {
         assert_eq!(cowork.total_chats(cx), 2);
         assert_eq!(cowork.longest_chat(cx), Duration::from_secs(90));
     });
-
-    _ = std::fs::remove_dir_all(dir);
 }
 
 #[gpui::test]
@@ -212,7 +207,7 @@ fn a_long_title_is_cut_off_inside_its_row(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
     let thread_id = add_thread(&cowork, 1, cx);
     cowork.update(cx, |cowork, cx| {
-        let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
+        let thread = cowork.thread_store.read(cx).loaded(thread_id, cx).unwrap();
         let title = Cowork::thread_title(&"a very long first prompt ".repeat(10));
         thread.update(cx, |thread, _| thread.summary.title = title);
         cx.notify();
@@ -247,8 +242,8 @@ fn recents_compose_only_appears_on_header_hover_and_starts_a_chat(cx: &mut gpui:
 
     hover("sidebar-section-Recents", cx);
     click("sidebar-section-action-Recents", cx);
-    cowork.read_with(cx, |cowork, _| {
-        assert_eq!(cowork.active_thread_id, None);
+    cowork.read_with(cx, |cowork, cx| {
+        assert_eq!(cowork.active_thread_id(cx), None);
         assert_eq!(cowork.main_stage, MainStage::Thread);
         assert!(cowork.recents_open, "composing must not collapse Recents");
     });
@@ -274,8 +269,8 @@ fn the_archive_button_only_takes_clicks_while_its_row_is_hovered(cx: &mut gpui::
     draw(cx);
 
     assert_eq!(thread_ids(&cowork, cx), (vec![thread_id], vec![]));
-    cowork.read_with(cx, |cowork, _| {
-        assert_eq!(cowork.active_thread_id, Some(thread_id));
+    cowork.read_with(cx, |cowork, cx| {
+        assert_eq!(cowork.active_thread_id(cx), Some(thread_id));
     });
 }
 
@@ -357,7 +352,7 @@ fn archived_threads_are_restored_or_deleted_from_the_archive(cx: &mut gpui::Test
     let open = add_thread(&cowork, 5, cx);
     cx.update(|window, cx| {
         cowork.update(cx, |cowork, cx| {
-            let thread = cowork.thread_store.read(cx).thread(deleted, cx).unwrap();
+            let thread = cowork.thread_store.read(cx).loaded(deleted, cx).unwrap();
             let usage = Usage {
                 total_tokens: Some(100),
                 ..Usage::default()
@@ -370,7 +365,9 @@ fn archived_threads_are_restored_or_deleted_from_the_archive(cx: &mut gpui::Test
     archive_from_sidebar(restored, cx);
     archive_from_sidebar(deleted, cx);
     // Archiving the open thread closes it.
-    cowork.read_with(cx, |cowork, _| assert_eq!(cowork.active_thread_id, None));
+    cowork.read_with(cx, |cowork, cx| {
+        assert_eq!(cowork.active_thread_id(cx), None)
+    });
 
     assert!(cx.debug_bounds("archived-threads").is_none());
     open_archive_settings(&cowork, cx);
@@ -415,14 +412,14 @@ fn archived_threads_are_restored_or_deleted_from_the_archive(cx: &mut gpui::Test
 
     // Back to app returns to the thread stage and its sidebar.
     click("settings-back", cx);
-    cowork.read_with(cx, |cowork, _| {
+    cowork.read_with(cx, |cowork, cx| {
         assert_eq!(cowork.main_stage, MainStage::Thread);
-        assert_eq!(cowork.active_thread_id, None);
+        assert_eq!(cowork.active_thread_id(cx), None);
     });
     click(selector("sidebar-thread", open), cx);
-    cowork.read_with(cx, |cowork, _| {
+    cowork.read_with(cx, |cowork, cx| {
         assert_eq!(cowork.main_stage, MainStage::Thread);
-        assert_eq!(cowork.active_thread_id, Some(open));
+        assert_eq!(cowork.active_thread_id(cx), Some(open));
     });
 }
 
@@ -506,8 +503,8 @@ fn a_project_is_created_in_the_dialog_without_starting_a_chat(cx: &mut gpui::Tes
             cowork.projects.shown_chats(record.id),
             Some(SHOWN_CHATS_STEP)
         );
-        assert!(cowork.thread_store.read(cx).threads.is_empty());
-        assert_eq!(cowork.active_thread_id, None);
+        assert!(cowork.thread_store.read(cx).recent_ids(cx).is_empty());
+        assert_eq!(cowork.active_thread_id(cx), None);
     });
 }
 
@@ -529,9 +526,9 @@ fn composing_in_a_project_files_the_new_chat_under_it(cx: &mut gpui::TestAppCont
     hover(row, cx);
     assert!(!drawn("sidebar-section-action-Projects", cx));
     click(compose, cx);
-    cowork.read_with(cx, |cowork, _| {
+    cowork.read_with(cx, |cowork, cx| {
         assert_eq!(cowork.new_thread_project, Some(project));
-        assert_eq!(cowork.active_thread_id, None);
+        assert_eq!(cowork.active_thread_id(cx), None);
         assert_eq!(cowork.projects.shown_chats(project), Some(SHOWN_CHATS_STEP));
     });
 
@@ -589,7 +586,7 @@ fn project_chats_leave_while_shared_or_archived_and_come_back(cx: &mut gpui::Tes
     cowork.update(cx, |cowork, cx| {
         cowork
             .thread_store
-            .update(cx, |store, _| store.threads.rotate_left(1));
+            .update(cx, |store, _| store.rotate_recents(1));
     });
     assert_eq!(
         project_groups(&cowork, cx),
@@ -597,7 +594,7 @@ fn project_chats_leave_while_shared_or_archived_and_come_back(cx: &mut gpui::Tes
     );
 
     let thread = cowork.read_with(cx, |cowork, cx| {
-        cowork.thread_store.read(cx).thread(newer, cx).unwrap()
+        cowork.thread_store.read(cx).loaded(newer, cx).unwrap()
     });
     thread.update(cx, |thread, _| thread.sharing = ThreadSharing::Sharing);
     assert_eq!(project_groups(&cowork, cx).0, [(project, vec![older])]);
@@ -698,4 +695,54 @@ fn a_project_shows_five_more_chats_at_a_time(cx: &mut gpui::TestAppContext) {
     click("sidebar-section-Projects", cx);
     assert!(drawn(row, cx));
     assert_eq!(shown(cx), 0);
+}
+
+/// Recents draws a page of rows, and more as its end scrolls into view,
+/// never every chat at once.
+#[gpui::test]
+fn recents_draws_more_rows_as_it_is_scrolled(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let ids: Vec<Uuid> = cowork.update(cx, |cowork, cx| {
+        let store = cowork.thread_store.clone();
+        let ids = (0..200).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        store.update(cx, |store, cx| {
+            for (n, id) in ids.iter().enumerate() {
+                let meta = crate::chat_meta::ChatMeta {
+                    id: *id,
+                    title: format!("Chat {n}"),
+                    project: None,
+                    tokens_used: 0,
+                    generation_time: Duration::ZERO,
+                    last_run_at: None,
+                    token_activity: Vec::new(),
+                };
+                store.push_unloaded(meta, false, cx);
+            }
+        });
+        cx.notify();
+        ids
+    });
+    let drawn_rows = |cx: &mut gpui::VisualTestContext| {
+        for _ in 0..4 {
+            draw(cx);
+        }
+        ids.iter()
+            .filter(|id| drawn(selector("sidebar-thread", **id), cx))
+            .count()
+    };
+    let first = drawn_rows(cx);
+    assert!(
+        (crate::sidebar::RECENTS_PAGE..ids.len()).contains(&first),
+        "{first} rows drawn"
+    );
+    cx.simulate_event(gpui::ScrollEvent {
+        position: point(px(100.), px(400.)),
+        delta: gpui::ScrollDelta::Pixels(point(px(0.), px(-2000.))),
+        ..Default::default()
+    });
+    let scrolled = drawn_rows(cx);
+    assert!(
+        first < scrolled && scrolled < ids.len(),
+        "{first} rows, then {scrolled}"
+    );
 }

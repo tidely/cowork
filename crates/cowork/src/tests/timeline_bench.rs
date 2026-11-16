@@ -564,10 +564,7 @@ fn timeline_bench() {
                     let thread = cx.new(|_| {
                         test_thread(thread_id, messages, ThreadDraft::new(ParticipantId::new()))
                     });
-                    let store = cx.new(|_| ThreadStore {
-                        threads: std::collections::VecDeque::from([thread.clone()]),
-                        ..Default::default()
-                    });
+                    let store = cx.new(|cx| ThreadStore::with_recents([thread.clone()], cx));
                     let cowork = cx.new(|cx| {
                         test_cowork(store, Some(thread_id), runtime.handle().clone(), window, cx)
                     });

@@ -422,8 +422,7 @@ impl Cowork {
     fn draft_thread(&self, draft_id: Uuid, cx: &App) -> Option<Entity<Thread>> {
         self.thread_store
             .read(cx)
-            .threads
-            .iter()
+            .loaded_recents(cx)
             .find(|thread| thread.read(cx).draft().id == draft_id)
             .cloned()
     }
@@ -685,7 +684,9 @@ mod tests {
             });
             // The active composer is still writable. Only the captured
             // destination's policy may decide where this completion lands.
-            cowork.active_thread_id = None;
+            cowork
+                .thread_store
+                .update(cx, |store, _| store.clear_active());
             assert!(cowork.writable_draft_id(cx).is_some());
         });
         app.set_mode(PeerMode::ReadOnly);

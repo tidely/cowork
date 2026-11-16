@@ -23,8 +23,8 @@ fn context_window_changes_update_local_and_archived_threads(cx: &mut gpui::TestA
             Some(ollama_qwen()),
             cx,
         );
-        cowork.thread_store.update(cx, |store, _| {
-            store.archived.push_front(archived.clone());
+        cowork.thread_store.update(cx, |store, cx| {
+            store.push_front_archived(archived.clone(), cx);
         });
         cowork.set_context_settings(
             crate::context_settings::ContextSettings {
@@ -283,7 +283,7 @@ fn provider_setup_starts_onboarding_with_the_selected_model(cx: &mut gpui::TestA
     cowork.read_with(cx, |cowork, cx| {
         let thread = cowork.active_thread(cx).unwrap();
         let thread = thread.read(cx);
-        assert_eq!(cowork.thread_store.read(cx).threads.len(), 1);
+        assert_eq!(cowork.thread_store.read(cx).recent_ids(cx).len(), 1);
         assert!(cowork.agents.contains_key(&thread.instance_id));
         assert!(thread.is_generating());
         assert_eq!(thread.timeline.len(), 3);
@@ -340,11 +340,12 @@ fn provider_can_be_set_up_without_discovered_models(cx: &mut gpui::TestAppContex
 #[gpui::test]
 fn providers_settings_pick_the_new_chats_model(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
-    let dir = std::env::temp_dir().join(format!("cowork-settings-{}", Uuid::new_v4()));
-    let settings = dir.join("settings.json");
-    cowork.update(cx, |cowork, cx| {
+    // The database answers from a Tokio thread.
+    cx.executor().allow_parking();
+    let (test_db, db) = crate::chat_db::TestDb::open();
+    cowork.update(cx, |cowork, _| {
         cowork.new_thread_model = None;
-        cowork.start_settings(Some(settings.clone()), cx);
+        cowork.chat_db = Some(db);
     });
     cx.update(|window, cx| {
         cowork.update(cx, |cowork, cx| {
@@ -396,13 +397,15 @@ fn providers_settings_pick_the_new_chats_model(cx: &mut gpui::TestAppContext) {
     };
     cowork.update(cx, |cowork, cx| {
         cowork.set_context_settings(context, cx);
+        futures::executor::block_on(cowork.chat_db.take().unwrap().quit());
         cowork.context_settings = Default::default();
         cowork.new_thread_model = None;
-        cowork.start_settings(Some(settings.clone()), cx);
+        let (db, saved) = test_db.reopen();
+        cowork.start_settings(saved.state.settings, cx);
         assert_eq!(cowork.new_thread_model, Some(ollama_qwen()));
         assert_eq!(cowork.context_settings, context);
+        futures::executor::block_on(db.quit());
     });
-    _ = std::fs::remove_dir_all(dir);
 }
 
 /// Onboarding depends only on whether the user has threads; the model only
@@ -422,20 +425,20 @@ fn launch_onboards_only_users_without_threads(cx: &mut gpui::TestAppContext) {
         );
         cowork
             .thread_store
-            .update(cx, |store, _| store.archived.push_front(thread));
+            .update(cx, |store, cx| store.push_front_archived(thread, cx));
         cowork.new_thread_model = None;
         cowork.main_stage = MainStage::Welcome;
         cowork.open_start_stage(window, cx);
         assert_eq!(cowork.main_stage, MainStage::Thread);
         assert_eq!(cowork.stage_before_settings, MainStage::Thread);
-        assert!(cowork.active_thread_id.is_none());
+        assert!(cowork.active_thread_id(cx).is_none());
 
         // Without threads, as after deleting the onboarding chat, the welcome
         // screen waits for discovery (not driven here), then onboarding
         // starts with the selected model without choosing it again.
         cowork
             .thread_store
-            .update(cx, |store, _| store.archived.clear());
+            .update(cx, |store, _| store.clear_archived());
         cowork.new_thread_model = Some(ollama_qwen());
         cowork.open_start_stage(window, cx);
         assert_eq!(cowork.main_stage, MainStage::Welcome);
@@ -510,13 +513,17 @@ fn picked_models_apply_to_the_active_thread_and_new_threads(cx: &mut gpui::TestA
         assert_eq!(cowork.new_thread_model, Some(ollama_qwen()));
 
         // Without an active thread the picker shows the new thread model.
-        cowork.active_thread_id = None;
+        cowork
+            .thread_store
+            .update(cx, |store, _| store.clear_active());
         cowork.sync_model_picker(window, cx);
         assert_eq!(
             cowork.model_picker.read(cx).selected_value(),
             Some(ollama_qwen())
         );
-        cowork.active_thread_id = Some(thread_id);
+        cowork
+            .thread_store
+            .update(cx, |store, cx| assert!(store.activate(thread_id, cx)));
     });
 }
 
@@ -613,10 +620,12 @@ fn mirrored_picker_uses_host_catalog_and_restores_local_models(cx: &mut gpui::Te
             )
         });
         let mirror_id = mirror.read(cx).instance_id;
-        cowork.thread_store.update(cx, |store, _| {
-            store.threads.push_front(mirror.clone());
+        cowork.thread_store.update(cx, |store, cx| {
+            store.push_front(mirror.clone(), cx);
         });
-        cowork.active_thread_id = Some(mirror_id);
+        cowork
+            .thread_store
+            .update(cx, |store, cx| assert!(store.activate(mirror_id, cx)));
         cowork.sync_model_picker(window, cx);
         assert_eq!(picker_catalog(cowork), host_catalog);
         // Local discovery must not replace the host's catalog while joined.
@@ -652,10 +661,14 @@ fn mirrored_picker_uses_host_catalog_and_restores_local_models(cx: &mut gpui::Te
         cowork.sync_model_picker(window, cx);
         assert_eq!(picker_catalog(cowork), host_catalog);
 
-        cowork.active_thread_id = Some(local_id);
+        cowork
+            .thread_store
+            .update(cx, |store, cx| assert!(store.activate(local_id, cx)));
         cowork.sync_model_picker(window, cx);
         assert_eq!(picker_catalog(cowork), local_catalog);
-        cowork.active_thread_id = None;
+        cowork
+            .thread_store
+            .update(cx, |store, _| store.clear_active());
         cowork.sync_model_picker(window, cx);
         assert_eq!(picker_catalog(cowork), local_catalog);
     });

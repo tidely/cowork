@@ -29,6 +29,7 @@ use uuid::Uuid;
 
 use std::path::{Path, PathBuf};
 
+use crate::chat_store::Place;
 use crate::{
     Cowork, MainStage,
     models::ModelRef,
@@ -345,11 +346,11 @@ impl Cowork {
             let store = self.thread_store.read(cx);
             match last_thread {
                 None => (None, "No chat yet. The first run creates one."),
-                Some(id) if store.thread(id, cx).is_some() => (Some(id), "Open its chat"),
-                Some(id) if store.archived_thread(id, cx).is_some() => {
-                    (None, "Its chat is archived.")
-                }
-                Some(_) => (None, "Its chat was deleted."),
+                Some(id) => match store.listed(id, cx) {
+                    Some((Place::Recents(_), _)) => (Some(id), "Open its chat"),
+                    Some((Place::Archived(_), _)) => (None, "Its chat is archived."),
+                    None => (None, "Its chat was deleted."),
+                },
             }
         };
         // The buttons' icons have their own color, which would hide the
@@ -1245,7 +1246,8 @@ impl ScheduleEditor {
                 .map(|record| {
                     let open = record
                         .thread_id
-                        .is_some_and(|thread_id| store.thread(thread_id, cx).is_some());
+                        .and_then(|thread_id| store.listed(thread_id, cx))
+                        .is_some_and(|(place, _)| matches!(place, Place::Recents(_)));
                     (record.clone(), open)
                 })
                 .unzip()

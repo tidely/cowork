@@ -945,7 +945,7 @@ impl Cowork {
     /// Scrolls the active thread to turn `group`, and stops following a
     /// run's output there, as scrolling up by hand does.
     pub(crate) fn navigate_to_turn(&mut self, group: Uuid, cx: &mut Context<Self>) {
-        let Some(thread_id) = self.active_thread_id else {
+        let Some(thread_id) = self.active_thread_id(cx) else {
             return;
         };
         self.timeline_layout.borrow_mut().navigate(thread_id, group);

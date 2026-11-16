@@ -17,10 +17,11 @@ local presentation in separate fields; records and views share a lifetime while
 all history stays in memory. Only records cross the sharing boundary. Welcome
 snapshots carry the whole transcript as one `Json<TranscriptRecord>` value, its
 entries and compactions in the agent's versioned records, plus the run records
-and their pending previews. All history and local views remain
-in memory; there is no transcript offloading or history paging. The host saves
-its own threads at turn boundaries and reads them back when it starts, unless
-launched with `--ephemeral`. Normal launches require exclusive ownership of
+and their pending previews. A loaded thread keeps all its history and local views
+in memory; there is no transcript offloading or history paging within one.
+The host saves its own threads at turn boundaries, lists them by their rows
+when it starts, and loads each when opened, unless launched with
+`--ephemeral`. Normal launches require exclusive ownership of
 the saved state; see
 [Saved threads](#saved-threads).
 
@@ -881,40 +882,52 @@ host's app; a saved thread comes back with an empty one.
 
 ### Saved threads
 
-The host saves its own threads, archived ones included, each in a folder of
-its own, `~/.cowork/threads/<thread id>/`: `thread.json` (title, model,
-project folders and mode, the sidebar project it is filed under (local
-organization, never sent to collaborators; see `docs/projects.md`), the
-profiles and prompt names of everyone who took
-part, token usage, and the timeline's messages and run records),
-`messages.jsonl` (the transcript, one of the agent's versioned entry or
-compaction records per line, only appended to), `attachments/` (the bytes of
-the files its messages attach), and `scratch/` (its commands' scratch
-folder). `crates/cowork/src/thread_files.rs` has the format.
+The host saves its own threads, archived ones included, in one SQLite
+database, `~/.cowork/cowork.db` (`crates/cowork/src/chat_db.rs`; the
+schema is in `crates/cowork/migrations/`, the design and its reasons in
+`docs/sqlite-storage.md`). It holds each thread's row (title, model, project
+folders and mode, the sidebar project it is filed under, which is local
+organization never sent to collaborators; see `docs/projects.md`; token
+usage), the profiles and prompt names of everyone who took part, its timeline
+messages and run records, its transcript entries and compactions in the
+agent's versioned records, the bytes of the files its messages attach, and
+the text the search palette looks in. Each thread's commands' scratch folder
+stays on disk, in `~/.cowork/threads/<thread id>/scratch/`.
 
 - Only the host saves a thread. Collaborators save nothing of a thread they
   joined.
+- At startup only every thread's row is read; a thread loads whole when it is
+  opened or a scheduled task continues it, and goes back to its row after 5
+  idle minutes once everything it holds is confirmed saved. A shared thread
+  is always loaded: only the active thread can be shared, and peers get the
+  whole of it in `Welcome`.
 - A thread is saved at turn boundaries: when a run ends, when it is archived
-  or restored, and when the app quits. Never during a run, so every tool call
-  in a saved transcript has its result; a crash during a run loses what that
-  run did since the last save.
+  or restored, before it is unloaded, and when the app quits. Never during a
+  run, so every tool call in a saved transcript has its result; a crash
+  during a run loses what that run did since the last save.
+- The timeline, the transcript and attached files only grow, and a save
+  appends what is new in one transaction. It carries the extent it was built
+  from, which the database checks: a save after a failed one starts from what
+  is stored, and one holding less than is stored is refused.
 - The draft, pending submissions, sharing, and per-peer permissions are not
   saved. A thread comes back unshared, in the sidebar or archive where it
   was, with an empty draft and the profiles kept so earlier messages still
   name their authors.
 - Loading checks a saved thread as a collaborator checks a host's `Welcome`
-  snapshot: the files are converted to one in memory. The files have their
-  own format version, independent of `PROTOCOL_VERSION`; a file of another
-  version is neither read nor overwritten.
-- One app instance keeps the threads, holding `~/.cowork/threads/.lock`.
+  snapshot: the rows are converted to one in memory. The schema has its own
+  migrations, independent of `PROTOCOL_VERSION`; a database a newer app
+  migrated fails to open. Chats saved by the earlier JSON format are not
+  read.
+- One app instance keeps the threads, holding `~/.cowork/.lock`.
   Another normal launch exits with an already-running error before loading
   saved state. There is no automatic activation of the first instance.
   `--ephemeral` opens an independent instance without reading or writing
-  `~/.cowork` or acquiring its lock: threads, statistics, schedules, and
-  projects are not persisted. Scratch files use a unique temporary folder removed on
-  orderly shutdown (a crash may leave it behind). Ephemeral mode does not
-  restrict otherwise permitted agent changes to project files.
-- Deleting a thread from the archive removes its folder.
+  `~/.cowork` or acquiring its lock: threads, settings, statistics, schedules, and
+  projects are not persisted, and no thread is unloaded. Scratch files use a
+  unique temporary folder removed on orderly shutdown (a crash may leave it
+  behind). Ephemeral mode does not restrict otherwise permitted agent changes
+  to project files.
+- Deleting a thread from the archive removes its rows and its folder.
 
 ## Document layout
 

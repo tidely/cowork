@@ -121,8 +121,8 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) {
         let generating = self
-            .active_thread_id
-            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
+            .active_thread_id(cx)
+            .and_then(|thread_id| self.thread_store.read(cx).loaded(thread_id, cx))
             .is_some_and(|thread| thread.read(cx).is_generating());
         let empty = self.active_thread(cx).is_none_or(|thread| {
             thread
@@ -418,11 +418,10 @@ impl Cowork {
             self.move_project_into(&thread, cx);
             thread.update(cx, |thread, cx| thread.name_in_prompts(prompt_names, cx));
             let thread_id = thread.read(cx).instance_id;
-            self.thread_store.update(cx, |store, _| {
-                store.threads.push_front(thread.clone());
+            self.thread_store.update(cx, |store, cx| {
+                store.push_front_active(thread.clone(), cx);
             });
             self.profile_statistics = None;
-            self.active_thread_id = Some(thread_id);
             thread_id
         };
 
@@ -473,7 +472,7 @@ impl Cowork {
         id: Uuid,
         cx: &mut Context<Self>,
     ) {
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+        let Some(thread) = self.thread_store.read(cx).loaded(thread_id, cx) else {
             return;
         };
         let actor = thread.read(cx).participant_id();
@@ -537,7 +536,7 @@ impl Cowork {
             || self
                 .thread_store
                 .read(cx)
-                .thread(state.instance_id, cx)
+                .loaded(state.instance_id, cx)
                 .is_none()
         {
             return;

@@ -7,6 +7,15 @@
 //!
 //! The palette does its own matching instead of `Command`'s substring
 //! filter; see [`PaletteQuery`].
+//!
+//! Titles, and the text of loaded chats (joined ones included), are matched
+//! in memory as the query is typed. The text of chats that aren't loaded is
+//! in the database, searched on Tokio for each query ([`SavedChatSearch`]):
+//! its rows join the group when the search answers, after the rows matched
+//! by title, so nothing under the pointer moves. The database only narrows;
+//! every text it returns is matched by [`PaletteQuery`] like any other, so
+//! matching is the same either way. Its index needs three characters, so a
+//! shorter query matches unloaded chats by title only.
 
 use std::{cell::Cell, cmp::Reverse, iter, ops::Range, rc::Rc};
 
@@ -27,11 +36,25 @@ use nucleo_matcher::{
 use unicode_segmentation::UnicodeSegmentation as _;
 use uuid::Uuid;
 
+use crate::chat_store::ListedChat;
 use crate::{
     Cowork,
+    chat_db::SearchHit,
     thread::ThreadSharing,
     timeline::{AgentMessage, TimelineMessage},
 };
+
+/// What the database found in unloaded chats' text for the latest query.
+#[derive(Default)]
+pub(crate) struct SavedChatSearch {
+    /// The query, trimmed, that `found` and `searching` are for.
+    phrase: String,
+    /// The texts found, per chat, in each chat's order.
+    found: std::collections::HashMap<Uuid, Vec<String>>,
+    /// The search under way. Replacing it drops it, so an older query's
+    /// answer is never applied.
+    searching: Option<gpui::Task<()>>,
+}
 
 /// How many chars of a message an excerpt shows before the match. Enough to
 /// read the match in context; the row cuts off whatever follows.
@@ -274,14 +297,24 @@ fn push_on_one_line(line: &mut String, text: &str) {
 /// What the palette searches in a chat besides its title: what people asked,
 /// and what the agent finally replied, without its work along the way.
 fn searchable_texts(timeline: &[TimelineMessage]) -> impl Iterator<Item = &str> {
-    timeline.iter().flat_map(|message| match message {
+    timeline.iter().flat_map(message_texts)
+}
+
+/// [`searchable_texts`] of one message, as a saved chat's search index
+/// keeps them (`chat_db.rs`).
+pub(crate) fn message_search_texts(message: &TimelineMessage) -> Vec<&str> {
+    message_texts(message).collect()
+}
+
+fn message_texts(message: &TimelineMessage) -> impl Iterator<Item = &str> {
+    match message {
         TimelineMessage::User(group) => {
             Either::Left(group.record.blocks.iter().map(|block| block.text.as_str()))
         }
         TimelineMessage::Agent(AgentMessage { ui, .. }) => {
             Either::Right(iter::once(ui.output.text.as_str()))
         }
-    })
+    }
 }
 
 /// `text` with `ranges` drawn in `highlight`.
@@ -373,14 +406,28 @@ impl Cowork {
     /// to show them. Categories with no matches are left out, so that
     /// section indices line up with the groups shown.
     pub(crate) fn search_palette_sections(&self, query: &str, cx: &App) -> Vec<PaletteSection> {
+        let phrase = query.trim();
         let mut query = PaletteQuery::new(query);
         let chats = self
             .thread_store
             .read(cx)
-            .threads
-            .iter()
-            .filter_map(|thread| {
-                let thread = thread.read(cx);
+            .recents(cx)
+            .filter_map(|chat| {
+                let thread = match chat {
+                    ListedChat::Loaded(thread) => thread.read(cx),
+                    // Its text is searched in the database, asynchronously.
+                    ListedChat::Unloaded(meta) => {
+                        let found = (self.saved_chat_search.phrase == phrase)
+                            .then(|| self.saved_chat_search.found.get(&meta.id))
+                            .flatten();
+                        return query.row(
+                            PaletteTarget::Chat(meta.id),
+                            meta.title.clone().into(),
+                            None,
+                            found.into_iter().flatten().map(String::as_str),
+                        );
+                    }
+                };
                 query.row(
                     PaletteTarget::Chat(thread.instance_id),
                     thread.summary.title.clone().into(),
@@ -406,6 +453,7 @@ impl Cowork {
 
         // A fresh state per opening, so it starts with an empty query.
         let state = cx.new(|cx| CommandState::new(window, cx));
+        self.saved_chat_search = SavedChatSearch::default();
         let cowork = cx.entity().downgrade();
         let focus_on_mount = Rc::new(Cell::new(true));
         window.open_dialog(cx, move |dialog, _, cx| {
@@ -452,7 +500,15 @@ impl Cowork {
                         })
                         // The rows are ranked while the dialog renders, so a
                         // new query needs a new render to take effect.
-                        .on_query(|_, window, _| window.refresh())
+                        .on_query({
+                            let cowork = cowork.clone();
+                            move |query, window, cx| {
+                                _ = cowork.update(cx, |cowork, cx| {
+                                    cowork.search_saved_chats(query, window, cx)
+                                });
+                                window.refresh();
+                            }
+                        })
                         .on_confirm(move |index, window, cx| {
                             let Some(target) = target_at(&confirm_sections, index) else {
                                 return;
@@ -469,6 +525,48 @@ impl Cowork {
                     )
                 })
         });
+    }
+
+    /// Starts searching unloaded chats' saved text for `query`, unless that
+    /// search is already done or under way. Its answer refreshes the palette.
+    pub(crate) fn search_saved_chats(
+        &mut self,
+        query: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let phrase = query.trim();
+        if self.saved_chat_search.phrase == phrase {
+            return;
+        }
+        self.saved_chat_search = SavedChatSearch {
+            phrase: phrase.to_owned(),
+            ..SavedChatSearch::default()
+        };
+        let Some(db) = &self.chat_db else {
+            return;
+        };
+        let search = db.search(phrase);
+        let phrase = phrase.to_owned();
+        self.saved_chat_search.searching = Some(cx.spawn_in(window, async move |this, cx| {
+            let hits = match search.await {
+                Ok(hits) => hits,
+                Err(error) => {
+                    eprintln!("could not search saved chats: {error:#}");
+                    return;
+                }
+            };
+            _ = this.update_in(cx, |this, window, _| {
+                let search = &mut this.saved_chat_search;
+                if search.phrase != phrase {
+                    return;
+                }
+                for SearchHit { thread_id, text } in hits {
+                    search.found.entry(thread_id).or_default().push(text);
+                }
+                window.refresh();
+            });
+        }));
     }
 
     fn open_palette_target(

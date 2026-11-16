@@ -15,6 +15,7 @@ use gpui_component::{
     tooltip::Tooltip,
 };
 
+use crate::chat_store::ListedChat;
 use crate::{
     Cowork, assets,
     context_settings::{context_details, context_ring},
@@ -222,9 +223,8 @@ impl Cowork {
         let store = self.thread_store.read(cx);
         // Archived threads too, as a scheduled run may bring one back.
         let threads = store
-            .threads
-            .iter()
-            .chain(&store.archived)
+            .all(cx)
+            .filter_map(ListedChat::loaded)
             .cloned()
             .collect::<Vec<_>>();
         for thread in threads {

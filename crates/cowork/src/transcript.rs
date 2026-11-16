@@ -71,8 +71,8 @@ pub(crate) struct TranscriptIndex(pub(crate) u64);
 /// The conversation of a thread's agent session, and where each of its
 /// compactions was accepted, so a run's output can show it in place.
 ///
-/// All entries remain resident. A saved thread keeps them as
-/// [`TranscriptLine`]s; see `thread_files.rs`.
+/// All entries remain resident. A saved chat keeps them as rows; see
+/// `chat_db.rs`.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Transcript {
     conversation: Conversation<RunSource>,
@@ -188,30 +188,8 @@ impl Json<TranscriptRecord> {
     /// compaction as they were checked when they were first applied.
     pub(crate) fn to_transcript(&self) -> anyhow::Result<Transcript> {
         let record = self.parse().context("invalid transcript from host")?;
-        let mut transcript = Transcript::default();
-        let mut entries = record.entries.iter();
-        for (at, compaction) in &record.compactions {
-            while (transcript.len() as u64) < *at {
-                let entry = entries.next().context("compaction past the transcript")?;
-                transcript.commit(transcript.len() as u64, entry.decode()?)?;
-            }
-            transcript.compact(compaction.decode()?)?;
-        }
-        for entry in entries {
-            transcript.commit(transcript.len() as u64, entry.decode()?)?;
-        }
-        Ok(transcript)
+        Transcript::from_records(record.entries, record.compactions)
     }
-}
-
-/// A transcript record as a saved thread keeps it, one per line of its
-/// message log in the order they were accepted, so the log only grows.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum TranscriptLine {
-    Entry(StoredEntry),
-    /// Accepted with as many entries as the lines before it hold.
-    Compaction(StoredCompaction),
 }
 
 /// How much of a transcript is saved: its first `entries` entries and
@@ -222,6 +200,13 @@ pub(crate) struct TranscriptExtent {
     pub(crate) compactions: usize,
 }
 
+impl TranscriptExtent {
+    /// Whether `self` holds no more than `other` of either.
+    pub(crate) fn within(self, other: Self) -> bool {
+        self.entries <= other.entries && self.compactions <= other.compactions
+    }
+}
+
 impl Transcript {
     pub(crate) fn extent(&self) -> TranscriptExtent {
         TranscriptExtent {
@@ -230,35 +215,53 @@ impl Transcript {
         }
     }
 
-    /// The records after `saved`, in the order they were accepted: a
-    /// compaction accepted with `n` entries follows the `n`th entry.
-    pub(crate) fn lines_after(&self, saved: TranscriptExtent) -> Vec<TranscriptLine> {
-        let entry_line = |index: usize| {
-            TranscriptLine::Entry(
-                StoredEntry::encode(&self.entries()[index]).expect("committed entries encode"),
-            )
-        };
-        let mut lines = Vec::new();
-        let mut next = saved.entries;
-        let compactions = self.conversation.compactions();
-        for (index, at) in self.compacted_at.iter().enumerate().skip(saved.compactions) {
-            lines.extend((next..*at).map(entry_line));
-            next = next.max(*at);
-            lines.push(TranscriptLine::Compaction(
-                StoredCompaction::encode(&compactions[index]).expect("accepted summaries encode"),
-            ));
-        }
-        lines.extend((next..self.len()).map(entry_line));
-        lines
+    /// The entries after `saved.entries`, and the compactions after
+    /// `saved.compactions`, each after the number of entries it was
+    /// accepted at.
+    pub(crate) fn records_after(
+        &self,
+        saved: TranscriptExtent,
+    ) -> (Vec<StoredEntry>, Vec<(u64, StoredCompaction)>) {
+        let entries = self.entries()[saved.entries.min(self.len())..]
+            .iter()
+            .map(|entry| StoredEntry::encode(entry).expect("committed entries encode"))
+            .collect();
+        let compactions = self
+            .conversation
+            .compactions()
+            .iter()
+            .zip(&self.compacted_at)
+            .skip(saved.compactions)
+            .map(|(compaction, at)| {
+                (
+                    *at as u64,
+                    StoredCompaction::encode(compaction).expect("accepted summaries encode"),
+                )
+            })
+            .collect();
+        (entries, compactions)
     }
 
-    /// Adds the record after the ones applied so far, checking it as it was
-    /// checked when it was first accepted.
-    pub(crate) fn apply_line(&mut self, line: &TranscriptLine) -> anyhow::Result<()> {
-        match line {
-            TranscriptLine::Entry(entry) => self.commit(self.len() as u64, entry.decode()?),
-            TranscriptLine::Compaction(compaction) => self.compact(compaction.decode()?),
+    /// A transcript from its records, checking every entry and compaction
+    /// as they were checked when they were first applied. A compaction is
+    /// applied once as many entries as it was accepted at are.
+    pub(crate) fn from_records(
+        entries: impl IntoIterator<Item = StoredEntry>,
+        compactions: impl IntoIterator<Item = (u64, StoredCompaction)>,
+    ) -> anyhow::Result<Self> {
+        let mut transcript = Transcript::default();
+        let mut entries = entries.into_iter();
+        for (at, compaction) in compactions {
+            while (transcript.len() as u64) < at {
+                let entry = entries.next().context("compaction past the transcript")?;
+                transcript.commit(transcript.len() as u64, entry.decode()?)?;
+            }
+            transcript.compact(compaction.decode()?)?;
         }
+        for entry in entries {
+            transcript.commit(transcript.len() as u64, entry.decode()?)?;
+        }
+        Ok(transcript)
     }
 }
 

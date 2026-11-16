@@ -93,6 +93,15 @@ rrule = "0.14"
 schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Saved chats, in one SQLite database; see `docs/sqlite-storage.md`.
+sqlx = { version = "0.9", default-features = false, features = [
+    "sqlite",
+    "runtime-tokio",
+    "chrono",
+    "uuid",
+    "migrate",
+    "macros",
+] }
 # Turns a file's old and new text into the unified patch `gpui_component::diff` shows.
 similar = "2.7"
 syntect = { version = "5.3", default-features = false, features = [

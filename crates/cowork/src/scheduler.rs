@@ -1,5 +1,6 @@
 //! Running scheduled tasks: looking at the clock, the queue that runs them
-//! one at a time, submitting each run's prompt, and saving tasks to disk.
+//! one at a time, submitting each run's prompt, and saving tasks (in the
+//! chats' database, `chat_db/app_state.rs`).
 //! See `docs/schedule.md`; the policy for each task's occurrences is in
 //! `scheduled_task.rs`.
 //!
@@ -8,18 +9,15 @@
 //! time they were due, ties going to the task created first, and the next
 //! starts once the agent run of the last one ends.
 
-use std::{
-    borrow::Cow,
-    path::{Path, PathBuf},
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use chrono::{Local, NaiveDateTime};
 use gpui::{AnyWindowHandle, App, Context, Entity, Task};
 use gpui_component::{WindowExt as _, notification::Notification};
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::chat_db::StateSaver;
+use crate::chat_store::{ListedChat, Place};
 use crate::{
     Cowork, protocol,
     scheduled_task::{RunResult, ScheduledTask, TaskSettings, ThreadMode},
@@ -35,16 +33,6 @@ const TICK: Duration = Duration::from_secs(15);
 /// How often to ask for models again while runs wait for them, as when
 /// Ollama isn't running yet.
 const MODEL_RETRY: Duration = Duration::from_secs(60);
-
-/// The saved file's format. Older or newer files aren't read, nor
-/// overwritten until a task changes.
-const FILE_VERSION: u32 = 1;
-
-#[derive(Serialize, Deserialize)]
-struct ScheduleFile<'a> {
-    version: u32,
-    tasks: Cow<'a, [ScheduledTask]>,
-}
 
 /// The run going on now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -74,6 +62,8 @@ pub(crate) enum TaskStatus {
 /// Why the next run can't start yet.
 enum Blocked {
     Thread,
+    /// The chat it continues is loading, or must be loaded first.
+    Loading(Uuid),
     Models,
 }
 
@@ -82,8 +72,9 @@ pub(crate) struct Scheduler {
     /// In the order they were created, which breaks ties in the queue.
     pub(crate) tasks: Vec<ScheduledTask>,
     pub(crate) run: Option<ScheduledRun>,
-    /// Where tasks are saved; `None` keeps them in memory, as in tests.
-    file: Option<PathBuf>,
+    /// Saves the tasks; `None` keeps them in memory, as in tests and
+    /// ephemeral launches.
+    saver: Option<StateSaver>,
     /// Shows notifications; `None` in tests.
     window: Option<AnyWindowHandle>,
     last_model_request: Option<Instant>,
@@ -121,99 +112,32 @@ impl Scheduler {
             .collect()
     }
 
+    /// Takes up the saved `tasks`, saving them with `saver` from now on.
+    pub(crate) fn start_saving(&mut self, tasks: Vec<ScheduledTask>, saver: StateSaver) {
+        self.tasks = tasks;
+        self.saver = Some(saver);
+    }
+
+    /// Saves every task as it is now. Called on every change: there are
+    /// few, each with a bounded history.
     fn save(&self) {
-        let Some(path) = &self.file else {
-            return;
-        };
-        let file = ScheduleFile {
-            version: FILE_VERSION,
-            tasks: Cow::Borrowed(&self.tasks),
-        };
-        if let Err(error) = save_tasks(path, &file) {
-            eprintln!(
-                "could not save scheduled tasks to {}: {error:#}",
-                path.display()
-            );
+        if let Some(saver) = &self.saver {
+            saver.save_tasks(&self.tasks);
         }
     }
 }
 
-/// Where tasks are saved: next to Cowork's other files.
-pub(crate) fn schedule_file() -> Option<PathBuf> {
-    Some(std::env::home_dir()?.join(".cowork").join("schedules.json"))
-}
-
-/// Writes `file` whole, replacing the old one only once the new one is
-/// written, so a crash never leaves half a file. Small and only written when
-/// a task changes, so it is written in place of waiting on another thread.
-fn save_tasks(path: &Path, file: &ScheduleFile) -> anyhow::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_vec_pretty(file)?)?;
-    std::fs::rename(&temporary, path)?;
-    Ok(())
-}
-
-/// Reads the saved tasks. A file that can't be read is moved aside rather
-/// than overwritten by the next save.
-pub(crate) fn load_tasks(path: &Path) -> Vec<ScheduledTask> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(error) => {
-            eprintln!(
-                "could not read scheduled tasks from {}: {error}",
-                path.display()
-            );
-            return Vec::new();
-        }
-    };
-    match serde_json::from_slice::<ScheduleFile>(&bytes) {
-        Ok(file) if file.version == FILE_VERSION => file
-            .tasks
-            .into_owned()
-            .into_iter()
-            .map(ScheduledTask::loaded)
-            .collect(),
-        result => {
-            let aside = path.with_extension("json.unreadable");
-            match result {
-                Ok(file) => eprintln!(
-                    "scheduled tasks in {} are format {}, not {FILE_VERSION}; moved to {}",
-                    path.display(),
-                    file.version,
-                    aside.display()
-                ),
-                Err(error) => eprintln!(
-                    "could not read scheduled tasks from {}: {error}; moved to {}",
-                    path.display(),
-                    aside.display()
-                ),
-            }
-            _ = std::fs::rename(path, aside);
-            Vec::new()
-        }
-    }
-}
-
-fn now() -> NaiveDateTime {
+pub(crate) fn now() -> NaiveDateTime {
     Local::now().naive_local()
 }
 
 impl Cowork {
-    /// Loads the saved tasks and starts looking at the clock.
+    /// Starts looking at the clock, for the tasks taken up so far.
     pub(crate) fn start_scheduler(
         &mut self,
-        file: Option<PathBuf>,
         window: Option<AnyWindowHandle>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(path) = &file {
-            self.scheduler.tasks = load_tasks(path);
-        }
-        self.scheduler.file = file;
         self.scheduler.window = window;
         self.scheduler._ticking = Some(cx.spawn(async move |this, cx| {
             loop {
@@ -266,22 +190,31 @@ impl Cowork {
 
     /// Why the next queued run, `index`'s, can't start yet, if it can't.
     fn blocked(&self, index: usize, cx: &App) -> Option<Blocked> {
+        self.ready(index, cx).err()
+    }
+
+    /// The chat the next queued run, `index`'s, continues (`None` for a new
+    /// one), or why it can't start yet. Only a loaded chat is returned, so
+    /// a chat that isn't loaded can't be taken for deleted.
+    fn ready(&self, index: usize, cx: &App) -> Result<Option<Entity<Thread>>, Blocked> {
         let task = &self.scheduler.tasks[index];
-        let thread_busy = task.settings().thread == ThreadMode::ContinueLast
-            && task.thread_id.is_some_and(|thread_id| {
-                let store = self.thread_store.read(cx);
-                store
-                    .thread(thread_id, cx)
-                    .or_else(|| store.archived_thread(thread_id, cx))
-                    .is_some_and(|thread| thread.read(cx).is_generating())
-            });
-        if thread_busy {
-            Some(Blocked::Thread)
-        } else if self.models.providers().next().is_none() {
-            Some(Blocked::Models)
-        } else {
-            None
+        let continued = task
+            .thread_id
+            .filter(|_| task.settings().thread == ThreadMode::ContinueLast);
+        let store = self.thread_store.read(cx);
+        let thread = match continued.and_then(|thread_id| store.listed(thread_id, cx)) {
+            Some((_, ListedChat::Loaded(thread))) if thread.read(cx).is_generating() => {
+                return Err(Blocked::Thread);
+            }
+            Some((_, ListedChat::Loaded(thread))) => Some(thread.clone()),
+            Some((_, ListedChat::Unloaded(meta))) => return Err(Blocked::Loading(meta.id)),
+            // Deleted: the run starts a new chat.
+            None => None,
+        };
+        if self.models.providers().next().is_none() {
+            return Err(Blocked::Models);
         }
+        Ok(thread)
     }
 
     /// Starts the next queued run, or records why it failed to. Returns
@@ -290,15 +223,20 @@ impl Cowork {
         let Some(index) = self.scheduler.next_queued() else {
             return false;
         };
-        if self.blocked(index, cx).is_some() {
-            return false;
-        }
+        let continued = match self.ready(index, cx) {
+            Ok(continued) => continued,
+            Err(Blocked::Loading(thread_id)) => {
+                // Retried when it has loaded; see `ChatStoreEvent::Loaded`.
+                let models = self.models.clone();
+                self.thread_store
+                    .update(cx, |store, cx| store.load(thread_id, models, cx));
+                return false;
+            }
+            Err(_) => return false,
+        };
         let task = &self.scheduler.tasks[index];
         let task_id = task.id;
         let settings = task.settings().clone();
-        let continued = task
-            .thread_id
-            .filter(|_| settings.thread == ThreadMode::ContinueLast);
         let run = self.scheduler.tasks[index]
             .take_queued()
             .expect("the next task has a queued run");
@@ -307,9 +245,10 @@ impl Cowork {
         } else if let Some(folder) = settings.missing_folder() {
             Err(format!("The folder {} is gone.", folder.display()))
         } else {
-            let thread = continued
-                .and_then(|thread_id| self.restore_for_scheduled_run(thread_id, cx))
-                .unwrap_or_else(|| self.new_scheduled_thread(&settings, cx));
+            let thread = match continued {
+                Some(thread) => self.restore_for_scheduled_run(thread, cx),
+                None => self.new_scheduled_thread(&settings, cx),
+            };
             let thread_id = thread.read(cx).instance_id;
             // Before submitting, so the run's sandbox mounts it from its
             // first command; nothing runs in the thread now.
@@ -342,18 +281,17 @@ impl Cowork {
     }
 
     /// The thread a **continue the last thread** run goes on in, brought
-    /// back from the archive if it was put there; `None` once it is deleted.
+    /// back from the archive if it was put there.
     fn restore_for_scheduled_run(
         &mut self,
-        thread_id: Uuid,
+        thread: Entity<Thread>,
         cx: &mut Context<Self>,
-    ) -> Option<Entity<Thread>> {
-        if let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) {
-            return Some(thread);
+    ) -> Entity<Thread> {
+        let thread_id = thread.read(cx).instance_id;
+        if let Some((Place::Archived(_), _)) = self.thread_store.read(cx).listed(thread_id, cx) {
+            self.restore_thread(thread_id, cx);
         }
-        self.thread_store.read(cx).archived_thread(thread_id, cx)?;
-        self.restore_thread(thread_id, cx);
-        self.thread_store.read(cx).thread(thread_id, cx)
+        thread
     }
 
     /// A new thread for a run, at the top of the sidebar's recents. The
@@ -370,8 +308,8 @@ impl Cowork {
             Some(settings.model.clone()),
             cx,
         );
-        self.thread_store.update(cx, |store, _| {
-            store.threads.push_front(thread.clone());
+        self.thread_store.update(cx, |store, cx| {
+            store.push_front(thread.clone(), cx);
         });
         self.profile_statistics = None;
         thread
@@ -476,7 +414,9 @@ impl Cowork {
             let index = self.scheduler.tasks.iter().position(|t| t.id == task.id);
             if self.scheduler.run.is_none() && index == self.scheduler.next_queued() {
                 match index.and_then(|index| self.blocked(index, cx)) {
-                    Some(Blocked::Thread) => return TaskStatus::WaitingForThread,
+                    Some(Blocked::Thread | Blocked::Loading(_)) => {
+                        return TaskStatus::WaitingForThread;
+                    }
                     Some(Blocked::Models) => return TaskStatus::WaitingForModels,
                     None => {}
                 }
@@ -560,6 +500,7 @@ impl Cowork {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chat_db::TestDb;
     use crate::scheduled_task::{
         MissedRuns, When,
         tests::{SATURDAY, at, settings, time},
@@ -567,28 +508,32 @@ mod tests {
 
     #[test]
     fn tasks_are_saved_and_loaded() {
-        let dir = std::env::temp_dir().join(format!("cowork-schedules-{}", Uuid::new_v4()));
-        let path = dir.join("schedules.json");
-        assert!(load_tasks(&path).is_empty(), "no file yet");
-
-        let mut task = ScheduledTask::new(
+        let (test_db, db) = TestDb::open();
+        let mut queued = ScheduledTask::new(
             settings(When::Daily(time(9, 0)), MissedRuns::RunOnce),
             at(SATURDAY, 8, 0),
         );
-        task.queue_now(at(SATURDAY, 8, 0));
-        let scheduler = Scheduler {
-            tasks: vec![task.clone()],
-            file: Some(path.clone()),
-            ..Default::default()
-        };
+        queued.queue_now(at(SATURDAY, 8, 0));
+        let mut ran = ScheduledTask::new(
+            crate::scheduled_task::TaskSettings {
+                folders: vec![std::env::temp_dir()],
+                ..settings(When::Once(at(SATURDAY, 9, 0)), MissedRuns::Skip)
+            },
+            at(SATURDAY, 8, 0),
+        );
+        ran.queue_now(at(SATURDAY, 8, 0));
+        let run = ran.take_queued().unwrap();
+        ran.start(run, at(SATURDAY, 8, 1), Uuid::new_v4());
+        ran.advance(at(SATURDAY, 9, 30));
+        let mut scheduler = Scheduler::default();
+        scheduler.start_saving(vec![queued.clone(), ran.clone()], db.saver());
         scheduler.save();
-        assert_eq!(load_tasks(&path), vec![task]);
+        futures::executor::block_on(db.quit());
 
-        // An unreadable file is kept aside, not replaced by nothing.
-        std::fs::write(&path, b"{ not json").unwrap();
-        assert!(load_tasks(&path).is_empty());
-        assert!(!path.exists());
-        assert!(path.with_extension("json.unreadable").exists());
-        _ = std::fs::remove_dir_all(dir);
+        let (db, saved) = test_db.reopen();
+        // The run going on when Cowork quit didn't finish.
+        let ran = ScheduledTask::loaded(ran.to_saved());
+        assert_eq!(saved.state.tasks, vec![queued, ran]);
+        futures::executor::block_on(db.quit());
     }
 }

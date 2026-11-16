@@ -37,7 +37,7 @@ fn thread_project(
     cx: &mut gpui::VisualTestContext,
 ) -> (Vec<PathBuf>, ProjectMode, sandbox::Project) {
     cowork.read_with(cx, |cowork, cx| {
-        let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
+        let thread = cowork.thread_store.read(cx).loaded(thread_id, cx).unwrap();
         let thread = thread.read(cx);
         (
             thread
@@ -130,7 +130,7 @@ fn finish(
     cx: &mut gpui::VisualTestContext,
 ) {
     cowork.update(cx, |cowork, cx| {
-        let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
+        let thread = cowork.thread_store.read(cx).loaded(thread_id, cx).unwrap();
         let message_id = cowork.active_generations[&thread_id].message_id();
         cowork.finish_generation(
             &thread,
@@ -154,7 +154,7 @@ fn prompts(
     cx: &mut gpui::VisualTestContext,
 ) -> Vec<String> {
     cowork.read_with(cx, |cowork, cx| {
-        let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
+        let thread = cowork.thread_store.read(cx).loaded(thread_id, cx).unwrap();
         thread
             .read(cx)
             .timeline
@@ -305,13 +305,13 @@ fn a_due_run_starts_in_a_new_thread_and_records_how_it_ended(cx: &mut gpui::Test
     tick(&cowork, at(SATURDAY, 9, 0), cx);
     let thread_id = running_thread(&cowork, cx).expect("the run started");
     cowork.read_with(cx, |cowork, cx| {
-        let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
+        let thread = cowork.thread_store.read(cx).loaded(thread_id, cx).unwrap();
         let thread = thread.read(cx);
         assert_eq!(thread.summary.title, "Morning briefing");
         assert_eq!(thread.model(), Some(&ollama_qwen()));
         assert!(thread.is_generating());
         // The user's own new-thread draft is untouched, and stays open.
-        assert_eq!(cowork.active_thread_id, None);
+        assert_eq!(cowork.active_thread_id(cx), None);
         let task = cowork.scheduler.task(task_id).unwrap();
         assert_eq!(cowork.task_status(task, cx), TaskStatus::Running);
     });
@@ -381,7 +381,7 @@ fn continuing_runs_wait_for_their_thread_and_bring_it_back(cx: &mut gpui::TestAp
 
     // Someone is chatting in the thread, so the next run waits for them.
     cowork.update(cx, |cowork, cx| {
-        let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
+        let thread = cowork.thread_store.read(cx).loaded(thread_id, cx).unwrap();
         thread.update(cx, |thread, cx| thread.set_generating_for_test(true, cx));
         cowork.run_scheduled_task_now(task_id, cx);
         let task = cowork.scheduler.task(task_id).unwrap();
@@ -389,7 +389,7 @@ fn continuing_runs_wait_for_their_thread_and_bring_it_back(cx: &mut gpui::TestAp
     });
     assert_eq!(running_thread(&cowork, cx), None);
     cowork.update(cx, |cowork, cx| {
-        let thread = cowork.thread_store.read(cx).thread(thread_id, cx).unwrap();
+        let thread = cowork.thread_store.read(cx).loaded(thread_id, cx).unwrap();
         thread.update(cx, |thread, cx| thread.set_generating_for_test(false, cx));
         cowork.run_next_scheduled(at(SATURDAY, 9, 5), cx);
     });
@@ -410,10 +410,56 @@ fn continuing_runs_wait_for_their_thread_and_bring_it_back(cx: &mut gpui::TestAp
     assert_eq!(running_thread(&cowork, cx), Some(thread_id));
     cowork.read_with(cx, |cowork, cx| {
         let store = cowork.thread_store.read(cx);
-        assert_eq!(store.threads[0].read(cx).instance_id, thread_id);
-        assert!(store.archived.is_empty());
+        assert_eq!(store.recent_ids(cx)[0], thread_id);
+        assert!(store.archived_ids(cx).is_empty());
     });
     assert_eq!(prompts(&cowork, thread_id, cx).len(), 3);
+}
+
+/// A chat that isn't loaded is neither deleted to the schedules page nor
+/// replaced by a new chat: the run waits for it to load, then continues it.
+#[gpui::test]
+fn a_continuing_run_waits_for_its_unloaded_chat_to_load(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let task_id = add_task(
+        &cowork,
+        TaskSettings {
+            thread: ThreadMode::ContinueLast,
+            ..daily("Triage", 9, 0)
+        },
+        at(SATURDAY, 8, 0),
+        cx,
+    );
+    tick(&cowork, at(SATURDAY, 9, 0), cx);
+    let thread_id = running_thread(&cowork, cx).unwrap();
+    finish(&cowork, thread_id, protocol::RunOutcome::Completed, cx);
+    cx.update(|window, cx| {
+        cowork.update(cx, |cowork, cx| {
+            cowork.archive_thread(thread_id, window, cx)
+        });
+    });
+    let loader = crate::chat_meta::ManualLoader::default();
+    cowork.update(cx, |cowork, cx| {
+        cowork.thread_store.update(cx, |store, cx| {
+            store.set_loader(loader.loader());
+            assert!(store.unload_for_test(thread_id, cx));
+        });
+        cowork.run_scheduled_task_now(task_id, cx);
+        let task = cowork.scheduler.task(task_id).unwrap();
+        assert_eq!(cowork.task_status(task, cx), TaskStatus::WaitingForThread);
+    });
+    assert_eq!(running_thread(&cowork, cx), None);
+    assert_eq!(loader.started(thread_id), 1);
+    open_schedules_page(&cowork, cx);
+
+    loader.finish(thread_id);
+    cx.run_until_parked();
+    assert_eq!(running_thread(&cowork, cx), Some(thread_id));
+    cowork.read_with(cx, |cowork, cx| {
+        let store = cowork.thread_store.read(cx);
+        assert_eq!(store.recent_ids(cx), [thread_id]);
+        assert!(store.archived_ids(cx).is_empty());
+    });
 }
 
 #[gpui::test]
@@ -541,7 +587,7 @@ fn a_run_whose_folder_is_gone_fails(cx: &mut gpui::TestAppContext) {
     assert!(error.contains("is gone"), "{error}");
     // No thread was made for it.
     cowork.read_with(cx, |cowork, cx| {
-        assert!(cowork.thread_store.read(cx).threads.is_empty());
+        assert!(cowork.thread_store.read(cx).recent_ids(cx).is_empty());
     });
 }
 
@@ -625,9 +671,9 @@ fn run_now_records_history_and_opens_its_thread_while_in_the_sidebar(
     cowork.update(cx, |cowork, cx| cowork.restore_thread(thread_id, cx));
     draw(cx);
     click(open, cx);
-    cowork.read_with(cx, |cowork, _| {
+    cowork.read_with(cx, |cowork, cx| {
         assert_eq!(cowork.main_stage, MainStage::Thread);
-        assert_eq!(cowork.active_thread_id, Some(thread_id));
+        assert_eq!(cowork.active_thread_id(cx), Some(thread_id));
     });
 }
 
@@ -673,6 +719,6 @@ fn deleting_a_continued_thread_warns_and_can_delete_its_schedule(cx: &mut gpui::
     let ids: Vec<_> = tasks(&cowork, cx).iter().map(|task| task.id).collect();
     assert_eq!(ids, [kept]);
     cowork.read_with(cx, |cowork, cx| {
-        assert!(cowork.thread_store.read(cx).archived.is_empty());
+        assert!(cowork.thread_store.read(cx).archived_ids(cx).is_empty());
     });
 }

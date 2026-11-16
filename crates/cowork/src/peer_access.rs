@@ -282,7 +282,7 @@ impl Cowork {
             PermissionOperation::UploadAttachment => "upload this attachment",
             PermissionOperation::ApproveTools => "allow or deny tool calls",
         };
-        if let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) {
+        if let Some(thread) = self.thread_store.read(cx).loaded(thread_id, cx) {
             let draft_id = thread.read(cx).draft().id;
             let message = if denied.reason == DenialReason::StaleDraftGeneration {
                 "The host reset your draft. Edits queued before the reset were discarded."

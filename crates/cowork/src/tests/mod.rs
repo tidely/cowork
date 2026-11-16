@@ -6,7 +6,7 @@ use super::*;
 
 use std::{
     cell::RefCell,
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     ops::Range,
     path::PathBuf,
     rc::Rc,
@@ -215,7 +215,7 @@ fn test_cowork(
     bind_app_keys(cx);
     let (model_picker, model_picker_subscription) = Cowork::new_model_picker(window, cx);
     let local_participant_id = active_thread_id
-        .and_then(|id| thread_store.read(cx).thread(id, cx))
+        .and_then(|id| thread_store.read(cx).loaded(id, cx))
         .filter(|thread| thread.read(cx).is_host())
         .map_or_else(ParticipantId::new, |thread| {
             thread.read(cx).participant_id()
@@ -223,6 +223,7 @@ fn test_cowork(
     Cowork {
         sidebar_open: true,
         recents_open: true,
+        recents_shown: crate::sidebar::RECENTS_PAGE,
         new_thread_draft: ThreadDraft::new(local_participant_id),
         attachment_errors: Vec::new(),
         pending_attachments: Vec::new(),
@@ -233,8 +234,12 @@ fn test_cowork(
         timeline_selection: Default::default(),
         timeline_focus_handle: cx.focus_handle(),
         follow_generation: true,
-        thread_store,
-        active_thread_id,
+        thread_store: {
+            if let Some(id) = active_thread_id {
+                thread_store.update(cx, |store, cx| assert!(store.activate(id, cx)));
+            }
+            thread_store.clone()
+        },
         selection_message_id: None,
         segment_text_views: HashMap::new(),
         shown_segments: HashMap::new(),
@@ -261,8 +266,8 @@ fn test_cowork(
         agents: HashMap::new(),
         deleted: Default::default(),
         profile_statistics: None,
-        statistics_file: None,
-        thread_files: None,
+        saved_chat_search: Default::default(),
+        chat_db: None,
         scheduler: Default::default(),
         activity_range: ActivityRange::default(),
         local_participant_id,
@@ -271,7 +276,6 @@ fn test_cowork(
         caret_label_refresh: None,
         working_refresh: None,
         new_thread_model: None,
-        settings_file: None,
         new_thread_project_folders: Vec::new(),
         new_thread_project_mode: Default::default(),
         new_thread_project: None,
@@ -279,8 +283,10 @@ fn test_cowork(
         model_picker,
         models: Arc::default(),
         picker_rows: None,
+        idle_clock: Default::default(),
         _model_picker_subscription: model_picker_subscription,
         _window_activation_subscription: cx.observe_window_activation(window, |_, _, _| {}),
+        _thread_store_subscription: Cowork::subscribe_thread_store(&thread_store, window, cx),
     }
 }
 
@@ -310,10 +316,7 @@ fn attachment_test_cowork(
     let (view, cx) = cx.add_window_view(|window, cx| {
         let draft = ThreadDraft::new(ParticipantId::new());
         let thread = cx.new(|_| test_thread(thread_id, Vec::new(), draft));
-        let thread_store = cx.new(|_| ThreadStore {
-            threads: VecDeque::from([thread]),
-            ..Default::default()
-        });
+        let thread_store = cx.new(|cx| ThreadStore::with_recents([thread], cx));
         let cowork =
             cx.new(|cx| test_cowork(thread_store, Some(thread_id), tokio_handle, window, cx));
         AttachmentTestRoot { cowork }
@@ -351,7 +354,7 @@ impl Render for EmptyThreadTestView {
 }
 
 /// A full `Cowork` window showing the draft of a new thread.
-fn composer_test_cowork(
+pub(crate) fn composer_test_cowork(
     cx: &mut gpui::TestAppContext,
 ) -> (
     Entity<Cowork>,
@@ -525,10 +528,7 @@ impl<'a> Collaboration<'a> {
                 .expect("local host can select a model");
             assert!(thread.start_hosting(endpoint));
             let thread = cx.new(|_| thread);
-            let host_store = cx.new(|_| ThreadStore {
-                threads: VecDeque::from([thread]),
-                ..Default::default()
-            });
+            let host_store = cx.new(|cx| ThreadStore::with_recents([thread], cx));
             let host = cx.new(|cx| {
                 test_cowork(
                     host_store,

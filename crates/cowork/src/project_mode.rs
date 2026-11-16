@@ -235,11 +235,13 @@ impl Cowork {
         mode: ProjectMode,
         cx: &mut Context<Self>,
     ) {
-        match thread.and_then(|thread| thread.upgrade()) {
-            Some(thread) => {
+        match thread.map(|thread| thread.upgrade()) {
+            Some(Some(thread)) => {
                 thread.update(cx, |thread, cx| thread.set_project_mode(mode, cx));
                 self.sync_sandbox_project(&thread, cx);
             }
+            // Deleted or unloaded since the menu opened.
+            Some(None) => return,
             None => self.new_thread_project_mode = mode,
         }
         cx.notify();

@@ -2,10 +2,11 @@
 //! the folders its new chats start with. See `docs/projects.md`.
 //!
 //! A project is only local organization. Its record (name, starting
-//! folders, when it was made) is saved in `~/.cowork/projects.json`; which
-//! project a chat belongs to is the chat's own [`Thread::project`], saved
-//! with the chat in its `thread.json` and never sent to collaborators.
-//! Membership is always explicit: it is never inferred from folders.
+//! folders, when it was made) is saved in the chats' database
+//! (`chat_db/app_state.rs`); which project a chat belongs to is the chat's
+//! own [`Thread::project`], saved with the chat in its row, which refers to
+//! the project's, and never sent to collaborators. Membership is always
+//! explicit: it is never inferred from folders.
 //!
 //! A project's folders are not the folders its chats work in. Those are
 //! each chat's own ([`Thread::project_folders`], what `sandbox::Project` is
@@ -15,23 +16,27 @@
 //! [`Thread::project`]: crate::thread::Thread::project
 //! [`Thread::project_folders`]: crate::thread::Thread::project_folders
 
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    time::SystemTime,
-};
+use std::{collections::HashMap, path::PathBuf, time::SystemTime};
 
-use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::chat_db::StateSaver;
+
 /// Identifies a project, in its record and in the chats filed under it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(transparent)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ProjectId(Uuid);
 
 impl ProjectId {
     pub(crate) fn new() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    pub(crate) fn from_uuid(id: Uuid) -> Self {
+        Self(id)
+    }
+
+    pub(crate) fn as_uuid(self) -> Uuid {
+        self.0
     }
 }
 
@@ -42,7 +47,7 @@ impl std::fmt::Display for ProjectId {
 }
 
 /// A project as it is saved.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProjectRecord {
     pub(crate) id: ProjectId,
     /// Trimmed and never blank. Names needn't be unique.
@@ -65,9 +70,9 @@ pub(crate) const SHOWN_CHATS_STEP: usize = 5;
 pub(crate) struct Projects {
     /// Newest first.
     records: Vec<ProjectRecord>,
-    /// Where the records are saved; `None` keeps them in memory, as in tests
-    /// and ephemeral launches.
-    file: Option<PathBuf>,
+    /// Saves changes to the records; `None` keeps them in memory, as in
+    /// tests and ephemeral launches.
+    saver: Option<StateSaver>,
     /// Whether the sidebar's Projects section lists the projects.
     section_open: bool,
     /// The open projects, each with how many of its chats it shows. A
@@ -83,7 +88,7 @@ impl Default for Projects {
     fn default() -> Self {
         Self {
             records: Vec::new(),
-            file: None,
+            saver: None,
             section_open: true,
             open: HashMap::new(),
             menu_open: None,
@@ -92,13 +97,12 @@ impl Default for Projects {
 }
 
 impl Projects {
-    /// The projects saved at `file`, saved there from now on.
-    pub(crate) fn load(file: Option<PathBuf>) -> Self {
-        let mut records = file.as_deref().map(load_records).unwrap_or_default();
+    /// The saved `records`, with changes saved by `saver` from now on.
+    pub(crate) fn new(mut records: Vec<ProjectRecord>, saver: Option<StateSaver>) -> Self {
         records.sort_by_key(|record| std::cmp::Reverse(record.created_at));
         Self {
             records,
-            file,
+            saver,
             ..Self::default()
         }
     }
@@ -122,23 +126,23 @@ impl Projects {
     ) -> Option<ProjectId> {
         let name = project_name(name)?;
         let id = ProjectId::new();
-        self.records.insert(
-            0,
-            ProjectRecord {
-                id,
-                name,
-                folders,
-                created_at: now,
-            },
-        );
+        let record = ProjectRecord {
+            id,
+            name,
+            folders,
+            created_at: now,
+        };
+        if let Some(saver) = &self.saver {
+            saver.create_project(&record);
+        }
+        self.records.insert(0, record);
         self.open.insert(id, SHOWN_CHATS_STEP);
-        self.save();
         Some(id)
     }
 
-    /// Removes the project's record. Its chats are not touched here: the
-    /// caller takes them out of it, as only they record their membership.
-    /// Returns whether it was known.
+    /// Removes the project's record. Its saved chats are unfiled with it,
+    /// but not the chats in memory: the caller takes them out of it. Returns
+    /// whether it was known.
     pub(crate) fn remove(&mut self, id: ProjectId) -> bool {
         let before = self.records.len();
         self.records.retain(|record| record.id != id);
@@ -149,7 +153,9 @@ impl Projects {
         if self.menu_open == Some(id) {
             self.menu_open = None;
         }
-        self.save();
+        if let Some(saver) = &self.saver {
+            saver.remove_project(id);
+        }
         true
     }
 
@@ -196,17 +202,6 @@ impl Projects {
             *shown += SHOWN_CHATS_STEP;
         }
     }
-
-    /// Small and written only when a project is created or removed, so it
-    /// is written in place of waiting on another thread.
-    fn save(&self) {
-        let Some(path) = &self.file else {
-            return;
-        };
-        if let Err(error) = save_records(path, &self.records) {
-            eprintln!("could not save projects to {}: {error:#}", path.display());
-        }
-    }
 }
 
 /// `name` trimmed, or `None` when that leaves nothing.
@@ -230,83 +225,12 @@ pub(crate) fn add_folder_paths(
     folders.len() != before
 }
 
-/// The saved file's format. Older or newer files aren't read, nor
-/// overwritten. A new field doesn't need a new format if it has a default.
-const FILE_VERSION: u32 = 1;
-
-#[derive(Serialize, Deserialize)]
-struct ProjectsFile {
-    version: u32,
-    projects: Vec<ProjectRecord>,
-}
-
-/// Where the projects are saved: next to Cowork's other files.
-pub(crate) fn projects_file() -> Option<PathBuf> {
-    Some(std::env::home_dir()?.join(".cowork").join("projects.json"))
-}
-
-/// Writes `records` whole, replacing the old file only once the new one is
-/// written, so a crash never leaves half a file.
-fn save_records(path: &Path, records: &[ProjectRecord]) -> anyhow::Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-    let file = ProjectsFile {
-        version: FILE_VERSION,
-        projects: records.to_vec(),
-    };
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_vec_pretty(&file)?)?;
-    std::fs::rename(&temporary, path)?;
-    Ok(())
-}
-
-/// Reads the saved projects, or none yet. A file that can't be read is moved
-/// aside rather than overwritten by the next save. Chats filed under a
-/// project no longer known show in Recents, keeping their membership.
-fn load_records(path: &Path) -> Vec<ProjectRecord> {
-    let bytes = match std::fs::read(path) {
-        Ok(bytes) => bytes,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(error) => {
-            eprintln!("could not read projects from {}: {error}", path.display());
-            return Vec::new();
-        }
-    };
-    match serde_json::from_slice::<ProjectsFile>(&bytes) {
-        Ok(file) if file.version == FILE_VERSION => file.projects,
-        result => {
-            let aside = path.with_extension("json.unreadable");
-            match result {
-                Ok(file) => eprintln!(
-                    "projects in {} are format {}, not {FILE_VERSION}; moved to {}",
-                    path.display(),
-                    file.version,
-                    aside.display()
-                ),
-                Err(error) => eprintln!(
-                    "could not read projects from {}: {error}; moved to {}",
-                    path.display(),
-                    aside.display()
-                ),
-            }
-            _ = std::fs::rename(path, aside);
-            Vec::new()
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
 
     use super::*;
-
-    fn temporary_file() -> PathBuf {
-        std::env::temp_dir()
-            .join(format!("cowork-projects-{}", Uuid::new_v4()))
-            .join("projects.json")
-    }
+    use crate::chat_db::TestDb;
 
     fn at(seconds: u64) -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
@@ -314,9 +238,14 @@ mod tests {
 
     #[test]
     fn projects_are_saved_newest_first_and_reopen_collapsed() {
-        let path = temporary_file();
-        let mut projects = Projects::load(Some(path.clone()));
-        assert!(projects.records().is_empty(), "no file yet");
+        let (test_db, db) = TestDb::open();
+        let reopen = |db: crate::chat_db::ChatDb| {
+            futures::executor::block_on(db.quit());
+            let (db, saved) = test_db.reopen();
+            let projects = Projects::new(saved.state.projects, Some(db.saver()));
+            (db, projects)
+        };
+        let mut projects = Projects::new(Vec::new(), Some(db.saver()));
         assert_eq!(projects.create("  \t ", Vec::new(), at(1)), None);
         let missing = PathBuf::from("/no/such/folder");
         let first = projects
@@ -326,7 +255,7 @@ mod tests {
         let second = projects.create("Site", Vec::new(), at(2)).unwrap();
         assert_eq!(projects.shown_chats(second), Some(SHOWN_CHATS_STEP));
 
-        let mut reopened = Projects::load(Some(path.clone()));
+        let (db, mut reopened) = reopen(db);
         let ids: Vec<_> = reopened.records().iter().map(|record| record.id).collect();
         assert_eq!(ids, [second, first]);
         assert_eq!(reopened.records()[1].name, "Site");
@@ -335,26 +264,13 @@ mod tests {
         assert_eq!(reopened.shown_chats(first), None);
         assert_eq!(reopened.shown_chats(second), None);
 
-        // A project created after reopening goes first and is saved too.
-        let third = reopened.create("Docs", Vec::new(), at(3)).unwrap();
-        let ids: Vec<_> = Projects::load(Some(path.clone()))
-            .records()
-            .iter()
-            .map(|record| record.id)
-            .collect();
-        assert_eq!(ids, [third, second, first]);
-
         // Removing one is saved too.
         assert!(reopened.remove(second));
         assert!(!reopened.remove(second));
-        let ids: Vec<_> = Projects::load(Some(path.clone()))
-            .records()
-            .iter()
-            .map(|record| record.id)
-            .collect();
-        assert_eq!(ids, [third, first]);
-
-        _ = std::fs::remove_dir_all(path.parent().unwrap());
+        let (db, reopened) = reopen(db);
+        let ids: Vec<_> = reopened.records().iter().map(|record| record.id).collect();
+        assert_eq!(ids, [first]);
+        futures::executor::block_on(db.quit());
     }
 
     #[test]
@@ -390,18 +306,5 @@ mod tests {
         ));
         assert_eq!(folders, [PathBuf::from("/src/a"), PathBuf::from("/src/b")]);
         assert!(!add_folder_paths(&mut folders, ["/src/a".into()]));
-    }
-
-    #[test]
-    fn other_formats_are_moved_aside() {
-        let path = temporary_file();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, br#"{"version": 99, "projects": []}"#).unwrap();
-
-        assert!(Projects::load(Some(path.clone())).records().is_empty());
-        assert!(!path.exists());
-        assert!(path.with_extension("json.unreadable").exists());
-
-        _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

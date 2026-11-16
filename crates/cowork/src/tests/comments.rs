@@ -358,10 +358,7 @@ fn assert_backslash_selection_creates_comment(
             },
         })];
         let thread = cx.new(|_| test_thread(thread_id, timeline, draft));
-        let thread_store = cx.new(|_| ThreadStore {
-            threads: VecDeque::from([thread]),
-            ..Default::default()
-        });
+        let thread_store = cx.new(|cx| ThreadStore::with_recents([thread], cx));
         let cowork =
             cx.new(|cx| test_cowork(thread_store, Some(thread_id), tokio_handle, window, cx));
         composer.focus_handle(cx).focus(window, cx);
@@ -428,7 +425,7 @@ fn assert_backslash_selection_creates_comment(
         let thread = cowork
             .thread_store
             .read(cx)
-            .thread(cowork.active_thread_id.expect("active thread"), cx)
+            .loaded(cowork.active_thread_id(cx).expect("active thread"), cx)
             .expect("thread");
         let thread = thread.read(cx);
         // New comments are appended after any existing one.
@@ -464,7 +461,7 @@ fn assert_backslash_selection_creates_comment(
             cowork
                 .thread_store
                 .read(cx)
-                .thread(cowork.active_thread_id.expect("active thread"), cx)
+                .loaded(cowork.active_thread_id(cx).expect("active thread"), cx)
                 .expect("thread")
                 .read(cx)
                 .draft()
@@ -659,10 +656,7 @@ fn commenting_on_a_long_response_keeps_the_timeline_scroll_position(cx: &mut gpu
         })];
         let draft = ThreadDraft::new(ParticipantId::new());
         let thread = cx.new(|_| test_thread(thread_id, timeline, draft));
-        let thread_store = cx.new(|_| ThreadStore {
-            threads: VecDeque::from([thread]),
-            ..Default::default()
-        });
+        let thread_store = cx.new(|cx| ThreadStore::with_recents([thread], cx));
         let cowork =
             cx.new(|cx| test_cowork(thread_store, Some(thread_id), tokio_handle, window, cx));
         Root::new(cowork, window, cx)
@@ -706,7 +700,7 @@ fn commenting_on_a_long_response_keeps_the_timeline_scroll_position(cx: &mut gpu
             let thread = cowork
                 .thread_store
                 .read(cx)
-                .thread(thread_id, cx)
+                .loaded(thread_id, cx)
                 .expect("thread");
             let comment_id = thread.update(cx, |thread, _| {
                 thread

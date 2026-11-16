@@ -244,8 +244,8 @@ impl Cowork {
         cx: &mut Context<Self>,
     ) {
         if self
-            .active_thread_id
-            .and_then(|thread_id| self.thread_store.read(cx).thread(thread_id, cx))
+            .active_thread_id(cx)
+            .and_then(|thread_id| self.thread_store.read(cx).loaded(thread_id, cx))
             .is_some_and(|thread| !thread.read(cx).can_edit_draft())
         {
             return;
@@ -265,14 +265,14 @@ impl Cowork {
         }
         let quote = TextSelection::selected_text(window, cx).trim().to_string();
         let (Some(thread_id), Some(preferred_message_id)) =
-            (self.active_thread_id, self.selection_message_id)
+            (self.active_thread_id(cx), self.selection_message_id)
         else {
             return;
         };
         if quote.is_empty() {
             return;
         }
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+        let Some(thread) = self.thread_store.read(cx).loaded(thread_id, cx) else {
             return;
         };
         let (message_id, source_range) =
@@ -343,7 +343,12 @@ impl Cowork {
             return;
         }
 
-        let threads = self.thread_store.read(cx).threads.clone();
+        let threads = self
+            .thread_store
+            .read(cx)
+            .loaded_recents(cx)
+            .cloned()
+            .collect::<Vec<_>>();
         for thread in threads {
             let toggled = thread.update(cx, |thread, _| {
                 if let Some(message) = thread.timeline.iter_mut().find_map(|entry| match entry {
@@ -858,7 +863,7 @@ impl Cowork {
         step_index: usize,
         cx: &mut Context<Self>,
     ) {
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+        let Some(thread) = self.thread_store.read(cx).loaded(thread_id, cx) else {
             return;
         };
         thread.update(cx, |thread, _| {
@@ -1201,7 +1206,7 @@ impl Cowork {
     }
 
     fn toggle_work(&mut self, thread_id: Uuid, message_id: Uuid, cx: &mut Context<Self>) {
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+        let Some(thread) = self.thread_store.read(cx).loaded(thread_id, cx) else {
             return;
         };
         thread.update(cx, |thread, _| {
@@ -1455,7 +1460,7 @@ impl Cowork {
         let projection = self
             .thread_store
             .read(cx)
-            .thread(thread_id, cx)
+            .loaded(thread_id, cx)
             .map(|thread| {
                 let thread = thread.read(cx);
                 RunProjection::new(message, thread.run_activity(message.record.id))
@@ -1526,7 +1531,7 @@ impl Cowork {
         let rights = self
             .thread_store
             .read(cx)
-            .thread(thread_id, cx)
+            .loaded(thread_id, cx)
             .map(|thread| ApprovalRights::of(thread.read(cx)))
             .unwrap_or_default();
         let failed = message.record.run.failure().is_some();
@@ -1679,7 +1684,7 @@ impl Cowork {
     ) -> Vec<Vec<AttachmentCard>> {
         self.thread_store
             .read(cx)
-            .thread(thread_id, cx)
+            .loaded(thread_id, cx)
             .map(|thread| {
                 let draft = thread.read(cx).draft();
                 group
@@ -1772,7 +1777,7 @@ impl Cowork {
         let activity = self
             .thread_store
             .read(cx)
-            .thread(thread_id, cx)
+            .loaded(thread_id, cx)
             .and_then(|thread| thread.read(cx).run_activity(message.record.id));
         for item in RunProjection::new(message, activity).into_items() {
             match item {

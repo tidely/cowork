@@ -1,7 +1,7 @@
 //! The local context settings and the shared context details shown by the
 //! composer and the component preview. Compaction starts at the configured
 //! percentage of the context window. The settings are saved with the
-//! others; see `settings_file.rs`.
+//! others; see `saved_settings.rs`.
 
 use gpui::{
     App, Context, Div, Entity, IntoElement, Subscription, Window, div, prelude::*, px, relative,

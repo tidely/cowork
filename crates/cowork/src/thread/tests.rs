@@ -662,3 +662,40 @@ fn summary_steps_survive_streaming_and_stay_with_their_run(cx: &mut gpui::TestAp
         thread.agent_message_mut(id.into_bytes()).unwrap().ui.output
     );
 }
+
+/// A submitted block keeps its draft item's id, and a saved chat is keyed by
+/// it: a collaborator bringing the id back would make the chat unsavable.
+#[test]
+fn a_collaborator_cannot_reuse_a_submitted_items_id() {
+    let mut thread = local_thread();
+    let peer = add_peer(&mut thread);
+    thread.peer_permissions.set_default_mode(PeerMode::Write);
+    let submitted = Uuid::new_v4();
+    thread.timeline.push(crate::timeline::TimelineMessage::User(
+        crate::timeline::UserMessageGroup {
+            id: Uuid::new_v4(),
+            comments: Vec::new(),
+            blocks: vec![crate::timeline::PromptBlock {
+                id: submitted,
+                author: peer,
+                text: "sent".into(),
+                attachments: Vec::new(),
+            }],
+            comments_folded: false,
+        }
+        .into(),
+    ));
+    let before = thread.draft().encode_state();
+    let replica = Draft::new();
+    replica.apply_update(&before).unwrap();
+    replica.create_prompt_with_id(
+        ::draft::ItemId::from_uuid(submitted),
+        peer.as_uuid(),
+        "again",
+    );
+    let update = replica.take_local_update().unwrap();
+    let error = thread
+        .apply_collaborator_update(peer, 0, update)
+        .unwrap_err();
+    assert!(error.to_string().contains("reuses a submitted one's id"));
+}

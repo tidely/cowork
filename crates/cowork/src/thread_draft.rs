@@ -144,6 +144,51 @@ impl ThreadDraft {
     pub(crate) fn items(&self) -> Vec<DraftItem> {
         self.doc.items()
     }
+
+    /// Why this draft keeps its thread loaded, if it does: a draft is never
+    /// saved, so unloading drops it. The destructure names every field, so
+    /// a new one doesn't compile until it is classified here.
+    pub(crate) fn unload_blocker(&self) -> Option<crate::unload::UnloadBlocker> {
+        use crate::unload::UnloadBlocker;
+        let Self {
+            // Memory-only, dropped: a reloaded draft gets a new id, so work
+            // routed by the old one (attachment reads) would be lost; Cowork
+            // blocks while any is in flight.
+            id: _,
+            // Persisted: the thread's participant id.
+            author: _,
+            // Memory-only and blocking: the draft itself.
+            doc,
+            // Persisted: the bytes of submitted messages' files are saved
+            // with the thread. The draft's own are named by `doc`.
+            files: _,
+            // Memory-only and blocking: bytes still arriving or leaving.
+            incoming,
+            uploads,
+            // Derived on load: every saved file is stored.
+            stored: _,
+            // Memory-only, dropped: matters only while pieces are in flight,
+            // which `incoming` and `uploads` block on.
+            discarded: _,
+            // Derived from ownership on load.
+            keeps_removed_files: _,
+            // Memory-only, dropped: editors, typed text, the comment fold;
+            // rebuilt by `prepare_draft` when the thread is shown.
+            editor_state: _,
+            // Memory-only, dropped: groups attachments picked together while
+            // their reads are in flight, which Cowork blocks on.
+            attachment_batches: _,
+            // Memory-only, dropped: presence exists only while shared.
+            presence: _,
+        } = self;
+        if !doc.items().iter().all(DraftItem::is_empty) {
+            return Some(UnloadBlocker::DraftNotEmpty);
+        }
+        if !incoming.is_empty() || !uploads.is_empty() {
+            return Some(UnloadBlocker::Transferring);
+        }
+        None
+    }
     pub(crate) fn item(&self, id: ItemId) -> Option<DraftItem> {
         self.doc.item(id)
     }

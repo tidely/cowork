@@ -35,11 +35,13 @@ use tools::{Calculate, RespondToComment};
 use uuid::Uuid;
 
 use super::GenerationPlan;
+use crate::chat_store::Place;
 use crate::{
     Cowork,
     models::{ModelInfo, ModelRef},
     participant::ParticipantId,
     protocol::{self, Preview, PreviewDelta, RunEvent},
+    statistics::Statistics,
     thread::{ControlGeneration, Thread, ThreadOwnership, ThreadSharing},
     tool_approval::{self, CoworkHost, CoworkInput},
     transcript::{RunSource, shared_compaction, shared_entry, steering_comment_ids},
@@ -519,7 +521,7 @@ impl Cowork {
             turn_comments,
             source,
         } = plan;
-        let thread = self.thread_store.read(cx).thread(thread_id, cx)?;
+        let thread = self.thread_store.read(cx).loaded(thread_id, cx)?;
         // Only the host runs agents, so commands run on the host's computer
         // with its project for this thread, whoever asked for the run. Later
         // project changes reach it through `Cowork::sync_sandbox_project`,
@@ -690,8 +692,8 @@ impl Cowork {
         let thread = self
             .thread_store
             .read(cx)
-            .thread(thread_id, cx)
-            .or_else(|| self.thread_store.read(cx).archived_thread(thread_id, cx));
+            .loaded(thread_id, cx)
+            .or_else(|| self.thread_store.read(cx).loaded_archived(thread_id, cx));
         if let Some(thread) = thread {
             self.finish_generation(
                 &thread,
@@ -726,7 +728,7 @@ impl Cowork {
                 .collect::<HashSet<_>>();
             if *reason == DiscardReason::Removed
                 && !ours.is_empty()
-                && let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx)
+                && let Some(thread) = self.thread_store.read(cx).loaded(thread_id, cx)
             {
                 thread.update(cx, |thread, cx| {
                     thread.pending.retain(|pending| !ours.contains(&pending.id));
@@ -764,7 +766,7 @@ impl Cowork {
                 // copy has the group when the entry places it.
                 if let agent::Origin::Input { id, .. } = &entry.origin
                     && generation.offered.remove(id)
-                    && let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx)
+                    && let Some(thread) = self.thread_store.read(cx).loaded(thread_id, cx)
                 {
                     thread.update(cx, |thread, cx| {
                         if let Some(pending) = thread
@@ -813,8 +815,8 @@ impl Cowork {
                 let thread = self
                     .thread_store
                     .read(cx)
-                    .thread(thread_id, cx)
-                    .or_else(|| self.thread_store.read(cx).archived_thread(thread_id, cx));
+                    .loaded(thread_id, cx)
+                    .or_else(|| self.thread_store.read(cx).loaded_archived(thread_id, cx));
                 if let Some(thread) = thread {
                     self.finish_generation(&thread, message_id, outcome, totals, cx);
                 }
@@ -825,8 +827,8 @@ impl Cowork {
         let thread = self
             .thread_store
             .read(cx)
-            .thread(thread_id, cx)
-            .or_else(|| self.thread_store.read(cx).archived_thread(thread_id, cx));
+            .loaded(thread_id, cx)
+            .or_else(|| self.thread_store.read(cx).loaded_archived(thread_id, cx));
         if let Some(thread) = thread {
             thread.update(cx, |thread, cx| {
                 thread.emit(
@@ -894,9 +896,11 @@ impl Cowork {
         {
             entry.remove();
         }
-        if self.thread_store.read(cx).thread(thread_id, cx).is_none() {
+        if !matches!(
+            self.thread_store.read(cx).listed(thread_id, cx),
+            Some((Place::Recents(_), _))
+        ) {
             self.settle_retired_thread(thread, cx);
-            self.save_statistics();
         }
         // A turn boundary, before the next pending submission starts.
         self.save_thread(thread, cx);
@@ -917,7 +921,7 @@ impl Cowork {
         tool: &str,
         cx: &mut Context<Self>,
     ) {
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+        let Some(thread) = self.thread_store.read(cx).loaded(thread_id, cx) else {
             return;
         };
         let Some(generation) = self
@@ -972,18 +976,20 @@ impl Cowork {
             self.profile_statistics = None;
         }
         let store = self.thread_store.read(cx);
-        let deleted =
-            store.thread(thread_id, cx).is_none() && store.archived_thread(thread_id, cx).is_none();
+        let deleted = store.listed(thread_id, cx).is_none();
         if ownership == ThreadOwnership::Local && deleted {
-            self.deleted.tokens_used += tokens;
-            self.deleted.token_activity.extend(activity);
+            self.count_deleted(Statistics {
+                tokens_used: tokens,
+                token_activity: activity.into_iter().collect(),
+                ..Statistics::default()
+            });
         }
     }
 
     /// Redraws the timeline after `thread_id` changed, staying pinned to the
     /// newest output unless the user has scrolled away.
     pub(crate) fn thread_updated(&mut self, thread_id: Uuid, cx: &mut Context<Self>) {
-        if self.active_thread_id != Some(thread_id) {
+        if self.active_thread_id(cx) != Some(thread_id) {
             return;
         }
         if self.follow_generation {
@@ -1031,7 +1037,7 @@ impl Cowork {
         if message_id.is_some_and(|message_id| message_id != generation.message_id) {
             return;
         }
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+        let Some(thread) = self.thread_store.read(cx).loaded(thread_id, cx) else {
             return;
         };
         if !thread.read(cx).is_host() {

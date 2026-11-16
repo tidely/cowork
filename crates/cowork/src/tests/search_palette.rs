@@ -77,10 +77,8 @@ fn search_palette_finds_chats_by_title_prompt_and_reply(cx: &mut gpui::TestAppCo
         );
         let (_, review) = titled_thread("Beta review", Vec::new());
         ids = Some(bread_id);
-        let thread_store = cx.new(|cx| ThreadStore {
-            threads: VecDeque::from([cx.new(|_| bread), cx.new(|_| review)]),
-            ..Default::default()
-        });
+        let thread_store =
+            cx.new(|cx| ThreadStore::with_recents([cx.new(|_| bread), cx.new(|_| review)], cx));
         Root::new(
             cx.new(|cx| test_cowork(thread_store, None, tokio_handle, window, cx)),
             window,
@@ -131,7 +129,62 @@ fn search_palette_finds_chats_by_title_prompt_and_reply(cx: &mut gpui::TestAppCo
     cx.run_until_parked();
     assert!(!cx.update(|window, cx| window.has_active_dialog(cx)));
     assert_eq!(
-        cowork.read_with(cx, |cowork, _| cowork.active_thread_id),
+        cowork.read_with(cx, |cowork, cx| cowork.active_thread_id(cx)),
         Some(bread_id)
     );
+}
+
+/// A chat that isn't loaded is found by its saved text once the database
+/// answers, matched as a loaded chat's text is.
+#[gpui::test]
+fn search_palette_finds_unloaded_chats_by_saved_text(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    // The database answers from a Tokio thread.
+    cx.executor().allow_parking();
+    let (_test_db, db) = crate::chat_db::TestDb::open();
+    let bread_id = cx.update(|_, cx| {
+        let (bread_id, bread) = titled_thread("Alpha plans", vec![prompt("Bake Sourdough?")]);
+        let bread = cx.new(|_| bread);
+        cowork.update(cx, |cowork, cx| {
+            cowork.chat_db = Some(db);
+            let store = cowork.thread_store.clone();
+            store.update(cx, |store, cx| store.push_back_loaded(bread.clone(), cx));
+            cowork.save_thread(&bread, cx);
+            futures::executor::block_on(cowork.chat_db.as_ref().unwrap().flush());
+            store.update(cx, |store, cx| assert!(store.unload_for_test(bread_id, cx)));
+        });
+        bread_id
+    });
+    let found = |query: &str, cx: &mut gpui::VisualTestContext| {
+        cowork.read_with(cx, |cowork, cx| {
+            cowork
+                .search_palette_sections(query, cx)
+                .into_iter()
+                .flat_map(|section| section.rows)
+                .map(|row| (row.target, row.excerpt.map(|excerpt| excerpt.text)))
+                .collect::<Vec<_>>()
+        })
+    };
+    cx.update(|window, cx| {
+        cowork.update(cx, |cowork, cx| {
+            cowork.search_saved_chats("sourdough", window, cx)
+        })
+    });
+    assert_eq!(found("sourdough", cx), [], "not until the database answers");
+    for _ in 0..200 {
+        cx.run_until_parked();
+        if !found("sourdough", cx).is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(
+        found("sourdough", cx),
+        [(
+            PaletteTarget::Chat(bread_id),
+            Some("Bake Sourdough?".into())
+        )]
+    );
+    // Smart case, as for any text: an uppercase letter must match.
+    assert_eq!(found("SOURDOUGH", cx), []);
 }

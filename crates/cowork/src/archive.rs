@@ -19,7 +19,12 @@ use gpui_component::{
 use gpui_kit_assets::IconName as AssetIconName;
 use uuid::Uuid;
 
-use crate::{Cowork, MainStage, thread::Thread};
+use crate::{
+    Cowork, MainStage,
+    chat_store::{ListedChat, Place},
+    statistics::Statistics,
+    thread::Thread,
+};
 
 /// Asks before something that can't be undone, or that ends what others
 /// are doing, with the action's own name on its button.
@@ -59,8 +64,14 @@ impl Cowork {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
-            return;
+        let thread = match self.thread_store.read(cx).listed(thread_id, cx) {
+            Some((Place::Recents(_), ListedChat::Loaded(thread))) => thread.clone(),
+            // Neither running nor shared: nothing to ask about.
+            Some((Place::Recents(_), ListedChat::Unloaded(_))) => {
+                self.archive_thread(thread_id, window, cx);
+                return;
+            }
+            Some((Place::Archived(_), _)) | None => return,
         };
         // Joined chats are their host's to archive; nothing to ask about.
         if !thread.read(cx).is_host() {
@@ -111,11 +122,10 @@ impl Cowork {
 
     /// A chat's title as the sidebar and archive show it.
     pub(crate) fn shown_title(&self, thread_id: Uuid, cx: &App) -> String {
-        let store = self.thread_store.read(cx);
-        store
-            .thread(thread_id, cx)
-            .or_else(|| store.archived_thread(thread_id, cx))
-            .map(|thread| thread.read(cx).summary.title.clone())
+        self.thread_store
+            .read(cx)
+            .listed(thread_id, cx)
+            .map(|(_, chat)| chat.title(cx).to_owned())
             .unwrap_or_else(|| "this chat".to_owned())
     }
 
@@ -128,32 +138,35 @@ impl Cowork {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
-            return;
+        let loaded = match self.thread_store.read(cx).listed(thread_id, cx) {
+            Some((Place::Recents(_), ListedChat::Loaded(thread))) => {
+                let thread = thread.clone();
+                if !thread.read(cx).is_host() {
+                    return;
+                }
+                let host = thread.read(cx).participant_id();
+                self.cancel_generation(thread_id, host, None, cx);
+                let endpoint = thread.update(cx, |thread, cx| thread.stop_hosting(cx));
+                if let Some(endpoint) = endpoint {
+                    self.tokio_handle.spawn(async move {
+                        endpoint.close().await;
+                    });
+                }
+                Some(thread)
+            }
+            // Its draft is empty and it has no run, sharing or session.
+            Some((Place::Recents(_), ListedChat::Unloaded(_))) => None,
+            Some((Place::Archived(_), _)) | None => return,
         };
-        if !thread.read(cx).is_host() {
-            return;
+        self.thread_store
+            .update(cx, |store, cx| store.archive(thread_id, cx));
+        let draft_id = loaded.as_ref().map(|thread| thread.read(cx).draft().id);
+        if let Some(thread) = &loaded {
+            // A run still being stopped settles this again once it has
+            // ended, and saves it then.
+            self.settle_retired_thread(thread, cx);
         }
-        let host = thread.read(cx).participant_id();
-        self.cancel_generation(thread_id, host, None, cx);
-        let endpoint = thread.update(cx, |thread, cx| thread.stop_hosting(cx));
-        if let Some(endpoint) = endpoint {
-            self.tokio_handle.spawn(async move {
-                endpoint.close().await;
-            });
-        }
-
-        let draft_id = thread.read(cx).draft().id;
-        self.thread_store.update(cx, |store, cx| {
-            store
-                .threads
-                .retain(|thread| thread.read(cx).instance_id != thread_id);
-            store.archived.push_front(thread.clone());
-        });
-        // A run still being stopped settles this again once it has ended,
-        // and saves it then.
-        self.settle_retired_thread(&thread, cx);
-        self.save_thread(&thread, cx);
+        self.save_chat(thread_id, cx);
         self.published_presence.remove(&thread_id);
         self.segment_text_views
             .retain(|(message, _), _| message.thread_id != thread_id);
@@ -165,12 +178,13 @@ impl Cowork {
         if self
             .typing_in
             .as_ref()
-            .is_some_and(|(typing_in, _, _)| *typing_in == draft_id)
+            .is_some_and(|(typing_in, _, _)| Some(*typing_in) == draft_id)
         {
             self.typing_in = None;
         }
-        if self.active_thread_id == Some(thread_id) {
-            self.active_thread_id = None;
+        if self.active_thread_id(cx) == Some(thread_id) {
+            self.thread_store
+                .update(cx, |store, _| store.clear_active());
             self.selection_message_id = None;
             if self.main_stage == MainStage::Thread {
                 self.focus_composer(window, cx);
@@ -182,32 +196,16 @@ impl Cowork {
     /// Puts an archived thread back at the top of the sidebar's recents,
     /// as it was but no longer shared.
     pub(crate) fn restore_thread(&mut self, thread_id: Uuid, cx: &mut Context<Self>) {
-        self.thread_store.update(cx, |store, cx| {
-            let Some(index) = store
-                .archived
-                .iter()
-                .position(|thread| thread.read(cx).instance_id == thread_id)
-            else {
-                return;
-            };
-            if let Some(thread) = store.archived.remove(index) {
-                store.threads.push_front(thread);
-            }
-        });
-        if let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) {
-            self.save_thread(&thread, cx);
-        }
+        self.thread_store
+            .update(cx, |store, cx| store.restore(thread_id, cx));
+        self.save_chat(thread_id, cx);
         cx.notify();
     }
 
     /// Restores every archived thread, keeping the archive's order at the top
     /// of the recents.
     pub(crate) fn restore_all_threads(&mut self, cx: &mut Context<Self>) {
-        self.thread_store.update(cx, |store, _| {
-            while let Some(thread) = store.archived.pop_back() {
-                store.threads.push_front(thread);
-            }
-        });
+        self.thread_store.update(cx, |store, _| store.restore_all());
         self.save_all_threads(cx);
         cx.notify();
     }
@@ -215,18 +213,20 @@ impl Cowork {
     /// Deletes an archived thread for good, its folder too. The profile's
     /// statistics keep counting it.
     pub(crate) fn delete_archived_thread(&mut self, thread_id: Uuid, cx: &mut Context<Self>) {
-        let Some(thread) = self.thread_store.read(cx).archived_thread(thread_id, cx) else {
+        if !matches!(
+            self.thread_store.read(cx).listed(thread_id, cx),
+            Some((Place::Archived(_), _))
+        ) {
+            return;
+        }
+        let Some(meta) = self
+            .thread_store
+            .update(cx, |store, cx| store.remove(thread_id, cx))
+        else {
             return;
         };
-        self.thread_store.update(cx, |store, cx| {
-            store
-                .archived
-                .retain(|thread| thread.read(cx).instance_id != thread_id);
-        });
-        self.deleted.add_thread(thread.read(cx));
-        self.save_statistics();
         self.forget_scheduled_thread(thread_id);
-        self.settle_retired_thread(&thread, cx);
+        self.retire_chat(thread_id, Statistics::of_chat(&meta));
         cx.notify();
     }
 
@@ -349,9 +349,8 @@ impl Cowork {
         let thread_ids: Vec<Uuid> = self
             .thread_store
             .read(cx)
-            .archived
-            .iter()
-            .map(|thread| thread.read(cx).instance_id)
+            .archived(cx)
+            .map(|chat| chat.id(cx))
             .collect();
         if thread_ids.is_empty() {
             return;
@@ -401,30 +400,35 @@ impl Cowork {
         let thread_id = thread.instance_id;
         // Its session ends with it; restoring the thread starts another.
         self.retire_agent(thread_id);
-        if self
-            .thread_store
-            .read(cx)
-            .archived_thread(thread_id, cx)
-            .is_some()
-        {
+        // Archived. (Listed, loaded or not, rather than loaded: a chat
+        // unloaded since would otherwise count as deleted.)
+        if self.thread_store.read(cx).listed(thread_id, cx).is_some() {
             return;
         }
-        self.deleted.longest_chat = self.deleted.longest_chat.max(thread.generation_time());
+        // Deleted already; its run's time may make it the longest.
+        let counted = Statistics {
+            longest_chat: thread.generation_time(),
+            ..Statistics::default()
+        };
+        self.retire_chat(thread_id, counted);
+    }
+
+    /// Forgets a deleted chat but for its statistics, adding `counted` to
+    /// them as its rows are deleted.
+    fn retire_chat(&mut self, thread_id: Uuid, counted: Statistics) {
+        self.retire_agent(thread_id);
         self.profile_statistics = None;
         self.sandboxes.forget(&thread_id.to_string());
-        self.delete_thread_files(thread_id);
+        self.delete_saved_chat(thread_id, &counted);
+        self.deleted.add(&counted);
     }
 
     pub(crate) fn render_archive_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let archived: Vec<(Uuid, SharedString)> = self
             .thread_store
             .read(cx)
-            .archived
-            .iter()
-            .map(|thread| {
-                let thread = thread.read(cx);
-                (thread.instance_id, thread.summary.title.clone().into())
-            })
+            .archived(cx)
+            .map(|chat| (chat.id(cx), chat.title(cx).to_owned().into()))
             .collect();
         let empty = archived.is_empty();
         let count = match archived.len() {

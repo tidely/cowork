@@ -363,11 +363,13 @@ impl Cowork {
         paths: Vec<PathBuf>,
         cx: &mut Context<Self>,
     ) {
-        match thread.and_then(|thread| thread.upgrade()) {
-            Some(thread) => {
+        match thread.map(|thread| thread.upgrade()) {
+            Some(Some(thread)) => {
                 thread.update(cx, |thread, _| thread.add_project_folders(paths));
                 self.sync_sandbox_project(&thread, cx);
             }
+            // Deleted or unloaded since the menu or picker opened.
+            Some(None) => return,
             None => {
                 add_folders(&mut self.new_thread_project_folders, paths);
             }
@@ -381,11 +383,13 @@ impl Cowork {
         path: &Path,
         cx: &mut Context<Self>,
     ) {
-        match thread.and_then(|thread| thread.upgrade()) {
-            Some(thread) => {
+        match thread.map(|thread| thread.upgrade()) {
+            Some(Some(thread)) => {
                 thread.update(cx, |thread, _| thread.remove_project_folder(path));
                 self.sync_sandbox_project(&thread, cx);
             }
+            // Deleted or unloaded since the menu or picker opened.
+            Some(None) => return,
             None => {
                 remove_folder(&mut self.new_thread_project_folders, path);
             }

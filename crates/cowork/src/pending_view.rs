@@ -97,7 +97,7 @@ impl Cowork {
         document_order_base: usize,
         cx: &mut Context<Self>,
     ) -> Vec<AnyElement> {
-        let Some(thread) = self.thread_store.read(cx).thread(thread_id, cx) else {
+        let Some(thread) = self.thread_store.read(cx).loaded(thread_id, cx) else {
             return Vec::new();
         };
         let state = thread.read(cx);

@@ -414,8 +414,8 @@ fn a_joined_thread_closes_when_the_host_stops_sharing(cx: &mut gpui::TestAppCont
     });
     session.wait_until("the collaborator's thread closes", |this| {
         this.collaborator.read_with(this.cx, |collaborator, cx| {
-            collaborator.active_thread_id.is_none()
-                && collaborator.thread_store.read(cx).threads.is_empty()
+            collaborator.active_thread_id(cx).is_none()
+                && collaborator.thread_store.read(cx).recent_ids(cx).is_empty()
         })
     });
 }
@@ -438,8 +438,8 @@ fn a_joined_thread_closes_when_the_host_sends_invalid_json(cx: &mut gpui::TestAp
 
     session.wait_until("the collaborator rejects the invalid host event", |this| {
         this.collaborator.read_with(this.cx, |collaborator, cx| {
-            collaborator.active_thread_id.is_none()
-                && collaborator.thread_store.read(cx).threads.is_empty()
+            collaborator.active_thread_id(cx).is_none()
+                && collaborator.thread_store.read(cx).recent_ids(cx).is_empty()
         })
     });
 
@@ -502,7 +502,9 @@ fn the_host_sees_the_collaborators_caret_and_selection(cx: &mut gpui::TestAppCon
 
     // Leaving the draft clears the presence.
     collaborator.update(session.cx, |collaborator, cx| {
-        collaborator.active_thread_id = None;
+        collaborator
+            .thread_store
+            .update(cx, |store, _| store.clear_active());
         cx.notify();
     });
     session.wait_until("the host sees the collaborator leave the block", |this| {
