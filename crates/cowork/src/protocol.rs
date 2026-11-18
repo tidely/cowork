@@ -45,7 +45,7 @@ pub(crate) const ATTACHMENT_CHUNK_SIZE: usize = 64 * 1024;
 /// [`CollaboratorMessage::Join`] and [`HostMessage::Rejected`] must never
 /// change: each keeps its variant index, and `Join` keeps the version as its
 /// only field.
-pub(crate) const PROTOCOL_VERSION: u32 = 38;
+pub(crate) const PROTOCOL_VERSION: u32 = 39;
 
 /// A request from a collaborator to the host.
 ///
@@ -317,6 +317,11 @@ pub(crate) enum HostMessage {
 /// entries and compactions travel in the agent's versioned records.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum RunEvent {
+    /// The first model content arrived; excludes request startup from the
+    /// displayed work duration. The host supplies the time for all replicas.
+    ContentStarted {
+        at: SystemTime,
+    },
     /// A fragment of the reply being sampled. Only previews it; the reply
     /// joins the transcript whole, once it is complete.
     Preview(Preview),
@@ -522,6 +527,8 @@ pub(crate) struct AgentMessage {
     pub(crate) id: uuid::Bytes,
     pub(crate) comment_group_id: Option<uuid::Bytes>,
     pub(crate) started_at: SystemTime,
+    /// The host's first model content, not the time it sent the request.
+    pub(crate) first_content_at: Option<SystemTime>,
     /// Where this run starts in the ordered transcript. Its first input
     /// entry is its prompt, possibly after context notes. Only the active
     /// run may still lack it.
@@ -947,6 +954,9 @@ mod tests {
                     id: [4; 16],
                     comment_group_id: Some([2; 16]),
                     started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+                    first_content_at: Some(
+                        SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_002),
+                    ),
                     start: TranscriptIndex(0),
                     pending_events: vec![Preview {
                         index: 0,
@@ -1056,6 +1066,12 @@ mod tests {
                 comment_group_id: Some([8; 16]),
                 started_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
                 model: Some(sample_model()),
+            },
+            HostMessage::AgentEvent {
+                id: [7; 16],
+                event: RunEvent::ContentStarted {
+                    at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_002),
+                },
             },
             HostMessage::AgentEvent {
                 id: [7; 16],

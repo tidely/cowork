@@ -60,6 +60,63 @@ fn previews_text(event: &protocol::HostMessage) -> bool {
     )
 }
 
+#[gpui::test]
+fn work_duration_excludes_startup_and_survives_a_snapshot(cx: &mut gpui::TestAppContext) {
+    let (thread, cx) = empty_thread(cx, Arc::default());
+    cx.update(|_, cx| {
+        thread.update(cx, |thread, cx| {
+            let id = Uuid::new_v4();
+            let mut host = ScriptedHost::default();
+            for event in host.start(id, "Hello") {
+                thread.apply_for_test(event, cx);
+            }
+            let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+            let message = thread.agent_message_mut(id.into_bytes()).unwrap();
+            assert!(!message.has_work_summary());
+            assert_eq!(message.record.work_duration(at), None);
+
+            thread.apply_for_test(
+                protocol::HostMessage::AgentEvent {
+                    id: id.into_bytes(),
+                    event: protocol::RunEvent::ContentStarted { at },
+                },
+                cx,
+            );
+            for event in host.turn(id, [streamed_text("answer", "Hi", false)], 5) {
+                thread.apply_for_test(event, cx);
+            }
+            let message = thread.agent_message_mut(id.into_bytes()).unwrap();
+            assert!(message.has_work_summary());
+            let record = &message.record;
+            assert_eq!(record.work_duration(at), Some(Duration::ZERO));
+            assert_eq!(
+                record.work_duration(at + Duration::from_secs(3)),
+                Some(Duration::from_secs(3))
+            );
+            let restored = record.to_protocol().into_native(cx);
+            assert_eq!(
+                restored.record.work_duration(at + Duration::from_secs(3)),
+                Some(Duration::from_secs(3))
+            );
+
+            thread.apply_for_test(
+                protocol::HostMessage::AgentEnded {
+                    id: id.into_bytes(),
+                    outcome: protocol::RunOutcome::Completed,
+                    duration: Duration::from_secs(15),
+                },
+                cx,
+            );
+            let record = &thread.agent_message_mut(id.into_bytes()).unwrap().record;
+            assert_eq!(
+                record.work_duration(at + Duration::from_secs(100)),
+                Some(Duration::from_secs(5))
+            );
+            assert_eq!(record.run.duration(), Some(Duration::from_secs(15)));
+        });
+    });
+}
+
 /// The messages a host sends while answering one prompt: a reply that
 /// thinks, answers, and replies to a comment with a tool call, then the
 /// tool's result and a second reply.

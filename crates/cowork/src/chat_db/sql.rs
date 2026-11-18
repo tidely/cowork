@@ -299,8 +299,8 @@ pub(super) async fn insert_message(
             sqlx::query(
                 "INSERT INTO agent_runs (message_id, comment_group_id, started_at, duration_ns,
                      tokens, transcript_start, outcome, error, unfinished, model_provider,
-                     model_id)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                     model_id, first_content_at)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             )
             .bind(id)
             .bind(run.comment_group_id)
@@ -313,6 +313,7 @@ pub(super) async fn insert_message(
             .bind(&run.unfinished)
             .bind(provider)
             .bind(model)
+            .bind(run.first_content_at)
             .execute(&mut *conn)
             .await?;
             // Entries before compactions: the trigger checks a compaction
@@ -562,7 +563,7 @@ pub(super) async fn load(
     for row in sqlx::query(on_path!(
         "SELECT r.message_id, r.comment_group_id, r.started_at, r.duration_ns, r.tokens,
                 r.transcript_start, r.outcome, r.error, r.unfinished, r.model_provider,
-                r.model_id
+                r.model_id, r.first_content_at
          FROM path p JOIN agent_runs r ON r.message_id = p.id"
     ))
     .bind(id)
@@ -580,6 +581,7 @@ pub(super) async fn load(
                 outcome: columns::to_outcome(row.get::<&str, _>(6), row.get(7))?,
                 unfinished: row.get(8),
                 model: to_model(row.get(9), row.get(10))?,
+                first_content_at: row.get(11),
             },
         );
     }

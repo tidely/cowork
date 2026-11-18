@@ -238,6 +238,7 @@ pub(crate) struct CommentRow {
 pub(crate) struct RunRow {
     pub(crate) comment_group_id: Option<Uuid>,
     pub(crate) started_at: DateTime<Utc>,
+    pub(crate) first_content_at: Option<DateTime<Utc>>,
     pub(crate) duration_ns: i64,
     pub(crate) tokens: i64,
     pub(crate) transcript_start: i64,
@@ -326,6 +327,7 @@ impl MessageRow {
                     run: RunRow {
                         comment_group_id: run.comment_group_id.map(Uuid::from_bytes),
                         started_at: columns::time(run.started_at),
+                        first_content_at: run.first_content_at.map(columns::time),
                         duration_ns: columns::nanos(duration, "run duration")?,
                         tokens: columns::int(run.tokens, "run tokens")?,
                         transcript_start: columns::int(run.start.0, "run start")?,
@@ -400,6 +402,7 @@ impl MessageRow {
                     id: id.into_bytes(),
                     comment_group_id: run.comment_group_id.map(Uuid::into_bytes),
                     started_at: columns::system_time(run.started_at),
+                    first_content_at: run.first_content_at.map(columns::system_time),
                     start: crate::transcript::TranscriptIndex(columns::uint(
                         run.transcript_start,
                         "run start",

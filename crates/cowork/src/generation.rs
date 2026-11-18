@@ -276,6 +276,7 @@ pub(crate) struct ActiveGeneration {
     started_at: SystemTime,
     /// Monotonic, so the duration survives clock changes.
     started: Instant,
+    content_started: bool,
     #[cfg(test)]
     decisions: Vec<(ToolCallId, bool)>,
 }
@@ -291,6 +292,7 @@ impl ActiveGeneration {
             offered: HashSet::new(),
             started_at: SystemTime::now(),
             started: Instant::now(),
+            content_started: false,
             #[cfg(test)]
             decisions: Vec::new(),
         }
@@ -713,6 +715,45 @@ impl Cowork {
             return;
         }
         let message_id = generation.message_id;
+        let has_content = match &event.kind {
+            EventKind::Preview { delta, .. } => match delta {
+                ContentDelta::Text(text) | ContentDelta::Reasoning(text) => !text.is_empty(),
+                ContentDelta::ToolCall { .. } => true,
+            },
+            EventKind::MessageCommitted { entry, .. } => {
+                entry.message.role == agent::model::Role::Assistant
+                    && entry.message.content.iter().any(|content| match content {
+                        agent::model::Content::Text { text }
+                        | agent::model::Content::Reasoning(agent::model::Reasoning::Text {
+                            text,
+                        }) => !text.is_empty(),
+                        _ => true,
+                    })
+            }
+            _ => false,
+        };
+        if has_content && !generation.content_started {
+            generation.content_started = true;
+            let thread = self
+                .thread_store
+                .read(cx)
+                .loaded(thread_id, cx)
+                .or_else(|| self.thread_store.read(cx).loaded_archived(thread_id, cx));
+            if let Some(thread) = thread {
+                thread.update(cx, |thread, cx| {
+                    thread.emit(
+                        protocol::HostMessage::AgentEvent {
+                            id: message_id.into_bytes(),
+                            event: RunEvent::ContentStarted {
+                                at: SystemTime::now(),
+                            },
+                        },
+                        cx,
+                    );
+                });
+                cx.notify();
+            }
+        }
         let told = match event.kind {
             EventKind::Preview { index, delta } => {
                 let delta = match delta {

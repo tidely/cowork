@@ -1137,18 +1137,18 @@ impl Cowork {
     ) -> gpui::AnyElement {
         let message_id = message.record.id;
         // Shimmering while the agent works, to draw the eye; static after.
-        let label = match message.record.run.duration() {
-            None => ShimmerText::new(format!(
-                "Working for {}",
-                format_duration(message.record.started_at.elapsed().unwrap_or_default())
-            ))
-            // The text changes every second; a stable id keeps the sweep
-            // going instead of restarting it.
-            .id(format!("working-{message_id}"))
-            .into_any_element(),
+        let label = match message.record.work_duration(std::time::SystemTime::now()) {
+            Some(duration) if message.is_generating() => {
+                ShimmerText::new(format!("Working for {}", format_duration(duration)))
+                    // The text changes every second; a stable id keeps the sweep
+                    // going instead of restarting it.
+                    .id(format!("working-{message_id}"))
+                    .into_any_element()
+            }
             Some(duration) => {
                 format!("Worked for {}", format_duration(duration)).into_any_element()
             }
+            None => "No content received".into_any_element(),
         };
         let outcome = match message.record.run.outcome() {
             Some(RunOutcome::Stopped) => {
@@ -1515,10 +1515,7 @@ impl Cowork {
             });
         // A plain reply that completed needs no summary, nor does the
         // onboarding greeting while it streams in.
-        let summarized = !self.streaming_intro(message_id)
-            && (message.is_generating()
-                || message.ui.output.work().next().is_some()
-                || !matches!(message.record.run.outcome(), Some(RunOutcome::Completed)));
+        let summarized = !self.streaming_intro(message_id) && message.has_work_summary();
         let summary = summarized.then(|| Self::render_work_summary(thread_id, message, cx));
         let rights = self
             .thread_store

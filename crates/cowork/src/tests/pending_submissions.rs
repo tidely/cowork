@@ -18,6 +18,83 @@ fn generating(session: &mut Collaboration<'_>) -> Uuid {
     message_id
 }
 
+#[gpui::test]
+fn work_clock_starts_once_on_nonempty_content(cx: &mut gpui::TestAppContext) {
+    use agent::{AgentEvent, EventKind, RunId, model::ContentDelta};
+
+    let mut session = Collaboration::start(cx);
+    let message_id = generating(&mut session);
+    let thread = session.host_thread.clone();
+    let thread_id = thread.read_with(session.cx, |thread, _| thread.instance_id);
+    session.host.update(session.cx, |_, cx| {
+        thread.update(cx, |thread, cx| {
+            thread.emit_for_test(ScriptedHost::default().prompt(message_id, "Hello"), cx);
+        });
+    });
+    let run = RunId::new();
+    let mut sequence = 0;
+    let mut tell = |session: &mut Collaboration<'_>, kind| {
+        sequence += 1;
+        session.host.update(session.cx, |cowork, cx| {
+            cowork.agent_event_for_test(
+                thread_id,
+                AgentEvent {
+                    sequence,
+                    run: Some(run),
+                    kind,
+                },
+                cx,
+            );
+        });
+    };
+    let clock = |session: &mut Collaboration<'_>| {
+        thread.read_with(session.cx, |thread, _| {
+            thread.timeline.iter().find_map(|message| match message {
+                TimelineMessage::Agent(message) => message.record.first_content_at,
+                _ => None,
+            })
+        })
+    };
+    tell(&mut session, EventKind::RunStarted);
+    tell(
+        &mut session,
+        EventKind::Preview {
+            index: 0,
+            delta: ContentDelta::Reasoning(String::new()),
+        },
+    );
+    assert_eq!(clock(&mut session), None);
+    tell(
+        &mut session,
+        EventKind::Preview {
+            index: 0,
+            delta: ContentDelta::Reasoning("Plan".into()),
+        },
+    );
+    let started = clock(&mut session).expect("first reasoning starts the clock");
+    tell(
+        &mut session,
+        EventKind::Preview {
+            index: 1,
+            delta: ContentDelta::Text("Answer".into()),
+        },
+    );
+    assert_eq!(clock(&mut session), Some(started));
+    let mirror = session.collaborator_thread().unwrap();
+    mirror.read_with(session.cx, |thread, _| {
+        let message = thread
+            .timeline
+            .iter()
+            .find_map(|message| match message {
+                TimelineMessage::Agent(message) => Some(message),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(message.record.first_content_at, Some(started));
+        assert!(message.has_work_summary());
+    });
+}
+
 fn accept(session: &mut Collaboration<'_>, text: &str) {
     accept_mode(session, text, protocol::SubmissionMode::Queue);
 }
@@ -210,6 +287,7 @@ fn steering_commit_delivers_inline_and_replays_for_collaborators(cx: &mut gpui::
                 _ => None,
             })
             .unwrap();
+        assert!(message.record.first_content_at.is_some());
         assert!(matches!(message.ui.output.steps(), [
             AgentStep::Steering(a), AgentStep::Steering(b), AgentStep::ToolCall(_),
         ] if *a == first && *b == id));

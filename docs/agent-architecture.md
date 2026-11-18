@@ -334,7 +334,13 @@ collaborators see what the session commits.
 
 Before any model content arrives, the timeline shows “Working on it…”.
 “Thinking…” is reserved for streamed reasoning; answer text and tool calls
-render as their own content.
+render as their own content. The “Working for…” header appears at the first
+model content (including a streamed tool call). Its timer and final “Worked
+for…” duration exclude the initial wait, but include the rest of the run,
+including tools and later requests. The host publishes this start time and
+saves it with the run, so collaborators, late joiners and reopened chats use
+the same timing. Request durations used for usage statistics are unchanged;
+older saved runs without a recorded content start retain their full duration.
 
 | Concept | In Cowork |
 | --- | --- |

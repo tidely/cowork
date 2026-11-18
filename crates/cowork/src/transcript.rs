@@ -407,6 +407,16 @@ impl Thread {
             .context("event is not for the active run")?;
         let mut completed = None;
         match event {
+            RunEvent::ContentStarted { at } => {
+                if let Some(message) = agent_message(&mut self.timeline, message_id) {
+                    anyhow::ensure!(
+                        message.record.first_content_at.is_none(),
+                        "model content already started"
+                    );
+                    message.record.first_content_at = Some(at);
+                }
+                return Ok(());
+            }
             RunEvent::Preview(preview) => {
                 anyhow::ensure!(
                     activity != RunActivity::Compacting && self.transcript.is_settled(),

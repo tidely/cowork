@@ -139,6 +139,12 @@ fn thread_with_history(
 
     let run = Uuid::new_v4();
     let mut events = host.start(run, "Read the notes");
+    events.push(protocol::HostMessage::AgentEvent {
+        id: run.into_bytes(),
+        event: protocol::RunEvent::ContentStarted {
+            at: SystemTime::UNIX_EPOCH + Duration::from_millis(250),
+        },
+    });
     events.extend(host.turn(
         run,
         [streamed_tool_call(

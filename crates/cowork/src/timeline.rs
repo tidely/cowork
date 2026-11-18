@@ -68,6 +68,7 @@ pub(crate) struct AgentRunRecord {
     pub(crate) id: Uuid,
     pub(crate) comment_group_id: Option<Uuid>,
     pub(crate) started_at: SystemTime,
+    pub(crate) first_content_at: Option<SystemTime>,
     /// See [`protocol::AgentMessage::start`].
     pub(crate) start: crate::transcript::TranscriptIndex,
     /// See [`protocol::AgentMessage::pending_events`].
@@ -842,6 +843,7 @@ impl AgentMessage {
                 id,
                 comment_group_id,
                 started_at,
+                first_content_at: None,
                 start,
                 pending_events,
                 run,
@@ -908,6 +910,18 @@ impl AgentMessage {
         self.record.run.is_generating()
     }
 
+    pub(crate) fn has_work_summary(&self) -> bool {
+        if self.is_generating() {
+            self.record.first_content_at.is_some()
+        } else {
+            self.ui.output.work().next().is_some()
+                || !matches!(
+                    self.record.run.outcome(),
+                    Some(protocol::RunOutcome::Completed)
+                )
+        }
+    }
+
     /// Where the call awaiting approval is among `output`'s steps; only the
     /// last reply's calls can be waiting, so it is the latest with that id.
     pub(crate) fn awaiting_approval_step(&self) -> Option<usize> {
@@ -919,11 +933,26 @@ impl AgentMessage {
 }
 
 impl AgentRunRecord {
+    /// Request duration is retained for usage statistics; only the work
+    /// summary excludes the initial wait for model content.
+    pub(crate) fn work_duration(&self, now: SystemTime) -> Option<std::time::Duration> {
+        let first_content_at = self.first_content_at?;
+        Some(match self.run.duration() {
+            Some(duration) => duration.saturating_sub(
+                first_content_at
+                    .duration_since(self.started_at)
+                    .unwrap_or_default(),
+            ),
+            None => now.duration_since(first_content_at).unwrap_or_default(),
+        })
+    }
+
     pub(crate) fn to_protocol(&self) -> protocol::AgentMessage {
         protocol::AgentMessage {
             id: self.id.into_bytes(),
             comment_group_id: self.comment_group_id.map(Uuid::into_bytes),
             started_at: self.started_at,
+            first_content_at: self.first_content_at,
             start: self.start,
             pending_events: self.pending_events.clone(),
             run: self.run.clone(),
@@ -948,6 +977,7 @@ impl protocol::AgentMessage {
             self.pending_events,
             cx,
         );
+        message.record.first_content_at = self.first_content_at;
         message.record.tokens = self.tokens;
         message.record.model = self.model;
         message.record.awaiting_approval = self.awaiting_approval;
