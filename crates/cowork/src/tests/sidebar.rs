@@ -700,10 +700,8 @@ fn opening_an_unloaded_chat_shows_a_placeholder_until_it_loads(cx: &mut gpui::Te
                     id: saved,
                     title: "Saved".into(),
                     project: None,
-                    tokens_used: 0,
                     generation_time: Duration::ZERO,
                     last_run_at: None,
-                    token_activity: Vec::new(),
                 };
                 store.push_unloaded(meta, false, cx);
             });

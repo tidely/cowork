@@ -428,10 +428,12 @@ fn launch_onboards_only_users_without_threads(cx: &mut gpui::TestAppContext) {
             .update(cx, |store, cx| store.push_front_archived(thread, cx));
         cowork.new_thread_model = None;
         cowork.main_stage = MainStage::Welcome;
+        window.blur(cx);
         cowork.open_start_stage(window, cx);
         assert_eq!(cowork.main_stage, MainStage::Thread);
         assert_eq!(cowork.stage_before_settings, MainStage::Thread);
         assert!(cowork.active_thread_id(cx).is_none());
+        assert!(cowork.focused_draft_editor(window, cx).is_some());
 
         // Without threads, as after deleting the onboarding chat, the welcome
         // screen waits for discovery (not driven here), then onboarding

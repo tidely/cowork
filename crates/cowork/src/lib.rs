@@ -295,6 +295,7 @@ impl Cowork {
             self.offer_onboarding(discovered, window, cx);
         } else {
             self.main_stage = MainStage::Thread;
+            self.focus_composer(window, cx);
             discovered.detach();
         }
         self.stage_before_settings = self.main_stage;
@@ -969,7 +970,10 @@ pub fn run() -> anyhow::Result<()> {
                     cowork.start_unload_sweep(cx);
                     cowork.open_start_stage(window, cx);
                 });
-                cx.new(|cx| Root::new(cowork, window, cx))
+                let root = cx.new(|cx| Root::new(cowork, window, cx));
+                // App activation alone does not focus a window on every platform.
+                window.activate_window();
+                root
             }) {
                 eprintln!("failed to open Cowork window: {error}");
                 cx.quit();
