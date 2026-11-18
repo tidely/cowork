@@ -332,6 +332,10 @@ first run and kept for its later ones, so what the model was told (such as the
 environment note) carries over between runs. Only the host runs the agent;
 collaborators see what the session commits.
 
+Before any model content arrives, the timeline shows “Working on it…”.
+“Thinking…” is reserved for streamed reasoning; answer text and tool calls
+render as their own content.
+
 | Concept | In Cowork |
 | --- | --- |
 | `AgentHost` | `CoworkHost` ([tool_approval.rs](../crates/cowork/src/tool_approval.rs)): sources are the participant or schedule that started a run, inputs are a submission's content, access is the sandbox's `Needs`, and permissions are the sandbox's project, read when a call starts |

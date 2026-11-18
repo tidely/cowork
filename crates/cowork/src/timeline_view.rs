@@ -1616,7 +1616,7 @@ impl Cowork {
                             content.push(Self::render_compaction_marker(index, true, cx))
                         }
                         RunItem::Activity(_) => content.push(
-                            ShimmerText::new("Thinking…")
+                            ShimmerText::new("Working on it…")
                                 .id(("agent-waiting", index))
                                 .text_color(cx.theme().muted_foreground)
                                 .into_any_element(),
