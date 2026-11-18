@@ -81,6 +81,15 @@ fn work_clock_starts_once_on_nonempty_content(cx: &mut gpui::TestAppContext) {
     );
     assert_eq!(clock(&mut session), Some(started));
     let mirror = session.collaborator_thread().unwrap();
+    session.wait_until("content start reaches the collaborator", |session| {
+        mirror.read_with(session.cx, |thread, _| {
+            thread.timeline.iter().any(|message| {
+                matches!(message, TimelineMessage::Agent(message)
+                    if message.record.id == message_id
+                        && message.record.first_content_at == Some(started))
+            })
+        })
+    });
     mirror.read_with(session.cx, |thread, _| {
         let message = thread
             .timeline

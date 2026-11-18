@@ -149,20 +149,27 @@ impl JsonlLog {
         let directory = directory.as_ref().to_path_buf();
         let loaded = load::<S>(&directory).await?;
         let bytes = fs::read(directory.join("updates.jsonl")).await?;
+        if loaded.ignored_torn_tail {
+            // Remove only the incomplete final record; prior complete records
+            // and unsupported versions are never silently discarded. Windows
+            // append-only handles cannot truncate, so repair before appending.
+            let length = bytes
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |index| index + 1);
+            OpenOptions::new()
+                .write(true)
+                .open(directory.join("updates.jsonl"))
+                .await?
+                .set_len(length as u64)
+                .await?;
+        }
         let file = OpenOptions::new()
             .append(true)
             .open(directory.join("updates.jsonl"))
             .await?;
         let mut writer = BufWriter::new(file);
-        if loaded.ignored_torn_tail {
-            // Remove only the incomplete final record; prior complete records
-            // and unsupported versions are never silently discarded.
-            let length = bytes
-                .iter()
-                .rposition(|byte| *byte == b'\n')
-                .map_or(0, |index| index + 1);
-            writer.get_mut().set_len(length as u64).await?;
-        } else if bytes.last().is_some_and(|byte| *byte != b'\n') {
+        if !loaded.ignored_torn_tail && bytes.last().is_some_and(|byte| *byte != b'\n') {
             writer.write_all(b"\n").await?;
         }
         // Rebuild the derived file if a crash left it behind the transcript.
