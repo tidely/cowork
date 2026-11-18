@@ -93,4 +93,12 @@ impl ManualLoader {
         // The receiver is gone if the load was cancelled.
         _ = done.send(ChatRows::of_meta(&meta));
     }
+
+    /// Ends the first started load of `id` without rows, as a load the
+    /// database could not answer does.
+    pub(crate) fn fail(&self, id: Uuid) {
+        let mut pending = self.pending.borrow_mut();
+        let loads = pending.get_mut(&id).expect("a load of this chat");
+        loads.remove(0);
+    }
 }

@@ -80,6 +80,44 @@ fn opening_a_loading_chat_again_starts_no_second_load(cx: &mut TestAppContext) {
     store.read_with(cx, |store, _| assert_eq!(store.active_id(), Some(a)));
 }
 
+/// A failed load leaves its chat the one being opened, marked failed,
+/// until opening it again loads it; archiving it ends the opening.
+#[gpui::test]
+fn a_failed_open_stays_until_retried_or_archived(cx: &mut TestAppContext) {
+    let (store, loader, ids) = store_of(&["a", "b"], cx);
+    let [a, b] = ids[..] else { unreachable!() };
+    let opening = |cx: &mut TestAppContext| {
+        store.read_with(cx, |store, cx| {
+            store
+                .opening(cx)
+                .map(|opening| (opening.id, opening.failed))
+        })
+    };
+    open(&store, a, cx);
+    assert_eq!(opening(cx), Some((a, false)));
+
+    loader.fail(a);
+    cx.run_until_parked();
+    assert_eq!(opening(cx), Some((a, true)));
+    store.read_with(cx, |store, _| assert_eq!(store.active_id(), None));
+
+    assert_eq!(open(&store, a, cx), Opened::Loading);
+    assert_eq!(opening(cx), Some((a, false)));
+    loader.finish(a);
+    cx.run_until_parked();
+    assert_eq!(opening(cx), None);
+    store.read_with(cx, |store, _| assert_eq!(store.active_id(), Some(a)));
+
+    open(&store, b, cx);
+    store.update(cx, |store, cx| assert!(store.archive(b, cx)));
+    assert_eq!(opening(cx), None);
+    loader.finish(b);
+    cx.run_until_parked();
+    store.read_with(cx, |store, _| {
+        assert_eq!(store.active_id(), Some(a), "an archived chat isn't shown")
+    });
+}
+
 #[gpui::test]
 fn a_load_finishing_after_its_chat_was_deleted_is_dropped(cx: &mut TestAppContext) {
     let (store, loader, ids) = store_of(&["a", "b"], cx);

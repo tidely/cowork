@@ -76,6 +76,7 @@ mod permissions;
 mod project_folders;
 mod project_mode;
 mod schedules;
+mod screenshots;
 mod search_palette;
 mod sidebar;
 mod threads;
@@ -243,6 +244,7 @@ fn test_cowork(
         join_dialog: None,
         main_stage: MainStage::Thread,
         stage_before_settings: MainStage::Thread,
+        opening_stage: Default::default(),
         selected_provider: None,
         ollama_watch: None,
         copied_pull_command: false,

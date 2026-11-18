@@ -690,6 +690,80 @@ fn a_project_shows_five_more_chats_at_a_time(cx: &mut gpui::TestAppContext) {
     assert_eq!(shown(cx), 0);
 }
 
+/// A chat slow to load is selected from the click on, keeps the chat shown
+/// before for a moment, then shows a placeholder until it loads, for no
+/// less than a minimum; a load that fails offers to try again, focused.
+#[gpui::test]
+fn opening_an_unloaded_chat_shows_a_placeholder_until_it_loads(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let before = add_thread(&cowork, 5, cx);
+    let loader = crate::chat_meta::ManualLoader::default();
+    let saved = Uuid::new_v4();
+    cx.update(|window, cx| {
+        cowork.update(cx, |cowork, cx| {
+            cowork.open_thread(before, window, cx);
+            cowork.thread_store.update(cx, |store, cx| {
+                store.set_loader(loader.loader());
+                let meta = crate::chat_meta::ChatMeta {
+                    id: saved,
+                    title: "Saved".into(),
+                    project: None,
+                    tokens_used: 0,
+                    generation_time: Duration::ZERO,
+                    last_run_at: None,
+                    token_activity: Vec::new(),
+                };
+                store.push_unloaded(meta, false, cx);
+            });
+        })
+    });
+    draw(cx);
+    let stage = |cx: &mut gpui::VisualTestContext| {
+        cowork.read_with(cx, |cowork, cx| {
+            (
+                cowork.main_stage,
+                cowork.current_chat_id(cx),
+                cowork.active_thread_id(cx),
+            )
+        })
+    };
+
+    click(selector("sidebar-thread", saved), cx);
+    assert_eq!(stage(cx), (MainStage::Thread, Some(saved), Some(before)));
+    cx.executor()
+        .advance_clock(crate::opening::PLACEHOLDER_DELAY);
+    draw(cx);
+    assert_eq!(stage(cx).0, MainStage::Opening);
+    assert!(drawn("opening-placeholder", cx));
+    assert!(drawn("opening-bottom-bar", cx));
+
+    loader.fail(saved);
+    draw(cx);
+    assert!(drawn("opening-failed", cx));
+    let retry_focused = cx.update(|window, cx| {
+        let focus = cowork.read(cx).opening_stage.retry_focus.clone();
+        focus.is_some_and(|focus| focus.is_focused(window))
+    });
+    assert!(retry_focused);
+    click("retry-opening", cx);
+    assert!(
+        drawn("opening-placeholder", cx),
+        "retrying shows it at once"
+    );
+
+    loader.finish(saved);
+    draw(cx);
+    assert!(
+        drawn("opening-placeholder", cx),
+        "held, having only just appeared"
+    );
+    cx.executor()
+        .advance_clock(crate::opening::PLACEHOLDER_MIN_SHOWN);
+    draw(cx);
+    assert_eq!(stage(cx), (MainStage::Thread, Some(saved), Some(saved)));
+    assert!(!drawn("opening-placeholder", cx));
+}
+
 /// Recents draws a page of rows, and more as its end scrolls into view,
 /// never every chat at once.
 #[gpui::test]

@@ -962,6 +962,7 @@ pub(crate) mod tests {
                         join_dialog: None,
                         main_stage: MainStage::Thread,
                         stage_before_settings: MainStage::Thread,
+                        opening_stage: Default::default(),
                         selected_provider: None,
                         ollama_watch: None,
                         copied_pull_command: false,

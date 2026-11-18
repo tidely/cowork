@@ -640,20 +640,30 @@ impl Cowork {
         match opened {
             Opened::Active => self.show_active_thread(window, cx),
             // Shown once loaded; see `ChatStoreEvent::Activated`.
-            Opened::Loading => cx.notify(),
+            Opened::Loading => self.await_opening(window, cx),
             Opened::Missing => {}
         }
     }
 
-    /// Shows a chat opened while unloaded once it has loaded, and starts a
-    /// scheduled run that waited for its chat to load.
+    /// The chat the main stage is for: one being opened from the moment it
+    /// is clicked, otherwise the active one. The sidebar selects it while
+    /// the stage shows it.
+    pub(crate) fn current_chat_id(&self, cx: &App) -> Option<Uuid> {
+        let store = self.thread_store.read(cx);
+        store.opening_id(cx).or(store.active_id())
+    }
+
+    /// Shows a chat opened while unloaded once it has loaded, or that it
+    /// failed to, and starts a scheduled run that waited for its chat to
+    /// load.
     pub(crate) fn subscribe_thread_store(
         store: &Entity<ThreadStore>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Subscription {
         cx.subscribe_in(store, window, |this, _, event, window, cx| match event {
-            ChatStoreEvent::Activated => this.show_active_thread(window, cx),
+            ChatStoreEvent::Activated => this.show_opened_chat(window, cx),
+            ChatStoreEvent::OpenFailed => this.show_failed_opening(window, cx),
             ChatStoreEvent::Loaded => this.run_next_scheduled(crate::scheduler::now(), cx),
         })
     }
@@ -663,6 +673,7 @@ impl Cowork {
             return;
         };
         let can_write = thread.read(cx).can_edit_draft();
+        self.end_opening();
         self.selection_message_id = None;
         self.main_stage = MainStage::Thread;
         self.follow_generation = true;
@@ -857,8 +868,8 @@ impl Cowork {
         ThreadRow {
             thread_id,
             title: thread.title.clone().into(),
-            active: self.main_stage == MainStage::Thread
-                && self.active_thread_id(cx) == Some(thread_id),
+            active: matches!(self.main_stage, MainStage::Thread | MainStage::Opening)
+                && self.current_chat_id(cx) == Some(thread_id),
             indented,
             on_open: Rc::new(move |window, cx| {
                 _ = open.update(cx, |this, cx| this.open_thread(thread_id, window, cx));
@@ -995,8 +1006,8 @@ impl Cowork {
                 this.open_create_project_dialog(window, cx);
             }),
         ));
-        // A page of Recents at a time, and the active chat wherever it is.
-        let active = self.active_thread_id(cx);
+        // A page of Recents at a time, and the current chat wherever it is.
+        let active = self.current_chat_id(cx);
         let shown = groups
             .recents
             .iter()

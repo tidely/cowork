@@ -104,6 +104,12 @@ schedules page. The scheduler uses `ready()`, which returns `Blocked::Loading` f
 an unloaded chat and retries when the load finishes. Loads come only from the
 loader, which alone can build a `Thread` with an existing id.
 
+Opening an unloaded chat makes it the store's opening chat until it loads, and
+the sidebar selects it from the click on. The chat shown before stays for 200 ms
+(most loads finish well within that) and then gives way to a placeholder, shown
+for at least 500 ms so it never flashes; a load that fails leaves the chat
+opening, marked failed, which shows a retry (`opening.rs`). Taking the chat off the recents ends its opening.
+
 Archiving, restoring and removing a project work on metadata through `save_meta`.
 Search matches every chat's full text, loaded or not.
 

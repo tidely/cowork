@@ -7,6 +7,8 @@
 //!   and dropping the chat (deleting it) cancels it; a finished load fills
 //!   only the chat that started it, and only while it is `Loading`;
 //! - the active chat is listed in the recents and loaded (private fields);
+//! - the chat being opened is listed in the recents: taking it off them
+//!   ends the opening, as it clears the active chat;
 //! - a chat's metadata has one copy: the row while unloaded or loading,
 //!   the `Thread` once loaded.
 
@@ -160,15 +162,30 @@ pub(crate) enum Opened {
 pub(crate) enum ChatStoreEvent {
     Activated,
     Loaded,
+    /// The chat being opened could not be loaded; it stays the opening
+    /// chat, marked failed, until it is opened again or another is shown.
+    OpenFailed,
+}
+
+/// The chat opened last, while it loads or after its load failed: by
+/// identity, so a chat removed meanwhile can't match.
+struct Opening {
+    chat: WeakEntity<Chat>,
+    failed: bool,
+}
+
+/// The chat being opened, as the main stage shows it until it is loaded.
+pub(crate) struct OpeningChat {
+    pub(crate) id: Uuid,
+    pub(crate) title: String,
+    pub(crate) failed: bool,
 }
 
 pub(crate) struct ThreadStore {
     recents: VecDeque<Entity<Chat>>,
     archived: VecDeque<Entity<Chat>>,
     active: Option<Uuid>,
-    /// The chat opened last, while it loads: by identity, so a chat
-    /// removed meanwhile can't match.
-    opening: Option<WeakEntity<Chat>>,
+    opening: Option<Opening>,
     loader: ChatLoader,
 }
 
@@ -285,6 +302,23 @@ impl ThreadStore {
         thread
     }
 
+    pub(crate) fn opening_id(&self, cx: &App) -> Option<Uuid> {
+        let chat = self.opening.as_ref()?.chat.upgrade()?;
+        Some(chat.read(cx).id)
+    }
+
+    pub(crate) fn opening(&self, cx: &App) -> Option<OpeningChat> {
+        let opening = self.opening.as_ref()?;
+        let chat = opening.chat.upgrade()?;
+        let chat = chat.read(cx);
+        Some(OpeningChat {
+            id: chat.id,
+            // Also once loaded, until `chat_loaded` makes it active.
+            title: chat.view().title(cx).to_owned(),
+            failed: opening.failed,
+        })
+    }
+
     #[cfg(test)]
     pub(crate) fn activate(&mut self, id: Uuid, cx: &App) -> bool {
         let found = self.loaded(id, cx).is_some();
@@ -332,6 +366,13 @@ impl ThreadStore {
         }?;
         if self.active == Some(id) {
             self.active = None;
+        }
+        if self
+            .opening
+            .as_ref()
+            .is_some_and(|opening| opening.chat == chat.downgrade())
+        {
+            self.opening = None;
         }
         Some((place, chat))
     }
@@ -403,7 +444,10 @@ impl ThreadStore {
             self.opening = None;
             return Opened::Active;
         }
-        self.opening = Some(chat.downgrade());
+        self.opening = Some(Opening {
+            chat: chat.downgrade(),
+            failed: false,
+        });
         self.start_load(&chat, models, cx);
         Opened::Loading
     }
@@ -429,16 +473,23 @@ impl ThreadStore {
     fn chat_loaded(&mut self, id: Uuid, chat: &Entity<Chat>, loaded: bool, cx: &mut Context<Self>) {
         let opened = self
             .opening
-            .as_ref()
-            .is_some_and(|opening| opening == &chat.downgrade());
+            .as_mut()
+            .filter(|opening| opening.chat == chat.downgrade());
+        if !loaded {
+            if let Some(opening) = opened {
+                opening.failed = true;
+                cx.emit(ChatStoreEvent::OpenFailed);
+                cx.notify();
+            }
+            return;
+        }
+        let opened = opened.is_some();
         if opened {
             self.opening = None;
         }
-        if !loaded {
-            return;
-        }
         cx.emit(ChatStoreEvent::Loaded);
-        if opened && matches!(self.find(id, cx), Some((Place::Recents(_), _))) {
+        // Still in the recents, or `take` would have ended the opening.
+        if opened {
             self.active = Some(id);
             cx.emit(ChatStoreEvent::Activated);
         }

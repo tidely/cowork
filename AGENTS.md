@@ -30,6 +30,7 @@ Every module starts with a `//!` doc saying what it owns; read it before changin
 - `cargo run -p cowork` — run the app (agent runs need a provider, e.g. a local Ollama).
 - `cargo run -p cowork --example component_preview` — components in states the app can't easily reach; also `compaction_preview`, `turn_navigation_preview`, `share_preview`.
 - `cargo test --workspace`; narrower: `cargo test -p draft`, `cargo test -p cowork <name>`. `cargo test -p sandbox` runs real contained commands.
+- `cargo test -p cowork ui_screenshots -- --ignored --nocapture --test-threads=1` renders UI states to PNGs offscreen; see the `ui-screenshots` skill (`.agents/skills/ui-screenshots/SKILL.md`) before looking at UI any other way.
 - `cargo fmt --all` (tree is fmt-clean) and `cargo clippy --workspace --all-targets` (has some existing warnings; add none).
 
 There is no CI: run fmt, clippy, and the tests before finishing. Use `uv` for Python scripts.

@@ -66,6 +66,7 @@ mod context_settings;
 mod create_project;
 mod model_picker;
 mod models;
+mod opening;
 mod participant;
 mod peer_access;
 mod pending_view;
@@ -130,6 +131,9 @@ enum MainStage {
     Welcome,
     ProviderSetup(models::ModelProvider),
     Thread,
+    /// Standing in for a chat that is slow to load or failed to; see
+    /// `opening.rs`.
+    Opening,
     /// A settings page, with the sidebar showing settings; see `settings.rs`.
     Settings(SettingsPage),
     Schedules,
@@ -164,6 +168,7 @@ struct Cowork {
     join_dialog: Option<Entity<JoinDialog>>,
     main_stage: MainStage,
     stage_before_settings: MainStage,
+    opening_stage: opening::OpeningStage,
     /// The provider card selected on the welcome screen or the Providers
     /// settings page, to continue to its models.
     selected_provider: Option<models::ModelProvider>,
@@ -344,24 +349,8 @@ impl Cowork {
         } else {
             px(0.)
         };
-        // Measure a character in the timeline's 14 px font so the text column
-        // stays 120 characters wide when the available stage is wider.
-        let character = "0";
-        let run = TextRun {
-            len: character.len(),
-            font: window.text_style().font(),
-            color: cx.theme().foreground,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        };
-        let text_width = window
-            .text_system()
-            .shape_line(character.into(), px(14.), &[run], None)
-            .width()
-            * 120.;
-        // Message rows reserve 40 px for the avatar and 40 px on the right.
-        let row_width = text_width + px(80.);
+        let text_width = timeline_text_width(window, cx);
+        let row_width = timeline_row_width(window, cx);
         let available_width = window.viewport_size().width - sidebar_width - px(82.);
         let wrap_width = available_width.max(px(120.)).min(text_width);
         // A selection's rows stay built while it lasts; see
@@ -558,10 +547,40 @@ impl Cowork {
     }
 }
 
+/// The timeline's text column: 120 characters of its 14 px font, so it
+/// stays that wide when the available stage is wider.
+fn timeline_text_width(window: &Window, cx: &App) -> gpui::Pixels {
+    let character = "0";
+    let run = TextRun {
+        len: character.len(),
+        font: window.text_style().font(),
+        color: cx.theme().foreground,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window
+        .text_system()
+        .shape_line(character.into(), px(14.), &[run], None)
+        .width()
+        * 120.
+}
+
+/// A timeline row at its widest: the text column, with 40 px for the
+/// avatar and 40 px on the right.
+pub(crate) fn timeline_row_width(window: &Window, cx: &App) -> gpui::Pixels {
+    timeline_text_width(window, cx) + px(80.)
+}
+
 impl Render for Cowork {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.main_stage != MainStage::Thread {
             self.timeline_press = None;
+        }
+        let opening = self.shown_opening(cx);
+        if self.main_stage == MainStage::Opening && opening.is_none() {
+            // Its chat was archived: back to the chat shown before.
+            self.main_stage = MainStage::Thread;
         }
         self.sync_model_picker(window, cx);
         let active_thread = self.active_thread(cx);
@@ -667,6 +686,9 @@ impl Render for Cowork {
                                     this.child(self.render_settings_page(page, window, cx))
                                 }
                                 MainStage::Schedules => this.child(self.render_schedules_page(cx)),
+                                MainStage::Opening => this.children(
+                                    opening.map(|opening| self.render_opening(opening, window, cx)),
+                                ),
                                 MainStage::Welcome => this.child(self.render_welcome(window, cx)),
                                 MainStage::ProviderSetup(provider) => {
                                     this.child(self.render_welcome_models(provider, window, cx))
@@ -779,6 +801,9 @@ fn init_app(cx: &mut App) {
     }
 }
 
+/// The size the window opens at, in logical pixels.
+pub(crate) const DEFAULT_WINDOW_SIZE: gpui::Size<gpui::Pixels> = size(px(1200.), px(760.));
+
 pub fn run() -> anyhow::Result<()> {
     // Run by the user's login shell to read its environment for the agent's
     // commands; see `sandbox::environment`.
@@ -834,7 +859,7 @@ pub fn run() -> anyhow::Result<()> {
             let window_options = WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
-                    size(px(1200.), px(760.)),
+                    DEFAULT_WINDOW_SIZE,
                     cx,
                 ))),
                 titlebar: Some(TitlebarOptions {
@@ -884,6 +909,7 @@ pub fn run() -> anyhow::Result<()> {
                         join_dialog: None,
                         main_stage: MainStage::Welcome,
                         stage_before_settings: MainStage::Welcome,
+                        opening_stage: Default::default(),
                         selected_provider: None,
                         ollama_watch: None,
                         copied_pull_command: false,

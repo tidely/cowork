@@ -66,6 +66,9 @@ gpui_platform = { package = "gpui-pre-platform", version = "=0.3.12", features =
     "x11",
     "runtime_shaders",
 ] }
+# GPUI's wgpu renderer, pinned with `gpui_platform`; its headless renderer draws
+# `cowork`'s UI screenshots on every platform.
+gpui_wgpu = { package = "gpui-pre-wgpu", version = "=0.3.12" }
 futures = "0.3"
 # Parses HTTP-date `Retry-After` values in the provider clients.
 httpdate = "1"
