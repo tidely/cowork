@@ -32,9 +32,6 @@ impl Thread {
             // Persisted.
             prompt_names: _,
             // Persisted.
-            tokens_used: _,
-            token_activity: _,
-            // Persisted.
             model: _,
             // Derived: the app's catalog, given again on load (`set_models`).
             models: _,

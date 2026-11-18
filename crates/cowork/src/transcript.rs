@@ -177,18 +177,11 @@ impl Json<TranscriptRecord> {
     }
 }
 
-/// How much of a transcript is saved: its first `entries` entries and
-/// `compactions` compactions.
+/// How much of a transcript there is: its entries and compactions.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct TranscriptExtent {
     pub(crate) entries: usize,
     pub(crate) compactions: usize,
-}
-
-impl TranscriptExtent {
-    pub(crate) fn within(self, other: Self) -> bool {
-        self.entries <= other.entries && self.compactions <= other.compactions
-    }
 }
 
 impl Transcript {
@@ -199,29 +192,29 @@ impl Transcript {
         }
     }
 
-    /// The entries after `saved.entries`, and the compactions after
-    /// `saved.compactions`, each after the number of entries it was
-    /// accepted at.
-    pub(crate) fn records_after(
+    /// What the run owning `entries` committed: those entries, and the
+    /// compactions accepted after more than `entries.start` and at most
+    /// `entries.end` entries, each after the number it was accepted at.
+    pub(crate) fn run_records(
         &self,
-        saved: TranscriptExtent,
+        entries: Range<usize>,
     ) -> (Vec<StoredEntry>, Vec<(u64, StoredCompaction)>) {
-        let entries = self.entries()[saved.entries.min(self.len())..]
-            .iter()
-            .map(|entry| StoredEntry::encode(entry).expect("committed entries encode"))
-            .collect();
         let compactions = self
             .conversation
             .compactions()
             .iter()
             .zip(&self.compacted_at)
-            .skip(saved.compactions)
+            .filter(|(_, at)| entries.start < **at && **at <= entries.end)
             .map(|(compaction, at)| {
                 (
                     *at as u64,
                     StoredCompaction::encode(compaction).expect("accepted summaries encode"),
                 )
             })
+            .collect();
+        let entries = self.entries()[entries]
+            .iter()
+            .map(|entry| StoredEntry::encode(entry).expect("committed entries encode"))
             .collect();
         (entries, compactions)
     }
@@ -463,6 +456,9 @@ impl Thread {
                 completed = Some(entry.message);
             }
             RunEvent::Usage { tokens } => {
+                if let Some(message) = agent_message(&mut self.timeline, message_id) {
+                    message.record.tokens = message.record.tokens.saturating_add(tokens);
+                }
                 // A summary's usage measures the context it summarized.
                 if activity != RunActivity::Compacting {
                     self.context_tokens = Some(tokens);

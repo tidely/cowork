@@ -17,7 +17,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use agent::model::{Content, Usage};
+use agent::model::Content;
 use draft::{
     AttachmentId, AttachmentKind, AttachmentRecord, CommentTarget, Draft, DraftItem, DraftItemKind,
     ItemId, TextEdit,
@@ -262,6 +262,7 @@ fn test_cowork(
         onboarding_intro: None,
         agents: HashMap::new(),
         deleted: Default::default(),
+        token_activity: Vec::new(),
         profile_statistics: None,
         saved_chat_search: Default::default(),
         chat_db: None,

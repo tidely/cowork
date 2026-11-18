@@ -6,8 +6,8 @@
 //! a transaction of its own, in order with the chat saves around it.
 //!
 //! Projects and the deleted chats' counts change by steps (a project made
-//! or removed, a chat's usage added); settings and tasks are small and
-//! written whole.
+//! or removed, a chat or a run's usage added); settings and tasks are small
+//! and written whole.
 
 use std::{collections::HashMap, path::PathBuf};
 
@@ -23,7 +23,8 @@ use crate::{
     projects::{ProjectId, ProjectRecord},
     saved_settings::Settings,
     scheduled_task::{QueuedRun, RunRecord, SavedTask, ScheduledTask, TaskSettings},
-    statistics::Statistics,
+    statistics::DeletedChats,
+    usage::TokenActivity,
 };
 
 /// Everything besides chats, as the database holds it at startup. Rows that
@@ -33,7 +34,9 @@ pub(crate) struct AppState {
     /// Newest first.
     pub(crate) projects: Vec<ProjectRecord>,
     pub(crate) settings: Settings,
-    pub(crate) deleted: Statistics,
+    pub(crate) deleted: DeletedChats,
+    /// The usage of deleted chats' runs.
+    pub(crate) deleted_activity: Vec<TokenActivity>,
     pub(crate) tasks: Vec<ScheduledTask>,
 }
 
@@ -42,7 +45,8 @@ pub(super) enum StateJob {
     RemoveProject(Uuid),
     Settings(SettingsRow),
     Tasks(Vec<TaskRow>),
-    CountDeleted(UsageRow),
+    /// A run that ended after its chat was deleted.
+    CountDeletedRun(ActivityRow),
 }
 
 impl StateJob {
@@ -52,7 +56,7 @@ impl StateJob {
             Self::RemoveProject(_) => "the project's removal",
             Self::Settings(_) => "settings",
             Self::Tasks(_) => "scheduled tasks",
-            Self::CountDeleted(_) => "deleted chats' statistics",
+            Self::CountDeletedRun(_) => "a deleted chat's run",
         }
     }
 }
@@ -123,37 +127,23 @@ impl SettingsRow {
     }
 }
 
-pub(super) struct UsageRow {
+pub(super) struct DeletedRow {
     chats: i64,
-    tokens_used: i64,
     longest_chat_ns: i64,
-    activity: Vec<ActivityRow>,
 }
 
-impl UsageRow {
-    pub(super) fn of(statistics: &Statistics) -> anyhow::Result<Self> {
+impl DeletedRow {
+    pub(super) fn of(deleted: &DeletedChats) -> anyhow::Result<Self> {
         Ok(Self {
-            chats: columns::index(statistics.chats, "chats")?,
-            tokens_used: columns::int(statistics.tokens_used, "tokens used")?,
-            longest_chat_ns: columns::nanos(statistics.longest_chat, "longest chat")?,
-            activity: statistics
-                .token_activity
-                .iter()
-                .map(ActivityRow::of)
-                .collect::<anyhow::Result<_>>()?,
+            chats: columns::index(deleted.chats, "chats")?,
+            longest_chat_ns: columns::nanos(deleted.longest_chat, "longest chat")?,
         })
     }
 
-    fn into_statistics(self) -> anyhow::Result<Statistics> {
-        Ok(Statistics {
+    fn into_deleted(self) -> anyhow::Result<DeletedChats> {
+        Ok(DeletedChats {
             chats: columns::count(self.chats, "chats")?,
-            tokens_used: columns::uint(self.tokens_used, "tokens used")?,
             longest_chat: columns::duration(self.longest_chat_ns, "longest chat")?,
-            token_activity: self
-                .activity
-                .into_iter()
-                .map(ActivityRow::into_activity)
-                .collect::<anyhow::Result<_>>()?,
         })
     }
 }
@@ -250,7 +240,7 @@ pub(super) async fn write(conn: &mut SqliteConnection, job: &StateJob) -> anyhow
         }
         StateJob::Settings(settings) => write_settings(conn, settings).await,
         StateJob::Tasks(tasks) => replace_tasks(conn, tasks).await,
-        StateJob::CountDeleted(usage) => count_deleted(conn, usage).await,
+        StateJob::CountDeletedRun(run) => count_deleted_runs(conn, std::slice::from_ref(run)).await,
     }
 }
 
@@ -295,23 +285,29 @@ async fn write_settings(conn: &mut SqliteConnection, settings: &SettingsRow) -> 
     Ok(())
 }
 
-/// Adds `usage` to the deleted chats' counts: sums, but the longest chat is
-/// the longer of the two.
+/// Adds `deleted` to the deleted chats' counts: sums, but the longest chat
+/// is the longer of the two.
 pub(super) async fn count_deleted(
     conn: &mut SqliteConnection,
-    usage: &UsageRow,
+    deleted: &DeletedRow,
 ) -> anyhow::Result<()> {
     sqlx::query(
-        "UPDATE deleted_usage SET chats = chats + ?, tokens_used = tokens_used + ?,
-             longest_chat_ns = max(longest_chat_ns, ?)
+        "UPDATE deleted_usage SET chats = chats + ?, longest_chat_ns = max(longest_chat_ns, ?)
          WHERE id = 1",
     )
-    .bind(usage.chats)
-    .bind(usage.tokens_used)
-    .bind(usage.longest_chat_ns)
+    .bind(deleted.chats)
+    .bind(deleted.longest_chat_ns)
     .execute(&mut *conn)
     .await?;
-    for activity in &usage.activity {
+    Ok(())
+}
+
+/// Adds the usage of deleted chats' runs.
+pub(super) async fn count_deleted_runs(
+    conn: &mut SqliteConnection,
+    runs: &[ActivityRow],
+) -> anyhow::Result<()> {
+    for activity in runs {
         sqlx::query(
             "INSERT INTO deleted_token_activity (at, duration_ns, tokens) VALUES (?, ?, ?)",
         )
@@ -390,10 +386,12 @@ async fn replace_tasks(conn: &mut SqliteConnection, tasks: &[TaskRow]) -> anyhow
 /// left out is gone at the next save of the tasks, as a schedules file that
 /// couldn't be read was set aside.)
 pub(super) async fn read(pool: &SqlitePool) -> anyhow::Result<AppState> {
+    let (deleted, deleted_activity) = read_deleted(pool).await?;
     Ok(AppState {
         projects: read_projects(pool).await?,
         settings: read_settings(pool).await?,
-        deleted: read_deleted(pool).await?,
+        deleted,
+        deleted_activity,
         tasks: read_tasks(pool).await?,
     })
 }
@@ -461,34 +459,39 @@ async fn read_settings(pool: &SqlitePool) -> anyhow::Result<Settings> {
     }))
 }
 
-async fn read_deleted(pool: &SqlitePool) -> anyhow::Result<Statistics> {
-    let (chats, tokens_used, longest_chat_ns) = sqlx::query_as::<_, (i64, i64, i64)>(
-        "SELECT chats, tokens_used, longest_chat_ns FROM deleted_usage WHERE id = 1",
+async fn read_deleted(pool: &SqlitePool) -> anyhow::Result<(DeletedChats, Vec<TokenActivity>)> {
+    let (chats, longest_chat_ns) = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT chats, longest_chat_ns FROM deleted_usage WHERE id = 1",
     )
     .fetch_one(pool)
     .await?;
-    let activity = sqlx::query_as::<_, (DateTime<Utc>, i64, i64)>(
+    let deleted = DeletedRow {
+        chats,
+        longest_chat_ns,
+    }
+    .into_deleted()
+    .unwrap_or_else(|error| {
+        eprintln!("could not read deleted chats' statistics: {error:#}");
+        DeletedChats::default()
+    });
+    let mut activity = Vec::new();
+    for (at, duration_ns, tokens) in sqlx::query_as::<_, (DateTime<Utc>, i64, i64)>(
         "SELECT at, duration_ns, tokens FROM deleted_token_activity ORDER BY seq",
     )
     .fetch_all(pool)
     .await?
-    .into_iter()
-    .map(|(at, duration_ns, tokens)| ActivityRow {
-        at,
-        duration_ns,
-        tokens,
-    })
-    .collect();
-    let usage = UsageRow {
-        chats,
-        tokens_used,
-        longest_chat_ns,
-        activity,
-    };
-    Ok(usage.into_statistics().unwrap_or_else(|error| {
-        eprintln!("could not read deleted chats' statistics: {error:#}");
-        Statistics::default()
-    }))
+    {
+        let row = ActivityRow {
+            at,
+            duration_ns,
+            tokens,
+        };
+        match row.into_activity() {
+            Ok(row) => activity.push(row),
+            Err(error) => eprintln!("could not read a deleted run's usage: {error:#}"),
+        }
+    }
+    Ok((deleted, activity))
 }
 
 async fn read_tasks(pool: &SqlitePool) -> anyhow::Result<Vec<ScheduledTask>> {

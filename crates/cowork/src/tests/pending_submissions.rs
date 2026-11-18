@@ -321,7 +321,6 @@ fn completed_runs_prioritize_undelivered_steering_but_stopping_preserves_pending
             RunTotals {
                 started_at: SystemTime::now(),
                 duration: Duration::ZERO,
-                usage: Usage::default(),
             },
             cx,
         )
@@ -344,7 +343,6 @@ fn completed_runs_prioritize_undelivered_steering_but_stopping_preserves_pending
             RunTotals {
                 started_at: SystemTime::now(),
                 duration: Duration::ZERO,
-                usage: Usage::default(),
             },
             cx,
         )
@@ -375,7 +373,6 @@ fn stop_wins_late_completion_and_resume_delivers_the_queue_in_order(cx: &mut gpu
             RunTotals {
                 started_at: SystemTime::now(),
                 duration: Duration::ZERO,
-                usage: Usage::default(),
             },
             cx,
         );
@@ -419,7 +416,6 @@ fn stop_wins_late_completion_and_resume_delivers_the_queue_in_order(cx: &mut gpu
                 RunTotals {
                     started_at: SystemTime::now(),
                     duration: Duration::ZERO,
-                    usage: Usage::default(),
                 },
                 cx,
             );
@@ -531,7 +527,6 @@ fn empty_draft_resume_rejects_write_only_peer_before_starting_any_run(
             RunTotals {
                 started_at: SystemTime::now(),
                 duration: Duration::ZERO,
-                usage: Usage::default(),
             },
             cx,
         );

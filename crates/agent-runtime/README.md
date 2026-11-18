@@ -77,7 +77,8 @@ their content counts.
 entries after it. Compaction never rewrites entries or drops their replay data;
 `Compaction` records say which entries a summary replaces for inference.
 `summarized_fraction` (default 0.7) is the share of the context the summary
-replaces, cut where every tool call has its result. `Compact` requests it, and
+replaces, cut where every tool call has its result. `Compact` requests it (with
+`run`, only during that run; a request read after the run ended is refused), and
 `trigger_bytes` (serialized context size, off by default) compacts automatically
 at settled boundaries.
 

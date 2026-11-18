@@ -15,6 +15,25 @@ owner's own feature notes.
   all or nothing per command (the Write + Network scope); on macOS Seatbelt can
   only allow or deny all outbound traffic, not filter by host.
 
+## Forking chats
+
+- **Fork, edit and resend, retry.** A fork is a new chat whose history is
+  another's up to a settled turn boundary (after an ended run, or the empty
+  root). Storage already holds it (`docs/sqlite-storage.md` "Chats as a tree"):
+  a `threads` row whose head is an existing message, with the source's per-chat
+  rows (folders, profiles, prompt names) copied. What a fork does with the
+  scratch folder and project folders waits for something like worktrees.
+- **A `/compact` command.** Its own run in the open chat: an agent message with
+  no entries and one compaction at its start, compacting with
+  `Compact { run: None }` while the message is open. Needs
+  `validate_agent_runs` to accept a run without a prompt that starts where the
+  next run does.
+- **Stable identities for blocks and comments**, so a collaborator reusing an
+  id is a non-issue; until then such a reuse fails that chat's save.
+- Two loaded forks each hold a full `Transcript`; sharing the common prefix in
+  memory is possible later. A branch switcher inside a chat, and merging
+  branches, are not planned: a fork is its own chat.
+
 ## Commands
 
 - **Cancel Command button.** A button on a running `run_command` card that ends

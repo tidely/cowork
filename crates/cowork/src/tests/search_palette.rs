@@ -43,6 +43,7 @@ fn reply(text: &str, cx: &mut App) -> TimelineMessage {
                 outcome: RunOutcome::Completed,
                 duration: Duration::ZERO,
             },
+            tokens: 0,
             model: None,
             awaiting_approval: None,
         },

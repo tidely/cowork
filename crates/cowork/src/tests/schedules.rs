@@ -136,7 +136,6 @@ fn finish(
             RunTotals {
                 started_at: SystemTime::now(),
                 duration: Duration::from_secs(1),
-                usage: Usage::default(),
             },
             cx,
         );

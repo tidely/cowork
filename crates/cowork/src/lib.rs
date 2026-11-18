@@ -198,9 +198,13 @@ struct Cowork {
     onboarding_intro: Option<thread::OnboardingIntro>,
     agents: HashMap<Uuid, ThreadAgent>,
     /// What the profile's statistics still count of the user's deleted
-    /// threads; the rest they count from the threads themselves. See
-    /// [`Cowork::delete_archived_thread`] and `statistics.rs`.
-    deleted: statistics::Statistics,
+    /// threads besides their runs' usage; the rest they count from the
+    /// threads themselves. See [`Cowork::delete_archived_thread`] and
+    /// `statistics.rs`.
+    deleted: statistics::DeletedChats,
+    /// The usage of every run of the user's own chats, deleted ones
+    /// included; see `statistics.rs`.
+    token_activity: Vec<usage::TokenActivity>,
     /// Lazily rebuilt on Profile, not on unrelated streaming redraws.
     profile_statistics: Option<statistics::ProfileStatistics>,
     /// What the search palette found in unloaded chats; see `search_palette.rs`.
@@ -927,6 +931,7 @@ pub fn run() -> anyhow::Result<()> {
                         onboarding_intro: None,
                         agents: HashMap::new(),
                         deleted: Default::default(),
+                        token_activity: Vec::new(),
                         profile_statistics: None,
                         saved_chat_search: Default::default(),
                         chat_db: None,

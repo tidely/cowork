@@ -8,17 +8,46 @@ schema, with a comment on every table and the column encodings, is
 applied one. What a saved chat holds, from the collaboration side, is in
 `docs/collaboration.md` "Saved threads".
 
-Every table is keyed by its chat, so deleting a `threads` row deletes the chat.
 Enums are written by explicit `match`, never serde, and numbers and times go
 through the checked conversions in `chat_db/columns.rs`, so a row holds only
 values its columns accept.
+
+## Chats as a tree
+
+Several chats can share one stored history up to a fork point and then go their
+own way, though nothing forks yet (see `ROADMAP.md` "Forking chats"). A fork
+will be a new chat: there is no branch switcher inside one.
+
+The tree's nodes are **timeline messages**, each pointing at its parent. A chat
+(`threads`) points at its last message, its head, and its history is the path
+from the root to the head. Everything a message holds hangs off it and cascades
+from it: blocks, comments, its run, the run's transcript entries and
+compactions, attached files' bytes, search texts. Only `thread_folders`,
+`thread_profiles` and `prompt_names` are keyed by chat; a fork will copy them.
+
+Why messages and not transcript entries: a fork can only start at a settled turn
+boundary (after an ended run, or the empty root), since the conversation refuses
+a new message while calls are open and saves happen only at turn ends; and
+every entry and compaction belongs to a run. Agent message k owns the entries
+from its `transcript_start` to the next run's, and the compactions accepted after
+more than its start and at most that many entries (`NewMessage::after`).
+Compactions only happen inside a run: Cowork's automatic request names the run
+asking, and the session refuses it once that run is over.
+
+A message's depth is fixed by its parent, so **a loaded chat is still its path**,
+built into the same linear `Transcript` and timeline as before: depth is the
+timeline index, entries keep their absolute `idx`. `Conversation`,
+`TranscriptIndex`, `AgentRun.start` and the protocol know nothing of the tree.
+Every value that places a row in the tree is set once and never changed, and
+triggers check each against its parent (the migration lists them), so there is
+nothing to keep in sync.
 
 ## What loads when
 
 | When | Reads |
 |---|---|
-| Startup | every `threads` row, every `token_activity` row, and the rest of the app's state |
-| Opening a chat, or a scheduled task continuing it | the rest of the chat's rows, attachment bytes included |
+| Startup | every `threads` row, every run's `(started_at, duration_ns, tokens)`, and the rest of the app's state |
+| Opening a chat, or a scheduled task continuing it | the rows of the messages on its path (a `WITH RECURSIVE` walk up from the head), attachment bytes included |
 | Typing in the search palette | matching `search_texts` of unloaded chats, through `chat_search` |
 
 Startup does not read chat contents, so it stays fast however many chats are
@@ -30,30 +59,38 @@ schedules' lookups by id, and `position` as a dense index.
 A chat loads whole. Attachment bytes stay with it because saving, serving them
 to peers, the join snapshot and prompts all expect them in `draft().files`. The
 schema would allow loading attachments or timeline windows on demand
-(`messages.seq` is the row index), but a chat that runs, or that someone joins,
-needs its whole transcript.
+(`messages.depth` is the timeline index), but a chat that runs, or that someone
+joins, needs its whole transcript. A load fails unless the path runs from the
+head down to the chat's root with every depth once, and the entries are exactly
+`0..n`.
 
 ## Saving
 
 **The database is the truth about what is saved.** The module doc of
-`chat_db.rs` describes the protocol: a save carries the extent it was built from
-(`from`) and the chat's whole extent (`end`); inside its transaction the writer
-reads what the database holds and refuses with `Behind` if that is less than
-`from` (an earlier save failed, so the next one starts from what is there) or
-`Ahead` if it is more than `end` (the chat in memory is not the whole chat, such
-as a placeholder). Otherwise it writes only the rows past what is stored. The
+`chat_db.rs` describes the protocol: a save carries the head it was built on
+(`base`, the head this side believes is stored) and every message after it, each
+with its depth and everything it holds. Inside its transaction the writer reads
+the stored head: if it is the base or one of the sent messages, it writes the
+messages after it and moves the head there; if it is shallower than the base it
+refuses with `Behind` (an earlier save failed, so the next one starts from what
+is there); otherwise with `Ahead` (the chat in memory is not the whole chat, such
+as a placeholder, or is on another branch). Membership plus depth is enough: the
+writer never walks the tree, and the head only ever moves to a descendant. The
 alternative, GPUI-side bookkeeping of what was saved, let a placeholder save wipe
 a saved chat and, after a failure, rewrote the chat whole.
 
-Two rules in the writer exist for reasons that are easy to break:
+Rules in the writer that are easy to break:
 
 - The `threads` row is upserted with `INSERT … ON CONFLICT (id) DO UPDATE`, never
-  `INSERT OR REPLACE`: replace deletes the row first, and the cascade wipes the
-  chat.
+  `INSERT OR REPLACE`: replace deletes the row first, and the cascade wipes its
+  per-chat rows.
+- Messages are inserted before the `threads` row moves its head to them, and a
+  run's entries before its compactions, which the triggers check against them.
 - The timeline is only appended to (runs are saved once ended, comments are fixed
-  at submission). Rewriting it cost about 300 ms per save at 2,000 messages. The
-  transcript entries and compactions are likewise append-only, which triggers in
-  the schema enforce.
+  at submission). Rewriting it cost about 300 ms per save at 2,000 messages.
+- Each file's bytes are written once, with the message attaching it, by a plain
+  `INSERT`: an attachment id belongs to one block, and a fork reaches the bytes
+  through that message on its path.
 
 One Tokio task writes, draining one unbounded channel, so saves apply in order, a
 load never races a delete queued before it, and `Job::Quit` answers after every
@@ -77,10 +114,33 @@ builds a `Thread` with a saved chat's id out of less.
   foreign key with `ON DELETE SET NULL`, so deleting a project unfiles its chats
   in the same transaction, and a chat saved after its project was removed is saved
   unfiled rather than failing.
-- **Deleted chats' statistics** are only added to. Deleting a chat adds its counts
-  (`Statistics::of_chat`) in the transaction that deletes its rows, and a run
-  ending after that adds its own usage. The longest chat is the larger of the
-  two; the rest sums.
+- **Deleted chats' statistics** are only added to. Deleting a chat adds it to
+  the count and its time to the longest chat (`DeletedChats::of_chat`), and the
+  usage of the runs removed with it, in the transaction that deletes its rows. A
+  run ending after that adds its own usage. The longest chat is the larger of
+  the two; the rest sums.
+
+### Usage
+
+Usage is counted per run, in `agent_runs.tokens`: every replica adds up the
+run's `RunEvent::Usage` into its record, so the run's tokens travel with it.
+Statistics sum runs, not chats, so a run shared by several chats counts once:
+in memory `Cowork` keeps one list of every own run's activity, deleted chats'
+included (at startup `deleted_token_activity` plus `agent_runs`), which deleting
+a chat leaves alone. Lifetime tokens are its sum. Per-chat `generation_ns` and
+`last_run_at` stay cached on `threads`, written from the chat in memory with the
+runs they sum, so startup needn't walk every path; a path's runs never change,
+so they can't go stale.
+
+## Deleting
+
+Deleting a chat deletes its `threads` row, then its messages from its old head
+up, stopping at a message another chat still needs: one with another child, or
+another chat's head (a chat can end exactly where another branches off). Each
+message takes what it holds with it by cascade. `parent_id` and `head_id` have no
+`ON DELETE`, so deleting a message still needed fails rather than orphaning a
+chat. Until forks exist every path is unshared, and this deletes the whole
+chain.
 - **Settings** are one row, upserted on every change. No row reads as the
   defaults, and values are brought into range when read.
 - **Scheduled tasks** are written whole on every change: there are few, each with
@@ -184,6 +244,11 @@ so matching semantics are identical for loaded and unloaded chats.
 - A query returns at most `SEARCH_LIMIT` rows, so a common phrase does not ship
   every message.
 - The index costs a few times the searchable text's size on disk.
+- `search_texts` is keyed by message, so a match is a message, and it is a hit
+  for every chat in that message's tree (`threads.root_id`), even one whose path
+  doesn't hold it. Until forks exist that is exactly the chat that wrote it. A
+  list of heads kept in the root instead would be a copy of `threads.head_id`
+  every save, create and delete had to keep right.
 
 ## Startup
 
@@ -191,7 +256,7 @@ so matching semantics are identical for loaded and unloaded chats.
 takes `~/.cowork/.lock` (SQLite's own locks do not stop a second instance from
 writing, and the error is clearer), opens the pool (`journal_mode = WAL`,
 `synchronous = NORMAL`, `foreign_keys = ON`), runs migrations, and reads `threads`,
-`token_activity` and the app state. Blocking keeps `needs_onboarding` from briefly
+the runs' usage and the app state. Blocking keeps `needs_onboarding` from briefly
 seeing no chats. Failures, a held lock or a database migrated by a newer app,
 return from `run`, and Cowork does not start. `start_chat_db` then lists the
 `Unloaded` chats.
@@ -207,9 +272,9 @@ delete, since scratch folders stay on disk for the sandbox.
   the boundary, which is lossless. The app's types stay `SystemTime` because
   `started_at` travels on the wire and changing it would bump `PROTOCOL_VERSION`.
 - A collaborator could re-add a draft item with the id of an already submitted block
-  or comment, which would make the chat unsavable under the `(thread_id, id)` keys.
-  `apply_collaborator_update_authorized` refuses new item ids already submitted,
-  pending ones included.
+  or comment, which would make the chat unsavable: block and comment ids are
+  global keys. `apply_collaborator_update_authorized` refuses new item ids already
+  submitted, pending ones included.
 
 ## sqlx
 
@@ -219,5 +284,6 @@ override; none infer `u64`. sqlx 0.9 rejects `format!`-built SQL unless wrapped 
 `sqlx::AssertSqlSafe`. Migrations are embedded by `sqlx::migrate!()`.
 
 Tests use a temporary database (`chat_db::TestDb`) with a multi-thread runtime
-driving the writer. A test awaiting the database from GPUI calls
+driving the writer. Until forking exists, `ChatDb::fork_for_test` makes chats
+that share a history, as a fork will. A test awaiting the database from GPUI calls
 `cx.executor().allow_parking()`, because the answer comes from a Tokio thread.

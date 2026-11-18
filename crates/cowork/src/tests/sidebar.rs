@@ -165,11 +165,7 @@ fn deleted_threads_still_count_after_a_restart(cx: &mut gpui::TestAppContext) {
     cowork.update(cx, |cowork, cx| {
         for (thread_id, tokens) in [(kept, 10), (deleted, 100)] {
             let thread = cowork.thread_store.read(cx).loaded(thread_id, cx).unwrap();
-            let usage = Usage {
-                total_tokens: Some(tokens),
-                ..Usage::default()
-            };
-            cowork.record_turn_usage(&thread, usage, SystemTime::now(), Duration::ZERO, cx);
+            cowork.record_turn_usage(&thread, tokens, SystemTime::now(), Duration::ZERO, cx);
         }
         let thread = cowork.thread_store.read(cx).loaded(deleted, cx).unwrap();
         cowork.thread_store.update(cx, |store, cx| {
@@ -179,8 +175,8 @@ fn deleted_threads_still_count_after_a_restart(cx: &mut gpui::TestAppContext) {
         cowork.delete_archived_thread(deleted, cx);
     });
 
-    // The kept thread is still in memory; the deleted one's statistics
-    // come from the database.
+    // The deleted chat still counts as a chat, and with its time, from the
+    // database; usage stays counted per run.
     cowork.update(cx, |cowork, _| {
         futures::executor::block_on(cowork.chat_db.take().unwrap().quit());
         let (db, saved) = test_db.reopen();
@@ -188,8 +184,8 @@ fn deleted_threads_still_count_after_a_restart(cx: &mut gpui::TestAppContext) {
         futures::executor::block_on(db.quit());
     });
     cowork.read_with(cx, |cowork, cx| {
-        assert_eq!(cowork.tokens_used(cx), 110);
-        assert_eq!(cowork.token_activity(cx).len(), 2);
+        assert_eq!(cowork.tokens_used(), 110);
+        assert_eq!(cowork.token_activity().len(), 2);
         assert_eq!(cowork.total_chats(cx), 2);
         assert_eq!(cowork.longest_chat(cx), Duration::from_secs(90));
     });
@@ -346,11 +342,7 @@ fn archived_threads_are_restored_or_deleted_from_the_archive(cx: &mut gpui::Test
     cx.update(|window, cx| {
         cowork.update(cx, |cowork, cx| {
             let thread = cowork.thread_store.read(cx).loaded(deleted, cx).unwrap();
-            let usage = Usage {
-                total_tokens: Some(100),
-                ..Usage::default()
-            };
-            cowork.record_turn_usage(&thread, usage, SystemTime::now(), Duration::ZERO, cx);
+            cowork.record_turn_usage(&thread, 100, SystemTime::now(), Duration::ZERO, cx);
             cowork.open_thread(deleted, window, cx);
         })
     });
@@ -398,7 +390,7 @@ fn archived_threads_are_restored_or_deleted_from_the_archive(cx: &mut gpui::Test
     );
     // What was done in the deleted thread still counts.
     cowork.read_with(cx, |cowork, cx| {
-        assert_eq!(cowork.tokens_used(cx), 100);
+        assert_eq!(cowork.tokens_used(), 100);
         assert_eq!(cowork.longest_chat(cx), Duration::from_secs(90));
         assert_eq!(cowork.total_chats(cx), 3);
     });
@@ -778,10 +770,8 @@ fn recents_draws_more_rows_as_it_is_scrolled(cx: &mut gpui::TestAppContext) {
                     id: *id,
                     title: format!("Chat {n}"),
                     project: None,
-                    tokens_used: 0,
                     generation_time: Duration::ZERO,
                     last_run_at: None,
-                    token_activity: Vec::new(),
                 };
                 store.push_unloaded(meta, false, cx);
             }

@@ -73,6 +73,8 @@ pub(crate) struct AgentRunRecord {
     /// See [`protocol::AgentMessage::pending_events`].
     pub(crate) pending_events: Vec<protocol::Preview>,
     pub(crate) run: AgentRun,
+    /// See [`protocol::AgentMessage::tokens`].
+    pub(crate) tokens: u64,
     /// See [`protocol::AgentMessage::model`].
     pub(crate) model: Option<ModelRef>,
 
@@ -843,6 +845,7 @@ impl AgentMessage {
                 start,
                 pending_events,
                 run,
+                tokens: 0,
                 model: None,
                 awaiting_approval: None,
             },
@@ -924,6 +927,7 @@ impl AgentRunRecord {
             start: self.start,
             pending_events: self.pending_events.clone(),
             run: self.run.clone(),
+            tokens: self.tokens,
             model: self.model.clone(),
             awaiting_approval: self.awaiting_approval.clone(),
         }
@@ -944,6 +948,7 @@ impl protocol::AgentMessage {
             self.pending_events,
             cx,
         );
+        message.record.tokens = self.tokens;
         message.record.model = self.model;
         message.record.awaiting_approval = self.awaiting_approval;
         message

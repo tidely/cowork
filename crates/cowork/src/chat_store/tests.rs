@@ -11,10 +11,8 @@ fn row(title: &str) -> ChatMeta {
         id: Uuid::new_v4(),
         title: title.into(),
         project: None,
-        tokens_used: 7,
         generation_time: Duration::from_secs(3),
         last_run_at: None,
-        token_activity: Vec::new(),
     }
 }
 
@@ -164,11 +162,10 @@ fn a_loaded_chats_row_follows_the_chat(cx: &mut TestAppContext) {
     let thread = store.read_with(cx, |store, cx| store.loaded(a, cx).unwrap());
     thread.update(cx, |thread, _| {
         thread.summary.title = "renamed".into();
-        thread.tokens_used += 5;
     });
     store.read_with(cx, |store, cx| {
         let row = store.meta(a, cx).unwrap();
-        assert_eq!((row.title.as_str(), row.tokens_used), ("renamed", 12));
+        assert_eq!(row.title, "renamed");
     });
 
     // Unloading keeps it, once another chat is active.
@@ -179,6 +176,6 @@ fn a_loaded_chats_row_follows_the_chat(cx: &mut TestAppContext) {
         assert!(store.unload_for_test(a, cx));
         assert!(!store.is_loaded(a, cx));
         let row = store.meta(a, cx).unwrap();
-        assert_eq!((row.title.as_str(), row.tokens_used), ("renamed", 12));
+        assert_eq!(row.title, "renamed");
     });
 }

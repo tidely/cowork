@@ -484,7 +484,12 @@ impl<H: AgentHost> AgentSession<H> {
                     return;
                 }
                 let Request { source, kind } = *request;
-                if let RequestKind::Compact = kind {
+                if let RequestKind::Compact { run } = kind {
+                    if run.is_some() && run != self.active.as_ref().map(|active| active.id) {
+                        let _ = response
+                            .send(Err(RequestError::Compaction(CompactionError::Cancelled)));
+                        return;
+                    }
                     // Answered when the summary is applied or fails.
                     self.compaction_requests.push(response);
                     return;
@@ -589,7 +594,7 @@ impl<H: AgentHost> AgentSession<H> {
                 self.inbox.resume();
                 Ok(Response::Done)
             }
-            RequestKind::Compact => unreachable!("compaction requests are deferred"),
+            RequestKind::Compact { .. } => unreachable!("compaction requests are deferred"),
             RequestKind::Shutdown => {
                 self.closing = true;
                 self.commands.close();

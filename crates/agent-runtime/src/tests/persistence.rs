@@ -72,7 +72,7 @@ async fn transcript_and_tool_elements_survive_compaction_and_model_context_file_
                 .is_ok()
         );
         respond(recv(&mut requests).await, text("done"));
-        let compact = send(RequestKind::Compact);
+        let compact = send(RequestKind::Compact { run: None });
         let answer = async {
             respond(recv(&mut requests).await, text("summary"));
         };

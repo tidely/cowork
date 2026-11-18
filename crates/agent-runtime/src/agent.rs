@@ -338,7 +338,7 @@ impl<H: AgentHost> Agent<H> {
     }
 
     pub async fn compact(&self) -> Result<CompactionOutcome, AgentError> {
-        match self.send(RequestKind::Compact).await {
+        match self.send(RequestKind::Compact { run: None }).await {
             Ok(Response::Compacted(compaction)) => {
                 Ok(CompactionOutcome::Applied(Box::new(compaction)))
             }

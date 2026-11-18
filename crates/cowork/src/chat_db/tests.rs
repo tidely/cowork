@@ -13,7 +13,7 @@ use crate::{
     profile::Profile,
     projects::ProjectId,
     protocol,
-    statistics::Statistics,
+    statistics::DeletedChats,
     test_support::{ScriptedHost, attached, streamed_text, streamed_tool_call, text_attachment},
     thread_draft::ThreadDraft,
     timeline::{
@@ -64,10 +64,8 @@ fn load(db: &ChatDb, id: Uuid, cx: &mut gpui::App) -> Thread {
         id,
         title: String::new(),
         project: None,
-        tokens_used: 0,
         generation_time: Duration::ZERO,
         last_run_at: None,
-        token_activity: Vec::new(),
     };
     let rows = futures::executor::block_on((db.loader())(meta)).expect("a saved chat");
     rows.into_thread(ModelCatalog::default(), cx).unwrap()
@@ -138,12 +136,6 @@ fn thread_with_history(
     );
     thread.add_project_folders(vec![folder.to_owned()]);
     thread.set_project(Some(ProjectId::new()));
-    thread.tokens_used = 120;
-    thread.token_activity.push(TokenActivity {
-        at: SystemTime::UNIX_EPOCH + Duration::new(1_763_200_000, 123_456_789),
-        duration: Duration::from_secs(2),
-        tokens: 120,
-    });
 
     let run = Uuid::new_v4();
     let mut events = host.start(run, "Read the notes");
@@ -172,6 +164,43 @@ fn thread_with_history(
         }
     }
     (thread, records.into_iter().next().unwrap())
+}
+
+/// The usage statistics count of `thread`'s run that used `tokens`; the
+/// scripted host starts every run at the epoch.
+fn run_activity(tokens: u64) -> TokenActivity {
+    TokenActivity {
+        at: SystemTime::UNIX_EPOCH,
+        duration: Duration::from_secs(1),
+        tokens,
+    }
+}
+
+fn add_completed_run(
+    thread: &mut Thread,
+    host: &mut ScriptedHost,
+    tokens: u64,
+    cx: &mut gpui::App,
+) -> Uuid {
+    let run = Uuid::new_v4();
+    let mut events = host.start(run, "Branch");
+    events.extend(host.turn(run, [streamed_text("answer", "Branched.", false)], tokens));
+    events.push(host.ended(run, protocol::RunOutcome::Completed));
+    for event in events {
+        thread.apply_for_test(event, cx);
+    }
+    run
+}
+
+fn message_ids(thread: &Thread) -> Vec<Uuid> {
+    thread
+        .timeline
+        .iter()
+        .map(|message| match message {
+            TimelineMessage::User(message) => message.record.id,
+            TimelineMessage::Agent(message) => message.record.id,
+        })
+        .collect()
 }
 
 fn add_stopped_run(thread: &mut Thread, host: &mut ScriptedHost, cx: &mut gpui::App) {
@@ -259,9 +288,11 @@ fn a_saved_chat_comes_back_as_it_was(cx: &mut gpui::TestAppContext) {
         assert_eq!(restored.project(), thread.project());
         let ada = *thread.profiles.keys().next().unwrap();
         assert_eq!(restored.profiles[&ada].name.as_deref(), Some("Ada"));
-        assert_eq!(restored.tokens_used, 120);
-        assert_eq!(restored.token_activity, thread.token_activity);
         assert_eq!(restored.draft().files[&attachment.id].bytes(), b"# Notes");
+        futures::executor::block_on(db.quit());
+        // Statistics count the run that used tokens: its two replies'.
+        let (db, saved) = ChatDb::open(root.0.clone(), runtime.handle()).unwrap();
+        assert_eq!(saved.token_activity, [run_activity(50 + 70)]);
         futures::executor::block_on(db.quit());
     });
 }
@@ -360,25 +391,26 @@ fn deleting_a_chat_removes_its_rows_search_texts_and_folder(cx: &mut gpui::TestA
             }]
         );
 
-        let counted = Statistics {
+        let counted = DeletedChats {
             chats: 1,
-            tokens_used: 7,
             longest_chat: Duration::from_secs(3),
-            token_activity: vec![TokenActivity {
-                at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
-                duration: Duration::from_millis(2_250),
-                tokens: 7,
-            }],
         };
         db.delete(id, &counted);
-        // Usage of a run ending after it was deleted adds up, the longest
-        // chat being the longer.
-        let late = Statistics {
-            tokens_used: 5,
-            longest_chat: Duration::from_secs(2),
-            ..Statistics::default()
+        // A run ending after it was deleted adds its usage, and its time,
+        // the longest chat being the longer.
+        let late = TokenActivity {
+            at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
+            duration: Duration::from_millis(2_250),
+            tokens: 5,
         };
-        db.saver().count_deleted(&late);
+        db.saver().count_deleted_run(&late);
+        db.delete(
+            id,
+            &DeletedChats {
+                chats: 0,
+                longest_chat: Duration::from_secs(2),
+            },
+        );
         flush(&db);
         assert!(
             futures::executor::block_on(db.search("notes"))
@@ -389,13 +421,102 @@ fn deleting_a_chat_removes_its_rows_search_texts_and_folder(cx: &mut gpui::TestA
         futures::executor::block_on(db.quit());
         let (db, saved) = ChatDb::open(root.0.clone(), runtime.handle()).unwrap();
         assert!(saved.chats.is_empty());
-        assert_eq!(
-            saved.state.deleted,
-            Statistics {
-                tokens_used: 12,
-                ..counted
-            }
+        assert_eq!(saved.state.deleted, counted);
+        assert_eq!(saved.token_activity, [run_activity(120), late]);
+        futures::executor::block_on(db.quit());
+    });
+}
+
+/// Chats sharing a history up to where they branch, as forks will: each
+/// loads as its own path and saves below its fork point, search finds
+/// every chat of the tree, statistics count a shared run once, and
+/// deleting a chat removes only what no other chat still needs.
+#[gpui::test]
+fn chats_share_their_history_until_they_branch(cx: &mut gpui::TestAppContext) {
+    cx.update(|cx| {
+        let runtime = runtime();
+        let root = Root::new();
+        let mut host = ScriptedHost::default();
+        // A user message, a run, and a stopped run.
+        let (mut source, _) = thread_with_history(&mut host, &std::env::temp_dir(), cx);
+        add_stopped_run(&mut source, &mut host, cx);
+        let source_id = source.instance_id;
+        let ids = message_ids(&source);
+        let (db, _) = open(&root, &runtime);
+        db.save(&source, placement(&source)).unwrap();
+
+        // One fork after the first run, one where the source ends.
+        let (middle_id, tip_id) = (Uuid::new_v4(), Uuid::new_v4());
+        futures::executor::block_on(db.fork_for_test(source_id, ids[1], middle_id));
+        futures::executor::block_on(db.fork_for_test(source_id, ids[2], tip_id));
+        let mut middle = load(&db, middle_id, cx);
+        assert_eq!(message_ids(&middle), ids[..2]);
+        assert_eq!(middle.participant_id(), source.participant_id());
+        let mut fork_host = ScriptedHost::resuming(&middle);
+        let branch = add_completed_run(&mut middle, &mut fork_host, 30, cx);
+        db.save(&middle, placement(&middle)).unwrap();
+        flush(&db);
+        assert!(db.is_saved(&middle));
+
+        let shown_source = shown(&source).messages;
+        let shown_middle = shown(&middle).messages;
+        assert_eq!(shown(&load(&db, source_id, cx)).messages, shown_source);
+        assert_eq!(shown(&load(&db, tip_id, cx)).messages, shown_source);
+        let reloaded = load(&db, middle_id, cx);
+        assert_eq!(message_ids(&reloaded), [ids[0], ids[1], branch]);
+        assert_eq!(shown(&reloaded).messages, shown_middle);
+        assert_eq!(reloaded.transcript, middle.transcript);
+
+        let mut found = futures::executor::block_on(db.search("read the notes"))
+            .unwrap()
+            .into_iter()
+            .map(|hit| hit.thread_id)
+            .collect::<Vec<_>>();
+        found.sort();
+        let mut chats = vec![source_id, middle_id, tip_id];
+        chats.sort();
+        assert_eq!(found, chats);
+        futures::executor::block_on(db.quit());
+        let (db, saved) = ChatDb::open(root.0.clone(), runtime.handle()).unwrap();
+        assert_eq!(saved.chats.len(), 3);
+        let mut runs = saved.token_activity;
+        runs.sort_by_key(|run| run.tokens);
+        assert_eq!(runs, [run_activity(30), run_activity(120)]);
+
+        // The source ends where the tip fork does: deleting it removes
+        // nothing else.
+        let one = DeletedChats {
+            chats: 1,
+            longest_chat: Duration::ZERO,
+        };
+        db.delete(source_id, &one);
+        flush(&db);
+        assert_eq!(shown(&load(&db, tip_id, cx)).messages, shown_source);
+        // The middle fork's branch is its own.
+        db.delete(middle_id, &one);
+        flush(&db);
+        assert_eq!(shown(&load(&db, tip_id, cx)).messages, shown_source);
+        db.delete(tip_id, &one);
+        flush(&db);
+        assert!(
+            futures::executor::block_on(db.search("read the notes"))
+                .unwrap()
+                .is_empty()
         );
+        futures::executor::block_on(db.quit());
+
+        let (db, saved) = ChatDb::open(root.0.clone(), runtime.handle()).unwrap();
+        assert!(saved.chats.is_empty());
+        assert_eq!(saved.state.deleted.chats, 3);
+        // Each run counted once, as its last chat went.
+        assert_eq!(saved.token_activity, [run_activity(30), run_activity(120)]);
+        let leftover: i64 = runtime.block_on(async {
+            sqlx::query_scalar("SELECT count(*) FROM messages")
+                .fetch_one(&db.pool)
+                .await
+                .unwrap()
+        });
+        assert_eq!(leftover, 0);
         futures::executor::block_on(db.quit());
     });
 }
