@@ -384,7 +384,7 @@ fn folders_view(id: &SharedString, arguments: &serde_json::Value, cx: &App) -> O
             .min_w_0()
             .text_color(color)
             .child(Icon::new(icon).size_3())
-            .child(div().flex_none().child(verb.to_owned()))
+            .child(div().flex_none().child(SharedString::from(verb)))
             .child(
                 div()
                     .truncate()
@@ -430,7 +430,7 @@ fn command_view(
         .children(folders_view(id, arguments, cx))
         .child(code_block(
             format!("{id}-command"),
-            StyledText::new(command.to_owned()).with_highlights(highlights),
+            StyledText::new(command).with_highlights(highlights),
             cx,
         ))
         .when(line_count > 6, |view| {
@@ -462,7 +462,7 @@ fn permissions_view(
             div()
                 .debug_selector(move || reason_selector.clone())
                 .text_sm()
-                .child(reason.to_owned()),
+                .child(SharedString::from(reason)),
         )
         .children(folders_view(id, arguments, cx))
         .into_any_element()

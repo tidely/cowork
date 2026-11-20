@@ -1511,7 +1511,7 @@ impl Cowork {
             .map(|failure| {
                 div()
                     .text_color(cx.theme().danger)
-                    .child(failure.to_owned())
+                    .child(gpui::SharedString::from(failure))
             });
         // A plain reply that completed needs no summary, nor does the
         // onboarding greeting while it streams in.

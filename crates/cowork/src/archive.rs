@@ -422,7 +422,7 @@ impl Cowork {
             .thread_store
             .read(cx)
             .archived(cx)
-            .map(|chat| (chat.id(cx), chat.title(cx).to_owned().into()))
+            .map(|chat| (chat.id(cx), SharedString::from(chat.title(cx))))
             .collect();
         let empty = archived.is_empty();
         let count = match archived.len() {
