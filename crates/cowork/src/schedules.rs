@@ -363,7 +363,7 @@ impl Cowork {
         let project = (!folder_names.is_empty()).then(|| {
             let names = folder_names
                 .iter()
-                .map(|folder| folder.name.to_string())
+                .map(|folder| folder.name.as_str())
                 .collect::<Vec<_>>()
                 .join(", ");
             match settings.project_mode {

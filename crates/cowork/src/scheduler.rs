@@ -473,10 +473,7 @@ impl Cowork {
     pub(crate) fn forget_scheduled_thread(&mut self, thread_id: Uuid) {
         let mut changed = false;
         for task in &mut self.scheduler.tasks {
-            if task.thread_id == Some(thread_id) {
-                task.thread_id = None;
-                changed = true;
-            }
+            changed |= task.thread_id.take_if(|id| *id == thread_id).is_some();
         }
         if changed {
             self.scheduler.save();

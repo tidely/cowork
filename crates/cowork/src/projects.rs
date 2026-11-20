@@ -141,9 +141,7 @@ impl Projects {
             return false;
         }
         self.open.remove(&id);
-        if self.menu_open == Some(id) {
-            self.menu_open = None;
-        }
+        self.menu_open.take_if(|value| *value == id);
         if let Some(saver) = &self.saver {
             saver.remove_project(id);
         }
@@ -157,8 +155,8 @@ impl Projects {
     pub(crate) fn set_menu_open(&mut self, id: ProjectId, open: bool) {
         if open {
             self.menu_open = Some(id);
-        } else if self.menu_open == Some(id) {
-            self.menu_open = None;
+        } else {
+            self.menu_open.take_if(|value| *value == id);
         }
     }
 
