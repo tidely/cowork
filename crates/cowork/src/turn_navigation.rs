@@ -500,7 +500,7 @@ fn comment_previews<'a>(bodies: impl IntoIterator<Item = &'a str>) -> Vec<String
 /// How long before `now` a run started: "just now", "5 min ago", "3 h
 /// ago", "2 d ago". `None` for a time after `now`, as another computer's
 /// clock can give.
-fn time_ago(at: SystemTime, now: SystemTime) -> Option<String> {
+pub(crate) fn time_ago(at: SystemTime, now: SystemTime) -> Option<String> {
     let seconds = now.duration_since(at).ok()?.as_secs();
     Some(match seconds {
         0..60 => "just now".to_owned(),

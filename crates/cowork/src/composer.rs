@@ -268,6 +268,7 @@ impl Cowork {
                                 .child(self.render_layered_avatars(
                                     comment.author,
                                     &comment.presence.editors,
+                                    comment.id,
                                     cx,
                                 ))
                                 .child(body),
@@ -733,24 +734,30 @@ impl Cowork {
             );
             let block_id = block.id;
             rows.push(
-                self.render_presence_row(block.creator, &block.presence.editors, content, cx)
-                    .can_drop(move |value, _, _| {
-                        can_edit
-                            && value
-                                .downcast_ref::<ExternalPaths>()
-                                .is_some_and(|paths| !paths.paths().is_empty())
-                    })
-                    .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
-                        this.drop_attachments_on(
-                            draft_id,
-                            AttachmentTarget::Block(block_id),
-                            paths,
-                            window,
-                            cx,
-                        );
-                        cx.stop_propagation();
-                    }))
-                    .into_any_element(),
+                self.render_presence_row(
+                    block.creator,
+                    &block.presence.editors,
+                    block_id.as_uuid(),
+                    content,
+                    cx,
+                )
+                .can_drop(move |value, _, _| {
+                    can_edit
+                        && value
+                            .downcast_ref::<ExternalPaths>()
+                            .is_some_and(|paths| !paths.paths().is_empty())
+                })
+                .on_drop(cx.listener(move |this, paths: &ExternalPaths, window, cx| {
+                    this.drop_attachments_on(
+                        draft_id,
+                        AttachmentTarget::Block(block_id),
+                        paths,
+                        window,
+                        cx,
+                    );
+                    cx.stop_propagation();
+                }))
+                .into_any_element(),
             );
         }
 
@@ -788,11 +795,12 @@ impl Cowork {
             }));
             let (primary, others) = draft_position_people;
             rows.push(
-                self.render_presence_row(primary, &others, content, cx)
+                // Nil: there is one draft position, unlike the items' ids.
+                self.render_presence_row(primary, &others, Uuid::nil(), content, cx)
                     .into_any_element(),
             );
         } else if !errors.is_empty() {
-            rows.push(self.render_message_row(None, errors, cx).into_any_element());
+            rows.push(self.render_message_row(None, errors).into_any_element());
         }
 
         div()

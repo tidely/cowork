@@ -1,11 +1,11 @@
 //! The top bar: window controls, the sidebar toggle, sharing, and who is
 //! in the thread.
 
-use gpui::{Context, IntoElement, MouseButton, SharedString, Window, div, point, prelude::*, px};
+use gpui::{Context, IntoElement, MouseButton, Window, div, point, prelude::*, px};
 use gpui_base::GlobalState;
-use gpui_component::{ActiveTheme as _, TitleBar, sidebar::SidebarToggleButton, tooltip::Tooltip};
+use gpui_component::{ActiveTheme as _, TitleBar, sidebar::SidebarToggleButton};
 
-use crate::{Cowork, MainStage, thread::Thread};
+use crate::{Cowork, MainStage, avatar_card::AvatarCardSubject, thread::Thread};
 
 /// The height of the top bar and of the bottom bars below the sidebar and
 /// the main stage: the sidebar header's row height, so the window's chrome
@@ -112,18 +112,13 @@ impl Cowork {
             .take(MAX_VISIBLE)
             .enumerate()
             .map(|(index, &participant)| {
-                let name: SharedString = if participant == thread.participant_id() {
-                    format!("{} (you)", self.name_of(participant)).into()
-                } else {
-                    self.name_of(participant)
-                };
                 self.render_participant_avatar(participant, px(AVATAR_SIZE))
                     // Separates overlapping avatars from each other.
                     .border_2()
                     .border_color(cx.theme().title_bar)
                     .id(("participant", index))
                     .when(index > 0, |this| this.ml(px(-AVATAR_OVERLAP)))
-                    .tooltip(move |window, cx| Tooltip::new(name.clone()).build(window, cx))
+                    .tooltip(self.avatar_card(AvatarCardSubject::Participant(participant)))
             });
         // Flex layout measures overlapping (negatively margined) children as
         // taking no room at all, so the row is sized explicitly.

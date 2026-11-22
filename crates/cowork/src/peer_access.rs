@@ -700,7 +700,7 @@ fn separator(cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn mode_icon(mode: PeerMode) -> IconName {
+pub(crate) fn mode_icon(mode: PeerMode) -> IconName {
     match mode {
         PeerMode::ReadOnly => IconName::Eye,
         PeerMode::Write => IconName::Pencil,

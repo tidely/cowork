@@ -2,12 +2,13 @@
 
 use std::collections::HashMap;
 
-use gpui::{App, FontWeight, SharedString, div, img, prelude::*, px, rgb};
+use gpui::{AnyView, App, FontWeight, SharedString, Window, div, img, prelude::*, px, rgb};
 use gpui_component::{ActiveTheme, Icon};
 use gpui_kit_assets::IconName;
 
 use crate::{
     Cowork,
+    avatar_card::{AvatarCard, AvatarCardSubject},
     participant::ParticipantId,
     profile::{Profile, appearance, participant_name},
     thread::Thread,
@@ -87,6 +88,37 @@ impl Cowork {
             .child(initials)
     }
 
+    /// Builds the card about `subject` that an avatar shows on hover, for
+    /// `.tooltip`.
+    pub(crate) fn avatar_card(
+        &self,
+        subject: AvatarCardSubject,
+    ) -> impl Fn(&mut Window, &mut App) -> AnyView + 'static {
+        let cowork = self.weak.clone();
+        move |_, cx| cx.new(|_| AvatarCard::new(cowork.clone(), subject)).into()
+    }
+
+    /// `avatar` with its card on hover. `key` tells apart avatars of the same
+    /// subject, which may sit side by side.
+    pub(crate) fn with_avatar_card(
+        &self,
+        avatar: gpui::Div,
+        key: uuid::Uuid,
+        subject: AvatarCardSubject,
+    ) -> gpui::Stateful<gpui::Div> {
+        let key = match subject {
+            AvatarCardSubject::Participant(participant) => {
+                format!("avatar-{key}-{}", participant.as_uuid())
+            }
+            AvatarCardSubject::Reply(message) => format!("avatar-{key}-{message}"),
+        };
+        let id = SharedString::from(&key);
+        avatar
+            .id(id)
+            .debug_selector(move || key)
+            .tooltip(self.avatar_card(subject))
+    }
+
     /// The agent's avatar shows the logo of the provider whose model wrote
     /// the message, or a generic one when no model did.
     pub(crate) fn render_avatar(&self, author: MessageAuthor, cx: &App) -> gpui::Div {
@@ -121,6 +153,7 @@ impl Cowork {
         &self,
         primary: ParticipantId,
         others: &[ParticipantId],
+        key: uuid::Uuid,
         cx: &App,
     ) -> gpui::Div {
         const MAX_OTHERS: usize = 2;
@@ -132,9 +165,14 @@ impl Cowork {
             .iter()
             .take(MAX_OTHERS)
             .map(|&participant| {
-                self.render_participant_avatar(participant, SMALL)
-                    .border_1()
-                    .border_color(cx.theme().background)
+                self.with_avatar_card(
+                    self.render_participant_avatar(participant, SMALL)
+                        .border_1()
+                        .border_color(cx.theme().background),
+                    key,
+                    AvatarCardSubject::Participant(participant),
+                )
+                .into_any_element()
             })
             .collect::<Vec<_>>();
         if hidden > 0 {
@@ -151,17 +189,26 @@ impl Cowork {
                     .bg(cx.theme().secondary_active)
                     .text_size(MIN_TEXT)
                     .text_color(cx.theme().secondary_foreground)
-                    .child(format!("+{hidden}")),
+                    .child(format!("+{hidden}"))
+                    .into_any_element(),
             );
         }
         let count = layered.len();
         div()
             .relative()
-            .child(self.render_avatar(MessageAuthor::User(primary), cx))
+            .child(self.with_avatar_card(
+                self.render_avatar(MessageAuthor::User(primary), cx),
+                key,
+                AvatarCardSubject::Participant(primary),
+            ))
             .children(layered.into_iter().enumerate().map(|(index, avatar)| {
                 // Centered under the primary avatar, fanned out sideways.
                 let offset = (index as f32 - (count as f32 - 1.) / 2.) * STEP;
-                avatar.absolute().top(px(13.)).left(px(11. - 8. + offset))
+                div()
+                    .absolute()
+                    .top(px(13.))
+                    .left(px(11. - 8. + offset))
+                    .child(avatar)
             }))
     }
 }

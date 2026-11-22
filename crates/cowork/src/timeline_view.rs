@@ -25,6 +25,7 @@ use uuid::Uuid;
 
 use crate::{
     Cowork,
+    avatar_card::AvatarCardSubject,
     caret::{paint_caret_label, selection_rects},
     composer_attachments::AttachmentCard,
     file_change_view,
@@ -428,6 +429,7 @@ impl Cowork {
                     .child(self.render_layered_avatars(
                         comment.author,
                         &comment.presence.editors,
+                        comment.id,
                         cx,
                     ))
                     .child(body),
@@ -678,11 +680,12 @@ impl Cowork {
                         .into_any_element(),
                 );
             }
-            rows.push(self.render_message_row(
-                Some(MessageAuthor::User(block.author)),
-                content,
-                cx,
-            ));
+            let avatar = self.with_avatar_card(
+                self.render_avatar(MessageAuthor::User(block.author), cx),
+                block.id,
+                AvatarCardSubject::Participant(block.author),
+            );
+            rows.push(self.render_message_row(Some(avatar.into_any_element()), content));
         }
 
         div()
@@ -712,8 +715,11 @@ impl Cowork {
     ) -> gpui::Div {
         let authors = Self::comment_authors(comments);
         match authors.split_first() {
-            Some((first, rest)) => self.render_presence_row(*first, rest, content, cx),
-            None => self.render_message_row(None, content, cx),
+            // The first comment's id tells this group's avatars apart.
+            Some((first, rest)) => {
+                self.render_presence_row(*first, rest, comments[0].id, content, cx)
+            }
+            None => self.render_message_row(None, content),
         }
     }
 
@@ -732,10 +738,11 @@ impl Cowork {
         &self,
         primary: ParticipantId,
         others: &[ParticipantId],
+        key: Uuid,
         content: impl IntoIterator<Item = gpui::AnyElement>,
         cx: &App,
     ) -> gpui::Div {
-        self.render_message_row(None, content, cx)
+        self.render_message_row(None, content)
             .child(
                 div()
                     .absolute()
@@ -744,7 +751,7 @@ impl Cowork {
                     .w(px(40.))
                     .flex()
                     .justify_center()
-                    .child(self.render_layered_avatars(primary, others, cx)),
+                    .child(self.render_layered_avatars(primary, others, key, cx)),
             )
             .relative()
     }
@@ -818,9 +825,8 @@ impl Cowork {
     /// a matching gap on the right.
     pub(crate) fn render_message_row(
         &self,
-        author: Option<MessageAuthor>,
+        avatar: Option<gpui::AnyElement>,
         content: impl IntoIterator<Item = gpui::AnyElement>,
-        cx: &App,
     ) -> gpui::Div {
         div()
             .w_full()
@@ -832,7 +838,7 @@ impl Cowork {
                     .flex_none()
                     .flex()
                     .justify_center()
-                    .children(author.map(|author| self.render_avatar(author, cx))),
+                    .children(avatar),
             )
             .child(
                 div()
@@ -1637,19 +1643,18 @@ impl Cowork {
             .w_full()
             .flex()
             .items_start()
-            .child(
-                div()
-                    .w(px(40.))
-                    .flex_none()
-                    .flex()
-                    .justify_center()
-                    .child(self.render_avatar(
+            .child(div().w(px(40.)).flex_none().flex().justify_center().child(
+                self.with_avatar_card(
+                    self.render_avatar(
                         MessageAuthor::Agent(
                             message.record.model.as_ref().map(|model| model.provider),
                         ),
                         cx,
-                    )),
-            )
+                    ),
+                    message_id,
+                    AvatarCardSubject::Reply(message_id),
+                ),
+            ))
             .child(
                 div()
                     .flex_1()

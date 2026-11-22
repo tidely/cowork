@@ -23,6 +23,8 @@ impl Thread {
             participant_id: _,
             // Memory-only, dropped: empty unless shared, which blocks.
             participants: _,
+            // Memory-only, dropped: what this client saw while shared.
+            membership_times: _,
             // Persisted.
             profiles: _,
             // Persisted at turn boundaries; a failed save blocks (Cowork).

@@ -45,6 +45,7 @@ use crate::{
 mod archive;
 mod assets;
 mod attachments;
+mod avatar_card;
 mod avatars;
 mod caret;
 mod chat_db;
@@ -187,6 +188,8 @@ struct Cowork {
     /// Everyone's profile as the active thread shows them, refreshed at the
     /// start of every render; see [`Cowork::profiles_for`].
     shown_profiles: HashMap<ParticipantId, Profile>,
+    /// This view, for cards built away from its render, such as tooltips.
+    weak: gpui::WeakEntity<Self>,
     profile_error: Option<SharedString>,
     profile_name_subscription: Option<Subscription>,
     tokio_handle: tokio::runtime::Handle,
@@ -904,6 +907,7 @@ pub fn run() -> anyhow::Result<()> {
                         turn_rail: Default::default(),
                         timeline_selection: Default::default(),
                         timeline_focus_handle: cx.focus_handle(),
+                        weak: cx.weak_entity(),
                         follow_generation: true,
                         thread_store: thread_store.clone(),
                         selection_message_id: None,

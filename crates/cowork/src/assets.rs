@@ -87,6 +87,10 @@ gpui_kit_assets::icon_assets!(
         ChevronsUpDown,
         ArrowUp,
         ArrowDown,
+        // Avatar cards: the host, and where a reply's model ran.
+        Crown,
+        Laptop,
+        KeyRound,
     ]
 );
 

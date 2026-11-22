@@ -5,7 +5,7 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
 use ::draft::{AttachmentId, DraftItem, ItemId};
@@ -136,6 +136,10 @@ pub(crate) struct Thread {
     /// Connected participants in join order, starting with the host. Empty
     /// while the thread is not shared.
     participants: Vec<ParticipantId>,
+    /// When this client saw each participant join and leave. Local and
+    /// memory-only: a collaborator never learns when those already present
+    /// joined, and nothing here is saved.
+    membership_times: HashMap<ParticipantId, MembershipTimes>,
     /// The profile of everyone who has joined while shared, kept after they
     /// leave so their messages still name them. Includes the local user's,
     /// although [`Cowork::profile`] is what shows for them.
@@ -186,6 +190,13 @@ pub(crate) struct Thread {
     /// `projects.rs`. Local organization only: saved with the host's own
     /// thread and never sent to collaborators, so a mirror has none.
     project: Option<ProjectId>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MembershipTimes {
+    pub(crate) joined_at: Option<SystemTime>,
+    /// Cleared when they join again.
+    pub(crate) left_at: Option<SystemTime>,
 }
 
 struct ActiveRun {
@@ -326,6 +337,7 @@ impl Thread {
             draft,
             peer_permissions: PeerPermissions::default(),
             peer_draft_generations: HashMap::new(),
+            membership_times: HashMap::new(),
             draft_generation: 0,
             sharing: ThreadSharing::NotShared,
             ownership: ThreadOwnership::Local,
@@ -340,6 +352,12 @@ impl Thread {
     }
     pub(crate) fn participants(&self) -> &[ParticipantId] {
         &self.participants
+    }
+    pub(crate) fn membership_times(&self, participant: ParticipantId) -> MembershipTimes {
+        self.membership_times
+            .get(&participant)
+            .copied()
+            .unwrap_or_default()
     }
     pub(crate) fn ownership(&self) -> ThreadOwnership {
         self.ownership
@@ -627,6 +645,7 @@ impl Thread {
             draft,
             peer_permissions: PeerPermissions::default(),
             peer_draft_generations: HashMap::new(),
+            membership_times: HashMap::new(),
             draft_generation: 0,
             sharing,
             ownership: ThreadOwnership::Remote,
@@ -1590,6 +1609,13 @@ impl Thread {
                 if !self.participants.contains(&participant) {
                     self.participants.push(participant);
                 }
+                self.membership_times.insert(
+                    participant,
+                    MembershipTimes {
+                        joined_at: Some(SystemTime::now()),
+                        left_at: None,
+                    },
+                );
                 if self.is_host() && participant != self.participant_id {
                     self.peer_draft_generations.entry(participant).or_insert(0);
                 }
@@ -1609,6 +1635,10 @@ impl Thread {
                 let participant = ParticipantId::from_bytes(participant);
                 self.participants
                     .retain(|existing| *existing != participant);
+                self.membership_times
+                    .entry(participant)
+                    .or_default()
+                    .left_at = Some(SystemTime::now());
                 self.draft.presence.remove(&participant);
                 self.peer_permissions.set_override(participant, None);
                 self.peer_draft_generations.remove(&participant);

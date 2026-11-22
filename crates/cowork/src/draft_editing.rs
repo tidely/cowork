@@ -948,6 +948,7 @@ pub(crate) mod tests {
                         turn_rail: Default::default(),
                         timeline_selection: Default::default(),
                         timeline_focus_handle: cx.focus_handle(),
+                        weak: cx.weak_entity(),
                         follow_generation: true,
                         thread_store: {
                             thread_store

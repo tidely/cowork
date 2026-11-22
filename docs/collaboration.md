@@ -108,6 +108,16 @@ join order, which does not reshuffle on presence updates, up to the creator plus
 two editors and then "+N". The draft position row shows the avatars of
 participants at it. Comment cards show their creator's avatar inside the card.
 
+Resting the pointer on an avatar, in the timeline, the composer, or the top
+bar, shows a card about who is behind it (`avatar_card.rs`): a participant's
+name, whether they are here and what they are doing in the draft, their access,
+how many prompts and comments they have sent in this chat, and when they
+joined; or, for a reply, its model, whose computer or API key ran it, and how
+long it worked. The card is a tooltip and only informs: it closes as soon as
+the pointer leaves the avatar, and anything it mentions can be done elsewhere.
+Join and leave times are what this client saw, kept in memory only, so a
+collaborator never sees when those already present joined.
+
 ### Creating prompt blocks
 
 Independent prompts are the default. When the draft is empty, every editing
@@ -664,8 +674,8 @@ Gaps in what this document describes:
 - explaining non-permission submission refusals to collaborators (empty draft,
   unavailable model, attachments loading, size limit), which are dropped
   silently;
-- showing names when hovering a remote caret or an avatar (names show only
-  briefly after a caret moves, and on the top bar's avatars);
+- showing names when hovering a remote caret (names show only briefly after
+  a caret moves);
 - fully validating writable peers' presence at the host (focus, selections,
   announced file reads); only read-only presence is sanitized;
 - showing others' selections in agent messages, which needs a gpui-kit

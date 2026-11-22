@@ -64,6 +64,7 @@ use crate::{
 };
 
 mod attachments;
+mod avatar_cards;
 mod collaboration;
 mod comments;
 mod composer;
@@ -229,6 +230,7 @@ fn test_cowork(
         turn_rail: Default::default(),
         timeline_selection: Default::default(),
         timeline_focus_handle: cx.focus_handle(),
+        weak: cx.weak_entity(),
         follow_generation: true,
         thread_store: {
             if let Some(id) = active_thread_id {
