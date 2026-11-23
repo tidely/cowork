@@ -344,9 +344,9 @@ older saved runs without a recorded content start retain their full duration.
 
 | Concept | In Cowork |
 | --- | --- |
-| `AgentHost` | `CoworkHost` ([tool_approval.rs](../crates/cowork/src/tool_approval.rs)): sources are the participant or schedule that started a run, inputs are a submission's content, access is the sandbox's `Needs`, and permissions are the sandbox's project, read when a call starts |
-| Tool contexts | The thread's `sandbox::ThreadSandbox` (commands and file tools) and the run's `tools::RunComments` (`respond_to_comment`) |
-| Authorization | Calls within the project's mode, its folders, and the run's grants run; others ask, and only the host may decide commands, writes, and permission requests. A scheduled run refuses a call that would ask the first time |
+| `AgentHost` | `CoworkHost` ([tool_approval.rs](../crates/cowork/src/tool_approval.rs)): sources are the participant or schedule that started a run, inputs are a submission's content, and each call declares its sandbox needs or web access |
+| Tool contexts | The thread's sandbox (commands and files), the run's comments (`respond_to_comment`), and the host's shared web configuration (Firecrawl tools) |
+| Authorization | [Permissions](permissions.md) covers project modes, host-only approvals, and scheduled runs |
 | Tools | The tools registered in `generation.rs`'s `registry`, in that order, without dynamic tools |
 | Definition | The selected model, the system prompt, and the thinking and options the model's provider takes (`ModelProvider::request_parameters` in `providers.rs`: Ollama's `num_ctx`, Anthropic's `max_tokens` and thinking style, OpenAI's `reasoning_effort`). A change of provider or API key hands the session a new connection with the definition. A model change replaces it before the next run |
 | Context sections | `environment`: the project's folders and mode and the scratch folder, sent whenever they changed |

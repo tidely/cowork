@@ -28,10 +28,10 @@ use agent::{
 use futures::{StreamExt as _, channel::mpsc};
 use gpui::{App, Context, Entity};
 use sandbox::{
-    EditFile, ListDirectory, Needs, ReadFile, ReadPdf, RequestPermissions, RunCommand, ViewImage,
+    EditFile, ListDirectory, ReadFile, ReadPdf, RequestPermissions, RunCommand, ViewImage,
     WriteFile,
 };
-use tools::{Calculate, RespondToComment};
+use tools::{Calculate, ListSiteUrls, ReadWebPage, RespondToComment};
 use uuid::Uuid;
 
 use super::GenerationPlan;
@@ -43,7 +43,7 @@ use crate::{
     protocol::{self, Preview, PreviewDelta, RunEvent},
     thread::{ControlGeneration, Thread, ThreadOwnership, ThreadSharing},
     timeline::TimelineMessage,
-    tool_approval::{self, CoworkHost, CoworkInput},
+    tool_approval::{self, CallAccess, CoworkHost, CoworkInput},
     transcript::{RunSource, shared_compaction, shared_entry, steering_comment_ids},
     usage::{TokenActivity, usage_tokens},
 };
@@ -102,7 +102,7 @@ fn definition(model: &ModelRef, info: &ModelInfo) -> AgentDefinition {
 /// dynamic tools. They come first in the prompt prefix, so they never change
 /// with the thread, its comments, its project, or its model; what changes
 /// reaches the model in the environment note.
-fn registry() -> ToolRegistry<CoworkHost, Needs> {
+fn registry() -> ToolRegistry<CoworkHost, CallAccess> {
     let mut registry = ToolRegistry::default();
     let registered = [
         registry.register(RespondToComment),
@@ -115,6 +115,8 @@ fn registry() -> ToolRegistry<CoworkHost, Needs> {
         registry.register(ReadPdf),
         registry.register(WriteFile),
         registry.register(EditFile),
+        registry.register(ReadWebPage),
+        registry.register(ListSiteUrls),
     ];
     for result in registered {
         result.expect("tool names are unique");
@@ -596,10 +598,13 @@ impl Cowork {
             return Ok((agent.handle.clone(), agent.host.clone()));
         }
 
-        let host = Arc::new(CoworkHost::new(Arc::new(sandbox::ThreadSandbox::new(
-            self.sandboxes.clone(),
-            thread_id.to_string(),
-        ))));
+        let host = Arc::new(CoworkHost::new(
+            Arc::new(sandbox::ThreadSandbox::new(
+                self.sandboxes.clone(),
+                thread_id.to_string(),
+            )),
+            self.web_access.clone(),
+        ));
         let (events, mut received) = mpsc::unbounded();
         let handle = start_session(
             host.clone(),
@@ -1059,6 +1064,10 @@ impl Cowork {
 }
 
 #[cfg(test)]
+#[path = "generation/web_tool_tests.rs"]
+mod web_tool_tests;
+
+#[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
 
@@ -1145,10 +1154,13 @@ mod tests {
             ),
             reply(vec![Content::text("Summary.")], FinishReason::Stop, 5),
         ]);
-        let host = Arc::new(CoworkHost::new(Arc::new(sandbox::ThreadSandbox::new(
-            crate::test_support::unused_sandboxes(),
-            "thread",
-        ))));
+        let host = Arc::new(CoworkHost::new(
+            Arc::new(sandbox::ThreadSandbox::new(
+                crate::test_support::unused_sandboxes(),
+                "thread",
+            )),
+            Default::default(),
+        ));
         host.compaction.threshold.store(50, Ordering::Release);
         let model = ModelRef {
             provider: ModelProvider::Ollama,
@@ -1341,10 +1353,13 @@ mod tests {
             image_input: None,
             reasoning: Reasoning::Effort("medium".into()),
         };
-        let host = Arc::new(CoworkHost::new(Arc::new(sandbox::ThreadSandbox::new(
-            crate::test_support::unused_sandboxes(),
-            "thread",
-        ))));
+        let host = Arc::new(CoworkHost::new(
+            Arc::new(sandbox::ThreadSandbox::new(
+                crate::test_support::unused_sandboxes(),
+                "thread",
+            )),
+            Default::default(),
+        ));
         let (events, mut received) = mpsc::unbounded();
         let handle = start_session(
             host,

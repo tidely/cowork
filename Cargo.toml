@@ -32,6 +32,7 @@ agent = { path = "crates/agent" }
 agent-input = { path = "crates/agent-input" }
 agent-runtime = { path = "crates/agent-runtime" }
 draft = { path = "crates/draft" }
+firecrawl = { path = "crates/firecrawl" }
 sandbox = { path = "crates/sandbox" }
 tools = { path = "crates/tools" }
 tool-runtime = { path = "crates/tool-runtime" }

@@ -44,10 +44,23 @@ in the conversation, attachments included. `read_pdf` reads pages as text or as
 rendered images, with caps on pages per call, output size, file size and time. The
 limits are constants in `crates/sandbox/src/files.rs` and `pdf.rs`.
 
+`read_web_page` and `list_site_urls` use the Firecrawl service selected in
+**Settings → Web access** on the host. The switch applies immediately and
+preserves the saved endpoint. **Test connection** checks `/health` at the
+address in the field without saving it or enabling access. **Save endpoint**
+applies the address (or clears it for an empty field) for future calls and launches.
+The tools remain visible even when Web access is off (the default) or
+no endpoint is configured, but then fail without asking or fetching. Each
+configured call requires host approval, independent of command permissions.
+Approval is for the service selected when the call was prepared. Disabling
+access or removing the endpoint before execution prevents the fetch; changing
+from one configured endpoint to another affects new calls. Network reach and
+cloud fallback depend on the service, not on Cowork's command sandbox.
+
 `request_permissions` keeps approved command permissions for the rest of
 one run. Lowering auto-approve affects future calls but does not revoke
 those grants or a call already approved. Only the host can approve commands,
-file writes, and permission grants; Admin peers can approve other tools.
+file writes, web calls, and permission grants; Admin peers can approve other tools.
 `calculate` and `respond_to_comment` always run without approval, including
 in scheduled runs. Other tools ask unless explicitly allowlisted.
 

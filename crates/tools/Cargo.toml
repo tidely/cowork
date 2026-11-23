@@ -9,7 +9,9 @@ workspace = true
 
 [dependencies]
 agent.workspace = true
+firecrawl.workspace = true
 parking_lot.workspace = true
+reqwest.workspace = true
 schemars.workspace = true
 serde.workspace = true
 serde_json.workspace = true

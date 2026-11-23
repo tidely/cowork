@@ -1,5 +1,5 @@
 //! The user's settings that outlast a launch: the model new chats start
-//! with, and the context settings (the context window and when to compact).
+//! with, the context settings, and the host's web access configuration.
 //! Saved in the chats' database (`chat_db/app_state.rs`) whenever one
 //! changes. Only loading and saving them is here; what a launch opens on,
 //! onboarding included, is `Cowork::open_start_stage`'s.
@@ -15,6 +15,7 @@ pub(crate) struct Settings {
     /// picker shows it unavailable rather than silently picking another.
     pub(crate) model: Option<ModelRef>,
     pub(crate) context: ContextSettings,
+    pub(crate) web: crate::web_settings::WebSettings,
 }
 
 impl Cowork {
@@ -22,6 +23,7 @@ impl Cowork {
     /// chats start with, its provider preselected for setup.
     pub(crate) fn start_settings(&mut self, settings: Settings, cx: &mut Context<Self>) {
         self.apply_context_settings(settings.context, cx);
+        self.apply_web_settings(settings.web);
         if let Some(model) = settings.model {
             self.selected_provider = Some(model.provider);
             self.new_thread_model = Some(model);
@@ -45,6 +47,7 @@ impl Cowork {
         db.saver().save_settings(&Settings {
             model: self.new_thread_model.clone(),
             context: self.context_settings,
+            web: self.web_settings.clone(),
         });
     }
 }

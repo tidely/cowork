@@ -86,6 +86,7 @@ mod scheduler;
 mod schedules;
 mod search_palette;
 mod settings;
+mod web_settings;
 
 mod sidebar;
 mod statistics;
@@ -184,6 +185,8 @@ struct Cowork {
     /// first shows; see `provider_setup.rs`.
     api_key_input: Option<provider_setup::ApiKeyInput>,
     context_settings: context_settings::ContextSettings,
+    web_settings: web_settings::WebSettings,
+    web_editor: Option<web_settings::WebEditor>,
     profile: Profile,
     /// Everyone's profile as the active thread shows them, refreshed at the
     /// start of every render; see [`Cowork::profiles_for`].
@@ -195,6 +198,7 @@ struct Cowork {
     tokio_handle: tokio::runtime::Handle,
     /// Where the agent's commands run, with each hosted thread's project.
     sandboxes: Arc<sandbox::Sandboxes>,
+    web_access: Arc<parking_lot::RwLock<tools::WebAccess>>,
     active_generations: HashMap<Uuid, ActiveGeneration>,
     /// The first chat's greeting while it streams in; see
     /// `thread/onboarding.rs`.
@@ -926,12 +930,15 @@ pub fn run() -> anyhow::Result<()> {
                         providers: Default::default(),
                         api_key_input: None,
                         context_settings: context_settings::ContextSettings::default(),
+                        web_settings: Default::default(),
+                        web_editor: None,
                         profile: Profile::local(local_participant_id),
                         shown_profiles: HashMap::new(),
                         profile_error: None,
                         profile_name_subscription: None,
                         tokio_handle,
                         sandboxes,
+                        web_access: Default::default(),
                         active_generations: HashMap::new(),
                         onboarding_intro: None,
                         agents: HashMap::new(),

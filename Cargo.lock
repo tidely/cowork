@@ -1642,6 +1642,7 @@ dependencies = [
  "base64 0.23.1",
  "chrono",
  "draft",
+ "firecrawl",
  "futures",
  "gpui-base",
  "gpui-component",
@@ -1655,6 +1656,7 @@ dependencies = [
  "nucleo-matcher",
  "parking_lot",
  "postcard",
+ "reqwest",
  "rrule",
  "sandbox",
  "serde",
@@ -9568,7 +9570,9 @@ name = "tools"
 version = "0.1.0"
 dependencies = [
  "agent",
+ "firecrawl",
  "parking_lot",
+ "reqwest",
  "schemars",
  "serde",
  "serde_json",

@@ -26,14 +26,16 @@ pub(crate) enum SettingsPage {
     /// The LLM providers and their models, to pick the model new chats start
     /// with and discover models again; see `provider_setup.rs`.
     Providers,
+    WebAccess,
     Context,
     Archive,
 }
 
 impl SettingsPage {
-    pub(crate) const ALL: [SettingsPage; 4] = [
+    pub(crate) const ALL: [SettingsPage; 5] = [
         SettingsPage::Profile,
         SettingsPage::Providers,
+        SettingsPage::WebAccess,
         SettingsPage::Context,
         SettingsPage::Archive,
     ];
@@ -42,6 +44,7 @@ impl SettingsPage {
         match self {
             SettingsPage::Profile => "Profile",
             SettingsPage::Providers => "Providers",
+            SettingsPage::WebAccess => "Web access",
             SettingsPage::Context => "Context",
             SettingsPage::Archive => "Archived chats",
         }
@@ -51,6 +54,7 @@ impl SettingsPage {
         match self {
             SettingsPage::Profile => AssetIconName::CircleUser,
             SettingsPage::Providers => AssetIconName::Bot,
+            SettingsPage::WebAccess => AssetIconName::Globe,
             SettingsPage::Context => AssetIconName::FileText,
             SettingsPage::Archive => AssetIconName::Archive,
         }
@@ -78,6 +82,7 @@ impl Cowork {
                 self.api_key_input = None;
             }
             SettingsPage::Context | SettingsPage::Archive => {}
+            SettingsPage::WebAccess => self.open_web_editor(window, cx),
         }
         // The composer is hidden, so it must not keep taking keystrokes.
         window.blur(cx);
@@ -104,6 +109,7 @@ impl Cowork {
         match page {
             SettingsPage::Profile => self.render_profile_page(cx).into_any_element(),
             SettingsPage::Providers => self.render_providers_page(window, cx).into_any_element(),
+            SettingsPage::WebAccess => self.render_web_page(cx).into_any_element(),
             SettingsPage::Context => self.render_context_page(window, cx).into_any_element(),
             SettingsPage::Archive => self.render_archive_page(cx).into_any_element(),
         }

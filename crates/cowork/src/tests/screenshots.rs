@@ -23,6 +23,7 @@
 
 mod comments;
 mod opening;
+mod web_access;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
@@ -40,7 +41,11 @@ type Scene = fn(&SceneContext) -> anyhow::Result<()>;
 
 /// Every scene, by the name its PNGs are filed under and
 /// `COWORK_SCREENSHOTS` selects it by.
-const SCENES: &[(&str, Scene)] = &[("comments", comments::scene), ("opening", opening::scene)];
+const SCENES: &[(&str, Scene)] = &[
+    ("comments", comments::scene),
+    ("opening", opening::scene),
+    ("web-access", web_access::scene),
+];
 
 /// What scenes render at: the window's logical size and the scale factor
 /// of the PNG.

@@ -102,6 +102,7 @@ pub(super) struct SettingsRow {
     model: Option<ModelRef>,
     window_tokens: i64,
     threshold_percent: i64,
+    web: crate::web_settings::WebSettings,
 }
 
 impl SettingsRow {
@@ -110,6 +111,7 @@ impl SettingsRow {
             model: settings.model.clone(),
             window_tokens: columns::int(settings.context.window_tokens, "context window")?,
             threshold_percent: settings.context.threshold_percent.into(),
+            web: settings.web.clone(),
         })
     }
 
@@ -117,6 +119,7 @@ impl SettingsRow {
     fn into_settings(self) -> anyhow::Result<Settings> {
         Ok(Settings {
             model: self.model,
+            web: self.web,
             context: ContextSettings {
                 window_tokens: columns::uint(self.window_tokens, "context window")?,
                 threshold_percent: u8::try_from(self.threshold_percent)
@@ -269,17 +272,20 @@ async fn write_settings(conn: &mut SqliteConnection, settings: &SettingsRow) -> 
     };
     sqlx::query(
         "INSERT INTO settings (id, model_provider, model_id, context_window_tokens,
-             compact_threshold_percent)
-         VALUES (1, ?, ?, ?, ?)
+             compact_threshold_percent, web_enabled, firecrawl_endpoint)
+         VALUES (1, ?, ?, ?, ?, ?, ?)
          ON CONFLICT (id) DO UPDATE SET
              model_provider = excluded.model_provider, model_id = excluded.model_id,
              context_window_tokens = excluded.context_window_tokens,
-             compact_threshold_percent = excluded.compact_threshold_percent",
+             compact_threshold_percent = excluded.compact_threshold_percent,
+             web_enabled = excluded.web_enabled, firecrawl_endpoint = excluded.firecrawl_endpoint",
     )
     .bind(provider)
     .bind(model)
     .bind(settings.window_tokens)
     .bind(settings.threshold_percent)
+    .bind(settings.web.enabled)
+    .bind(&settings.web.endpoint)
     .execute(&mut *conn)
     .await?;
     Ok(())
@@ -427,7 +433,7 @@ async fn read_projects(pool: &SqlitePool) -> anyhow::Result<Vec<ProjectRecord>> 
 
 async fn read_settings(pool: &SqlitePool) -> anyhow::Result<Settings> {
     let Some(row) = sqlx::query(
-        "SELECT model_provider, model_id, context_window_tokens, compact_threshold_percent
+        "SELECT model_provider, model_id, context_window_tokens, compact_threshold_percent, web_enabled, firecrawl_endpoint
          FROM settings WHERE id = 1",
     )
     .fetch_optional(pool)
@@ -450,6 +456,10 @@ async fn read_settings(pool: &SqlitePool) -> anyhow::Result<Settings> {
             model,
             window_tokens: row.get(2),
             threshold_percent: row.get(3),
+            web: crate::web_settings::WebSettings {
+                enabled: row.get(4),
+                endpoint: row.get(5),
+            },
         }
         .into_settings()
     })();

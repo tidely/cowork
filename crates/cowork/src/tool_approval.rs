@@ -5,7 +5,7 @@
 //! other call asks, and runs with exactly what it asked for once allowed.
 //! Explicit narrower access is respected, and reads are global except
 //! denied credentials. Only the host may approve commands, file writes, and
-//! run permissions; Admin peers may approve other tools. Scheduled calls
+//! run permissions, and web access; Admin peers may approve other tools. Scheduled calls
 //! needing approval fail once, then an identical repeat asks. See
 //! `docs/permissions.md`.
 
@@ -19,12 +19,14 @@ use agent::{
     model::{Content, ToolCallId},
 };
 use gpui::Context;
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLock};
 use sandbox::{
     EditFile, ListDirectory, Needs, ReadFile, ReadPdf, RequestPermissions, RunCommand,
     ThreadSandbox, ViewImage, WriteFile,
 };
-use tools::{Calculate, CommentId, RespondToComment, RunComments};
+use tools::{
+    Calculate, CommentId, ListSiteUrls, ReadWebPage, RespondToComment, RunComments, WebAccess,
+};
 use uuid::Uuid;
 
 use crate::{
@@ -54,15 +56,15 @@ pub(crate) const DENIED: &str = "The user denied this tool call.";
 /// time, rather than waiting for someone who may not be there.
 pub(crate) const UNATTENDED: &str = "This tool call was not run: it needs the user's permission, and this is a scheduled run that nobody may be watching. Carry on without it if you can. If the call is necessary, make it again with exactly the same arguments: the user will then be notified and asked, and the run waits for their answer.";
 
-/// Tools whose calls only the host may allow: they act on the host's computer
-/// (its shell and tools for `run_command`, its files for `write_file` and
-/// `edit_file`, and what later commands may do there for
-/// `request_permissions`), so an `Admin` peer may not decide for it.
+/// These calls use the host's computer, its configured web service, or
+/// change what later commands may do. An `Admin` peer cannot consent for it.
 pub(crate) const HOST_ONLY: &[&str] = &[
     RunCommand::NAME,
     WriteFile::NAME,
     EditFile::NAME,
     RequestPermissions::NAME,
+    ReadWebPage::NAME,
+    ListSiteUrls::NAME,
 ];
 
 pub(crate) fn needs_approval(tool: &str) -> bool {
@@ -124,10 +126,11 @@ impl RenderInput for CoworkInput {
 }
 
 /// The application side of a thread's agent session: its tools' context
-/// (the thread's sandbox, and the run's comments), its policy for each call,
+/// (the thread's sandbox, host web service, and run's comments), its policy for each call,
 /// and when to compact.
 pub(crate) struct CoworkHost {
     sandbox: Arc<ThreadSandbox>,
+    web_access: Arc<RwLock<WebAccess>>,
     comments: RunComments,
     /// The calls a scheduled run already made once without being asked
     /// about, by tool and arguments (whose keys may come in any order).
@@ -147,9 +150,10 @@ pub(crate) struct CompactionTrigger {
 }
 
 impl CoworkHost {
-    pub(crate) fn new(sandbox: Arc<ThreadSandbox>) -> Self {
+    pub(crate) fn new(sandbox: Arc<ThreadSandbox>, web_access: Arc<RwLock<WebAccess>>) -> Self {
         Self {
             sandbox,
+            web_access,
             comments: RunComments::default(),
             unattended: Mutex::default(),
             compaction: CompactionTrigger {
@@ -192,6 +196,12 @@ impl AsRef<ThreadSandbox> for CoworkHost {
     }
 }
 
+impl AsRef<RwLock<WebAccess>> for CoworkHost {
+    fn as_ref(&self) -> &RwLock<WebAccess> {
+        &self.web_access
+    }
+}
+
 impl AsRef<RunComments> for CoworkHost {
     fn as_ref(&self) -> &RunComments {
         &self.comments
@@ -213,10 +223,35 @@ impl std::fmt::Debug for CoworkHost {
     }
 }
 
+/// Web requests are not shell commands and never inherit sandbox grants.
+#[derive(Clone, Debug)]
+pub(crate) enum CallAccess {
+    Sandbox(Needs),
+    Web(Result<(), &'static str>),
+}
+
+impl From<Needs> for CallAccess {
+    fn from(needs: Needs) -> Self {
+        Self::Sandbox(needs)
+    }
+}
+
+impl From<()> for CallAccess {
+    fn from(_: ()) -> Self {
+        Self::Sandbox(Needs::Nothing)
+    }
+}
+
+impl From<WebAccess> for CallAccess {
+    fn from(web: WebAccess) -> Self {
+        Self::Web(web.client().map(|_| ()))
+    }
+}
+
 impl AgentHost for CoworkHost {
     type Source = RunSource;
     type Input = CoworkInput;
-    type Access = Needs;
+    type Access = CallAccess;
     /// The project's mode and folders are the sandbox's, which the tools
     /// and authorization read as they are when a call starts.
     type Permissions = ();
@@ -227,10 +262,11 @@ impl AgentHost for CoworkHost {
             return Decision::Allow;
         }
         match call.access {
-            Needs::Refused(reason) => return Decision::Deny(reason.clone()),
-            Needs::Command { .. } | Needs::Write { .. } | Needs::Permissions(_)
-                if self.sandbox.covers(call.access) =>
-            {
+            CallAccess::Web(Err(reason)) => return Decision::Deny((*reason).into()),
+            CallAccess::Sandbox(Needs::Refused(reason)) => return Decision::Deny(reason.clone()),
+            CallAccess::Sandbox(
+                needs @ (Needs::Command { .. } | Needs::Write { .. } | Needs::Permissions(_)),
+            ) if self.sandbox.covers(needs) => {
                 return Decision::Allow;
             }
             _ => {}
@@ -351,15 +387,20 @@ mod tests {
         assert!(!admin.may_decide(RunCommand::NAME));
         assert!(!admin.may_decide(WriteFile::NAME));
         assert!(!admin.may_decide(RequestPermissions::NAME));
+        for tool in [ReadWebPage::NAME, ListSiteUrls::NAME] {
+            assert!(!admin.may_decide(tool));
+            assert!(host.may_decide(tool));
+        }
         assert!(admin.may_decide(Calculate::NAME));
         assert!(!writer.may_decide(Calculate::NAME));
     }
 
     fn host_in(access: Access) -> Arc<CoworkHost> {
         let sandboxes = crate::test_support::unused_sandboxes();
-        let host = Arc::new(CoworkHost::new(Arc::new(ThreadSandbox::new(
-            sandboxes, "thread",
-        ))));
+        let host = Arc::new(CoworkHost::new(
+            Arc::new(ThreadSandbox::new(sandboxes, "thread")),
+            Default::default(),
+        ));
         set_mode(&host, access);
         host
     }
@@ -385,14 +426,14 @@ mod tests {
     where
         T: agent::tool::Tool,
         CoworkHost: AsRef<T::Context>,
-        Needs: From<T::Access>,
+        CallAccess: From<T::Access>,
     {
         let tool = Arc::new(tool);
         let descriptor = ToolDescriptor {
-            definition: ToolDyn::<CoworkHost, Needs>::definition(&*tool),
+            definition: ToolDyn::<CoworkHost, CallAccess>::definition(&*tool),
             capabilities: Default::default(),
         };
-        let prepared = ToolDyn::<CoworkHost, Needs>::prepare(tool, arguments.clone(), host)
+        let prepared = ToolDyn::<CoworkHost, CallAccess>::prepare(tool, arguments.clone(), host)
             .expect("valid arguments");
         host.authorize(&CallAuthorization {
             tool: &descriptor,
