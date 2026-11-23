@@ -11,9 +11,9 @@
 
 use std::time::{Duration, Instant};
 
-use chrono::{Local, NaiveDateTime};
 use gpui::{AnyWindowHandle, App, Context, Entity, Task};
 use gpui_component::{WindowExt as _, notification::Notification};
+use jiff::civil::DateTime;
 use uuid::Uuid;
 
 use crate::chat_db::StateSaver;
@@ -52,7 +52,7 @@ pub(crate) enum TaskStatus {
     /// Next in the queue, but no models are known yet.
     WaitingForModels,
     Queued,
-    Due(NaiveDateTime),
+    Due(DateTime),
     NoMoreRuns,
     Paused,
 }
@@ -121,8 +121,9 @@ impl Scheduler {
     }
 }
 
-pub(crate) fn now() -> NaiveDateTime {
-    Local::now().naive_local()
+/// The local wall-clock time schedules run by.
+pub(crate) fn now() -> DateTime {
+    jiff::ZonedDateTime::now().datetime()
 }
 
 impl Cowork {
@@ -147,7 +148,7 @@ impl Cowork {
 
     /// Queues the runs due by `now`, records missed and skipped ones, and
     /// starts the next run if none is going on.
-    pub(crate) fn tick_schedules(&mut self, now: NaiveDateTime, cx: &mut Context<Self>) {
+    pub(crate) fn tick_schedules(&mut self, now: DateTime, cx: &mut Context<Self>) {
         let mut changed = false;
         for task in &mut self.scheduler.tasks {
             changed |= task.advance(now);
@@ -175,7 +176,7 @@ impl Cowork {
         self.refresh_models(cx);
     }
 
-    pub(crate) fn run_next_scheduled(&mut self, now: NaiveDateTime, cx: &mut Context<Self>) {
+    pub(crate) fn run_next_scheduled(&mut self, now: DateTime, cx: &mut Context<Self>) {
         while self.scheduler.run.is_none() && self.start_next_scheduled_run(now, cx) {}
     }
 
@@ -209,7 +210,7 @@ impl Cowork {
 
     /// Starts the next queued run, or records why it failed to. Returns
     /// whether the queue moved on.
-    fn start_next_scheduled_run(&mut self, now: NaiveDateTime, cx: &mut Context<Self>) -> bool {
+    fn start_next_scheduled_run(&mut self, now: DateTime, cx: &mut Context<Self>) -> bool {
         let Some(index) = self.scheduler.next_queued() else {
             return false;
         };

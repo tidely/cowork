@@ -1,14 +1,14 @@
 //! Every encoding between app values and SQLite columns, in one place:
 //! checked integer conversions (sqlx can't bind `u64`, and `as` would wrap),
-//! durations as nanoseconds, timestamps as `DateTime<Utc>`, and enums as
-//! the snake_case names the schema's CHECKs list, by explicit `match`
-//! rather than serde (`ModelProvider` and `ProjectMode` serialize
-//! unrenamed).
+//! durations as nanoseconds, timestamps as RFC 3339 text in UTC, local
+//! wall-clock times as ISO 8601 text, and enums as the snake_case names the
+//! schema's CHECKs list, by explicit `match` rather than serde
+//! (`ModelProvider` and `ProjectMode` serialize unrenamed).
 
 use std::time::{Duration, SystemTime};
 
 use anyhow::Context as _;
-use chrono::{DateTime, Utc};
+use jiff::{Timestamp, civil, tz::Offset};
 
 use crate::{
     models::ModelProvider,
@@ -41,12 +41,28 @@ pub(super) fn duration(nanos: i64, what: &'static str) -> anyhow::Result<Duratio
     Ok(Duration::from_nanos(uint(nanos, what)?))
 }
 
-pub(super) fn time(time: SystemTime) -> DateTime<Utc> {
-    DateTime::<Utc>::from(time)
+/// Written with a `+00:00` offset rather than jiff's default `Z`, as the
+/// schema's CHECKs require.
+pub(super) fn time(time: SystemTime) -> anyhow::Result<String> {
+    let time = Timestamp::try_from(time).context("time out of range")?;
+    Ok(time.display_with_offset(Offset::UTC).to_string())
 }
 
-pub(super) fn system_time(time: DateTime<Utc>) -> SystemTime {
-    SystemTime::from(time)
+pub(super) fn system_time(column: &str) -> anyhow::Result<SystemTime> {
+    let time: Timestamp = column
+        .parse()
+        .with_context(|| format!("invalid time {column:?}"))?;
+    SystemTime::try_from(time).context("time out of range")
+}
+
+pub(super) fn local_time(time: civil::DateTime) -> String {
+    time.to_string()
+}
+
+pub(super) fn to_local_time(column: &str) -> anyhow::Result<civil::DateTime> {
+    column
+        .parse()
+        .with_context(|| format!("invalid local time {column:?}"))
 }
 
 pub(super) fn provider(provider: ModelProvider) -> &'static str {
@@ -248,6 +264,9 @@ mod tests {
         assert!(uint(-1, "x").is_err());
         assert!(nanos(Duration::from_secs(u64::MAX), "x").is_err());
         let before_epoch = SystemTime::UNIX_EPOCH - Duration::new(3, 123_456_789);
-        assert_eq!(system_time(time(before_epoch)), before_epoch);
+        assert_eq!(
+            system_time(&time(before_epoch).unwrap()).unwrap(),
+            before_epoch
+        );
     }
 }

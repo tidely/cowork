@@ -4,9 +4,11 @@
 use std::time::{Duration, SystemTime};
 
 use agent::model::Usage;
-use chrono::{DateTime, Datelike as _, Days, Local, Months, NaiveTime, TimeDelta, Timelike as _};
 use gpui::{Hsla, SharedString};
 use gpui_component::Theme;
+use jiff::{
+    RoundMode, SignedDuration, Timestamp, ToSpan as _, Unit, ZonedDateTime, ZonedDateTimeRound,
+};
 
 use crate::Thread;
 
@@ -87,28 +89,33 @@ impl TokenActivity {
     /// at `starts`, in order. The last period is open-ended, so that a clock
     /// that moved back keeps a turn in it. What was used before the first
     /// period is left out.
-    pub(crate) fn spread(&self, starts: &[DateTime<Local>]) -> impl Iterator<Item = (usize, f64)> {
-        let start = DateTime::<Local>::from(self.at);
-        // A duration too long to date is treated as an instant.
-        let end = TimeDelta::from_std(self.duration)
-            .ok()
-            .and_then(|duration| start.checked_add_signed(duration))
-            .unwrap_or(start);
+    pub(crate) fn spread(&self, starts: &[Timestamp]) -> impl Iterator<Item = (usize, f64)> {
+        let interval = Timestamp::try_from(self.at).ok().map(|start| {
+            // A duration too long to date is treated as an instant.
+            let end = SignedDuration::try_from(self.duration)
+                .ok()
+                .and_then(|duration| start.checked_add(duration).ok())
+                .unwrap_or(start);
+            (start, end)
+        });
         let tokens = self.tokens as f64;
-        let length = (end - start).num_microseconds().unwrap_or(i64::MAX) as f64;
-        let instant = length <= 0.;
-        // An instant falls wholly in the period it starts in.
-        let instant_index = starts
-            .partition_point(|period| *period <= start)
-            .checked_sub(1);
-        (0..starts.len()).filter_map(move |index| {
-            if instant {
-                return (Some(index) == instant_index).then_some((index, tokens));
-            }
-            let from = start.max(starts[index]);
-            let to = starts.get(index + 1).map_or(end, |next| end.min(*next));
-            let overlap = (to - from).num_microseconds().unwrap_or(i64::MAX) as f64;
-            (overlap > 0.).then(|| (index, tokens * overlap / length))
+        interval.into_iter().flat_map(move |(start, end)| {
+            let length = end.duration_since(start).as_micros() as f64;
+            // An instant falls wholly in the period it starts in.
+            let instant_index = (length <= 0.).then(|| {
+                starts
+                    .partition_point(|period| *period <= start)
+                    .checked_sub(1)
+            });
+            (0..starts.len()).filter_map(move |index| {
+                if let Some(instant_index) = instant_index {
+                    return (Some(index) == instant_index).then_some((index, tokens));
+                }
+                let from = start.max(starts[index]);
+                let to = starts.get(index + 1).map_or(end, |next| end.min(*next));
+                let overlap = to.duration_since(from).as_micros() as f64;
+                (overlap > 0.).then(|| (index, tokens * overlap / length))
+            })
         })
     }
 }
@@ -192,7 +199,7 @@ pub(crate) struct ActivityChart {
 pub(crate) struct CachedActivityChart {
     range: ActivityRange,
     unit: BucketUnit,
-    current: DateTime<Local>,
+    current: ZonedDateTime,
     pub(crate) chart: ActivityChart,
 }
 
@@ -200,7 +207,7 @@ impl CachedActivityChart {
     pub(crate) fn new(
         activity: &[TokenActivity],
         range: ActivityRange,
-        now: DateTime<Local>,
+        now: &ZonedDateTime,
     ) -> Self {
         let layout = BucketLayout::of(range, activity, now);
         Self {
@@ -211,7 +218,7 @@ impl CachedActivityChart {
         }
     }
 
-    pub(crate) fn is_current(&self, range: ActivityRange, now: DateTime<Local>) -> bool {
+    pub(crate) fn is_current(&self, range: ActivityRange, now: &ZonedDateTime) -> bool {
         self.range == range && self.current == self.unit.floor(now)
     }
 }
@@ -250,45 +257,39 @@ enum BucketUnit {
 }
 
 impl BucketUnit {
-    fn floor(self, time: DateTime<Local>) -> DateTime<Local> {
-        let minute = time
-            .with_nanosecond(0)
-            .and_then(|time| time.with_second(0))
-            .unwrap_or(time);
-        match self {
-            Self::Minute => minute,
-            Self::Hour => minute.with_minute(0).unwrap_or(minute),
-            Self::Day => local_midnight(time.date_naive()).unwrap_or(time),
-            Self::Month => time
-                .date_naive()
-                .with_day(1)
-                .and_then(local_midnight)
-                .unwrap_or(time),
-        }
+    fn floor(self, time: &ZonedDateTime) -> ZonedDateTime {
+        let truncate = |unit| {
+            ZonedDateTimeRound::new()
+                .smallest(unit)
+                .mode(RoundMode::Trunc)
+        };
+        let floored = match self {
+            Self::Minute => time.round(truncate(Unit::Minute)),
+            Self::Hour => time.round(truncate(Unit::Hour)),
+            Self::Day => time.start_of_day(),
+            Self::Month => time.first_of_month().and_then(|day| day.start_of_day()),
+        };
+        floored.unwrap_or_else(|_| time.clone())
     }
 
     /// The start of the unit `count` units before the one starting at
     /// `start`.
-    pub(crate) fn back(self, start: DateTime<Local>, count: u32) -> DateTime<Local> {
-        let date = start.date_naive();
+    pub(crate) fn back(self, start: &ZonedDateTime, count: u32) -> ZonedDateTime {
+        let count = i64::from(count);
+        // Hours and smaller are exact; days and months are calendar units,
+        // whose start may have moved with a change of offset.
         let moved = match self {
-            Self::Minute => Some(start - TimeDelta::minutes(count.into())),
-            Self::Hour => Some(start - TimeDelta::hours(count.into())),
-            Self::Day => date
-                .checked_sub_days(Days::new(count.into()))
-                .and_then(local_midnight),
-            Self::Month => date
-                .checked_sub_months(Months::new(count))
-                .and_then(local_midnight),
+            Self::Minute => start.checked_sub(count.minutes()),
+            Self::Hour => start.checked_sub(count.hours()),
+            Self::Day => start
+                .checked_sub(count.days())
+                .and_then(|day| day.start_of_day()),
+            Self::Month => start
+                .checked_sub(count.months())
+                .and_then(|day| day.start_of_day()),
         };
-        moved.unwrap_or(start)
+        moved.unwrap_or_else(|_| start.clone())
     }
-}
-
-fn local_midnight(date: chrono::NaiveDate) -> Option<DateTime<Local>> {
-    date.and_time(NaiveTime::MIN)
-        .and_local_timezone(Local)
-        .earliest()
 }
 
 /// How [`token_activity_chart`] divides a range: `count` units ending with
@@ -346,7 +347,7 @@ impl BucketLayout {
     pub(crate) fn of(
         range: ActivityRange,
         activity: &[TokenActivity],
-        now: DateTime<Local>,
+        now: &ZonedDateTime,
     ) -> Self {
         match range {
             ActivityRange::Hour => Self::HOUR,
@@ -356,17 +357,19 @@ impl BucketLayout {
             ActivityRange::Lifetime => {
                 let Some(first) = activity
                     .iter()
-                    .map(|activity| DateTime::<Local>::from(activity.at))
+                    .filter_map(|activity| Timestamp::try_from(activity.at).ok())
                     .min()
                 else {
                     return Self::HOUR;
                 };
                 [Self::HOUR, Self::DAY, Self::MONTH, Self::YEAR]
                     .into_iter()
-                    .find(|layout| layout.start(now) <= first)
+                    .find(|layout| layout.start(now).timestamp() <= first)
                     .unwrap_or_else(|| {
-                        let months = (now.year() - first.year()) * 12 + now.month() as i32
-                            - first.month() as i32;
+                        let first = now.time_zone().to_datetime(first);
+                        let months = (i32::from(now.year()) - i32::from(first.year())) * 12
+                            + i32::from(now.month())
+                            - i32::from(first.month());
                         let count = u32::try_from(months + 1).unwrap_or(1);
                         Self {
                             unit: BucketUnit::Month,
@@ -383,27 +386,27 @@ impl BucketLayout {
         }
     }
 
-    pub(crate) fn start(self, now: DateTime<Local>) -> DateTime<Local> {
+    pub(crate) fn start(self, now: &ZonedDateTime) -> ZonedDateTime {
         self.unit
-            .back(self.unit.floor(now), self.count.saturating_sub(1))
+            .back(&self.unit.floor(now), self.count.saturating_sub(1))
     }
 }
 
 pub(crate) fn token_activity_chart(
     activity: &[TokenActivity],
     range: ActivityRange,
-    now: DateTime<Local>,
+    now: &ZonedDateTime,
 ) -> ActivityChart {
     let layout = BucketLayout::of(range, activity, now);
     let current = layout.unit.floor(now);
     let starts: Vec<_> = (0..layout.count)
         .rev()
-        .map(|back| layout.unit.back(current, back))
+        .map(|back| layout.unit.back(&current, back))
         .collect();
     let mut buckets: Vec<_> = starts
         .iter()
         .map(|start| ActivityBucket {
-            label: start.format(layout.title).to_string().into(),
+            label: start.strftime(layout.title).to_string().into(),
             tokens: 0.,
         })
         .collect();
@@ -417,7 +420,7 @@ pub(crate) fn token_activity_chart(
             let index = (layout.count - 1 - back) as usize;
             let text = match layout.axis {
                 AxisLabels::Ago { suffix, .. } => format!("{back}{suffix}"),
-                AxisLabels::Date { format, .. } => starts[index].format(format).to_string(),
+                AxisLabels::Date { format, .. } => starts[index].strftime(format).to_string(),
             };
             AxisLabel {
                 index,
@@ -426,6 +429,7 @@ pub(crate) fn token_activity_chart(
         })
         .rev()
         .collect();
+    let starts: Vec<_> = starts.iter().map(ZonedDateTime::timestamp).collect();
     let mut tokens = vec![0.; buckets.len()];
     for activity in activity {
         for (index, share) in activity.spread(&starts) {
@@ -486,6 +490,12 @@ pub(crate) fn format_token_count(tokens: u64) -> String {
 mod tests {
     use super::*;
 
+    fn chart_test_time() -> ZonedDateTime {
+        jiff::civil::datetime(2026, 5, 20, 14, 37, 12, 0)
+            .in_tz("America/New_York")
+            .unwrap()
+    }
+
     #[test]
     fn token_counts_are_shortened() {
         for (tokens, text) in [
@@ -526,55 +536,57 @@ mod tests {
 
     #[test]
     fn activity_chart_cache_tracks_range_and_calendar_bucket() {
-        use chrono::TimeZone as _;
-
-        let now = Local
-            .with_ymd_and_hms(2026, 5, 20, 14, 37, 12)
-            .single()
-            .unwrap();
+        let now = chart_test_time();
         let activity = [TokenActivity {
-            at: (now - TimeDelta::minutes(5)).into(),
+            at: SystemTime::try_from((&now - SignedDuration::from_mins(5)).timestamp()).unwrap(),
             duration: Duration::from_secs(90),
             tokens: 100,
         }];
-        let hour = CachedActivityChart::new(&activity, ActivityRange::Hour, now);
-        assert!(hour.is_current(ActivityRange::Hour, now + TimeDelta::seconds(47)));
-        assert!(!hour.is_current(ActivityRange::Hour, now + TimeDelta::seconds(48)));
-        assert!(!hour.is_current(ActivityRange::Day, now));
-        assert!(!hour.is_current(ActivityRange::Hour, now - TimeDelta::minutes(1)));
+        let hour = CachedActivityChart::new(&activity, ActivityRange::Hour, &now);
+        assert!(hour.is_current(ActivityRange::Hour, &(&now + SignedDuration::from_secs(47))));
+        assert!(!hour.is_current(ActivityRange::Hour, &(&now + SignedDuration::from_secs(48))));
+        assert!(!hour.is_current(ActivityRange::Day, &now));
+        assert!(!hour.is_current(ActivityRange::Hour, &(&now - SignedDuration::from_mins(1))));
         assert_eq!(
             hour.chart,
-            token_activity_chart(&activity, ActivityRange::Hour, now)
+            token_activity_chart(&activity, ActivityRange::Hour, &now)
         );
 
-        let year = CachedActivityChart::new(&activity, ActivityRange::Year, now);
-        assert!(year.is_current(ActivityRange::Year, now + TimeDelta::days(1)));
-        assert!(!year.is_current(ActivityRange::Year, now + TimeDelta::days(12)));
-        let lifetime = CachedActivityChart::new(&activity, ActivityRange::Lifetime, now);
-        assert!(lifetime.is_current(ActivityRange::Lifetime, now + TimeDelta::seconds(47)));
-        assert!(!lifetime.is_current(ActivityRange::Lifetime, now + TimeDelta::minutes(1)));
+        let year = CachedActivityChart::new(&activity, ActivityRange::Year, &now);
+        assert!(year.is_current(
+            ActivityRange::Year,
+            &(&now + SignedDuration::from_hours(24))
+        ));
+        assert!(!year.is_current(
+            ActivityRange::Year,
+            &(&now + SignedDuration::from_hours(24 * 12))
+        ));
+        let lifetime = CachedActivityChart::new(&activity, ActivityRange::Lifetime, &now);
+        assert!(lifetime.is_current(
+            ActivityRange::Lifetime,
+            &(&now + SignedDuration::from_secs(47))
+        ));
+        assert!(!lifetime.is_current(
+            ActivityRange::Lifetime,
+            &(&now + SignedDuration::from_mins(1))
+        ));
     }
 
     #[test]
     fn token_activity_is_bucketed_by_local_time() {
-        use chrono::TimeZone as _;
-
-        let now = Local
-            .with_ymd_and_hms(2026, 5, 20, 14, 37, 12)
-            .single()
-            .expect("unambiguous local time");
+        let now = chart_test_time();
         // Instants, which fall wholly in the period they start in.
-        let activity = |ago: TimeDelta, tokens| TokenActivity {
-            at: SystemTime::from(now - ago),
+        let activity = |ago: SignedDuration, tokens| TokenActivity {
+            at: SystemTime::try_from((&now - ago).timestamp()).unwrap(),
             duration: Duration::ZERO,
             tokens,
         };
         let recent = [
-            activity(TimeDelta::minutes(5), 10),
-            activity(TimeDelta::minutes(30), 20),
-            activity(TimeDelta::hours(2), 40),
+            activity(SignedDuration::from_mins(5), 10),
+            activity(SignedDuration::from_mins(30), 20),
+            activity(SignedDuration::from_hours(2), 40),
         ];
-        let chart = |activity: &[TokenActivity], range| token_activity_chart(activity, range, now);
+        let chart = |activity: &[TokenActivity], range| token_activity_chart(activity, range, &now);
         let titles = |chart: &ActivityChart| -> Vec<String> {
             chart
                 .buckets
@@ -638,7 +650,7 @@ mod tests {
         assert_eq!(chart(&recent, ActivityRange::Lifetime), day);
         let empty = chart(&[], ActivityRange::Lifetime);
         assert_eq!((empty.buckets.len(), empty.peak()), (60, None));
-        let old = [activity(TimeDelta::days(400), 5), recent[0]];
+        let old = [activity(SignedDuration::from_hours(24 * 400), 5), recent[0]];
         let lifetime = chart(&old, ActivityRange::Lifetime);
         let (titles_, tokens_) = (titles(&lifetime), tokens(&lifetime));
         assert_eq!(
@@ -659,8 +671,8 @@ mod tests {
 
         // Of equal peaks, the latest is marked.
         let tied = [
-            activity(TimeDelta::minutes(20), 7),
-            activity(TimeDelta::minutes(10), 7),
+            activity(SignedDuration::from_mins(20), 7),
+            activity(SignedDuration::from_mins(10), 7),
         ];
         let tied = chart(&tied, ActivityRange::Hour);
         assert_eq!(tied.peak().map(|(index, _)| index), Some(49));
@@ -668,26 +680,21 @@ mod tests {
 
     #[test]
     fn token_activity_is_spread_across_each_response() {
-        use chrono::TimeZone as _;
-
-        let now = Local
-            .with_ymd_and_hms(2026, 5, 20, 14, 37, 12)
-            .single()
-            .expect("unambiguous local time");
-        let response = |ago: TimeDelta, duration: TimeDelta, tokens| TokenActivity {
-            at: SystemTime::from(now - ago),
-            duration: duration.to_std().expect("positive duration"),
+        let now = chart_test_time();
+        let response = |ago: SignedDuration, duration: SignedDuration, tokens| TokenActivity {
+            at: SystemTime::try_from((&now - ago).timestamp()).unwrap(),
+            duration: Duration::try_from(duration).expect("positive duration"),
             tokens,
         };
         let hour = |activity: &[TokenActivity]| -> Vec<f64> {
-            token_activity_chart(activity, ActivityRange::Hour, now)
+            token_activity_chart(activity, ActivityRange::Hour, &now)
                 .buckets
                 .iter()
                 .map(|bucket| bucket.tokens)
                 .collect()
         };
-        let minutes = TimeDelta::minutes;
-        let seconds = TimeDelta::seconds;
+        let minutes = SignedDuration::from_mins;
+        let seconds = SignedDuration::from_secs;
 
         // 14:30:30 to 14:33:30: half a minute, two whole ones, and a half.
         let tokens = hour(&[response(minutes(6) + seconds(42), minutes(3), 600)]);

@@ -11,8 +11,8 @@
 
 use std::time::Duration;
 
-use chrono::{DateTime, Local};
 use gpui::App;
+use jiff::ZonedDateTime;
 
 use crate::chat_meta::ChatMeta;
 use crate::{
@@ -72,7 +72,7 @@ impl Cowork {
         self.token_activity.push(activity);
     }
 
-    pub(crate) fn prepare_profile_statistics(&mut self, now: DateTime<Local>, cx: &App) {
+    pub(crate) fn prepare_profile_statistics(&mut self, now: &ZonedDateTime, cx: &App) {
         if self.profile_statistics.is_none() {
             let totals = Statistics {
                 tokens_used: self.tokens_used(),

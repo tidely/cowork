@@ -251,14 +251,6 @@ impl<E> TimedEditor<E> {
     }
 }
 
-impl<E: Element> IntoElement for TimedEditor<E> {
-    type Element = Self;
-
-    fn into_element(self) -> Self {
-        self
-    }
-}
-
 impl<E: Element> Element for TimedEditor<E> {
     type RequestLayoutState = E::RequestLayoutState;
     type PrepaintState = E::PrepaintState;

@@ -26,9 +26,8 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 use gpui::{
     AnyElement, App, AvailableSpace, Bounds, Display, Element, ElementId, FlexDirection,
-    GlobalElementId, InspectorElementId, IntoElement, LayoutId, MouseButton, MouseDownEvent,
-    Pixels, Point, Refineable as _, ScrollHandle, Style, TextStyle, WeakEntity, Window, point, px,
-    relative, size,
+    GlobalElementId, InspectorElementId, LayoutId, MouseButton, MouseDownEvent, Pixels, Point,
+    Refineable as _, ScrollHandle, Style, TextStyle, WeakEntity, Window, point, px, relative, size,
 };
 use uuid::Uuid;
 
@@ -327,14 +326,6 @@ impl VirtualTimeline {
         if cursor.is_some() {
             selection.cursor = cursor;
         }
-    }
-}
-
-impl IntoElement for VirtualTimeline {
-    type Element = Self;
-
-    fn into_element(self) -> Self {
-        self
     }
 }
 

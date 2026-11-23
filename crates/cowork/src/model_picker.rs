@@ -226,7 +226,7 @@ impl Cowork {
             });
         }
         // Scheduled runs may have been waiting for models.
-        self.run_next_scheduled(chrono::Local::now().naive_local(), cx);
+        self.run_next_scheduled(crate::scheduler::now(), cx);
     }
 
     /// Applies a model picked by the local user to the active thread. Choices

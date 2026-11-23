@@ -18,8 +18,8 @@ use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc};
 
 use gpui::{
     App, BorderStyle, Bounds, ClipboardItem, Context, Corners, Edges, Element, ElementId,
-    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, IntoElement, LayoutId, PaintQuad,
-    Pixels, Point, SharedString, StyledText, Window, transparent_black,
+    GlobalElementId, Hitbox, HitboxBehavior, InspectorElementId, LayoutId, PaintQuad, Pixels,
+    Point, SharedString, StyledText, Window, transparent_black,
 };
 use gpui_base::{
     TextSelection, TextSelectionHandle, TextSelectionRegistration, TextSelectionRun, TextViewState,
@@ -168,14 +168,6 @@ impl PromptText {
             document_order,
             selection,
         }
-    }
-}
-
-impl IntoElement for PromptText {
-    type Element = Self;
-
-    fn into_element(self) -> Self {
-        self
     }
 }
 

@@ -3,7 +3,6 @@
 //! with their run history. See `docs/schedule.md` for what each option
 //! means; `scheduler.rs` runs them.
 
-use chrono::{Datelike as _, Duration, Local, NaiveDateTime, NaiveTime, Timelike as _, Weekday};
 use gpui::{
     App, Context, Entity, Focusable as _, FontWeight, Hsla, IntoElement, Render, SharedString,
     Subscription, WeakEntity, Window, div, prelude::*, px,
@@ -25,6 +24,10 @@ use gpui_component::{
     v_flex,
 };
 use gpui_kit_assets::IconName as AssetIconName;
+use jiff::{
+    ToSpan as _,
+    civil::{DateTime, Time, Weekday},
+};
 use uuid::Uuid;
 
 use std::path::{Path, PathBuf};
@@ -37,34 +40,34 @@ use crate::{
     project_mode::{NETWORK_WARNING, ProjectMode, WRITE_WARNING},
     scheduled_task::{
         IntervalUnit, MissedRuns, RunRecord, RunResult, ScheduledTask, SkipReason, TaskSettings,
-        ThreadMode, Trigger, When,
+        ThreadMode, Trigger, When, weekday_name,
     },
     scheduler::TaskStatus,
 };
 
 const WEEK: [Weekday; 7] = [
-    Weekday::Mon,
-    Weekday::Tue,
-    Weekday::Wed,
-    Weekday::Thu,
-    Weekday::Fri,
-    Weekday::Sat,
-    Weekday::Sun,
+    Weekday::Monday,
+    Weekday::Tuesday,
+    Weekday::Wednesday,
+    Weekday::Thursday,
+    Weekday::Friday,
+    Weekday::Saturday,
+    Weekday::Sunday,
 ];
 
 const SHOWN_RUNS: usize = 10;
 
 /// A time relative to `now`: "Today 09:00", "Tomorrow 09:00", "Yesterday
 /// 09:00", a weekday within the coming week, otherwise the date.
-pub(crate) fn format_relative(at: NaiveDateTime, now: NaiveDateTime) -> String {
-    let time = at.format("%H:%M");
-    match (at.date() - now.date()).num_days() {
+pub(crate) fn format_relative(at: DateTime, now: DateTime) -> String {
+    let time = at.strftime("%H:%M");
+    match (at.date() - now.date()).get_days() {
         0 => format!("Today {time}"),
         1 => format!("Tomorrow {time}"),
         -1 => format!("Yesterday {time}"),
-        2..=6 => format!("{} {time}", at.format("%a")),
-        _ if at.year() == now.year() => format!("{} {time}", at.format("%b %-d")),
-        _ => format!("{} {time}", at.format("%b %-d, %Y")),
+        2..=6 => format!("{} {time}", at.strftime("%a")),
+        _ if at.year() == now.year() => format!("{} {time}", at.strftime("%b %-d")),
+        _ => format!("{} {time}", at.strftime("%b %-d, %Y")),
     }
 }
 
@@ -193,7 +196,7 @@ impl Cowork {
     }
 
     pub(crate) fn render_schedules_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let now = Local::now().naive_local();
+        let now = crate::scheduler::now();
         let tasks = &self.scheduler.tasks;
         let active = tasks.iter().filter(|task| task.is_active()).count();
         let summary = match (tasks.len(), active) {
@@ -304,7 +307,7 @@ impl Cowork {
         &self,
         index: usize,
         task: &ScheduledTask,
-        now: NaiveDateTime,
+        now: DateTime,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let task_id = task.id;
@@ -601,7 +604,7 @@ pub(crate) struct ScheduleEditor {
     rule: Entity<InputState>,
     /// The custom rule being edited and its start, kept while the rule is
     /// unchanged so that editing other options doesn't move it.
-    custom: Option<(String, NaiveDateTime)>,
+    custom: Option<(String, DateTime)>,
     every: Entity<InputState>,
     unit: IntervalUnit,
     interval_start: Entity<DatePickerState>,
@@ -624,14 +627,11 @@ impl ScheduleEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let now = Local::now().naive_local();
-        let nine = NaiveTime::from_hms_opt(9, 0, 0).expect("a valid time");
-        let in_an_hour = now + Duration::hours(1);
-        let next_hour = in_an_hour
-            .date()
-            .and_hms_opt(in_an_hour.hour(), 0, 0)
-            .unwrap_or(now);
-        let tomorrow_nine = (now.date() + Duration::days(1)).and_time(nine);
+        let now = crate::scheduler::now();
+        let nine = Time::constant(9, 0, 0, 0);
+        let in_an_hour = now + 1.hour();
+        let next_hour = in_an_hour.date().at(in_an_hour.hour(), 0, 0, 0);
+        let tomorrow_nine = (now.date() + 1.day()).to_datetime(nine);
         let settings = task.map(ScheduledTask::settings);
         let when = settings.map(|settings| settings.when.clone());
 
@@ -659,7 +659,7 @@ impl ScheduleEditor {
         };
         let weekly_days = match &when {
             Some(When::Weekly { days, .. }) => days.clone(),
-            _ => vec![Weekday::Mon],
+            _ => vec![Weekday::Monday],
         };
         let month_day = match &when {
             Some(When::Monthly { day, .. }) => day.to_string(),
@@ -685,7 +685,7 @@ impl ScheduleEditor {
                 .placeholder("What should the agent do on each run?")
                 .default_value(settings.map(|s| s.prompt.clone()).unwrap_or_default())
         });
-        let date_time_picker = |at: NaiveDateTime, window: &mut Window, cx: &mut Context<Self>| {
+        let date_time_picker = |at: DateTime, window: &mut Window, cx: &mut Context<Self>| {
             cx.new(|cx| {
                 let mut picker =
                     DatePickerState::new(window, cx).time_precision(TimePrecision::Minute);
@@ -924,11 +924,8 @@ impl ScheduleEditor {
                 let start = match &self.custom {
                     Some((original, start)) if *original == rule => *start,
                     _ => {
-                        let now = Local::now().naive_local();
-                        now.with_second(0)
-                            .unwrap_or(now)
-                            .with_nanosecond(0)
-                            .unwrap_or(now)
+                        let now = crate::scheduler::now();
+                        now.date().at(now.hour(), now.minute(), 0, 0)
                     }
                 };
                 When::Custom { rule, start }
@@ -997,7 +994,7 @@ impl ScheduleEditor {
         } else {
             self.weekly_days.push(day);
             self.weekly_days
-                .sort_by_key(|day| day.num_days_from_monday());
+                .sort_by_key(|day| day.to_monday_zero_offset());
         }
         cx.notify();
     }
@@ -1143,12 +1140,13 @@ impl ScheduleEditor {
             Frequency::Weekly => v_flex()
                 .gap_2()
                 .child(h_flex().gap_1().children(WEEK.into_iter().map(|day| {
-                    Button::new(SharedString::from(format!("weekday-{day}")))
+                    let name = weekday_name(day);
+                    Button::new(SharedString::from(format!("weekday-{name}")))
                         .outline()
                         .small()
-                        .label(day.to_string())
+                        .label(name)
                         .selected(self.weekly_days.contains(&day))
-                        .debug_selector(move || format!("weekday-{day}"))
+                        .debug_selector(move || format!("weekday-{name}"))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.toggle_weekday(day, cx);
                         }))
@@ -1225,7 +1223,7 @@ impl ScheduleEditor {
     fn render_history(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let task_id = self.editing?;
         let cowork = self.cowork.upgrade()?;
-        let now = Local::now().naive_local();
+        let now = crate::scheduler::now();
         let (records, open): (Vec<RunRecord>, Vec<bool>) = {
             let cowork = cowork.read(cx);
             let task = cowork.scheduler.task(task_id)?;

@@ -3,7 +3,6 @@
 
 use std::{sync::Arc, time::Duration};
 
-use chrono::Local;
 use gpui::{
     App, AppContext, Context, Entity, Focusable, FontWeight, IntoElement, PathPromptOptions,
     SharedString, WeakEntity, Window, div, prelude::*, px, rgb,
@@ -18,6 +17,7 @@ use gpui_component::{
 };
 use gpui_kit_assets::IconName as AssetIconName;
 use itertools::Itertools;
+use jiff::ZonedDateTime;
 
 use crate::chat_meta::ChatMeta;
 use crate::{
@@ -38,7 +38,7 @@ impl Cowork {
     pub(crate) fn render_profile_page(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         const PICTURE_SIZE: gpui::Pixels = px(96.);
 
-        self.prepare_profile_statistics(Local::now(), cx);
+        self.prepare_profile_statistics(&ZonedDateTime::now(), cx);
         let picture = div()
             .id("profile-picture")
             .group("profile-picture")

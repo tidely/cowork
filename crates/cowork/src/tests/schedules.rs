@@ -1,8 +1,8 @@
 //! The Scheduled page, the dialog creating and editing its tasks, and
 //! running them.
 
-use chrono::{NaiveDateTime, NaiveTime, Weekday};
 use gpui_component::WindowExt as _;
+use jiff::civil::{DateTime, Weekday};
 
 use super::*;
 use crate::{
@@ -89,7 +89,7 @@ fn task(cowork: &Entity<Cowork>, task_id: Uuid, cx: &mut gpui::VisualTestContext
 fn add_task(
     cowork: &Entity<Cowork>,
     settings: TaskSettings,
-    created: NaiveDateTime,
+    created: DateTime,
     cx: &mut gpui::VisualTestContext,
 ) -> Uuid {
     cowork.update(cx, |cowork, cx| {
@@ -101,7 +101,7 @@ fn add_task(
     })
 }
 
-fn daily(title: &str, hour: u32, minute: u32) -> TaskSettings {
+fn daily(title: &str, hour: i8, minute: i8) -> TaskSettings {
     TaskSettings {
         title: title.into(),
         prompt: format!("{title} prompt"),
@@ -109,7 +109,7 @@ fn daily(title: &str, hour: u32, minute: u32) -> TaskSettings {
     }
 }
 
-fn tick(cowork: &Entity<Cowork>, now: NaiveDateTime, cx: &mut gpui::VisualTestContext) {
+fn tick(cowork: &Entity<Cowork>, now: DateTime, cx: &mut gpui::VisualTestContext) {
     cowork.update(cx, |cowork, cx| cowork.tick_schedules(now, cx));
     draw(cx);
 }
@@ -194,10 +194,7 @@ fn a_new_schedule_is_created_from_the_dialog(cx: &mut gpui::TestAppContext) {
     let settings = task.settings();
     assert_eq!(settings.title, "Summarize my inbox");
     assert_eq!(settings.prompt, "Summarize   my inbox");
-    assert_eq!(
-        settings.when,
-        When::Weekdays(NaiveTime::from_hms_opt(9, 0, 0).unwrap())
-    );
+    assert_eq!(settings.when, When::Weekdays(time(9, 0)));
     // The model new threads start with.
     assert_eq!(settings.model, ollama_qwen());
     assert_eq!(settings.thread, ThreadMode::ContinueLast);
@@ -233,8 +230,8 @@ fn the_dialog_says_what_keeps_a_schedule_from_saving(cx: &mut gpui::TestAppConte
     assert_eq!(
         task.settings().when,
         When::Weekly {
-            days: vec![Weekday::Tue, Weekday::Fri],
-            time: NaiveTime::from_hms_opt(9, 0, 0).unwrap(),
+            days: vec![Weekday::Tuesday, Weekday::Friday],
+            time: time(9, 0),
         }
     );
 }
@@ -242,7 +239,7 @@ fn the_dialog_says_what_keeps_a_schedule_from_saving(cx: &mut gpui::TestAppConte
 #[gpui::test]
 fn tasks_are_edited_paused_and_deleted_from_their_rows(cx: &mut gpui::TestAppContext) {
     let (cowork, _runtime, cx) = composer_test_cowork(cx);
-    let now = chrono::Local::now().naive_local();
+    let now = crate::scheduler::now();
     let [edited, paused, deleted, kept] = ["Edited", "Paused", "Deleted", "Kept"]
         .map(|title| add_task(&cowork, daily(title, 9, 0), now, cx));
     open_schedules_page(&cowork, cx);

@@ -319,6 +319,36 @@ fn a_saved_chat_comes_back_as_it_was(cx: &mut gpui::TestAppContext) {
     });
 }
 
+/// A scheduled task's schedule, local times, queued run and history are
+/// saved and read back unchanged.
+#[test]
+fn a_saved_scheduled_task_comes_back_as_it_was() {
+    use crate::scheduled_task::{
+        MissedRuns, ScheduledTask, When,
+        tests::{SATURDAY, at, settings, time},
+    };
+    use jiff::civil::Weekday;
+
+    let runtime = runtime();
+    let root = Root::new();
+    let (db, _) = open(&root, &runtime);
+    let weekly = When::Weekly {
+        days: vec![Weekday::Tuesday, Weekday::Sunday],
+        time: time(9, 30),
+    };
+    let mut task = ScheduledTask::new(settings(weekly, MissedRuns::Skip), at(SATURDAY, 8, 0));
+    task.queue_now(at(SATURDAY, 8, 5));
+    let run = task.take_queued().unwrap();
+    task.fail(run, at(SATURDAY, 8, 6), "no model".into());
+    task.queue_now(at(SATURDAY, 8, 7));
+    db.saver().save_tasks(std::slice::from_ref(&task));
+    futures::executor::block_on(db.quit());
+
+    let (db, saved) = ChatDb::open(root.0.clone(), runtime.handle()).unwrap();
+    assert_eq!(saved.state.tasks, [task]);
+    futures::executor::block_on(db.quit());
+}
+
 /// A save that fails partway writes nothing, and the next one starts from
 /// what the database holds rather than from what was queued.
 #[gpui::test]

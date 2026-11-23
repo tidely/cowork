@@ -729,8 +729,8 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
         let at = |seconds| SystemTime::UNIX_EPOCH + Duration::from_secs(seconds);
         let took = Duration::from_secs;
         cowork.record_turn_usage(&local, 100, at(10), took(3), cx);
-        let now = chrono::Local::now();
-        cowork.prepare_profile_statistics(now, cx);
+        let now = jiff::ZonedDateTime::now();
+        cowork.prepare_profile_statistics(&now, cx);
         assert_eq!(
             cowork
                 .profile_statistics
@@ -745,7 +745,7 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
         let buckets = snapshot.chart.chart.buckets.as_ptr();
         // Streaming invalidates the view, not the statistics snapshot or chart.
         cowork.thread_updated(local.read(cx).instance_id, cx);
-        cowork.prepare_profile_statistics(now, cx);
+        cowork.prepare_profile_statistics(&now, cx);
         let snapshot = cowork.profile_statistics.as_ref().unwrap();
         assert_eq!(snapshot.totals.token_activity.as_ptr(), activity);
         assert_eq!(snapshot.chart.chart.buckets.as_ptr(), buckets);
@@ -756,7 +756,7 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
             "zero-token runs can change duration"
         );
         cowork.record_turn_usage(&local, 50, at(20), took(2), cx);
-        cowork.prepare_profile_statistics(now, cx);
+        cowork.prepare_profile_statistics(&now, cx);
         cowork.record_turn_usage(&joined, 30, at(30), took(4), cx);
         assert!(
             cowork.profile_statistics.is_some(),
@@ -770,8 +770,8 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
 
         let activity = totals.token_activity.as_ptr();
         cowork.activity_range = ActivityRange::Day;
-        let later = now + chrono::TimeDelta::hours(2);
-        cowork.prepare_profile_statistics(later, cx);
+        let later = &now + jiff::SignedDuration::from_hours(2);
+        cowork.prepare_profile_statistics(&later, cx);
         let snapshot = cowork.profile_statistics.as_ref().unwrap();
         assert_eq!(snapshot.totals.token_activity.as_ptr(), activity);
         assert_eq!(
@@ -779,7 +779,7 @@ fn turn_usage_counts_globally_only_for_local_threads(cx: &mut gpui::TestAppConte
             crate::usage::token_activity_chart(
                 &snapshot.totals.token_activity,
                 ActivityRange::Day,
-                later,
+                &later,
             )
         );
 

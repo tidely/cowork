@@ -25,6 +25,7 @@ gpui_platform.workspace = true
 image.workspace = true
 iroh.workspace = true
 itertools.workspace = true
+jiff.workspace = true
 nucleo-matcher.workspace = true
 parking_lot.workspace = true
 postcard.workspace = true

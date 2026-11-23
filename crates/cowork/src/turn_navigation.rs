@@ -19,7 +19,6 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use chrono::{DateTime, Local};
 use draft::AttachmentKind;
 use gpui::{
     AnyElement, App, Bounds, Context, Element, ElementId, Entity, GlobalElementId, Hsla,
@@ -28,6 +27,7 @@ use gpui::{
 };
 use gpui_component::{ActiveTheme as _, Icon};
 use gpui_kit_assets::IconName;
+use jiff::{Timestamp, tz::TimeZone};
 use uuid::Uuid;
 
 use crate::{
@@ -71,14 +71,6 @@ struct PositionedTurnCard {
     card: AnyElement,
     stage: Bounds<Pixels>,
     marker_y: Pixels,
-}
-
-impl IntoElement for PositionedTurnCard {
-    type Element = Self;
-
-    fn into_element(self) -> Self {
-        self
-    }
 }
 
 impl Element for PositionedTurnCard {
@@ -513,9 +505,13 @@ pub(crate) fn time_ago(at: SystemTime, now: SystemTime) -> Option<String> {
 /// When a run started, relatively and in local time: "5 min ago · Today
 /// 09:00", the date as the scheduled tasks show theirs.
 fn started_label(at: SystemTime, now: SystemTime) -> String {
-    let local = |time: SystemTime| DateTime::<Local>::from(time).naive_local();
-    let absolute = crate::schedules::format_relative(local(at), local(now));
-    match time_ago(at, now) {
+    let ago = time_ago(at, now);
+    let (Ok(at), Ok(now)) = (Timestamp::try_from(at), Timestamp::try_from(now)) else {
+        return ago.unwrap_or_else(|| "Unknown time".to_owned());
+    };
+    let zone = TimeZone::system();
+    let absolute = crate::schedules::format_relative(zone.to_datetime(at), zone.to_datetime(now));
+    match ago {
         Some(ago) => format!("{ago} · {absolute}"),
         None => absolute,
     }

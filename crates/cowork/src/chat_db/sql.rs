@@ -9,7 +9,6 @@
 
 use std::{collections::HashMap, path::Path};
 
-use chrono::{DateTime, Utc};
 use sqlx::{
     Row, SqliteConnection, SqlitePool,
     sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous},
@@ -179,7 +178,7 @@ pub(super) async fn write_thread(
     .bind(head.context_tokens)
     .bind(head.streamed_bytes)
     .bind(head.generation_ns)
-    .bind(head.last_run_at)
+    .bind(&head.last_run_at)
     .bind(head_id)
     .bind(root_id)
     .execute(&mut *conn)
@@ -304,7 +303,7 @@ pub(super) async fn insert_message(
             )
             .bind(id)
             .bind(run.comment_group_id)
-            .bind(run.started_at)
+            .bind(&run.started_at)
             .bind(run.duration_ns)
             .bind(run.tokens)
             .bind(run.transcript_start)
@@ -313,7 +312,7 @@ pub(super) async fn insert_message(
             .bind(&run.unfinished)
             .bind(provider)
             .bind(model)
-            .bind(run.first_content_at)
+            .bind(&run.first_content_at)
             .execute(&mut *conn)
             .await?;
             // Entries before compactions: the trigger checks a compaction
@@ -466,7 +465,7 @@ pub(super) async fn load(
         context_tokens: row.get(6),
         streamed_bytes: row.get(7),
         generation_ns: row.get(8),
-        last_run_at: row.get::<Option<DateTime<Utc>>, _>(9),
+        last_run_at: row.get(9),
         folders: Vec::new(),
         profiles: Vec::new(),
         prompt_names: Vec::new(),

@@ -12,7 +12,6 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use anyhow::Context as _;
-use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlx::{Row, SqliteConnection, SqlitePool};
 use uuid::Uuid;
 
@@ -74,7 +73,7 @@ fn path_columns(paths: &[PathBuf]) -> anyhow::Result<Vec<String>> {
 pub(super) struct ProjectRow {
     id: Uuid,
     name: String,
-    created_at: DateTime<Utc>,
+    created_at: String,
     folders: Vec<String>,
 }
 
@@ -83,18 +82,18 @@ impl ProjectRow {
         Ok(Self {
             id: record.id.as_uuid(),
             name: record.name.clone(),
-            created_at: columns::time(record.created_at),
+            created_at: columns::time(record.created_at)?,
             folders: path_columns(&record.folders)?,
         })
     }
 
-    fn into_record(self) -> ProjectRecord {
-        ProjectRecord {
+    fn into_record(self) -> anyhow::Result<ProjectRecord> {
+        Ok(ProjectRecord {
             id: ProjectId::from_uuid(self.id),
             name: self.name,
             folders: self.folders.into_iter().map(PathBuf::from).collect(),
-            created_at: columns::system_time(self.created_at),
-        }
+            created_at: columns::system_time(&self.created_at)?,
+        })
     }
 }
 
@@ -161,17 +160,17 @@ pub(super) struct TaskRow {
     missed_runs: &'static str,
     project_mode: &'static str,
     active: bool,
-    checked_until: NaiveDateTime,
+    checked_until: String,
     thread_id: Option<Uuid>,
-    queued: Option<(NaiveDateTime, &'static str)>,
+    queued: Option<(String, &'static str)>,
     folders: Vec<String>,
     runs: Vec<RunRow>,
 }
 
 struct RunRow {
     id: Uuid,
-    scheduled_for: NaiveDateTime,
-    started_at: Option<NaiveDateTime>,
+    scheduled_for: String,
+    started_at: Option<String>,
     trigger: &'static str,
     result: &'static str,
     error: Option<String>,
@@ -185,8 +184,8 @@ impl RunRow {
         let result = columns::run_result(&record.result)?;
         Ok(Self {
             id: record.id,
-            scheduled_for: record.scheduled_for,
-            started_at: record.started_at,
+            scheduled_for: columns::local_time(record.scheduled_for),
+            started_at: record.started_at.map(columns::local_time),
             trigger: columns::trigger(record.trigger),
             result: result.result,
             error: result.error.map(str::to_owned),
@@ -219,9 +218,14 @@ impl TaskRow {
             prompt: settings.prompt,
             model: settings.model,
             active,
-            checked_until,
+            checked_until: columns::local_time(checked_until),
             thread_id,
-            queued: queued.map(|queued| (queued.scheduled_for, columns::trigger(queued.trigger))),
+            queued: queued.map(|queued| {
+                (
+                    columns::local_time(queued.scheduled_for),
+                    columns::trigger(queued.trigger),
+                )
+            }),
             runs: history
                 .iter()
                 .map(RunRow::of)
@@ -251,7 +255,7 @@ async fn insert_project(conn: &mut SqliteConnection, project: &ProjectRow) -> an
     sqlx::query("INSERT INTO projects (id, name, created_at) VALUES (?, ?, ?)")
         .bind(project.id)
         .bind(&project.name)
-        .bind(project.created_at)
+        .bind(&project.created_at)
         .execute(&mut *conn)
         .await?;
     for (seq, path) in project.folders.iter().enumerate() {
@@ -317,7 +321,7 @@ pub(super) async fn count_deleted_runs(
         sqlx::query(
             "INSERT INTO deleted_token_activity (at, duration_ns, tokens) VALUES (?, ?, ?)",
         )
-        .bind(activity.at)
+        .bind(&activity.at)
         .bind(activity.duration_ns)
         .bind(activity.tokens)
         .execute(&mut *conn)
@@ -331,7 +335,7 @@ async fn replace_tasks(conn: &mut SqliteConnection, tasks: &[TaskRow]) -> anyhow
         .execute(&mut *conn)
         .await?;
     for (seq, task) in tasks.iter().enumerate() {
-        let (queued_for, queued_trigger) = task.queued.unzip();
+        let (queued_for, queued_trigger) = task.queued.clone().unzip();
         sqlx::query(
             "INSERT INTO scheduled_tasks (id, seq, title, prompt, schedule, model_provider,
                  model_id, thread_mode, missed_runs, project_mode, active, checked_until,
@@ -349,7 +353,7 @@ async fn replace_tasks(conn: &mut SqliteConnection, tasks: &[TaskRow]) -> anyhow
         .bind(task.missed_runs)
         .bind(task.project_mode)
         .bind(task.active)
-        .bind(task.checked_until)
+        .bind(&task.checked_until)
         .bind(task.thread_id)
         .bind(queued_for)
         .bind(queued_trigger)
@@ -372,8 +376,8 @@ async fn replace_tasks(conn: &mut SqliteConnection, tasks: &[TaskRow]) -> anyhow
             .bind(task.id)
             .bind(columns::index(seq, "run")?)
             .bind(run.id)
-            .bind(run.scheduled_for)
-            .bind(run.started_at)
+            .bind(&run.scheduled_for)
+            .bind(&run.started_at)
             .bind(run.trigger)
             .bind(run.result)
             .bind(&run.error)
@@ -412,7 +416,7 @@ async fn read_projects(pool: &SqlitePool) -> anyhow::Result<Vec<ProjectRecord>> 
     {
         folders.entry(project).or_default().push(path);
     }
-    Ok(sqlx::query_as::<_, (Uuid, String, DateTime<Utc>)>(
+    sqlx::query_as::<_, (Uuid, String, String)>(
         "SELECT id, name, created_at FROM projects
          ORDER BY unixepoch(created_at, 'subsec') DESC",
     )
@@ -428,7 +432,7 @@ async fn read_projects(pool: &SqlitePool) -> anyhow::Result<Vec<ProjectRecord>> 
         }
         .into_record()
     })
-    .collect())
+    .collect()
 }
 
 async fn read_settings(pool: &SqlitePool) -> anyhow::Result<Settings> {
@@ -485,7 +489,7 @@ async fn read_deleted(pool: &SqlitePool) -> anyhow::Result<(DeletedChats, Vec<To
         DeletedChats::default()
     });
     let mut activity = Vec::new();
-    for (at, duration_ns, tokens) in sqlx::query_as::<_, (DateTime<Utc>, i64, i64)>(
+    for (at, duration_ns, tokens) in sqlx::query_as::<_, (String, i64, i64)>(
         "SELECT at, duration_ns, tokens FROM deleted_token_activity ORDER BY seq",
     )
     .fetch_all(pool)
@@ -526,8 +530,11 @@ async fn read_tasks(pool: &SqlitePool) -> anyhow::Result<Vec<ScheduledTask>> {
         let record = (|| {
             Ok(RunRecord {
                 id: row.get(1),
-                scheduled_for: row.get(2),
-                started_at: row.get(3),
+                scheduled_for: columns::to_local_time(row.get(2))?,
+                started_at: row
+                    .get::<Option<&str>, _>(3)
+                    .map(columns::to_local_time)
+                    .transpose()?,
                 trigger: columns::to_trigger(row.get::<&str, _>(4))?,
                 result: columns::to_run_result(
                     row.get::<&str, _>(5),
@@ -553,11 +560,11 @@ async fn read_tasks(pool: &SqlitePool) -> anyhow::Result<Vec<ScheduledTask>> {
         let id: Uuid = row.get(0);
         let task = (|| {
             let queued = match (
-                row.get::<Option<NaiveDateTime>, _>(12),
+                row.get::<Option<&str>, _>(12),
                 row.get::<Option<&str>, _>(13),
             ) {
                 (Some(scheduled_for), Some(trigger)) => Some(QueuedRun {
-                    scheduled_for,
+                    scheduled_for: columns::to_local_time(scheduled_for)?,
                     trigger: columns::to_trigger(trigger)?,
                 }),
                 _ => None,
@@ -578,7 +585,7 @@ async fn read_tasks(pool: &SqlitePool) -> anyhow::Result<Vec<ScheduledTask>> {
                     project_mode: columns::to_mode(row.get(8))?,
                 },
                 active: row.get(9),
-                checked_until: row.get(10),
+                checked_until: columns::to_local_time(row.get(10))?,
                 thread_id: row.get(11),
                 queued,
                 history: runs

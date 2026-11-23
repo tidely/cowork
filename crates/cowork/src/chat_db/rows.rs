@@ -10,7 +10,6 @@ use agent::{
     persistence::record::{StoredCompaction, StoredEntry},
 };
 use anyhow::Context as _;
-use chrono::{DateTime, Utc};
 use draft::AttachmentId;
 use gpui::AppContext;
 use uuid::Uuid;
@@ -100,7 +99,7 @@ pub(crate) struct ThreadRow {
     pub(crate) context_tokens: Option<i64>,
     pub(crate) streamed_bytes: i64,
     pub(crate) generation_ns: i64,
-    pub(crate) last_run_at: Option<DateTime<Utc>>,
+    pub(crate) last_run_at: Option<String>,
     pub(crate) folders: Vec<(String, String)>,
     /// Sorted by participant.
     pub(crate) profiles: Vec<ProfileRow>,
@@ -118,7 +117,7 @@ pub(crate) struct ProfileRow {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ActivityRow {
-    pub(crate) at: DateTime<Utc>,
+    pub(crate) at: String,
     pub(crate) duration_ns: i64,
     pub(crate) tokens: i64,
 }
@@ -126,7 +125,7 @@ pub(crate) struct ActivityRow {
 impl ActivityRow {
     pub(crate) fn of(activity: &TokenActivity) -> anyhow::Result<Self> {
         Ok(Self {
-            at: columns::time(activity.at),
+            at: columns::time(activity.at)?,
             duration_ns: columns::nanos(activity.duration, "turn duration")?,
             tokens: columns::int(activity.tokens, "turn tokens")?,
         })
@@ -134,7 +133,7 @@ impl ActivityRow {
 
     pub(crate) fn into_activity(self) -> anyhow::Result<TokenActivity> {
         Ok(TokenActivity {
-            at: columns::system_time(self.at),
+            at: columns::system_time(&self.at)?,
             duration: columns::duration(self.duration_ns, "turn duration")?,
             tokens: columns::uint(self.tokens, "turn tokens")?,
         })
@@ -175,7 +174,7 @@ impl ThreadRow {
                 .transpose()?,
             streamed_bytes: columns::int(thread.streamed_bytes, "streamed bytes")?,
             generation_ns: columns::nanos(thread.generation_time(), "generation time")?,
-            last_run_at: thread.last_activity().map(columns::time),
+            last_run_at: thread.last_activity().map(columns::time).transpose()?,
             // A folder whose path isn't UTF-8 can't be saved; the JSON files
             // couldn't hold one either.
             folders: thread
@@ -237,8 +236,8 @@ pub(crate) struct CommentRow {
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RunRow {
     pub(crate) comment_group_id: Option<Uuid>,
-    pub(crate) started_at: DateTime<Utc>,
-    pub(crate) first_content_at: Option<DateTime<Utc>>,
+    pub(crate) started_at: String,
+    pub(crate) first_content_at: Option<String>,
     pub(crate) duration_ns: i64,
     pub(crate) tokens: i64,
     pub(crate) transcript_start: i64,
@@ -326,8 +325,8 @@ impl MessageRow {
                     id: Uuid::from_bytes(run.id),
                     run: RunRow {
                         comment_group_id: run.comment_group_id.map(Uuid::from_bytes),
-                        started_at: columns::time(run.started_at),
-                        first_content_at: run.first_content_at.map(columns::time),
+                        started_at: columns::time(run.started_at)?,
+                        first_content_at: run.first_content_at.map(columns::time).transpose()?,
                         duration_ns: columns::nanos(duration, "run duration")?,
                         tokens: columns::int(run.tokens, "run tokens")?,
                         transcript_start: columns::int(run.start.0, "run start")?,
@@ -401,8 +400,12 @@ impl MessageRow {
                 protocol::TimelineMessage::Agent(protocol::AgentMessage {
                     id: id.into_bytes(),
                     comment_group_id: run.comment_group_id.map(Uuid::into_bytes),
-                    started_at: columns::system_time(run.started_at),
-                    first_content_at: run.first_content_at.map(columns::system_time),
+                    started_at: columns::system_time(&run.started_at)?,
+                    first_content_at: run
+                        .first_content_at
+                        .as_deref()
+                        .map(columns::system_time)
+                        .transpose()?,
                     start: crate::transcript::TranscriptIndex(columns::uint(
                         run.transcript_start,
                         "run start",
@@ -695,7 +698,7 @@ pub(crate) struct MetaRow {
     pub(crate) archived: bool,
     pub(crate) project: Option<Uuid>,
     pub(crate) generation_ns: i64,
-    pub(crate) last_run_at: Option<DateTime<Utc>>,
+    pub(crate) last_run_at: Option<String>,
 }
 
 impl MetaRow {
@@ -705,7 +708,11 @@ impl MetaRow {
             title: self.title,
             project: self.project.map(ProjectId::from_uuid),
             generation_time: columns::duration(self.generation_ns, "generation time")?,
-            last_run_at: self.last_run_at.map(columns::system_time),
+            last_run_at: self
+                .last_run_at
+                .as_deref()
+                .map(columns::system_time)
+                .transpose()?,
         })
     }
 }

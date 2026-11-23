@@ -3,13 +3,15 @@
 //! policy in `docs/schedule.md` is tested here without an app; running the
 //! queue is `scheduler.rs`.
 //!
-//! Times are local wall-clock times (`NaiveDateTime` from `Local::now()`),
-//! so a daily 09:00 task stays at 09:00 across daylight saving changes.
+//! Times are local wall-clock times (`civil::DateTime`, see
+//! `scheduler::now`), so a daily 09:00 task stays at 09:00 across daylight
+//! saving changes.
 
 use std::path::{Path, PathBuf};
 
-use chrono::{
-    Datelike as _, Duration, Months, NaiveDate, NaiveDateTime, NaiveTime, TimeZone as _, Weekday,
+use jiff::{
+    SignedDuration, ToSpan as _,
+    civil::{Date, DateTime, Time, Weekday},
 };
 use rrule::{RRule, RRuleSet, Tz, Unvalidated};
 use serde::{Deserialize, Serialize};
@@ -20,7 +22,7 @@ use crate::{models::ModelRef, project_mode::ProjectMode};
 /// How late an occurrence may be noticed and still run as scheduled. The
 /// scheduler looks every few seconds while the app runs, so anything older
 /// was due while the app was closed or the computer asleep: a missed run.
-pub(crate) const MISSED_AFTER: Duration = Duration::minutes(2);
+pub(crate) const MISSED_AFTER: SignedDuration = SignedDuration::from_mins(2);
 
 /// Runs kept in a task's history, oldest dropped first.
 pub(crate) const MAX_HISTORY: usize = 50;
@@ -60,39 +62,71 @@ pub(crate) enum When {
     Interval {
         every: u32,
         unit: IntervalUnit,
-        start: NaiveDateTime,
+        start: DateTime,
     },
-    Once(NaiveDateTime),
-    Daily(NaiveTime),
-    Weekdays(NaiveTime),
+    Once(DateTime),
+    Daily(Time),
+    Weekdays(Time),
     /// On each of `days`, kept in week order from Monday.
     Weekly {
+        #[serde(with = "weekdays")]
         days: Vec<Weekday>,
-        time: NaiveTime,
+        time: Time,
     },
     /// On day `day` of each month. Months without that day are skipped, as
     /// RFC 5545 does.
     Monthly {
-        day: u32,
-        time: NaiveTime,
+        day: i8,
+        time: Time,
     },
     /// An RFC 5545 `RRULE`, for what the presets can't express. `start` is
     /// its `DTSTART`: when the rule was written, which gives the dates and
     /// times of day the rule leaves out.
     Custom {
         rule: String,
-        start: NaiveDateTime,
+        start: DateTime,
     },
+}
+
+/// jiff's `Weekday` has no serde impls, since a weekday has no one standard
+/// text form; saved as ISO 8601 day numbers, Monday being 1.
+mod weekdays {
+    use jiff::civil::Weekday;
+    use serde::{Deserialize as _, Deserializer, Serializer, de::Error as _};
+
+    pub(super) fn serialize<S: Serializer>(days: &[Weekday], s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(days.iter().map(|day| day.to_monday_one_offset()))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<Weekday>, D::Error> {
+        Vec::<i8>::deserialize(d)?
+            .into_iter()
+            .map(|day| Weekday::from_monday_one_offset(day).map_err(D::Error::custom))
+            .collect()
+    }
+}
+
+/// The abbreviated English name, "Mon" to "Sun".
+pub(crate) fn weekday_name(day: Weekday) -> &'static str {
+    match day {
+        Weekday::Monday => "Mon",
+        Weekday::Tuesday => "Tue",
+        Weekday::Wednesday => "Wed",
+        Weekday::Thursday => "Thu",
+        Weekday::Friday => "Fri",
+        Weekday::Saturday => "Sat",
+        Weekday::Sunday => "Sun",
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Occurrences {
     pub(crate) count: u64,
-    pub(crate) latest: Option<NaiveDateTime>,
+    pub(crate) latest: Option<DateTime>,
 }
 
 impl Occurrences {
-    fn add(&mut self, at: NaiveDateTime) {
+    fn add(&mut self, at: DateTime) {
         self.count += 1;
         self.latest = Some(at);
     }
@@ -100,20 +134,52 @@ impl Occurrences {
 
 /// `rule` as `rrule` reads it, counted from `start`. Accepts the rule with
 /// or without its `RRULE:` prefix.
-fn custom_rule(rule: &str, start: NaiveDateTime) -> Result<RRuleSet, String> {
+///
+/// `rrule` works in `chrono` types, which stay inside this function and
+/// [`from_rrule`].
+fn custom_rule(rule: &str, start: DateTime) -> Result<RRuleSet, String> {
+    use chrono::TimeZone as _;
+
     let rule = rule.trim().trim_prefix("RRULE:");
     if rule.is_empty() {
         return Err("Enter a recurrence rule.".into());
     }
-    let start = Tz::LOCAL
-        .from_local_datetime(&start)
-        .earliest()
-        .ok_or("The rule's start time doesn't exist in this time zone.")?;
+    let start = chrono::NaiveDate::from_ymd_opt(
+        start.year().into(),
+        start.month() as u32,
+        start.day() as u32,
+    )
+    .and_then(|date| {
+        date.and_hms_opt(
+            start.hour() as u32,
+            start.minute() as u32,
+            start.second() as u32,
+        )
+    })
+    .and_then(|start| Tz::LOCAL.from_local_datetime(&start).earliest())
+    .ok_or("The rule's start time doesn't exist in this time zone.")?;
     rule.parse::<RRule<Unvalidated>>()
         .map_err(|error| error.to_string())?
         .build(start)
         .map(RRuleSet::limit)
         .map_err(|error| error.to_string())
+}
+
+/// An occurrence of a [`custom_rule`] as local wall-clock time.
+fn from_rrule(at: chrono::DateTime<Tz>) -> Option<DateTime> {
+    use chrono::{Datelike as _, Timelike as _};
+
+    let at = at.naive_local();
+    DateTime::new(
+        at.year().try_into().ok()?,
+        at.month() as i8,
+        at.day() as i8,
+        at.hour() as i8,
+        at.minute() as i8,
+        at.second() as i8,
+        0,
+    )
+    .ok()
 }
 
 impl When {
@@ -130,17 +196,21 @@ impl When {
     }
 
     pub(crate) fn describe(&self) -> String {
-        let time = |time: &NaiveTime| time.format("%H:%M").to_string();
+        let time = |time: &Time| time.strftime("%H:%M").to_string();
         match self {
             Self::Interval { every: 1, unit, .. } => format!("Every {}", unit.name(1)),
             Self::Interval { every, unit, .. } => format!("Every {every} {}", unit.name(*every)),
-            Self::Once(at) => format!("Once, {} at {}", at.format("%b %-d, %Y"), time(&at.time())),
+            Self::Once(at) => format!(
+                "Once, {} at {}",
+                at.strftime("%b %-d, %Y"),
+                time(&at.time())
+            ),
             Self::Daily(at) => format!("Every day at {}", time(at)),
             Self::Weekdays(at) => format!("Weekdays at {}", time(at)),
             Self::Weekly { days, time: at } => {
                 let days = days
                     .iter()
-                    .map(Weekday::to_string)
+                    .map(|day| weekday_name(*day))
                     .collect::<Vec<_>>()
                     .join(", ");
                 format!("Every {days} at {}", time(at))
@@ -154,14 +224,14 @@ impl When {
         }
     }
 
-    pub(crate) fn next_after(&self, after: NaiveDateTime) -> Option<NaiveDateTime> {
-        let first_day_after = |time: NaiveTime, runs_on: &dyn Fn(NaiveDate) -> bool| {
+    pub(crate) fn next_after(&self, after: DateTime) -> Option<DateTime> {
+        let first_day_after = |time: Time, runs_on: &dyn Fn(Date) -> bool| {
             after
                 .date()
-                .iter_days()
+                .series(1.day())
                 .take(8)
                 .filter(|date| runs_on(*date))
-                .map(|date| date.and_time(time))
+                .map(|date| date.to_datetime(time))
                 .find(|at| *at > after)
         };
         match self {
@@ -170,36 +240,38 @@ impl When {
                 if *start > after {
                     return Some(*start);
                 }
-                let periods = (after - *start).num_seconds() / period + 1;
-                Some(*start + Duration::seconds(periods * period))
+                let periods = start.duration_until(after).as_secs() / period + 1;
+                start
+                    .checked_add(SignedDuration::from_secs(periods * period))
+                    .ok()
             }
             Self::Once(at) => (*at > after).then_some(*at),
             Self::Daily(time) => first_day_after(*time, &|_| true),
             Self::Weekdays(time) => first_day_after(*time, &|date| {
-                !matches!(date.weekday(), Weekday::Sat | Weekday::Sun)
+                !matches!(date.weekday(), Weekday::Saturday | Weekday::Sunday)
             }),
             Self::Weekly { days, time } => {
                 first_day_after(*time, &|date| days.contains(&date.weekday()))
             }
             Self::Monthly { day, time } => {
-                let month = after.date().with_day(1)?;
+                let month = after.date().first_of_month();
                 (0..=48)
-                    .filter_map(|ahead| month.checked_add_months(Months::new(ahead)))
-                    .filter_map(|month| month.with_day(*day))
-                    .map(|date| date.and_time(*time))
+                    .filter_map(|ahead| month.checked_add(ahead.months()).ok())
+                    .filter_map(|month| Date::new(month.year(), month.month(), *day).ok())
+                    .map(|date| date.to_datetime(*time))
                     .find(|at| *at > after)
             }
             Self::Custom { rule, start } => {
                 let rule = custom_rule(rule, *start).ok()?;
                 (&rule)
                     .into_iter()
-                    .map(|at| at.naive_local())
+                    .filter_map(from_rrule)
                     .find(|at| *at > after)
             }
         }
     }
 
-    pub(crate) fn occurrences(&self, after: NaiveDateTime, until: NaiveDateTime) -> Occurrences {
+    pub(crate) fn occurrences(&self, after: DateTime, until: DateTime) -> Occurrences {
         let mut found = Occurrences::default();
         if until <= after {
             return found;
@@ -214,12 +286,14 @@ impl When {
                 let first = if after < *start {
                     0
                 } else {
-                    (after - *start).num_seconds() / period + 1
+                    start.duration_until(after).as_secs() / period + 1
                 };
-                let last = (until - *start).num_seconds() / period;
+                let last = start.duration_until(until).as_secs() / period;
                 if last >= first {
                     found.count = (last - first + 1) as u64;
-                    found.latest = Some(*start + Duration::seconds(last * period));
+                    found.latest = start
+                        .checked_add(SignedDuration::from_secs(last * period))
+                        .ok();
                 }
             }
             // One pass, as each lookup would start over from `start`.
@@ -229,7 +303,7 @@ impl When {
                 };
                 (&rule)
                     .into_iter()
-                    .map(|at| at.naive_local())
+                    .filter_map(from_rrule)
                     .skip_while(|at| *at <= after)
                     .take_while(|at| *at <= until)
                     .for_each(|at| found.add(at));
@@ -247,7 +321,7 @@ impl When {
     }
 }
 
-pub(crate) fn ordinal(day: u32) -> String {
+pub(crate) fn ordinal(day: i8) -> String {
     let suffix = match (day % 10, day % 100) {
         (_, 11..=13) => "th",
         (1, _) => "st",
@@ -321,7 +395,7 @@ pub(crate) enum Trigger {
 /// long it takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct QueuedRun {
-    pub(crate) scheduled_for: NaiveDateTime,
+    pub(crate) scheduled_for: DateTime,
     pub(crate) trigger: Trigger,
 }
 
@@ -349,20 +423,15 @@ pub(crate) enum RunResult {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RunRecord {
     pub(crate) id: Uuid,
-    pub(crate) scheduled_for: NaiveDateTime,
-    pub(crate) started_at: Option<NaiveDateTime>,
+    pub(crate) scheduled_for: DateTime,
+    pub(crate) started_at: Option<DateTime>,
     pub(crate) trigger: Trigger,
     pub(crate) result: RunResult,
     pub(crate) thread_id: Option<Uuid>,
 }
 
 impl RunRecord {
-    fn skipped(
-        scheduled_for: NaiveDateTime,
-        trigger: Trigger,
-        count: u64,
-        reason: SkipReason,
-    ) -> Self {
+    fn skipped(scheduled_for: DateTime, trigger: Trigger, count: u64, reason: SkipReason) -> Self {
         Self {
             id: Uuid::new_v4(),
             scheduled_for,
@@ -382,13 +451,13 @@ pub(crate) struct ScheduledTask {
     /// Every occurrence up to this time has been handled: queued, run, or
     /// recorded as skipped. Saved, so occurrences due while the app was
     /// closed are found when it starts.
-    checked_until: NaiveDateTime,
+    checked_until: DateTime,
     pub(crate) thread_id: Option<Uuid>,
     queued: Option<QueuedRun>,
     history: Vec<RunRecord>,
     /// The next occurrence after `checked_until`, kept so that neither each
     /// look at the clock nor each frame evaluates the schedule.
-    next_due: Option<NaiveDateTime>,
+    next_due: Option<DateTime>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -396,14 +465,14 @@ pub(crate) struct SavedTask {
     pub(crate) id: Uuid,
     pub(crate) settings: TaskSettings,
     pub(crate) active: bool,
-    pub(crate) checked_until: NaiveDateTime,
+    pub(crate) checked_until: DateTime,
     pub(crate) thread_id: Option<Uuid>,
     pub(crate) queued: Option<QueuedRun>,
     pub(crate) history: Vec<RunRecord>,
 }
 
 impl ScheduledTask {
-    pub(crate) fn new(settings: TaskSettings, now: NaiveDateTime) -> Self {
+    pub(crate) fn new(settings: TaskSettings, now: DateTime) -> Self {
         let mut task = Self {
             id: Uuid::new_v4(),
             settings,
@@ -483,13 +552,13 @@ impl ScheduledTask {
 
     /// When the next occurrence is due. It may have passed if the scheduler
     /// hasn't looked yet. `None` for a paused task, or one with no more runs.
-    pub(crate) fn next_due(&self) -> Option<NaiveDateTime> {
+    pub(crate) fn next_due(&self) -> Option<DateTime> {
         self.next_due.filter(|_| self.active)
     }
 
     /// Applies edited settings from their next occurrence on. A changed
     /// schedule only counts from `now`, so editing never finds missed runs.
-    pub(crate) fn set_settings(&mut self, settings: TaskSettings, now: NaiveDateTime) {
+    pub(crate) fn set_settings(&mut self, settings: TaskSettings, now: DateTime) {
         if settings.when != self.settings.when {
             self.checked_until = now;
         }
@@ -499,7 +568,7 @@ impl ScheduledTask {
 
     /// Pauses or resumes. Occurrences passing while paused aren't missed
     /// runs, so they never run; a run already queued is dropped.
-    pub(crate) fn set_active(&mut self, active: bool, now: NaiveDateTime) {
+    pub(crate) fn set_active(&mut self, active: bool, now: DateTime) {
         if active == self.active {
             return;
         }
@@ -517,7 +586,7 @@ impl ScheduledTask {
         }
     }
 
-    pub(crate) fn queue_now(&mut self, now: NaiveDateTime) -> bool {
+    pub(crate) fn queue_now(&mut self, now: DateTime) -> bool {
         if self.queued.is_some() {
             return false;
         }
@@ -535,7 +604,7 @@ impl ScheduledTask {
     /// a catch-up for the latest missed occurrence. Either way the rest are
     /// recorded as skipped, and a task keeps at most one run queued: one due
     /// while another waits is skipped.
-    pub(crate) fn advance(&mut self, now: NaiveDateTime) -> bool {
+    pub(crate) fn advance(&mut self, now: DateTime) -> bool {
         if !self.active || self.next_due.is_none_or(|due| due > now) {
             return false;
         }
@@ -611,7 +680,7 @@ impl ScheduledTask {
 
     /// Records `run` as started in thread `thread_id`, returning the
     /// record's id.
-    pub(crate) fn start(&mut self, run: QueuedRun, now: NaiveDateTime, thread_id: Uuid) -> Uuid {
+    pub(crate) fn start(&mut self, run: QueuedRun, now: DateTime, thread_id: Uuid) -> Uuid {
         let id = Uuid::new_v4();
         self.record(RunRecord {
             id,
@@ -627,7 +696,7 @@ impl ScheduledTask {
         id
     }
 
-    pub(crate) fn fail(&mut self, run: QueuedRun, now: NaiveDateTime, error: String) {
+    pub(crate) fn fail(&mut self, run: QueuedRun, now: DateTime, error: String) {
         self.record(RunRecord {
             id: Uuid::new_v4(),
             scheduled_for: run.scheduled_for,
@@ -644,19 +713,16 @@ pub(crate) mod tests {
     use super::*;
     use crate::models::ModelProvider;
 
-    pub(crate) fn at(date: (i32, u32, u32), hour: u32, minute: u32) -> NaiveDateTime {
-        NaiveDate::from_ymd_opt(date.0, date.1, date.2)
-            .unwrap()
-            .and_hms_opt(hour, minute, 0)
-            .unwrap()
+    pub(crate) fn at(date: (i16, i8, i8), hour: i8, minute: i8) -> DateTime {
+        jiff::civil::datetime(date.0, date.1, date.2, hour, minute, 0, 0)
     }
 
-    pub(crate) fn time(hour: u32, minute: u32) -> NaiveTime {
-        NaiveTime::from_hms_opt(hour, minute, 0).unwrap()
+    pub(crate) fn time(hour: i8, minute: i8) -> Time {
+        jiff::civil::time(hour, minute, 0, 0)
     }
 
     // 2026-10-10 is a Saturday.
-    pub(crate) const SATURDAY: (i32, u32, u32) = (2026, 10, 10);
+    pub(crate) const SATURDAY: (i16, i8, i8) = (2026, 10, 10);
 
     pub(crate) fn settings(when: When, missed: MissedRuns) -> TaskSettings {
         TaskSettings {
@@ -748,7 +814,7 @@ pub(crate) mod tests {
         );
         // Later today, or a week from now when today's time has passed.
         let saturdays = |hour| When::Weekly {
-            days: vec![Weekday::Sat],
+            days: vec![Weekday::Saturday],
             time: time(hour, 0),
         };
         assert_eq!(saturdays(12).next_after(now), Some(at(SATURDAY, 12, 0)));

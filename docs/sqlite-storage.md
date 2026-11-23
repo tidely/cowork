@@ -268,8 +268,12 @@ delete, since scratch folders stay on disk for the sandbox.
 ## Conversions that are easy to get wrong
 
 - Timestamps in chats (`AgentMessage::started_at`, `TokenActivity::at`) are
-  `SystemTime` in the app and chrono `DateTime<Utc>` in the database, converted at
-  the boundary, which is lossless. The app's types stay `SystemTime` because
+  `SystemTime` in the app and RFC 3339 text ending in `+00:00` in the database,
+  as the schema's CHECKs require (jiff's default would end in `Z`). sqlx has no
+  jiff support, so `chat_db/columns.rs` converts every timestamp and a
+  schedule's local times (`jiff::civil::DateTime`, ISO 8601 text). The header
+  of `0001_schema.sql` still describes the formats chrono wrote, which this
+  parsing also accepts; applied migrations can't be edited. The app's types stay `SystemTime` because
   `started_at` travels on the wire and changing it would bump `PROTOCOL_VERSION`.
 - A collaborator could re-add a draft item with the id of an already submitted block
   or comment, which would make the chat unsavable: block and comment ids are
