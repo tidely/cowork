@@ -386,7 +386,15 @@ impl Cowork {
                 this.toggle_comment_group(group_id, cx);
             }))
             .child(label)
-            .child(if collapsed { "›" } else { "⌄" })
+            .child(
+                Icon::new(if collapsed {
+                    AssetIconName::ChevronRight
+                } else {
+                    AssetIconName::ChevronDown
+                })
+                .size_3()
+                .flex_none(),
+            )
     }
 
     fn render_inline_comment(&self, comment: &UserComment, cx: &App) -> gpui::AnyElement {
