@@ -5,6 +5,7 @@ members = [
     "crates/agent-runtime",
     "crates/cowork",
     "crates/draft",
+    "crates/firecrawl",
     "crates/language-model",
     "crates/provider-sse",
     "crates/sandbox",
