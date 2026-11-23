@@ -738,6 +738,7 @@ impl Cowork {
                     block.creator,
                     &block.presence.editors,
                     block_id.as_uuid(),
+                    None,
                     content,
                     cx,
                 )
@@ -796,7 +797,7 @@ impl Cowork {
             let (primary, others) = draft_position_people;
             rows.push(
                 // Nil: there is one draft position, unlike the items' ids.
-                self.render_presence_row(primary, &others, Uuid::nil(), content, cx)
+                self.render_presence_row(primary, &others, Uuid::nil(), None, content, cx)
                     .into_any_element(),
             );
         } else if !errors.is_empty() {

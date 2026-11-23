@@ -45,6 +45,8 @@ use crate::{
     tool_call_card::ToolCallCard,
 };
 
+const COMMENT_GROUP_HEADER_HEIGHT: gpui::Pixels = px(24.);
+
 /// The text view of a segment, identified by where the segment starts in its
 /// message so that one that grows or shrinks keeps its view.
 pub(crate) struct SegmentTextView {
@@ -375,7 +377,7 @@ impl Cowork {
         let label = format!("{} comment{}", count, if count == 1 { "" } else { "s" });
         div()
             .id(format!("toggle-comments-{group_id}"))
-            .h(px(24.))
+            .h(COMMENT_GROUP_HEADER_HEIGHT)
             .flex()
             .items_center()
             .gap_2()
@@ -724,9 +726,14 @@ impl Cowork {
         let authors = Self::comment_authors(comments);
         match authors.split_first() {
             // The first comment's id tells this group's avatars apart.
-            Some((first, rest)) => {
-                self.render_presence_row(*first, rest, comments[0].id, content, cx)
-            }
+            Some((first, rest)) => self.render_presence_row(
+                *first,
+                rest,
+                comments[0].id,
+                Some(COMMENT_GROUP_HEADER_HEIGHT),
+                content,
+                cx,
+            ),
             None => self.render_message_row(None, content),
         }
     }
@@ -741,12 +748,14 @@ impl Cowork {
     }
 
     /// A composer row whose gutter shows `primary` with everyone else in the
-    /// row layered below it.
+    /// row layered below it. With a header, center the primary avatar against
+    /// that header rather than the full row, which can grow as it expands.
     pub(crate) fn render_presence_row(
         &self,
         primary: ParticipantId,
         others: &[ParticipantId],
         key: Uuid,
+        header_height: Option<gpui::Pixels>,
         content: impl IntoIterator<Item = gpui::AnyElement>,
         cx: &App,
     ) -> gpui::Div {
@@ -759,6 +768,9 @@ impl Cowork {
                     .w(px(40.))
                     .flex()
                     .justify_center()
+                    .when_some(header_height, |gutter, height| {
+                        gutter.h(height).items_center()
+                    })
                     .child(self.render_layered_avatars(primary, others, key, cx)),
             )
             .relative()

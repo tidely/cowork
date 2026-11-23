@@ -21,6 +21,7 @@
 //! ([`Resolution::from_env`]). GPUI's test window is fixed at scale 2, so
 //! frames are drawn at 2x and resized to the scale asked for.
 
+mod comments;
 mod opening;
 
 use std::{path::PathBuf, sync::Arc, time::Duration};
@@ -39,7 +40,7 @@ type Scene = fn(&SceneContext) -> anyhow::Result<()>;
 
 /// Every scene, by the name its PNGs are filed under and
 /// `COWORK_SCREENSHOTS` selects it by.
-const SCENES: &[(&str, Scene)] = &[("opening", opening::scene)];
+const SCENES: &[(&str, Scene)] = &[("comments", comments::scene), ("opening", opening::scene)];
 
 /// What scenes render at: the window's logical size and the scale factor
 /// of the PNG.
