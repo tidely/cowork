@@ -689,13 +689,14 @@ impl Thread {
         let mut comments = self
             .timeline
             .iter()
-            .find_map(|entry| match entry {
+            .enumerate()
+            .find_map(|(group_index, entry)| match entry {
                 TimelineMessage::User(group) if Some(group.record.id) == comment_group => Some(
                     group
                         .record
                         .comments
                         .iter()
-                        .map(|comment| comment.id)
+                        .map(|comment| (group_index, comment.id))
                         .collect(),
                 ),
                 _ => None,
@@ -708,17 +709,27 @@ impl Thread {
         }) {
             for step in message.ui.output.steps() {
                 if let crate::timeline::AgentStep::Steering(id) = step
-                    && let Some(group) = self.timeline.iter().find_map(|entry| match entry {
-                        TimelineMessage::User(group) if group.record.id == *id => Some(group),
-                        _ => None,
-                    })
+                    && let Some((group_index, group)) = self.timeline.iter().enumerate().find_map(
+                        |(group_index, entry)| match entry {
+                            TimelineMessage::User(group) if group.record.id == *id => {
+                                Some((group_index, group))
+                            }
+                            _ => None,
+                        },
+                    )
                 {
                     aliases.extend(steering_comment_ids(*id, group.record.comments.len()));
-                    comments.extend(group.record.comments.iter().map(|comment| comment.id));
+                    comments.extend(
+                        group
+                            .record
+                            .comments
+                            .iter()
+                            .map(|comment| (group_index, comment.id)),
+                    );
                 }
             }
         }
-        let Some(comment_id) = aliases
+        let Some((group_index, comment_id)) = aliases
             .iter()
             .position(|alias| alias.as_str() == args.comment_id)
             .and_then(|index| comments.get(index).copied())
@@ -744,6 +755,11 @@ impl Thread {
             response_view: cx.new(|cx| TextViewState::markdown(&args.response, cx)),
             response: args.response,
         });
+        // Fold the original group when its reply first appears, including
+        // when replaying a snapshot, without persisting local toggles.
+        if let TimelineMessage::User(group) = &mut self.timeline[group_index] {
+            group.ui.comments_folded = true;
+        }
     }
 }
 

@@ -96,8 +96,9 @@ fn thread_with_history(
 ) -> (Thread, AttachmentRecord) {
     let author = ParticipantId::new();
     let (records, files) = attached([text_attachment("notes.md", "# Notes")]);
+    let group_id = Uuid::new_v4();
     let group = UserMessageGroup {
-        id: Uuid::new_v4(),
+        id: group_id,
         comments: vec![UserComment {
             id: Uuid::new_v4(),
             author,
@@ -138,7 +139,10 @@ fn thread_with_history(
     thread.set_project(Some(ProjectId::new()));
 
     let run = Uuid::new_v4();
-    let mut events = host.start(run, "Read the notes");
+    let mut events = vec![
+        host.started(run, Some(group_id.into_bytes())),
+        host.prompt(run, "Read the notes"),
+    ];
     events.push(protocol::HostMessage::AgentEvent {
         id: run.into_bytes(),
         event: protocol::RunEvent::ContentStarted {
@@ -149,12 +153,12 @@ fn thread_with_history(
         run,
         [streamed_tool_call(
             "call",
-            "read_file",
-            serde_json::json!({ "path": "notes.md" }),
+            "respond_to_comment",
+            serde_json::json!({ "comment_id": "comment_1", "response": "I checked the notes." }),
         )],
         50,
     ));
-    events.extend(host.results(run, "# Notes"));
+    events.extend(host.results(run, "Recorded"));
     events.extend(host.compaction(run, 3, "Read."));
     events.extend(host.turn(run, [streamed_text("answer", "Done.", false)], 70));
     events.push(host.ended(run, protocol::RunOutcome::Completed));
@@ -262,6 +266,11 @@ fn a_saved_chat_comes_back_as_it_was(cx: &mut gpui::TestAppContext) {
         let id = thread.instance_id;
         let (db, rows) = open(&root, &runtime);
         assert!(rows.is_empty());
+        let TimelineMessage::User(group) = &mut thread.timeline[0] else {
+            panic!("expected the submitted comment group");
+        };
+        // Reopening the group in this session shouldn't change the next load's default.
+        group.ui.comments_folded = false;
         // Chats are filed only under projects the database has.
         db.saver().create_project(&crate::projects::ProjectRecord {
             id: thread.project().unwrap(),
@@ -288,6 +297,13 @@ fn a_saved_chat_comes_back_as_it_was(cx: &mut gpui::TestAppContext) {
         assert!(!row.archived);
         assert_eq!(row.meta, ChatMeta::of(&thread));
         let restored = load(&db, id, cx);
+        let TimelineMessage::User(group) = &restored.timeline[0] else {
+            panic!("expected the restored comment group");
+        };
+        assert!(
+            group.ui.comments_folded,
+            "the answered comment group should reopen folded"
+        );
         assert_eq!(shown(&restored), shown(&thread));
         assert_eq!(restored.participant_id(), thread.participant_id());
         assert_eq!(restored.project_folders(), thread.project_folders());

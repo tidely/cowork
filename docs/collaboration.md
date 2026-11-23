@@ -358,7 +358,9 @@ failed run keeps its prompt and every turn it completed.
   events**, the previews since the last reply joined the transcript; a run that
   stops mid-reply keeps them, since that output never joins the transcript.
   Comment replies come from `respond_to_comment` calls with IDs derived from the
-  message and call, so every participant names them alike.
+  message and call, so every participant names them alike. A reply folds its
+  submitted comment group both live and when rebuilding the timeline from saved
+  history or a shared snapshot. Manually opening the group is local to the view.
 - Only the **response**, the text after the agent's last tool call, can be
   commented on, and comment ranges are offsets into it. Everything before it is
   work, shown under "Working for" while the run goes and collapsed under "Worked
