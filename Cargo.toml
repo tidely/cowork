@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/actor-handle",
     "crates/agent",
     "crates/agent-input",
     "crates/agent-runtime",
