@@ -228,6 +228,8 @@ struct Cowork {
     typing_in: Option<(Uuid, EntityId, gpui::FocusHandle)>,
     published_presence: HashMap<Uuid, protocol::Presence>,
     caret_label_refresh: Option<gpui::Task<()>>,
+    /// Placeholder, send-key cap, and the pulse when that key changes.
+    draft_affordance: composer::DraftAffordance,
     working_refresh: Option<gpui::Task<()>>,
     /// The model new threads start with: the last one selected locally,
     /// saved for the next launch; see [`Cowork::set_new_thread_model`].
@@ -427,7 +429,7 @@ impl Cowork {
             .retain(|_, shown| shown.rendered_at >= previous_generation);
 
         let can_write = composer.is_some();
-        let composer = composer.map(|composer| self.render_composer(composer, cx));
+        let composer = composer.map(|composer| self.render_composer(composer, window, cx));
         let pending_rows = active_thread_id
             .map(|thread_id| self.render_pending_messages(thread_id, message_count, cx))
             .unwrap_or_default();
@@ -953,6 +955,7 @@ pub fn run() -> anyhow::Result<()> {
                         typing_in: None,
                         published_presence: HashMap::new(),
                         caret_label_refresh: None,
+                        draft_affordance: Default::default(),
                         working_refresh: None,
                         new_thread_model: None,
                         new_thread_project_folders: Vec::new(),

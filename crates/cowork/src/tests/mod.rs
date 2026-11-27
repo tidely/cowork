@@ -277,6 +277,7 @@ fn test_cowork(
         typing_in: None,
         published_presence: HashMap::new(),
         caret_label_refresh: None,
+        draft_affordance: Default::default(),
         working_refresh: None,
         new_thread_model: None,
         new_thread_project_folders: Vec::new(),
