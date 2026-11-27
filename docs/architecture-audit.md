@@ -179,11 +179,13 @@ known user-facing bugs. Line numbers are the sites to read.
 `Cowork` (`lib.rs:144`–`254`) is the session host, the database client, the
 scheduler, the provider registry, and the timeline. Every event of the active
 chat calls `thread_updated`, which notifies that one view
-(`generation.rs:1000`). GPUI coalesces notifications, and
-`docs/timeline-performance.md` keeps row construction to the viewport. The
-remaining cost is structural: a change to sharing, tools, or storage edits the
-same type the frame renders, and almost every regression test builds a
-`Cowork`.
+(`generation.rs:1000`). A draft keystroke does the same
+(`draft_editing.rs:348`), and `render` calls `prepare_draft` whenever a draft
+is readable (`lib.rs:601`), so each character walks the editors again. GPUI
+coalesces notifications, and `docs/timeline-performance.md` keeps row
+construction to the viewport. The remaining cost is structural: a change to
+sharing, tools, or storage edits the same type the frame renders, and almost
+every regression test builds a `Cowork`.
 
 **Fix.** A model entity for "this launch's chats, agents, and store", with
 `Cowork` rendering it. Notify the timeline from generation events without
@@ -368,6 +370,11 @@ Gaps that would miss a real regression:
   failed start (`generation.rs:561`), and `agent_session_ended`.
 - `Thread::apply`'s panic is untested because the tests call `try_apply`.
 - The three `retry_after` copies do not share a test vector.
+- `serve_peer` rejects a different `protocol_version` (`sharing.rs:224`).
+  The tests pin the bytes of `Join` and `Rejected`. They do not send a
+  mismatched version and watch the peer drop.
+- File-tool labels match name strings (`timeline.rs:358`) instead of the
+  tools' `NAME` constants, so a rename does not fail to compile.
 
 Screenshot and timeline bench tests are ignored on purpose
 (`docs/timeline-performance.md`).
@@ -383,8 +390,11 @@ Screenshot and timeline bench tests are ignored on purpose
 - **GPUI tasks and subscriptions.** Refresh tasks are stored and replaced
   (`ollama_watch`, `caret_label_refresh`, `working_refresh`, the idle sweep),
   so the previous task is dropped and cancelled. Subscriptions that must
-  outlive the frame are fields. `theme.rs` detaches a process-lifetime
-  theme observer. No foreground `block_on` on the UI path after startup.
+  outlive the frame are fields, except the draft editors
+  (`draft_editing.rs:57`) and the attachment read tasks
+  (`composer_attachments.rs`), which are detached and end when their entity
+  or channel does. `theme.rs` detaches a process-lifetime theme observer.
+  No foreground `block_on` on the UI path after startup.
 - **Dependencies that look heavy and are used.** `chrono` exists for `rrule`'s
   types (`Cargo.toml` workspace comment, `scheduled_task.rs:141`). `pdf_oxide`,
   `syntect`, `similar`, `nucleo-matcher`, `postcard`, and `image` are the PDF
@@ -522,7 +532,8 @@ and `cargo test --workspace`.
 
 ### Quick wins
 
-No product decision. Safe to merge in any order.
+No product decision. Safe to merge in any order. Items 1 and 4 are open as
+their own pull requests.
 
 1. **Redundant model clone.** Own the `(ModelRef, ModelInfo)` key once in
    `thread_agent` (`generation.rs:579`). `Range<usize>` is not `Copy` here, so
@@ -542,22 +553,24 @@ No product decision. Safe to merge in any order.
    `large_enum_variant` on `tests/generation_profile.rs:319`. The render
    methods next to `render_agent_text` already allow `too_many_arguments`
    (`timeline_view.rs:1465`). Do not raise the workspace threshold.
+5. **Tool labels.** Match `timeline.rs:358` on `ReadFile::NAME` and the other
+   tool constants, not on string literals. One compile break on a rename.
 
 ### Needs a decision
 
-5. **Host `apply` on failure** (finding 3). Confirm the UI: log and fail the
+6. **Host `apply` on failure** (finding 3). Confirm the UI: log and fail the
    run, or keep the crash as a tripwire. S, and it changes the failure path.
-6. **Where `retry_after` lives** (finding 6). A tiny shared module that
+7. **Where `retry_after` lives** (finding 6). A tiny shared module that
    depends on `reqwest` and `httpdate`, or leave the copies. Do not put it in
    `provider-sse` or `language-model`.
-7. **Sandbox thread key** (finding 7) and **typed draft/sandbox errors**
+8. **Sandbox thread key** (finding 7) and **typed draft/sandbox errors**
    (finding 4). API changes. Do draft's error type on its own; it has its
    own tests.
-8. **One owner for a run** (finding 2). After that, the test that the two
+9. **One owner for a run** (finding 2). After that, the test that the two
    sides cannot disagree.
-9. **Split `Cowork`** (finding 1). Only after 8, or the split preserves the
-   duplication.
-10. **Shed or keep** JSONL, dynamic tools, and runtime `AllowForRun`
+10. **Split `Cowork`** (finding 1). Only after 9, or the split preserves the
+    duplication.
+11. **Shed or keep** JSONL, dynamic tools, and runtime `AllowForRun`
     (tradeoffs). Each is its own PR, and only if the managed `Agent` and the
     examples are in or out together.
 
