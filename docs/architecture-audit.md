@@ -305,19 +305,20 @@ first. The next caller of `approval_is_host_only` can get that wrong.
 names this, next to reparsing the last Markdown block, and says it has not
 been measured as the bottleneck. It is still the obvious per-token copy.
 
-`thread_agent` also clones the selected model twice
-(`generation.rs:579` and `:583`): once to own it, again to use as the map key.
+`thread_agent` clones the selected model twice (`generation.rs:579` and
+`:583`): once to own it, again to use as the map key. One owned pair is enough.
 
-`Range<usize>` is `Copy`, and several sites call `.clone()` on it
-(`transcript.rs:140`, `transcript.rs:820`, `timeline_view.rs:1332` and
-`:1349`). Those copies are cheap. They are noise in the hot render path.
+`std::ops::Range<usize>` does not implement `Copy` on rustc 1.100, so a
+`.clone()` that is followed by another use of the same range is required
+(`transcript.rs:140`, `transcript.rs:330`, `timeline_view.rs:1332`). The clone
+in `for index in output.clone()` (`transcript.rs:820`) is not: the loop is the
+range's last use. These clones are two usizes. They are not the cost.
 
-**Fix.** Build the agent key once. Pass ranges by copy. Leave `partial` until
-someone profiles a long reply; replacing it changes how preview state is
-borrowed.
+**Fix.** Build the agent key once. Leave `partial` until someone profiles a
+long reply; replacing it changes how preview state is borrowed.
 
-**Blast radius.** `generation.rs`, `transcript.rs`, `timeline_view.rs` for the
-cheap copies. **Effort.** S for those, M for `partial`.
+**Blast radius.** `generation.rs` for the key. `transcript.rs` for `partial`.
+**Effort.** S for the key, M for `partial`.
 
 ### 10. Panics whose invariant is only "the other half of this function"
 
@@ -523,11 +524,11 @@ and `cargo test --workspace`.
 
 No product decision. Safe to merge in any order.
 
-1. **Redundant clones.** Own the `(ModelRef, ModelInfo)` key once in
-   `thread_agent` (`generation.rs:579`). Stop calling `Clone` on `Range<usize>`
-   in `transcript.rs` (`:140`, `:820`) and `timeline_view.rs` (`:1332`,
-   `:1349`). Check the session test `a_thread_session_asks_refuses_and_compacts`
-   and a timeline virtualization test.
+1. **Redundant model clone.** Own the `(ModelRef, ModelInfo)` key once in
+   `thread_agent` (`generation.rs:579`). `Range<usize>` is not `Copy` here, so
+   do not delete a range clone that still has a later use. The output walk in
+   `transcript.rs:820` can take the range by value. Check
+   `a_thread_session_asks_refuses_and_compacts`.
 2. **Facade dependency.** Point `sandbox` and `tools` at `tool-runtime` and
    `language-model`. `cargo test -p sandbox` and `cargo test -p tools`.
 3. **Approval audience.** Replace the bool in `approvals` with a two-variant
