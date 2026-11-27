@@ -817,7 +817,7 @@ impl crate::timeline::AgentOutput {
     ) -> Self {
         let mut shown = Self::default();
         let mut compactions = transcript.compactions_in(&output).peekable();
-        for index in output.clone() {
+        for index in output {
             while compactions.next_if(|at| *at == index).is_some() {
                 shown.push_compaction();
             }
