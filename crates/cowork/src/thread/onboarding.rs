@@ -291,7 +291,7 @@ mod tests {
     #[test]
     fn the_greeting_streams_in_whole_words_within_its_frames() {
         let text = WELCOME_MESSAGE;
-        let chunks = stream_chunks(&text);
+        let chunks = stream_chunks(text);
         assert!(chunks.len() <= STREAM_FRAMES);
         assert_eq!(chunks.concat(), text);
     }
