@@ -318,7 +318,7 @@ fn relayed(event: agent::AgentEvent<agent::BasicHost>) -> Option<RunEvent> {
 
 enum Update {
     Event(Instant, Box<RunEvent>),
-    Done(Result<Message, String>, Duration),
+    Done(Box<Result<Message, String>>, Duration),
 }
 
 #[test]
@@ -436,7 +436,10 @@ fn generation_profile() {
                         agent.close().await?;
                         Ok::<_, anyhow::Error>(reply.message)
                     }.await;
-                    let _ = sender.send(Update::Done(result.map_err(|e| format!("{e:#}")), started.elapsed()));
+                    let _ = sender.send(Update::Done(
+                        Box::new(result.map_err(|e| format!("{e:#}"))),
+                        started.elapsed(),
+                    ));
                 });
                 control.borrow_mut().abort = Some(task.abort_handle());
                 // Same serial recv/update flow as production. No arbitrary poll
@@ -454,7 +457,7 @@ fn generation_profile() {
                             cx.update(|cx| fixture.emit(HostMessage::AgentEvent { id: fixture.message_id.into_bytes(), event: *event }, &mut stats, cx));
                             stats.events += 1;
                         }
-                        Update::Done(result, wall) => break (result, wall),
+                        Update::Done(result, wall) => break (*result, wall),
                     }
                 };
                 let outcome = match &result { Ok(_) => RunOutcome::Completed, Err(error) => RunOutcome::Failed(error.clone()) };

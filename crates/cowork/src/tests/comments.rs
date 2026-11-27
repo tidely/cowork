@@ -223,6 +223,7 @@ fn a_comment_past_its_line_highlights_into_the_next_segment(cx: &mut gpui::TestA
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn assert_backslash_selection_creates_comment(
     cx: &mut gpui::TestAppContext,
     markdown: &'static str,

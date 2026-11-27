@@ -1254,6 +1254,7 @@ impl Cowork {
         }));
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn render_agent_text(
         &mut self,
         thread_message_id: ThreadMessageId,

@@ -665,7 +665,7 @@ pub(crate) fn render_turn_card(
             .text_color(theme.muted_foreground)
             .line_clamp(RESPONSE_LINES)
             .text_ellipsis()
-            .child(SharedString::new(&text)),
+            .child(SharedString::new(text)),
         TurnResponse::Status(status) => div()
             .italic()
             .text_color(theme.muted_foreground)
