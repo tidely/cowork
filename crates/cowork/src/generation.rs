@@ -576,19 +576,18 @@ impl Cowork {
     ) -> anyhow::Result<(SessionHandle<CoworkHost>, Arc<CoworkHost>)> {
         let state = thread.read(cx);
         let thread_id = state.instance_id;
-        let (model, info) = state
+        let key = state
             .runnable_model()
             .map(|(model, info)| (model.clone(), info.clone()))
             .ok_or_else(|| anyhow::anyhow!("No available model selected"))?;
-        let key = (model.clone(), info.clone());
-        let connection = self.providers.connection(model.provider)?;
+        let connection = self.providers.connection(key.0.provider)?;
         if let Some(agent) = self.agents.get_mut(&thread_id) {
             let reconnect = !Arc::ptr_eq(&agent.connection, &connection);
             if agent.model != key || reconnect {
                 agent.handle.post(Request::new(
                     RunSource::Host,
                     RequestKind::ReplaceDefinition {
-                        definition: definition(&model, &info),
+                        definition: definition(&key.0, &key.1),
                         provider: reconnect.then(|| connection.clone()),
                     },
                 ))?;
@@ -609,8 +608,8 @@ impl Cowork {
         let handle = start_session(
             host.clone(),
             connection.clone(),
-            &model,
-            &info,
+            &key.0,
+            &key.1,
             state.transcript.conversation().clone(),
             events,
             &self.tokio_handle,
