@@ -647,3 +647,485 @@ fn idle_pending_messages_show_resume_until_a_new_draft_is_written(cx: &mut gpui:
     assert!(cx.debug_bounds("resume-messages").is_none());
     assert!(cx.debug_bounds("send-message").is_some());
 }
+
+use crate::composer::{DRAFT_PLACEHOLDER, SEND_KEY_CUE, SendAction, SendKey, SendKeyCue};
+
+fn shows_placeholder(editor: &Entity<TextareaState>, cx: &mut gpui::VisualTestContext) -> bool {
+    cx.update(|window, cx| {
+        let placeholder = editor.read(cx).presentation().placeholder().to_string();
+        let empty = editor.read(cx).value().is_empty();
+        let marked = editor
+            .update(cx, |editor, cx| editor.marked_text_range(window, cx))
+            .is_some();
+        placeholder == DRAFT_PLACEHOLDER && empty && !marked
+    })
+}
+
+fn placeholder_text(editor: &Entity<TextareaState>, cx: &mut gpui::VisualTestContext) -> String {
+    cx.update(|_, cx| editor.read(cx).presentation().placeholder().to_string())
+}
+
+fn chip_selector(action: SendAction) -> &'static str {
+    Box::leak(format!("send-key-chip:{}:{}", action.label(), action.tooltip()).into_boxed_str())
+}
+
+fn cue_selector(cue: SendKeyCue) -> &'static str {
+    Box::leak(format!("send-key-cue:{}", cue.text()).into_boxed_str())
+}
+
+fn any_send_key_chip(cx: &mut gpui::VisualTestContext) -> bool {
+    [
+        SendAction::Send(SendKey::Enter),
+        SendAction::Steer(SendKey::Enter),
+        SendAction::Send(SendKey::ModifierEnter),
+        SendAction::Steer(SendKey::ModifierEnter),
+    ]
+    .into_iter()
+    .any(|action| cx.debug_bounds(chip_selector(action)).is_some())
+}
+
+#[gpui::test]
+fn placeholder_shows_on_an_empty_draft_until_the_first_character(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let editor = cowork.read_with(cx, |cowork, _| {
+        cowork
+            .new_thread_draft
+            .draft_position
+            .clone()
+            .expect("draft position")
+    });
+    assert!(shows_placeholder(&editor, cx));
+    assert!(
+        cx.debug_bounds(chip_selector(SendAction::Send(SendKey::Enter)))
+            .is_some()
+    );
+
+    cx.update(|window, cx| {
+        cowork.update(cx, |cowork, cx| {
+            cowork.timeline_focus_handle.focus(window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(!editor.focus_handle(cx).is_focused(window));
+    });
+    assert!(
+        shows_placeholder(&editor, cx),
+        "an empty draft keeps the placeholder when it is not focused"
+    );
+
+    cx.update(|window, cx| {
+        cowork.update(cx, |cowork, cx| cowork.focus_composer(window, cx));
+    });
+    cx.simulate_input("a");
+    cx.run_until_parked();
+    assert!(!shows_placeholder(&editor, cx));
+    assert!(
+        cx.debug_bounds(chip_selector(SendAction::Send(SendKey::Enter)))
+            .is_some()
+    );
+
+    cx.simulate_keystrokes("backspace");
+    cx.run_until_parked();
+    assert!(shows_placeholder(&editor, cx));
+}
+
+#[gpui::test]
+fn marked_text_hides_the_placeholder_until_the_buffer_is_empty(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let editor = cowork.read_with(cx, |cowork, _| {
+        cowork
+            .new_thread_draft
+            .draft_position
+            .clone()
+            .expect("draft position")
+    });
+    assert!(shows_placeholder(&editor, cx));
+
+    cx.update(|window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.replace_and_mark_text_in_range(None, "ni", None, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    cx.update(|window, cx| {
+        assert!(
+            editor
+                .update(cx, |editor, cx| editor.marked_text_range(window, cx))
+                .is_some()
+        );
+        assert!(!editor.read(cx).value().is_empty());
+    });
+    assert!(!shows_placeholder(&editor, cx));
+
+    cx.update(|window, cx| {
+        editor.update(cx, |editor, cx| {
+            editor.replace_and_mark_text_in_range(None, "", None, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(shows_placeholder(&editor, cx));
+}
+
+#[gpui::test]
+fn placeholder_is_only_on_the_last_empty_block(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let (draft_id, first, second) = cowork.update(cx, |cowork, cx| {
+        let author = cowork.new_thread_draft.author.as_uuid();
+        let draft_id = cowork.new_thread_draft.id;
+        let ids = cowork
+            .update_draft(draft_id, cx, |draft| {
+                (
+                    draft.create_prompt(author, ""),
+                    draft.create_prompt(author, ""),
+                )
+            })
+            .expect("the new chat's draft");
+        cx.notify();
+        (draft_id, ids.0, ids.1)
+    });
+    cx.update(|window, cx| {
+        cowork.update(cx, |cowork, cx| {
+            cowork.focus_draft_editor(draft_id, EditorSlot::Prompt(second), None, window, cx);
+        });
+    });
+    cx.run_until_parked();
+
+    let (first_editor, second_editor, position) = cowork.read_with(cx, |cowork, _| {
+        let draft = &cowork.new_thread_draft;
+        (
+            draft
+                .editor(EditorSlot::Prompt(first))
+                .expect("first block"),
+            draft
+                .editor(EditorSlot::Prompt(second))
+                .expect("last block"),
+            draft
+                .editor(EditorSlot::DraftPosition)
+                .expect("draft position"),
+        )
+    });
+    assert_ne!(placeholder_text(&first_editor, cx), DRAFT_PLACEHOLDER);
+    assert!(shows_placeholder(&second_editor, cx));
+    assert_ne!(placeholder_text(&position, cx), DRAFT_PLACEHOLDER);
+
+    cx.update(|window, cx| {
+        cowork.update(cx, |cowork, cx| {
+            cowork.focus_draft_editor(draft_id, EditorSlot::DraftPosition, None, window, cx);
+        });
+    });
+    cx.run_until_parked();
+    assert!(shows_placeholder(&position, cx));
+    assert_ne!(placeholder_text(&second_editor, cx), DRAFT_PLACEHOLDER);
+    assert_ne!(placeholder_text(&first_editor, cx), DRAFT_PLACEHOLDER);
+}
+
+fn open_read_only<'a>(
+    cx: &'a mut gpui::TestAppContext,
+    block: Option<&str>,
+) -> (
+    Entity<Cowork>,
+    tokio::runtime::Runtime,
+    &'a mut gpui::VisualTestContext,
+) {
+    cx.update(|cx| {
+        gpui_component::init(cx);
+        crate::theme::init(cx);
+    });
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .expect("test runtime");
+    let tokio_handle = runtime.handle().clone();
+    let (root, cx) = cx.add_window_view(|window, cx| {
+        let host_id = ParticipantId::new();
+        let actor = ParticipantId::new();
+        let mut draft = ThreadDraft::new(host_id);
+        if let Some(body) = block {
+            draft.create_prompt(host_id.as_uuid(), body);
+        }
+        let host = Thread::new_local(
+            "test".into(),
+            Vec::new(),
+            draft,
+            host_id,
+            std::sync::Arc::default(),
+            None,
+        );
+        let mut snapshot = host.to_protocol();
+        snapshot.participants = vec![host_id.into_bytes(), actor.into_bytes()];
+        let welcome = protocol::Welcome {
+            participant_id: actor.into_bytes(),
+            thread: snapshot,
+            draft: host.draft().encode_state(),
+            draft_generation: 0,
+            presence: Vec::new(),
+            stored_attachments: Vec::new(),
+        };
+        let thread = cx.new(|cx| {
+            let mut thread = Thread::from_prepared_welcome(
+                Thread::prepare_welcome(welcome).expect("valid welcome"),
+                ThreadDraft::new(actor),
+                crate::thread::ThreadSharing::NotShared,
+                cx,
+            );
+            thread.apply_for_test(
+                protocol::HostMessage::DefaultPeerModeChanged(crate::thread::PeerMode::ReadOnly),
+                cx,
+            );
+            thread
+        });
+        let thread_id = thread.read(cx).instance_id;
+        let store = cx.new(|cx| {
+            let mut store = ThreadStore::default();
+            store.push_front_active(thread, cx);
+            store
+        });
+        let cowork =
+            cx.new(|cx| super::test_cowork(store, Some(thread_id), tokio_handle, window, cx));
+        gpui_component::Root::new(cowork, window, cx)
+    });
+    let cowork = root.read_with(cx, |root, _| {
+        root.view()
+            .clone()
+            .downcast::<Cowork>()
+            .expect("root shows cowork")
+    });
+    cx.update(|window, _| window.activate_window());
+    cx.run_until_parked();
+    (cowork, runtime, cx)
+}
+
+#[gpui::test]
+fn read_only_chat_shows_neither_placeholder_nor_chip(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = open_read_only(cx, None);
+    assert!(
+        !cowork.read_with(cx, |cowork, cx| {
+            cowork
+                .readable_draft_id(cx)
+                .is_some_and(|draft_id| cowork.draft_can_edit(draft_id, cx))
+        }),
+        "the peer cannot edit"
+    );
+    assert!(!any_send_key_chip(cx));
+    let editors = cowork.read_with(cx, |cowork, cx| {
+        let draft_id = cowork.readable_draft_id(cx).expect("draft");
+        cowork
+            .read_draft(draft_id, cx, |draft| {
+                draft
+                    .all_editors()
+                    .map(|(_, editor)| editor.clone())
+                    .collect::<Vec<_>>()
+            })
+            .expect("draft")
+    });
+    assert!(editors.iter().all(|editor| !shows_placeholder(editor, cx)));
+}
+
+#[gpui::test]
+fn read_only_prompt_block_has_no_placeholder(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = open_read_only(cx, Some(""));
+    assert!(!any_send_key_chip(cx));
+    let editors = cowork.read_with(cx, |cowork, cx| {
+        let draft_id = cowork.readable_draft_id(cx).expect("draft");
+        cowork
+            .read_draft(draft_id, cx, |draft| {
+                draft
+                    .all_editors()
+                    .map(|(_, editor)| editor.clone())
+                    .collect::<Vec<_>>()
+            })
+            .expect("draft")
+    });
+    assert!(
+        editors
+            .iter()
+            .any(|editor| placeholder_text(editor, cx).is_empty()),
+        "the empty block is edited nowhere"
+    );
+    assert!(editors.iter().all(|editor| {
+        placeholder_text(editor, cx).is_empty() && !shows_placeholder(editor, cx)
+    }));
+}
+
+#[gpui::test]
+fn send_key_chip_tooltip_is_steer_while_generating(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let author = cowork.read_with(cx, |cowork, _| cowork.local_participant_id);
+    let thread_id = uuid::Uuid::new_v4();
+    let mut draft = ThreadDraft::new(author);
+    draft.create_prompt(author.as_uuid(), "hello");
+    let thread = cx.update(|_, cx| cx.new(|_| super::test_thread(thread_id, Vec::new(), draft)));
+    cowork.update(cx, |cowork, cx| {
+        cowork
+            .thread_store
+            .update(cx, |store, cx| store.push_front_active(thread.clone(), cx));
+        cx.notify();
+    });
+    cx.update(|window, cx| {
+        cowork.update(cx, |cowork, cx| cowork.focus_composer(window, cx));
+    });
+    cx.run_until_parked();
+    let draft_id = thread.read_with(cx, |thread, _| thread.draft().id);
+    assert!(
+        cowork
+            .read_with(cx, |cowork, _| cowork.send_key_pulse(draft_id))
+            .is_none()
+    );
+    assert!(
+        cx.debug_bounds(chip_selector(SendAction::Send(SendKey::Enter)))
+            .is_some()
+    );
+
+    thread.update(cx, |thread, cx| thread.set_generating_for_test(true, cx));
+    cowork.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    assert!(
+        thread.read_with(cx, |thread, _| thread.is_generating()),
+        "the fixture run is going"
+    );
+    assert!(
+        cx.debug_bounds(chip_selector(SendAction::Steer(SendKey::Enter)))
+            .is_some()
+    );
+    assert!(
+        cowork
+            .read_with(cx, |cowork, _| cowork.send_key_pulse(draft_id))
+            .is_none()
+    );
+}
+
+#[gpui::test]
+fn send_key_chip_pulses_only_when_the_key_changes(cx: &mut gpui::TestAppContext) {
+    let (cowork, _runtime, cx) = composer_test_cowork(cx);
+    let author = cowork.read_with(cx, |cowork, _| cowork.local_participant_id);
+    let thread_id = uuid::Uuid::new_v4();
+    let thread = cx.update(|_, cx| {
+        cx.new(|_| super::test_thread(thread_id, Vec::new(), ThreadDraft::new(author)))
+    });
+    cowork.update(cx, |cowork, cx| {
+        cowork
+            .thread_store
+            .update(cx, |store, cx| store.push_front_active(thread.clone(), cx));
+        cx.notify();
+    });
+    cx.update(|window, cx| {
+        cowork.update(cx, |cowork, cx| cowork.focus_composer(window, cx));
+    });
+    cx.simulate_input("ab");
+    cx.run_until_parked();
+
+    let draft_id = thread.read_with(cx, |thread, _| thread.draft().id);
+    assert!(
+        cowork
+            .read_with(cx, |cowork, _| cowork.send_key_pulse(draft_id))
+            .is_none()
+    );
+    assert!(
+        cx.debug_bounds(chip_selector(SendAction::Send(SendKey::Enter)))
+            .is_some()
+    );
+    let (cursor, focused) = cx.update(|window, cx| {
+        let editor = cowork
+            .read(cx)
+            .focused_draft_editor(window, cx)
+            .expect("caret")
+            .2;
+        (editor.read(cx).cursor(), editor.entity_id())
+    });
+
+    let peer = ParticipantId::new();
+    thread.update(cx, |thread, cx| {
+        thread.apply_for_test(super::joined(peer), cx)
+    });
+    cowork.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    let (cue, generation) = cowork
+        .read_with(cx, |cowork, _| cowork.send_key_pulse(draft_id))
+        .expect("a peer joining changes the send key");
+    assert_eq!(cue, SendKeyCue::OthersHere);
+    assert!(
+        cx.debug_bounds(chip_selector(SendAction::Send(SendKey::ModifierEnter)))
+            .is_some()
+    );
+    assert!(
+        cx.debug_bounds(cue_selector(SendKeyCue::OthersHere))
+            .is_some()
+    );
+    cx.update(|window, cx| {
+        let editor = cowork
+            .read(cx)
+            .focused_draft_editor(window, cx)
+            .expect("caret")
+            .2;
+        assert_eq!(editor.entity_id(), focused);
+        assert_eq!(editor.read(cx).cursor(), cursor);
+    });
+
+    let other = ParticipantId::new();
+    thread.update(cx, |thread, cx| {
+        thread.apply_for_test(super::joined(other), cx)
+    });
+    cowork.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    cx.simulate_input("c");
+    cx.run_until_parked();
+    assert_eq!(
+        cowork
+            .read_with(cx, |cowork, _| cowork.send_key_pulse(draft_id))
+            .map(|pulse| pulse.1),
+        Some(generation),
+        "another arrival, and typing, leave the send key alone"
+    );
+
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(2));
+    cx.run_until_parked();
+    assert_eq!(
+        cowork
+            .read_with(cx, |cowork, _| cowork.send_key_pulse(draft_id))
+            .map(|pulse| pulse.0),
+        Some(SendKeyCue::OthersHere)
+    );
+
+    thread.update(cx, |thread, cx| {
+        thread.apply_for_test(
+            protocol::HostMessage::ParticipantLeft(peer.into_bytes()),
+            cx,
+        );
+        thread.apply_for_test(
+            protocol::HostMessage::ParticipantLeft(other.into_bytes()),
+            cx,
+        );
+    });
+    cowork.update(cx, |_, cx| cx.notify());
+    cx.run_until_parked();
+    let (cue, next) = cowork
+        .read_with(cx, |cowork, _| cowork.send_key_pulse(draft_id))
+        .expect("leaving restores Enter");
+    assert_eq!(cue, SendKeyCue::JustYou);
+    assert_ne!(next, generation);
+    assert!(
+        cx.debug_bounds(chip_selector(SendAction::Send(SendKey::Enter)))
+            .is_some()
+    );
+    assert!(cx.debug_bounds(cue_selector(SendKeyCue::JustYou)).is_some());
+
+    // The first cue's timer was dropped with the replacement pulse.
+    cx.executor()
+        .advance_clock(std::time::Duration::from_secs(2));
+    cx.run_until_parked();
+    assert_eq!(
+        cowork
+            .read_with(cx, |cowork, _| cowork.send_key_pulse(draft_id))
+            .map(|pulse| pulse.1),
+        Some(next)
+    );
+    cx.executor().advance_clock(SEND_KEY_CUE);
+    cx.run_until_parked();
+    assert!(
+        cowork
+            .read_with(cx, |cowork, _| cowork.send_key_pulse(draft_id))
+            .is_none()
+    );
+    assert!(cx.debug_bounds(cue_selector(SendKeyCue::JustYou)).is_none());
+}

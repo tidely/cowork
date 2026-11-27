@@ -216,6 +216,7 @@ impl Cowork {
         if lost_focus {
             self.focus_draft_editor(draft_id, EditorSlot::DraftPosition, None, window, cx);
         }
+        self.sync_draft_affordance(draft_id, enter_sends, window, cx);
     }
 
     /// Replaces an editor's text, keeping its selection on the same text.
@@ -994,6 +995,7 @@ pub(crate) mod tests {
                         typing_in: None,
                         published_presence: HashMap::new(),
                         caret_label_refresh: None,
+                        draft_affordance: Default::default(),
                         working_refresh: None,
                         new_thread_model: None,
                         new_thread_project_folders: Vec::new(),

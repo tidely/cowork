@@ -22,6 +22,7 @@
 //! frames are drawn at 2x and resized to the scale asked for.
 
 mod comments;
+mod draft_chip;
 mod opening;
 mod web_access;
 
@@ -43,6 +44,7 @@ type Scene = fn(&SceneContext) -> anyhow::Result<()>;
 /// `COWORK_SCREENSHOTS` selects it by.
 const SCENES: &[(&str, Scene)] = &[
     ("comments", comments::scene),
+    ("draft-chip", draft_chip::scene),
     ("opening", opening::scene),
     ("web-access", web_access::scene),
 ];

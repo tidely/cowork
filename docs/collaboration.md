@@ -251,6 +251,8 @@ starts a new line. Once anyone else is there, Enter starts a new line, because
 a submission takes everyone's blocks and a habitual Enter must not send others'
 unfinished text. The send button's tooltip names whichever key sends.
 
+The local user's own empty draft-position row, or the empty prompt block at the end when that row is hidden, shows the placeholder "Write a message" in the editor's muted foreground. It is the editor's own empty-buffer text, so the caret stays in front of it and it disappears on the first character, marked text included. The same line carries a key cap for whichever key sends: ↵ alone, ⌘↵ on macOS or Ctrl ↵ elsewhere once anyone else is in the chat. The cap is not a control. While a run is going its tooltip says Steer. When someone joins or leaves and that key changes, the cap's border and text pulse to the primary color and a short label names the new key. A read-only peer sees neither, and neither is part of the shared document.
+
 Send requires that the draft has at least one non-empty item (or the idle
 thread has accepted pending messages to resume), that no participant has a
 pending attachment read, and that the host has stored every attachment in
