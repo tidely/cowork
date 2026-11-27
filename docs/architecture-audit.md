@@ -533,8 +533,14 @@ No product decision. Safe to merge in any order.
 3. **Approval audience.** Replace the bool in `approvals` with a two-variant
    enum (finding 8). Existing approval tests should not change their
    expectations.
-4. **Clippy, as it comes up.** Fix warnings in the crate that emits them.
-   Do not weaken `clippy.toml`.
+4. **Clippy in `cowork`.** `cargo clippy --workspace --all-targets -- -D warnings`
+   fails on master (rustc 1.100) with five lints, all in `cowork`:
+   `too_many_arguments` on `timeline_view.rs:1257` (`render_agent_text`) and
+   `tests/comments.rs:226`; `needless_borrows_for_generic_args` at
+   `turn_navigation.rs:668`; `needless_borrow` at `thread/onboarding.rs:294`;
+   `large_enum_variant` on `tests/generation_profile.rs:319`. The render
+   methods next to `render_agent_text` already allow `too_many_arguments`
+   (`timeline_view.rs:1465`). Do not raise the workspace threshold.
 
 ### Needs a decision
 
