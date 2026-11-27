@@ -83,6 +83,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "actor-handle"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "thiserror 2.0.21",
+]
+
+[[package]]
 name = "addr2line"
 version = "0.27.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
